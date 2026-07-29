@@ -1247,14 +1247,16 @@ class DfkvStoreWorker:
         # each rank holds a UNIQUE shard (separated by the @dcp{r} key field),
         # not a replica. put_step is a dedup stride that assumes replication:
         # only 1/put_step of the identical-across-TP keys are stored. Under DCP
-        # that assumption is wrong -- the stride would drop ~(1 - 1/put_step) of
-        # each rank's own unique shard, so cross-instance (PD) consumers miss
-        # most of the KV (observed ~7% hit at TP8/DCP8, i.e. ~1/8). Shrink the
-        # stride by dcp_size so every rank stores its full shard. head_or_tp_rank
-        # is left unchanged: the `dcp=S:R` coordinate already separates shards,
-        # and both P and D derive it identically.
+        # that assumption is wrong -- ANY stride > 1 drops ~(1 - 1/put_step) of
+        # each rank's own unique shard, leaving @dcp{r} chunks unwritten; the
+        # lookup's longest-contiguous-prefix walk then collapses at the first
+        # gap (observed ~7% hit at TP8/DCP8; ~0% at TP8/DCP4 where the old
+        # `put_step //= dcp_size` still left put_step=2). Disable striping
+        # entirely under DCP so every rank stores its FULL @dcp{r} shard.
+        # head_or_tp_rank stays folded (=0 for MLA) so the tp0-only lookup
+        # still resolves every @dcp{r}.
         if self.dcp_size > 1 and self.put_step > 1:
-            self.put_step = max(1, self.put_step // self.dcp_size)
+            self.put_step = 1
 
         # CLIENT_RANKS (issue #111): converge store-side dfkv clients onto a
         # subset of ranks when the KV object is TP-replicated. Layout-clamped,
