@@ -342,34 +342,43 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return
 
             # Check which blocks already exist (dedup). Blocks are stored under
-            # scatter-gather keys "<key>@sg{n}" (see _group_segments_sg), so we
-            # must probe the first SG group as the block-present proxy -- the
-            # SAME proxy the lookup path uses (find_longest_cache_hit). Probing
-            # the bare "<key>" never matches a stored "<key>@sg0", so without the
-            # suffix this dedup is a silent no-op: every block gets re-PUT on
-            # every request, even when identical KV is already cached.
+            # scatter-gather keys "<key>@sg{n}" (see _group_segments_sg); the
+            # bare "<key>" never matches, so we must probe the @sg{n} form or the
+            # dedup is a silent no-op (every block re-PUT every request). Probe
+            # EVERY @sg group, not just @sg0 (mirrors the lookup path): a block
+            # counts as already-stored only when all its groups exist, so a block
+            # whose @sg1 was lost gets re-PUT instead of silently skipped.
+            sg = _sg_segs_of(self.client)
+            probe_keys: list[str] = []
+            probe_owner: list[int] = []
+            for i, k in enumerate(keys):
+                db = self.token_databases[group_indices[i]]
+                for grp in range(_sg_groups_for_db(db, sg)):
+                    probe_keys.append(_sg_group_key(k, grp, sg))
+                    probe_owner.append(i)
             save_exists_start = time.perf_counter()
             try:
-                exists_states = self.client.batch_exist(
-                    [_sg_group_key(k, 0, _sg_segs_of(self.client)) for k in keys]
-                )
+                exists_states = self.client.batch_exist(probe_keys)
             except Exception:
                 self._record_operation(
                     "save_exists",
                     save_exists_start,
-                    len(keys),
+                    len(probe_keys),
                     status="error",
-                    num_failed_keys=len(keys),
+                    num_failed_keys=len(probe_keys),
                 )
                 raise
             self._record_operation(
                 "save_exists",
                 save_exists_start,
-                len(keys),
+                len(probe_keys),
             )
-            missing_indices = [
-                i for i, exists in enumerate(exists_states) if exists != 1
-            ]
+            # A block is missing if ANY of its @sg groups is absent.
+            present = [True] * len(keys)
+            for pk_idx, exists in enumerate(exists_states):
+                if exists != 1:
+                    present[probe_owner[pk_idx]] = False
+            missing_indices = [i for i in range(len(keys)) if not present[i]]
 
             if not missing_indices:
                 return
@@ -696,6 +705,20 @@ def _sg_group_key(key: str, grp: int, max_segs: int) -> str:
     if max_segs == SG_MAX_SEGS:
         return f"{key}@sg{grp}"
     return f"{key}@sgw{max_segs}.{grp}"
+
+
+# Number of "@sg{n}" groups one block of this db is split into. A block carries
+# len(kv_caches_base_addr) payload segments (see ChunkedTokenDatabase.
+# prepare_value), coalesced into ceil(n_segs / max_segs) scatter-gather keys.
+# The exist-probe (store dedup + lookup) must check EVERY group, not just @sg0:
+# a block with @sg0 present but a later @sg{n} missing (a partially-failed PUT
+# or an independent eviction of one blob) would otherwise be reported present,
+# and the subsequent load of the missing group fails into a recompute.
+def _sg_groups_for_db(db: Any, max_segs: int) -> int:
+    n_segs = len(db.kv_caches_base_addr)
+    if n_segs <= 0:
+        return 1
+    return (n_segs + max_segs - 1) // max_segs
 
 
 # dfkv scatter-gather grouping: coalesce each chunk's per-layer segments
@@ -1386,14 +1409,14 @@ class DfkvStoreWorker:
                     for pp in range(self.pp_size):
                         md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
                         # dfkv: keys are stored per scatter-gather group
-                        # ("<key>@sg{n}"); probe the first group as the
-                        # block-present proxy so the lookup agrees with the
-                        # SAVE/LOAD on-wire key.
-                        candidate_keys.append(
-                            _sg_group_key(PoolKey(md, h.hex()).to_string(), 0,
-                                          _sg_segs_of(self.client))
-                        )
-                        candidate_meta.append((g_idx, bytes(h)))
+                        # ("<key>@sg{n}"). Probe EVERY group so a block is
+                        # reported present only when all its @sg{n} exist --
+                        # matching the load path, which fetches all groups.
+                        sg = _sg_segs_of(self.client)
+                        base = PoolKey(md, h.hex()).to_string()
+                        for grp in range(_sg_groups_for_db(db, sg)):
+                            candidate_keys.append(_sg_group_key(base, grp, sg))
+                            candidate_meta.append((g_idx, bytes(h)))
 
         if not candidate_keys:
             return 0
@@ -1417,13 +1440,20 @@ class DfkvStoreWorker:
             logger.error("Remote connection failed in lookup: %s", e)
             return 0
 
-        # A (group, hash) is "present" only when every TP*PP rank has it.
-        expected_per_key = max(1, tp_count * self.pp_size)
+        # A (group, hash) is "present" only when every TP*PP rank has EVERY one
+        # of the block's scatter-gather groups, so the expected count scales by
+        # the per-db @sg group count.
+        sg = _sg_segs_of(self.client)
         present_count: dict[tuple[int, bytes], int] = {}
         for gh, exists in zip(candidate_meta, res, strict=True):
             if exists == 1:
                 present_count[gh] = present_count.get(gh, 0) + 1
-        exists_set = {gh for gh, c in present_count.items() if c >= expected_per_key}
+        exists_set = {
+            gh
+            for gh, c in present_count.items()
+            if c >= max(1, tp_count * self.pp_size
+                        * _sg_groups_for_db(self.token_dbs[gh[0]], sg))
+        }
 
         _masks, hit_length = self.coord.find_longest_cache_hit(
             block_hashes, token_len, ExternalCachedBlockPool(exists_set)
