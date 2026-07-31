@@ -100,7 +100,15 @@ def _lookup_hit_tokens(store: set[str], hashes: list[BlockHash]) -> int:
     )
     self_ = SimpleNamespace(
         coord=coord,
-        token_dbs=[SimpleNamespace(metadata=_md(0), block_size=BLOCK)],
+        token_dbs=[SimpleNamespace(
+            metadata=_md(0),
+            block_size=BLOCK,
+            # <= SG_MAX_SEGS payload segments -> a single @sg group, so the
+            # lookup probes @sg0 only (matching this test's single-group
+            # store). Required since the @sg-group-probing fix: lookup now
+            # calls _sg_groups_for_db(db, ...) = len(db.kv_caches_base_addr).
+            kv_caches_base_addr=list(range(SG_MAX_SEGS)),
+        )],
         client=_FakeClient(store),
         tp_size=8,
         num_kv_head=1,
