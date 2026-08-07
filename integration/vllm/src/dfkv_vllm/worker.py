@@ -1682,7 +1682,13 @@ class DfkvStoreWorker:
     def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
         """Check how many prefix tokens exist in the store.
 
-        Checks across all TP ranks and PP ranks.
+        Checks across all TP ranks at this worker's own PP rank.
+
+        PP partitions layers across stages: each (group, chunk) is SAVED and
+        LOADED under the owning stage's pp_rank only (both paths use
+        db.metadata directly). Lookup must probe the same coordinate; probing
+        every pp_rank with this worker's group ids matches nothing there and
+        forced present=0 on PP>1 deployments.
         """
         if not block_hashes or token_len <= 0:
             return 0
@@ -1692,7 +1698,7 @@ class DfkvStoreWorker:
         candidate_keys: list[bytes] = []
         candidate_meta: list[tuple[int, bytes]] = []
         # Per-(group_id, hash) hit count required to call the chunk present:
-        # TP*PP rank replicas x the chunk's number of scatter groups.
+        # TP rank replicas x the chunk's number of scatter groups.
         expected_per_chunk: dict[tuple[int, bytes], int] = {}
         tp_count = min(self.tp_size, self.num_kv_head)
         # dfkv: gate candidates by store_mask -- the SAME per-(group,chunk) set
@@ -1722,7 +1728,7 @@ class DfkvStoreWorker:
             tp_candidates = (
                 [db.metadata.tp_rank] if db.metadata.tp_rank < 0 else range(tp_count)
             )
-            rank_probes = max(1, len(list(tp_candidates)) * self.pp_size)
+            rank_probes = max(1, len(list(tp_candidates)))
             for chunk_id, h in enumerate(group_hashes):
                 start_idx = chunk_id * spec_block_size
                 if start_idx >= token_len:
@@ -1738,14 +1744,16 @@ class DfkvStoreWorker:
                 )
                 expected_per_chunk[(g_idx, bytes(h))] = rank_probes * n_groups
                 for tp in tp_candidates:
-                    for pp in range(self.pp_size):
-                        md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
-                        base_key = PoolKey(md, h.hex()).to_bytes()
-                        for grp in range(n_groups):
-                            candidate_keys.append(
-                                _sg_group_key(base_key, grp, max_sg_segs)
-                            )
-                            candidate_meta.append((g_idx, bytes(h)))
+                    # Keep this worker's own pp_rank (db.metadata.pp_rank): PP
+                    # partitions layers, so each (group, chunk) lives under a
+                    # single stage's pp_rank, matching the SAVE/LOAD keys.
+                    md = dataclasses.replace(db.metadata, tp_rank=tp)
+                    base_key = PoolKey(md, h.hex()).to_bytes()
+                    for grp in range(n_groups):
+                        candidate_keys.append(
+                            _sg_group_key(base_key, grp, max_sg_segs)
+                        )
+                        candidate_meta.append((g_idx, bytes(h)))
 
         if not candidate_keys:
             return 0
@@ -1769,8 +1777,8 @@ class DfkvStoreWorker:
             logger.error("Remote connection failed in lookup: %s", e)
             return 0
 
-        # A (group, hash) is "present" only when every TP*PP rank has every
-        # scatter group of it.
+        # A (group, hash) is "present" only when every TP rank (at this
+        # worker's own PP rank) has every scatter group of it.
         present_count: dict[tuple[int, bytes], int] = {}
         for gh, exists in zip(candidate_meta, res, strict=True):
             if exists == 1:
