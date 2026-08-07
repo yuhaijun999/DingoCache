@@ -1782,7 +1782,7 @@ class DfkvStoreWorker:
         _masks, hit_length = self.coord.find_longest_cache_hit(
             block_hashes, token_len, ExternalCachedBlockPool(exists_set)
         )
-        logger.debug(
+        logger.warning(
             "dfkv lookup: token_len=%d candidates=%d present=%d -> hit_length=%d",
             token_len, len(candidate_keys), len(exists_set), hit_length,
         )

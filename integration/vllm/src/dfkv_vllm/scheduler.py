@@ -91,7 +91,7 @@ class DfkvStoreScheduler:
 
         _lk0 = time.perf_counter()
         num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
-        logger.debug(
+        logger.warning(
             "dfkv matched: req=%s tokens=%d computed=%d lookup_ms=%.1f hit_tokens=%d",
             request.request_id, request.num_tokens, num_computed_tokens,
             (time.perf_counter() - _lk0) * 1000.0, num_external_hit_tokens,
