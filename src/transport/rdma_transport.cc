@@ -2145,7 +2145,7 @@ std::vector<Status> RdmaTransport::RangeMany(
 
 std::vector<Status> RdmaTransport::ExistMany(
     const std::string& node, const std::vector<BlockKey>& keys,
-    std::vector<char>* exists) {
+    std::vector<char>* exists, std::string* out_dev) {
   const size_t count = keys.size();
   if (exists == nullptr) return InvalidStatuses(count);
   exists->assign(count, 0);
@@ -2178,6 +2178,7 @@ std::vector<Status> RdmaTransport::ExistMany(
       return result;
     }
     Conn* conn = acquired.conn;
+    if (out_dev) *out_dev = devs_[conn->rail_index];
     rdma::RcEndpoint& ep = conn->ep;
     const size_t window = std::min(
         ep.window(), static_cast<size_t>(conn->lease.credits));
@@ -2443,7 +2444,7 @@ std::vector<Status> RdmaTransport::CacheFrom(
 }
 
 std::vector<Status> RdmaTransport::CacheFromMulti(
-    const std::string& node, const std::vector<CacheSrcMulti>& sources) {
+    const std::string& node, const std::vector<CacheSrcMulti>& sources, std::string* out_dev) {
   const size_t count = sources.size();
   std::vector<Status> result(count, Status::kIOError);
   if (count == 0) return result;
@@ -2503,6 +2504,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       return result;
     }
     Conn* conn = acquired.conn;
+    if (out_dev) *out_dev = devs_[conn->rail_index];
     rdma::RcEndpoint& ep = conn->ep;
     const size_t seg_limit = std::max<size_t>(1, ep.max_sge() - 1);
     bool conn_ok = !InjectLocalRailFailure(attempt);
@@ -2681,7 +2683,7 @@ bool RdmaTransport::NoteBlock(size_t n) const {
 std::vector<Status> RdmaTransport::RangeIntoMulti(
     const std::string& node, const std::vector<BlockKey>& keys,
     const std::vector<RangeDstMulti>& destinations,
-    std::vector<size_t>* out_lengths) {
+    std::vector<size_t>* out_lengths, std::string* out_dev) {
   const size_t count = keys.size();
   if (destinations.size() != count) {
     if (out_lengths) out_lengths->assign(count, 0);
@@ -2773,6 +2775,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       return result;
     }
     Conn* conn = acquired.conn;
+    if (out_dev) *out_dev = devs_[conn->rail_index];
     rdma::RcEndpoint& ep = conn->ep;
     const size_t target_limit =
         std::max<size_t>(1, std::min(ep.max_sge() - 1,
