@@ -1591,7 +1591,7 @@ std::vector<Status> RdmaTransport::RangeMany(
 
 std::vector<Status> RdmaTransport::ExistMany(
     const std::string& node, const std::vector<BlockKey>& keys,
-    std::vector<char>* exists) {
+    std::vector<char>* exists, std::string* out_dev) {
   const size_t count = keys.size();
   if (exists == nullptr) return InvalidStatuses(count);
   exists->assign(count, 0);
@@ -1607,6 +1607,7 @@ std::vector<Status> RdmaTransport::ExistMany(
     Conn* conn = Acquire(node, Lane::kControl, &from_pool, attempt > 0,
                          std::min(count, depth_));
     if (!conn) return result;
+    if (out_dev) *out_dev = devs_[conn->rail_index];
     rdma::RcEndpoint& ep = conn->ep;
     const size_t window = std::min(
         ep.window(), static_cast<size_t>(conn->lease.credits));
@@ -1800,7 +1801,8 @@ std::vector<Status> RdmaTransport::CacheFrom(
 }
 
 std::vector<Status> RdmaTransport::CacheFromMulti(
-    const std::string& node, const std::vector<CacheSrcMulti>& sources) {
+    const std::string& node, const std::vector<CacheSrcMulti>& sources,
+    std::string* out_dev) {
   const size_t count = sources.size();
   std::vector<Status> result(count, Status::kIOError);
   if (count == 0) return result;
@@ -1845,6 +1847,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
     bool from_pool = false;
     Conn* conn = Acquire(node, Lane::kSgData, &from_pool, attempt > 0, 1);
     if (!conn) return result;
+    if (out_dev) *out_dev = devs_[conn->rail_index];
     rdma::RcEndpoint& ep = conn->ep;
     const size_t seg_limit = std::max<size_t>(1, ep.max_sge() - 1);
     bool conn_ok = true;
@@ -2006,7 +2009,7 @@ bool RdmaTransport::NoteBlock(size_t n) const {
 std::vector<Status> RdmaTransport::RangeIntoMulti(
     const std::string& node, const std::vector<BlockKey>& keys,
     const std::vector<RangeDstMulti>& destinations,
-    std::vector<size_t>* out_lengths) {
+    std::vector<size_t>* out_lengths, std::string* out_dev) {
   const size_t count = keys.size();
   if (out_lengths) out_lengths->assign(count, 0);
   if (destinations.size() != count) return InvalidStatuses(count);
@@ -2056,6 +2059,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
         node, Lane::kSgData, &from_pool, attempt > 0,
         std::min<size_t>(valid_count, depth_));
     if (!conn) return result;
+    if (out_dev) *out_dev = devs_[conn->rail_index];
     rdma::RcEndpoint& ep = conn->ep;
     const size_t target_limit =
         std::max<size_t>(1, std::min(ep.max_sge() - 1,
