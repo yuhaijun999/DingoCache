@@ -756,10 +756,13 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
   }
   conn->ep.set_remote_depth(remote.depth);
   if (remote.depth < depth_)
-    DFKV_LOG_INFO("rdma: server depth " + std::to_string(remote.depth) +
-                  " < client depth " + std::to_string(depth_) +
-                  ": batching window clamped to " +
-                  std::to_string(remote.depth));
+    // SG lane advertises depth 1 by design (per-QP isolation), so this fires on
+    // every SG connection -- demote to debug to keep default INFO logs clean.
+    // Recover with DFKV_LOG=debug if you need to see rail-depth clamping.
+    DFKV_LOG_DEBUG("rdma: server depth " + std::to_string(remote.depth) +
+                   " < client depth " + std::to_string(depth_) +
+                   ": batching window clamped to " +
+                   std::to_string(remote.depth));
 
   char ready = 0;
   char encoded[rdma::kRecvSegmentInfoBytes];
