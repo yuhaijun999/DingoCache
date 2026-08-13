@@ -2290,15 +2290,9 @@ std::vector<Status> RdmaTransport::RangeInto(
     completion_fault.BeginAttempt(attempt);
     final_timeout = false;
     std::fill(result.begin(), result.end(), Status::kIOError);
-    std::vector<std::vector<char>> attempt_outputs(count);
-    std::vector<uint64_t> attempt_data_lens(count, 0);
     std::vector<uint64_t> attempt_value_lens(count, 0);
     for (size_t i = 0; i < count; ++i) {
-      if (bad[i]) {
-        result[i] = Status::kInvalid;
-      } else {
-        attempt_outputs[i].resize(destinations[i].n);
-      }
+      if (bad[i]) result[i] = Status::kInvalid;
     }
     AcquireOptions options;
     options.force_new = attempt != 0;
@@ -2337,10 +2331,13 @@ std::vector<Status> RdmaTransport::RangeInto(
         const size_t item_index = base + slot;
         if (bad[item_index]) continue;
         const RangeDst& destination = destinations[item_index];
-        std::vector<char>& output = attempt_outputs[item_index];
+        // Server DMA lands directly in the caller buffer (GPUDirect when it is
+        // device memory; a host bounce here would fault on CUDA pointers).
+        // Rail-retry fencing comes from Destroy(conn) below: tearing down the
+        // QP drops in-flight remote writes before the next attempt reposts.
         if (destination.n != 0) {
           output_mrs[slot] =
-              ep.RegisterTransient(output.data(), output.size());
+              ep.RegisterTransient(destination.payload, destination.n);
           if (!output_mrs[slot]) {
             conn_ok = false;
             break;
@@ -2349,7 +2346,7 @@ std::vector<Status> RdmaTransport::RangeInto(
         std::vector<RdmaWriteTarget> targets;
         if (destination.n != 0) {
           targets.push_back(
-              {reinterpret_cast<uint64_t>(output.data()),
+              {reinterpret_cast<uint64_t>(destination.payload),
                output_mrs[slot]->rkey,
                static_cast<uint32_t>(destination.n)});
         }
@@ -2392,17 +2389,10 @@ std::vector<Status> RdmaTransport::RangeInto(
           break;
         }
         result[item_index] = status;
-        attempt_data_lens[item_index] = data_len;
         attempt_value_lens[item_index] = value_len;
       }
     }
     if (conn_ok) {
-      for (size_t i = 0; i < count; ++i) {
-        if (result[i] == Status::kOk && attempt_data_lens[i] != 0) {
-          std::memcpy(destinations[i].payload, attempt_outputs[i].data(),
-                      static_cast<size_t>(attempt_data_lens[i]));
-        }
-      }
       if (value_lens) *value_lens = std::move(attempt_value_lens);
       Release(node, Lane::kData, conn);
       if (cross_rail_retry)
@@ -2725,16 +2715,13 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     if (out_lengths) out_lengths->assign(count, 0);
     return result;
   }
-  // Keep fully validated items across a rail retry, but fence every server DMA
-  // in operation-owned storage. Caller segments are published only after all
-  // remaining items complete on the final healthy connection.
+  // Server DMA lands directly in the caller segments (GPUDirect when they are
+  // device memory; a host bounce here would fault on CUDA pointers).
+  // Rail-retry fencing comes from Destroy(conn): tearing down the QP drops
+  // in-flight remote writes before the next attempt reposts, and a retried
+  // item is rewritten in full from window 0.
   std::vector<char> completed(count, 0);
-  std::vector<std::vector<char>> staged_outputs(count);
-  std::vector<size_t> staged_out_lengths(count, 0);
-  for (size_t i = 0; i < count; ++i) {
-    if (!bad[i]) staged_outputs[i].resize(capacities[i]);
-  }
-  if (valid_count == 0) return result;
+  std::vector<size_t> out_value_lens(count, 0);
   rdma::OperationContext operation;
   if (!operation.Submit() || !operation.ClaimPoller()) return result;
   bool final_timeout = false;
@@ -2752,7 +2739,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
         result[i] = Status::kInvalid;
       } else if (!completed[i]) {
         result[i] = Status::kIOError;
-        staged_out_lengths[i] = 0;
+        out_value_lens[i] = 0;
         ++remaining_count;
       }
     }
@@ -2855,16 +2842,14 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
             const auto& payload =
                 destination.payloads[progress.segment_index++];
             if (payload.second == 0) continue;
-            char* const target =
-                staged_outputs[progress.item].data() +
-                progress.logical_offset + window_capacity;
-            ibv_mr* mr = ep.RegisterTransient(target, payload.second);
+            ibv_mr* mr =
+                ep.RegisterTransient(payload.first, payload.second);
             if (!mr) {
               conn_ok = false;
               break;
             }
             targets.push_back(
-                {reinterpret_cast<uint64_t>(target), mr->rkey,
+                {reinterpret_cast<uint64_t>(payload.first), mr->rkey,
                  static_cast<uint32_t>(payload.second)});
             mrs.push_back(mr);
             window_capacity += payload.second;
@@ -2976,7 +2961,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
             }
             progress.finished = true;
             completed[progress.item] = 1;
-            staged_out_lengths[progress.item] =
+            out_value_lens[progress.item] =
                 static_cast<size_t>(progress.response_value_len);
             --remaining;
           }
@@ -2986,20 +2971,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     }
 
     if (conn_ok) {
-      for (size_t i = 0; i < count; ++i) {
-        if (result[i] != Status::kOk) continue;
-        size_t copied = 0;
-        for (const auto& payload : destinations[i].payloads) {
-          const size_t remaining = staged_out_lengths[i] - copied;
-          const size_t n = std::min(payload.second, remaining);
-          if (n != 0) {
-            std::memcpy(payload.first, staged_outputs[i].data() + copied, n);
-            copied += n;
-          }
-          if (copied == staged_out_lengths[i]) break;
-        }
-      }
-      if (out_lengths) *out_lengths = staged_out_lengths;
+      if (out_lengths) *out_lengths = out_value_lens;
       Release(node, Lane::kSgData, conn);
       if (cross_rail_retry)
         cross_rail_retry_successes_.fetch_add(1,
