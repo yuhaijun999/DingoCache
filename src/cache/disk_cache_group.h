@@ -87,6 +87,9 @@ class DiskCacheGroup {
     // this empty and constructs the selected file/slab engine normally.
     std::function<std::unique_ptr<StoreEngine>(const std::string&, uint64_t)>
         engine_factory{};
+    // Explicit choice overrides DFKV_SLAB_EVICTION_POLICY, including an empty
+    // value (invalid). Unset reads the environment, then requests the default.
+    std::optional<std::string> eviction_policy{};
   };
 
   explicit DiskCacheGroup(Options opt);

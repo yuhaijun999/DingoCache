@@ -235,18 +235,41 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   config_dump::RecordResolved("DFKV_TENANT_QUOTAS_COUNT",
                               std::to_string(tenant_quotas_.size()));
 
-
-  std::string engine = opt.engine;
-  if (engine.empty()) {
-    const char* value = std::getenv("DFKV_STORE_ENGINE");
-    engine = (value && *value) ? value : "slab";
+  DiskEvictionConfigInput config_input;
+  if (!opt.engine.empty()) config_input.cli_engine = opt.engine;
+  if (const char* value = std::getenv("DFKV_STORE_ENGINE")) {
+    config_input.env_engine = value;
   }
-  if (engine != "file" && engine != "slab") {
-    fail("DFKV_STORE_ENGINE must be 'file' or 'slab'");
+  if (opt.eviction_policy.has_value()) {
+    config_input.cli_policy = *opt.eviction_policy;
+  }
+  if (const char* value = std::getenv("DFKV_SLAB_EVICTION_POLICY")) {
+    config_input.env_policy = value;
+  }
+  const DiskEvictionConfigResult config =
+      ResolveDiskEvictionConfig(config_input);
+  if (config.status != Status::kOk) {
+    fail(config.error);
+    DFKV_LOG_ERROR(startup_error_);
     return;
   }
-  engine_ = engine;
-  const bool use_slab = engine == "slab";
+  // Parsing a lifetime request is valid, but opening storage with it must wait
+  // for the implementation/recovery gate. Never silently fall back for an
+  // explicit request; an unspecified default still uses the legacy allocator.
+  if (config.policy == DiskEvictionPolicy::kLifetime &&
+      config.source != DiskEvictionPolicySource::kDefault) {
+    const char* name = config_input.cli_policy.has_value()
+                           ? "--slab-eviction-policy"
+                           : "DFKV_SLAB_EVICTION_POLICY";
+    const std::string_view value =
+        config_input.cli_policy.value_or(config_input.env_policy.value_or(""));
+    fail(std::string(name) + "='" + std::string(value) +
+         "' is not ready before stage 4.5; use 'legacy'");
+    DFKV_LOG_ERROR(startup_error_);
+    return;
+  }
+  const bool use_slab = config.engine == DiskEvictionEngine::kSlab;
+  engine_ = use_slab ? "slab" : "file";
 
   int disk_weight = 1;
   if (!ResolveDiskHashWeight(&disk_weight)) {
