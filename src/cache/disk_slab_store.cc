@@ -7,18 +7,20 @@
 #endif
 
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <string>
 #include <system_error>
-#include <sys/stat.h>
-#include <sys/mman.h>
 #include <vector>
 
 #include "utils/net_util.h"
@@ -331,38 +333,50 @@ bool DiskSlabStore::ClearInitMarker() {
   return true;
 }
 
-bool DiskSlabStore::ValidateOptions() {
-  if (opt_.dir.empty()) return SetStartupError("cache directory is empty");
-  if (opt_.capacity_bytes == 0)
-    return SetStartupError("capacity_bytes must be non-zero");
-  if (opt_.extent_bytes == 0 ||
-      opt_.extent_bytes > std::numeric_limits<uint32_t>::max())
-    return SetStartupError("extent_bytes must fit uint32 and be non-zero");
-  if (opt_.slot_granularity < 4096 ||
-      opt_.slot_granularity > std::numeric_limits<uint32_t>::max() ||
-      (opt_.slot_granularity % 4096) != 0)
-    return SetStartupError(
+bool DiskSlabStore::ValidateGeometry(const Options& options,
+                                     std::string* error) {
+  error->clear();
+  const auto invalid = [error](const char* message) {
+    *error = message;
+    return false;
+  };
+  if (options.dir.empty()) return invalid("cache directory is empty");
+  if (options.capacity_bytes == 0)
+    return invalid("capacity_bytes must be non-zero");
+  if (options.extent_bytes == 0 ||
+      options.extent_bytes > std::numeric_limits<uint32_t>::max())
+    return invalid("extent_bytes must fit uint32 and be non-zero");
+  if (options.slot_granularity < 4096 ||
+      options.slot_granularity > std::numeric_limits<uint32_t>::max() ||
+      (options.slot_granularity % 4096) != 0)
+    return invalid(
         "slot_granularity must be a non-zero 4 KiB multiple fitting uint32");
-  if ((opt_.extent_bytes % opt_.slot_granularity) != 0)
-    return SetStartupError(
-        "extent_bytes must be divisible by slot_granularity");
-  if (opt_.capacity_bytes < opt_.extent_bytes ||
-      (opt_.capacity_bytes % opt_.extent_bytes) != 0)
-    return SetStartupError(
+  if ((options.extent_bytes % options.slot_granularity) != 0)
+    return invalid("extent_bytes must be divisible by slot_granularity");
+  if (options.capacity_bytes < options.extent_bytes ||
+      (options.capacity_bytes % options.extent_bytes) != 0)
+    return invalid(
         "capacity_bytes must be an exact positive multiple of extent_bytes");
 
-  const uint64_t extents = opt_.capacity_bytes / opt_.extent_bytes;
-  const uint64_t slots = opt_.extent_bytes / opt_.slot_granularity;
+  const uint64_t extents = options.capacity_bytes / options.extent_bytes;
+  const uint64_t slots = options.extent_bytes / options.slot_granularity;
   if (extents > std::numeric_limits<uint32_t>::max() || slots == 0 ||
       slots > std::numeric_limits<uint32_t>::max())
-    return SetStartupError("slab geometry exceeds uint32 limits");
+    return invalid("slab geometry exceeds uint32 limits");
   if (extents > static_cast<uint64_t>(
                     std::numeric_limits<off_t>::max()) /
                     slots / kRecBytes)
-    return SetStartupError("slots.tbl geometry exceeds off_t");
+    return invalid("slots.tbl geometry exceeds off_t");
 
-  num_extents_ = static_cast<uint32_t>(extents);
-  max_slots_per_extent_ = static_cast<uint32_t>(slots);
+  return true;
+}
+
+bool DiskSlabStore::ValidateOptions() {
+  std::string error;
+  if (!ValidateGeometry(opt_, &error)) return SetStartupError(error);
+  num_extents_ = static_cast<uint32_t>(opt_.capacity_bytes / opt_.extent_bytes);
+  max_slots_per_extent_ =
+      static_cast<uint32_t>(opt_.extent_bytes / opt_.slot_granularity);
   return true;
 }
 
