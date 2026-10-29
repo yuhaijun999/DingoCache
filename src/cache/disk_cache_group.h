@@ -11,20 +11,69 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
-#include <memory>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
-#include "utils/con_hash.h"
 #include "cache/disk_slab_store.h"
 #include "cache/kv_store.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
+#include "common/status.h"
+#include "utils/con_hash.h"
 
 namespace dfkv {
+
+enum class DiskEvictionPolicy : unsigned char {
+  kInvalid = 0,  // Empty or unrecognized policy name.
+  kLegacy = 1,   // Preserve the existing disk eviction strategy.
+  kLifetime = 2  // Use lifetime scoring once the new strategy is enabled.
+};
+
+// Parses a policy name without reading environment or opening storage. ASCII
+// letter case is ignored; whitespace is not trimmed and aliases are rejected.
+// Empty/unknown input returns kInvalid. The caller handles missing input and
+// defaults before calling; no input view is retained. Accepting "lifetime"
+// here does not enable that storage strategy.
+DiskEvictionPolicy ParseDiskEvictionPolicy(std::string_view text);
+
+enum class DiskEvictionPolicySource : unsigned char {
+  kDefault = 0,
+  kEnvironment = 1,
+  kCommandLine = 2
+};
+enum class DiskEvictionEngine : unsigned char { kSlab = 0, kFile = 1 };
+
+struct DiskEvictionConfigInput {
+  std::optional<std::string_view> cli_policy;
+  std::optional<std::string_view> env_policy;
+  std::optional<std::string_view> cli_engine;
+  std::optional<std::string_view> env_engine;
+};
+
+struct DiskEvictionConfigResult {
+  Status status = Status::kOk;
+  std::string error;
+  // Selected request, not the running strategy. Only use when status is kOk.
+  DiskEvictionPolicy policy = DiskEvictionPolicy::kLifetime;
+  DiskEvictionPolicySource source = DiskEvictionPolicySource::kDefault;
+  DiskEvictionEngine engine = DiskEvictionEngine::kSlab;
+};
+
+// Resolves supplied values only; does not inspect the process environment or
+// open storage. A missing policy requests lifetime by default; explicit
+// lifetime is valid only with slab. File permits default/explicit legacy and
+// has no effective disk eviction policy. This validates configuration, not
+// algorithm readiness: startup must separately reject an unimplemented strategy
+// before opening disks. Callers must reject a non-OK result before constructing
+// disks.
+DiskEvictionConfigResult ResolveDiskEvictionConfig(
+    const DiskEvictionConfigInput& input);
 
 class DiskCacheGroup {
  public:

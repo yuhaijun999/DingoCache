@@ -8,20 +8,66 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstdlib>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
+
+#include "common/status.h"
 
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
+
+TEST(DiskEvictionPolicyParsing, EnumHasExplicitByteValues) {
+  static_assert(
+      std::is_same_v<std::underlying_type_t<DiskEvictionPolicy>, unsigned char>,
+      "DiskEvictionPolicy must use unsigned char");
+  EXPECT_EQ(static_cast<unsigned char>(DiskEvictionPolicy::kInvalid), 0U);
+  EXPECT_EQ(static_cast<unsigned char>(DiskEvictionPolicy::kLegacy), 1U);
+  EXPECT_EQ(static_cast<unsigned char>(DiskEvictionPolicy::kLifetime), 2U);
+}
+
+TEST(DiskEvictionPolicyParsing, AcceptsAsciiCaseInsensitivePolicyNames) {
+  for (const std::string_view text : {"legacy", "LEGACY", "Legacy", "lEgAcY"}) {
+    SCOPED_TRACE(text);
+    const DiskEvictionPolicy result = ParseDiskEvictionPolicy(text);
+    EXPECT_EQ(result, DiskEvictionPolicy::kLegacy);
+  }
+  for (const std::string_view text :
+       {"lifetime", "LIFETIME", "Lifetime", "lIfEtImE"}) {
+    SCOPED_TRACE(text);
+    const DiskEvictionPolicy result = ParseDiskEvictionPolicy(text);
+    EXPECT_EQ(result, DiskEvictionPolicy::kLifetime);
+  }
+}
+
+TEST(DiskEvictionPolicyParsing, RejectsExplicitEmptyAndUnknownNames) {
+  for (const std::string_view text :
+       {"", "unknown", "LEGAC", "LIFETIMES", " legacy", "lifetime ", "\t",
+        "legacy,lifetime", "l\xFFgacy"}) {
+    SCOPED_TRACE(text);
+    const DiskEvictionPolicy result = ParseDiskEvictionPolicy(text);
+    EXPECT_EQ(result, DiskEvictionPolicy::kInvalid);
+  }
+}
+
+TEST(DiskEvictionPolicyParsing, DoesNotIgnoreEmbeddedNullOrTrailingBytes) {
+  const char text[] = "legacy\0lifetime";
+  const DiskEvictionPolicy result =
+      ParseDiskEvictionPolicy(std::string_view(text, sizeof(text) - 1));
+  EXPECT_EQ(result, DiskEvictionPolicy::kInvalid);
+}
+
 namespace {
 struct BatchProbe {
   void Enter(size_t disk) {
@@ -73,6 +119,177 @@ class ScopedEnv {
   std::string old_;
   bool had_old_ = false;
 };
+
+TEST(DiskEvictionPolicyParsing, DoesNotReadEnvironment) {
+  const ScopedEnv env("DFKV_SLAB_EVICTION_POLICY", "unknown");
+  const DiskEvictionPolicy result = ParseDiskEvictionPolicy("legacy");
+  EXPECT_EQ(result, DiskEvictionPolicy::kLegacy);
+  EXPECT_STREQ(std::getenv("DFKV_SLAB_EVICTION_POLICY"), "unknown");
+}
+
+TEST(DiskEvictionConfig, DefaultAndExplicitLegacyAreDistinct) {
+  const DiskEvictionConfigResult default_config = ResolveDiskEvictionConfig({});
+  EXPECT_EQ(default_config.status, Status::kOk);
+  EXPECT_EQ(default_config.policy, DiskEvictionPolicy::kLifetime);
+  EXPECT_EQ(default_config.source, DiskEvictionPolicySource::kDefault);
+  EXPECT_EQ(default_config.engine, DiskEvictionEngine::kSlab);
+
+  DiskEvictionConfigInput explicit_input;
+  explicit_input.cli_policy = "LEGACY";
+  const DiskEvictionConfigResult explicit_config =
+      ResolveDiskEvictionConfig(explicit_input);
+  EXPECT_EQ(explicit_config.status, Status::kOk);
+  EXPECT_EQ(explicit_config.policy, DiskEvictionPolicy::kLegacy);
+  EXPECT_EQ(explicit_config.source, DiskEvictionPolicySource::kCommandLine);
+}
+
+TEST(DiskEvictionConfig, PolicyAndEngineSourcesHaveIndependentPriority) {
+  DiskEvictionConfigInput input;
+  input.cli_policy = "legacy";
+  input.env_policy = "invalid";
+  input.cli_engine = "slab";
+  input.env_engine = "invalid";
+  const DiskEvictionConfigResult cli = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(cli.status, Status::kOk);
+  EXPECT_EQ(cli.source, DiskEvictionPolicySource::kCommandLine);
+  EXPECT_EQ(cli.engine, DiskEvictionEngine::kSlab);
+
+  input.cli_policy.reset();
+  input.cli_engine.reset();
+  input.env_policy = "legacy";
+  input.env_engine = "file";
+  const DiskEvictionConfigResult env = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(env.status, Status::kOk);
+  EXPECT_EQ(env.source, DiskEvictionPolicySource::kEnvironment);
+  EXPECT_EQ(env.engine, DiskEvictionEngine::kFile);
+
+  input.cli_engine = "";  // Existing engine setting treats empty as absent.
+  EXPECT_EQ(ResolveDiskEvictionConfig(input).engine, DiskEvictionEngine::kFile);
+}
+
+TEST(DiskEvictionConfig, FileAcceptsDefaultAndExplicitLegacy) {
+  DiskEvictionConfigInput input;
+  input.env_engine = "file";
+  const DiskEvictionConfigResult default_file =
+      ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(default_file.status, Status::kOk);
+  EXPECT_EQ(default_file.policy, DiskEvictionPolicy::kLifetime);
+  EXPECT_EQ(default_file.source, DiskEvictionPolicySource::kDefault);
+  EXPECT_EQ(default_file.engine, DiskEvictionEngine::kFile);
+  input.env_policy = "legacy";
+  const DiskEvictionConfigResult legacy_file = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(legacy_file.status, Status::kOk);
+  EXPECT_EQ(legacy_file.policy, DiskEvictionPolicy::kLegacy);
+  EXPECT_EQ(legacy_file.engine, DiskEvictionEngine::kFile);
+}
+
+TEST(DiskEvictionConfig, RejectsInvalidNamesAndLifetimeOnFile) {
+  DiskEvictionConfigInput input;
+  input.env_policy = "legacy";
+  for (const std::string_view invalid : {"", "unknown"}) {
+    SCOPED_TRACE(invalid);
+    input.cli_policy = invalid;
+    const DiskEvictionConfigResult result = ResolveDiskEvictionConfig(input);
+    EXPECT_EQ(result.status, Status::kInvalid);
+    EXPECT_NE(result.error.find("--slab-eviction-policy"), std::string::npos);
+    EXPECT_NE(result.error.find(std::string(invalid)), std::string::npos);
+  }
+  input.cli_policy = "LiFeTiMe";
+  const DiskEvictionConfigResult slab_lifetime =
+      ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(slab_lifetime.status, Status::kOk);
+  EXPECT_TRUE(slab_lifetime.error.empty());
+  EXPECT_EQ(slab_lifetime.policy, DiskEvictionPolicy::kLifetime);
+  EXPECT_EQ(slab_lifetime.engine, DiskEvictionEngine::kSlab);
+  EXPECT_EQ(slab_lifetime.source, DiskEvictionPolicySource::kCommandLine);
+  input.cli_engine = "file";
+  const DiskEvictionConfigResult file_lifetime =
+      ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(file_lifetime.status, Status::kInvalid);
+  EXPECT_NE(file_lifetime.error.find("LiFeTiMe"), std::string::npos);
+  EXPECT_NE(file_lifetime.error.find("slab"), std::string::npos);
+  input.cli_policy.reset();
+  input.env_policy = "";
+  const DiskEvictionConfigResult empty_env = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(empty_env.status, Status::kInvalid);
+  EXPECT_NE(empty_env.error.find("DFKV_SLAB_EVICTION_POLICY"),
+            std::string::npos);
+  input.env_policy = "legacy";
+  input.cli_engine = "unknown";
+  const DiskEvictionConfigResult bad_engine = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(bad_engine.status, Status::kInvalid);
+  EXPECT_NE(bad_engine.error.find("--store-engine='unknown'"),
+            std::string::npos);
+}
+
+TEST(DiskEvictionConfig, EngineErrorsIdentifySelectedSource) {
+  DiskEvictionConfigInput input;
+  input.env_engine = "bad-env";
+  const DiskEvictionConfigResult env = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(env.status, Status::kInvalid);
+  EXPECT_EQ(env.error, "DFKV_STORE_ENGINE='bad-env' must be 'file' or 'slab'");
+
+  input.env_engine = "file";
+  input.cli_engine = "bad-cli";
+  const DiskEvictionConfigResult cli = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(cli.status, Status::kInvalid);
+  EXPECT_EQ(cli.error, "--store-engine='bad-cli' must be 'file' or 'slab'");
+}
+
+TEST(DiskEvictionConfig, InactiveLifetimeValuesAndRamAckDoNotAffectLegacy) {
+  const ScopedEnv lifetime_value("DFKV_SLAB_LIFE_MAX_READS", "invalid");
+  const ScopedEnv ack_mode("DFKV_PUT_ACK_MODE", "ram");
+  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "lifetime");
+  DiskEvictionConfigInput input;
+  input.cli_policy = "legacy";
+  const DiskEvictionConfigResult result = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(result.status, Status::kOk);
+
+  input.cli_engine = "file";
+  const DiskEvictionConfigResult file_result = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(file_result.status, Status::kOk);
+  EXPECT_EQ(file_result.engine, DiskEvictionEngine::kFile);
+  EXPECT_EQ(file_result.policy, DiskEvictionPolicy::kLegacy);
+}
+
+TEST(DiskEvictionConfig, EnvironmentLifetimeAcceptsAndCliCanOverride) {
+  DiskEvictionConfigInput input;
+  input.env_policy = "LIFETIME";
+  const DiskEvictionConfigResult accepted = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(accepted.status, Status::kOk);
+  EXPECT_TRUE(accepted.error.empty());
+  EXPECT_EQ(accepted.policy, DiskEvictionPolicy::kLifetime);
+  EXPECT_EQ(accepted.engine, DiskEvictionEngine::kSlab);
+  EXPECT_EQ(accepted.source, DiskEvictionPolicySource::kEnvironment);
+
+  input.env_engine = "file";
+  const DiskEvictionConfigResult file_lifetime =
+      ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(file_lifetime.status, Status::kInvalid);
+  EXPECT_NE(file_lifetime.error.find("DFKV_SLAB_EVICTION_POLICY"),
+            std::string::npos);
+  EXPECT_NE(file_lifetime.error.find("slab"), std::string::npos);
+
+  input.cli_policy = "legacy";
+  const DiskEvictionConfigResult overridden = ResolveDiskEvictionConfig(input);
+  EXPECT_EQ(overridden.status, Status::kOk);
+  EXPECT_TRUE(overridden.error.empty());
+  EXPECT_EQ(overridden.policy, DiskEvictionPolicy::kLegacy);
+  EXPECT_EQ(overridden.source, DiskEvictionPolicySource::kCommandLine);
+}
+
+TEST(DiskEvictionConfig, EmptyInputDoesNotReadProcessEnvironment) {
+  const ScopedEnv policy("DFKV_SLAB_EVICTION_POLICY", "unknown");
+  const ScopedEnv engine("DFKV_STORE_ENGINE", "unknown");
+  const DiskEvictionConfigResult result = ResolveDiskEvictionConfig({});
+  EXPECT_EQ(result.status, Status::kOk);
+  EXPECT_TRUE(result.error.empty());
+  EXPECT_EQ(result.policy, DiskEvictionPolicy::kLifetime);
+  EXPECT_EQ(result.source, DiskEvictionPolicySource::kDefault);
+  EXPECT_EQ(result.engine, DiskEvictionEngine::kSlab);
+  EXPECT_STREQ(std::getenv("DFKV_SLAB_EVICTION_POLICY"), "unknown");
+  EXPECT_STREQ(std::getenv("DFKV_STORE_ENGINE"), "unknown");
+}
 
 class ProbeEngine final : public StoreEngine {
  public:
