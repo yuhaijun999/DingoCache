@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -26,6 +27,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "cache/disk_slab_store.h"
 #include "cache/kv_node_server.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -486,6 +488,91 @@ TEST_F(DiskGroupTest, KvNodeServerExplicitOptionsOverridePolicyEnvironment) {
   EXPECT_FALSE(server.Healthy());
   EXPECT_EQ(server.Start(0), Status::kIOError);
   EXPECT_FALSE(fs::exists(base_));
+}
+
+TEST(DiskSlabGeometry, ValidatesBoundariesWithoutOpeningStorage) {
+  DiskSlabStore::Options options;
+  std::string error;
+  options.dir = "unused-by-pure-geometry-check";
+  options.capacity_bytes = 4096;
+  options.extent_bytes = 4096;
+  options.slot_granularity = 4096;
+  EXPECT_TRUE(DiskSlabStore::ValidateGeometry(options, &error)) << error;
+
+  struct InvalidGeometry {
+    uint64_t capacity;
+    uint64_t extent;
+    uint64_t granularity;
+    const char* error;
+  };
+  const InvalidGeometry invalid[] = {
+      {0, 4096, 4096, "capacity_bytes"},
+      {4096, 0, 4096, "extent_bytes"},
+      {1ull << 32, 1ull << 32, 4096, "extent_bytes"},
+      {4096, 4096, 0, "slot_granularity"},
+      {4096, 4096, 1, "slot_granularity"},
+      {8192, 8192, 6000, "slot_granularity"},
+      {4096, 4096, 1ull << 32, "slot_granularity"},
+      {12288, 12288, 8192, "divisible"},
+      {4096, 8192, 4096, "capacity_bytes"},
+      {8193, 8192, 4096, "capacity_bytes"},
+      {(1ull << 32) * 4096, 4096, 4096, "uint32 limits"},
+  };
+  for (const InvalidGeometry& geometry : invalid) {
+    SCOPED_TRACE(geometry.error);
+    options.capacity_bytes = geometry.capacity;
+    options.extent_bytes = geometry.extent;
+    options.slot_granularity = geometry.granularity;
+    EXPECT_FALSE(DiskSlabStore::ValidateGeometry(options, &error));
+    EXPECT_NE(error.find(geometry.error), std::string::npos);
+  }
+  options.capacity_bytes =
+      static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) * 4096;
+  options.extent_bytes = 4096;
+  options.slot_granularity = 4096;
+  EXPECT_TRUE(DiskSlabStore::ValidateGeometry(options, &error)) << error;
+  EXPECT_TRUE(error.empty());
+  options.dir.clear();
+  EXPECT_FALSE(DiskSlabStore::ValidateGeometry(options, &error));
+  EXPECT_EQ(error, "cache directory is empty");
+}
+
+TEST_F(DiskGroupTest, InvalidSecondSlabGeometryNeverOpensFirstDisk) {
+  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY");
+  const std::vector<std::string> dirs = {(base_ / "a").string(),
+                                         (base_ / "b").string()};
+  // Splitting 2 GiB - 1 assigns 1 GiB to A, but 1 GiB - 1 to B.
+  const DiskCacheGroup group({dirs, (2ull << 30) - 1, "slab"});
+  EXPECT_FALSE(group.Healthy());
+  EXPECT_EQ(group.DiskCount(), 0U);
+  EXPECT_NE(group.StartupError().find(dirs[1]), std::string::npos);
+  EXPECT_NE(group.StartupError().find("capacity_bytes"), std::string::npos);
+  EXPECT_FALSE(fs::exists(dirs[0]));
+  EXPECT_FALSE(fs::exists(dirs[1]));
+}
+
+TEST_F(DiskGroupTest, ValidSlabGeometriesOpenAllDisks) {
+  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY");
+  const std::vector<std::string> dirs = Dirs(2);
+  const DiskCacheGroup group({dirs, 2ull << 30, "slab"});
+  ASSERT_TRUE(group.Healthy()) << group.StartupError();
+  EXPECT_EQ(group.DiskCount(), 2U);
+  for (const std::string& dir : dirs) {
+    EXPECT_TRUE(fs::exists(fs::path(dir) / "slots.tbl"));
+  }
+}
+
+TEST_F(DiskGroupTest, SlabGeometryLimitsDoNotApplyToFileEngine) {
+  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "6000");
+  const std::vector<std::string> dirs = Dirs(2);
+  const DiskCacheGroup group({dirs, 8193, "file"});
+  EXPECT_TRUE(group.Healthy()) << group.StartupError();
+  EXPECT_EQ(group.DiskCount(), 2U);
 }
 
 TEST_F(DiskGroupTest, SpreadsBlocksAcrossAllDisks) {
