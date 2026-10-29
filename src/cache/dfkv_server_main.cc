@@ -3,25 +3,26 @@
  *   --dir accepts comma-separated NVMe SSD paths (like dingo-cache --cache_dir);
  *   --cap is the TOTAL capacity, split evenly across the disks.
  * Prints "PORT <port>" on stdout once listening, then runs until SIGTERM/SIGINT. */
+#include <atomic>
+#include <charconv>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
-
-#include <atomic>
-#include <charconv>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include "utils/args.h"
+#include "cache/disk_cache_group.h"
 #include "cache/kv_node_server.h"
-#include "utils/wire_limits.h"
-#include "utils/log.h"
 #include "common/config_dump.h"
-#include "mds/mds_registrar.h"
-#include "utils/metrics_http.h"
 #include "common/version.h"
+#include "mds/mds_registrar.h"
+#include "utils/args.h"
+#include "utils/log.h"
+#include "utils/metrics_http.h"
+#include "utils/wire_limits.h"
 #ifdef DFKV_WITH_RDMA
 #include "cache/store_engine.h"
 #include "cache/rdma_server.h"
@@ -87,24 +88,60 @@ int main(int argc, char** argv) {
       "METRICS.md for the current server matrix. A flag overrides a pre-set env.\n"
       "--rdma-dev is passed directly to the RDMA server (param wins over env).\n",
       dfkv::Version());
+    // Buffered output errors may surface only when the stream is flushed.
+    if (std::fprintf(
+            out,
+            "\nDisk eviction policy (passed directly, not an env facade):\n"
+            "  --slab-eviction-policy <legacy|lifetime>\n"
+            "  Overrides DFKV_SLAB_EVICTION_POLICY; lifetime is not ready.\n") <
+            0 ||
+        std::fflush(out) != 0) {
+      return 1;
+    }
     return help ? 0 : 1;
   }
   dfkv::Args args(argc, argv,
-                  {"--dir", "--port", "--cap", "--rdma-port", "--rdma-dev",
-                   "--mds", "--group",
-                   "--id", "--advertise", "--weight",
-                   "--metrics-port", "--metrics-bind", "--store-engine",
-                   "--slab-write", "--ram-tier", "--ram-tier-bytes", "--ram-write-mode",
-                   "--slab-granularity", "--put-inflight-limit",
-                   "--tcp-max-conns", "--tcp-io-timeout-s",
-                   "--rdma-depth", "--rdma-numa", "--rdma-idle-ms",
-                   "--rdma-op-timeout-ms", "--server-uring",
-                   "--server-uring-depth", "--ram-flush-threads",
-                   "--ram-tier-numa", "--ram-tier-shards", "--slab-table-sync-ms",
-                   "--slab-reclaim-ms", "--ram-reclaim-ms", "--log",
-                   "--mds-registration-timeout-ms", "--max-msg",
-                   "--rdma-recv-segment-size", "--rdma-recv-chunk-bytes",
-                   "--disk-hash-weight", "--read-coalesce"});
+                  {"--dir",
+                   "--port",
+                   "--cap",
+                   "--rdma-port",
+                   "--rdma-dev",
+                   "--mds",
+                   "--group",
+                   "--id",
+                   "--advertise",
+                   "--weight",
+                   "--metrics-port",
+                   "--metrics-bind",
+                   "--store-engine",
+                   "--slab-write",
+                   "--ram-tier",
+                   "--ram-tier-bytes",
+                   "--ram-write-mode",
+                   "--slab-granularity",
+                   "--put-inflight-limit",
+                   "--tcp-max-conns",
+                   "--tcp-io-timeout-s",
+                   "--rdma-depth",
+                   "--rdma-numa",
+                   "--rdma-idle-ms",
+                   "--rdma-op-timeout-ms",
+                   "--server-uring",
+                   "--server-uring-depth",
+                   "--ram-flush-threads",
+                   "--ram-tier-numa",
+                   "--ram-tier-shards",
+                   "--slab-table-sync-ms",
+                   "--slab-reclaim-ms",
+                   "--ram-reclaim-ms",
+                   "--log",
+                   "--mds-registration-timeout-ms",
+                   "--max-msg",
+                   "--rdma-recv-segment-size",
+                   "--rdma-recv-chunk-bytes",
+                   "--disk-hash-weight",
+                   "--read-coalesce",
+                   "--slab-eviction-policy"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -309,6 +346,10 @@ int main(int argc, char** argv) {
     cd::Record("DFKV_MDS_REGISTRATION_TIMEOUT_MS",
                std::to_string(mds_registration_timeout_ms),
                mds_registration_timeout_source);
+    if (args.Has("--slab-eviction-policy")) {
+      cd::Record("DFKV_SLAB_EVICTION_POLICY",
+                 args.Get("--slab-eviction-policy", ""), cd::Source::kFlag);
+    }
   }
   std::signal(SIGINT, OnSig);
   std::signal(SIGTERM, OnSig);
@@ -322,7 +363,11 @@ int main(int argc, char** argv) {
   }
   if (dirs.empty()) dirs.push_back(dir);
 
-  KvNodeServer srv(dirs, cap);
+  dfkv::DiskCacheGroup::Options store_options{dirs, cap, store_engine};
+  if (args.Has("--slab-eviction-policy")) {
+    store_options.eviction_policy = args.Get("--slab-eviction-policy", "");
+  }
+  KvNodeServer srv(std::move(store_options));
   // TCP request frames share the RDMA path's resolved max-value bound (OOM-DoS
   // guard; see utils/wire_limits.h).
   srv.set_max_request_payload(dfkv::wire_limits::MaxRequestPayload());

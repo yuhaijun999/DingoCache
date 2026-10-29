@@ -13,14 +13,19 @@ done
 echo "version smoke OK"
 "$BUILD/dfkv_server" --help | grep -q \
   'storage backend: slab | file (default slab)'
+"$BUILD/dfkv_server" --help | grep -q -- '--slab-eviction-policy'
+rc=0
+help_error=$("$BUILD/dfkv_server" --help 2>&1 >/dev/full) || rc=$?
+[ "$rc" = 1 ] || { echo "help write failure: expected exit 1, got $rc"; exit 1; }
+[ -z "$help_error" ] || { echo "unexpected help error: $help_error"; exit 1; }
 
 D=$(mktemp -d)
 mkdir "$D/cache"
 : > "$D/srv.out"   # pre-create so the awk below can't fail on a missing file under `set -e`
-env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE "$BUILD/dfkv_server" \
+env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_SLAB_EVICTION_POLICY "$BUILD/dfkv_server" \
   --dir "$D/cache" --port 0 --cap 1073741824 >>"$D/srv.out" 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null; rm -rf "$D"' EXIT
+trap 'if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; fi; rm -rf "$D"' EXIT
 P=""
 # `|| true`: a transient awk read must never trip `set -e` before the server prints PORT.
 for i in $(seq 1 100); do P=$(awk '/PORT/{print $2}' "$D/srv.out" 2>/dev/null || true); [ -n "$P" ] && break; sleep 0.05; done
@@ -184,3 +189,79 @@ rc=0; DFKV_MDS_ETCD_PROBE_MS=500 "$BUILD/dfkv_mds" --listen 0 --etcd 127.0.0.1:9
   >/dev/null 2>&1 || rc=$?
 [ "$rc" = 1 ] || { echo "dfkv_mds bad etcd: expected exit 1, got $rc"; exit 1; }
 echo "mds etcd-probe smoke OK"
+
+# CLI policy selection must reach the existing library checks, not a second
+# parser or an env rewrite. Conflicting invalid env must not win over the flag.
+for engine in slab file; do
+  rc=0
+  DFKV_SLAB_EVICTION_POLICY=unknown DFKV_SLAB_WRITE=buffered \
+    timeout --kill-after=2s 3s "$BUILD/dfkv_server" \
+    --dir "$D/policy-$engine" --port 0 --cap 1073741824 \
+    --store-engine "$engine" --slab-eviction-policy LeGaCy \
+    >"$D/policy-$engine.out" 2>&1 || rc=$?
+  [ "$rc" = 124 ] || { cat "$D/policy-$engine.out"; exit 1; }
+  grep -q '^PORT ' "$D/policy-$engine.out"
+  grep -qE 'DFKV_SLAB_EVICTION_POLICY[[:space:]]*= LeGaCy[[:space:]]+[(]flag[)]' \
+    "$D/policy-$engine.out"
+done
+[ -f "$D/policy-slab/slots.tbl" ]
+[ ! -e "$D/policy-file/slots.tbl" ]
+
+rc=0
+"$BUILD/dfkv_server" --dir "$D/missing-policy-value" \
+  --slab-eviction-policy >"$D/missing-policy-value.out" 2>&1 || rc=$?
+[ "$rc" = 2 ]
+grep -q 'missing value for --slab-eviction-policy' "$D/missing-policy-value.out"
+[ ! -e "$D/missing-policy-value" ]
+
+for engine in slab file; do
+  i=0
+  for policy in '' unknown lifetime; do
+    target="$D/reject-$engine-$i"
+    rc=0
+    DFKV_SLAB_EVICTION_POLICY=legacy timeout --kill-after=2s 3s "$BUILD/dfkv_server" \
+      --dir "$target" --port 0 --cap 1073741824 --store-engine "$engine" \
+      --slab-eviction-policy "$policy" >"$D/reject.out" 2>&1 || rc=$?
+    [ "$rc" = 1 ] || { cat "$D/reject.out"; exit 1; }
+    grep -q 'ERROR.*--slab-eviction-policy' "$D/reject.out"
+    grep -qF -- "='$policy'" "$D/reject.out"
+    [ ! -e "$target" ]
+    i=$((i + 1))
+  done
+done
+
+# The timed-out slab process handled SIGTERM and closed cleanly. Abruptly stop
+# the original serving process only after its last use to obtain a real dirty
+# store, with committed data, without fabricating epoch records.
+# In v3 slab_state, the native uint32 at byte 16 is clean=1 or dirty=2.
+[ "$(od -An -tu4 -j16 -N4 "$D/policy-slab/slab_state" | tr -d ' \n')" = 1 ]
+kill -KILL "$PID"
+rc=0; wait "$PID" 2>/dev/null || rc=$?
+PID=""
+[ "$rc" = 137 ]
+[ "$(od -An -tu4 -j16 -N4 "$D/cache/slab_state" | tr -d ' \n')" = 2 ]
+
+policy_metadata() {
+  ( cd "$1"
+    # Hash the required metadata, not the 1 GiB payload extent contents.
+    find . -printf '%P %y %s\n' | sort
+    for f in slots.tbl slab_state slab_meta slab_initializing; do
+      if [ -e "$f" ]; then sha256sum "$f"; else echo "missing $f"; fi
+    done
+  )
+}
+for policy in '' unknown lifetime; do
+  policy_metadata "$D/policy-slab" >"$D/clean.before"
+  policy_metadata "$D/cache" >"$D/dirty.before"
+  rc=0
+  DFKV_SLAB_EVICTION_POLICY=legacy timeout --kill-after=2s 3s "$BUILD/dfkv_server" \
+    --dir "$D/policy-slab,$D/cache" --port 0 --cap 2147483648 --store-engine slab \
+    --slab-eviction-policy "$policy" >"$D/metadata-reject.out" 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { cat "$D/metadata-reject.out"; exit 1; }
+  grep -q 'ERROR.*--slab-eviction-policy' "$D/metadata-reject.out"
+  policy_metadata "$D/policy-slab" >"$D/clean.after"
+  policy_metadata "$D/cache" >"$D/dirty.after"
+  cmp "$D/clean.before" "$D/clean.after"
+  cmp "$D/dirty.before" "$D/dirty.after"
+done
+echo "eviction-policy CLI and clean/dirty refusal smoke OK"

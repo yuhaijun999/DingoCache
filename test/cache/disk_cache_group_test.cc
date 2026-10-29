@@ -478,6 +478,16 @@ TEST_F(DiskGroupTest, KvNodeServerRejectsPolicyBeforeStorageInitialization) {
   EXPECT_FALSE(fs::exists(base_));
 }
 
+TEST_F(DiskGroupTest, KvNodeServerExplicitOptionsOverridePolicyEnvironment) {
+  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
+  DiskCacheGroup::Options options{{base_.string()}, 1ull << 30, "slab"};
+  options.eviction_policy = "lifetime";
+  KvNodeServer server(options);
+  EXPECT_FALSE(server.Healthy());
+  EXPECT_EQ(server.Start(0), Status::kIOError);
+  EXPECT_FALSE(fs::exists(base_));
+}
+
 TEST_F(DiskGroupTest, SpreadsBlocksAcrossAllDisks) {
   auto dirs = Dirs(3);
   DiskCacheGroup g({dirs, 1ull << 30, "file"});
