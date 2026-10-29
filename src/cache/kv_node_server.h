@@ -31,6 +31,9 @@ class KvNodeServer {
   // multiple NVMe SSDs on this node (total capacity split across disks)
   KvNodeServer(const std::vector<std::string>& cache_dirs,
                uint64_t capacity_bytes);
+  // Explicit options retain policy presence/precedence without rewriting env.
+  // The existing engine factory also remains available to focused tests.
+  explicit KvNodeServer(DiskCacheGroup::Options options);
   ~KvNodeServer();
 
   Status Start(int port);  // port 0 => ephemeral; query with port()
@@ -153,8 +156,6 @@ class KvNodeServer {
  private:
   friend class KvNodeServerTestPeer;
   friend class KvNodeServerWiringTestPeer;
-  // Reuse the storage group's engine factory in focused admission tests.
-  explicit KvNodeServer(DiskCacheGroup::Options options);
   static void FinishDiskRead(void* owner, uint64_t flight, bool committed,
                              Status result, size_t bytes_read,
                              double elapsed_sec, const char* data) noexcept;
