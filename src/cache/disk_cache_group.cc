@@ -1,24 +1,42 @@
 #include "cache/disk_cache_group.h"
 
 #include <algorithm>
-#include <cstdlib>
-#include <chrono>
 #include <charconv>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
+#include <string>
+#include <string_view>
 
 #include "cache/disk_slab_store.h"
 #include "common/config_dump.h"
+#include "common/status.h"
 #include "utils/log.h"
 #include "utils/parallel_for.h"
 
 namespace dfkv {
 
 namespace {
+// Expected names are lowercase ASCII. Avoid locale-dependent conversion and
+// allocation; bytes outside A-Z remain unchanged and cannot match these names.
+bool MatchesPolicyName(std::string_view text, std::string_view expected) {
+  if (text.size() != expected.size()) return false;
+  for (size_t i = 0; i < text.size(); ++i) {
+    char letter = text[i];
+    if (letter >= 'A' && letter <= 'Z') {
+      letter = static_cast<char>(letter + ('a' - 'A'));
+    }
+    if (letter != expected[i]) return false;
+  }
+  return true;
+}
+
 bool ParseUnsigned(const char* text, uint64_t max, uint64_t* out) {
   if (text == nullptr || *text == '\0') return false;
   uint64_t value = 0;
@@ -97,6 +115,69 @@ bool ParseTenantQuotasFile(const std::string& path,
   return true;
 }
 }  // namespace
+
+DiskEvictionPolicy ParseDiskEvictionPolicy(std::string_view text) {
+  if (MatchesPolicyName(text, "legacy")) {
+    return DiskEvictionPolicy::kLegacy;
+  }
+  if (MatchesPolicyName(text, "lifetime")) {
+    return DiskEvictionPolicy::kLifetime;
+  }
+  return DiskEvictionPolicy::kInvalid;
+}
+
+DiskEvictionConfigResult ResolveDiskEvictionConfig(
+    const DiskEvictionConfigInput& input) {
+  DiskEvictionConfigResult result;
+  std::string_view engine_name = "slab";
+  const char* engine_parameter = "DFKV_STORE_ENGINE";
+  if (input.env_engine.has_value() && !input.env_engine->empty()) {
+    engine_name = *input.env_engine;
+  }
+  if (input.cli_engine.has_value() && !input.cli_engine->empty()) {
+    engine_name = *input.cli_engine;
+    engine_parameter = "--store-engine";
+  }
+  if (engine_name == "file") {
+    result.engine = DiskEvictionEngine::kFile;
+  } else if (engine_name != "slab") {
+    result.status = Status::kInvalid;
+    result.error = std::string(engine_parameter) + "='" +
+                   std::string(engine_name) + "' must be 'file' or 'slab'";
+    return result;
+  }
+
+  std::optional<std::string_view> policy_text;
+  const char* policy_name = "DFKV_SLAB_EVICTION_POLICY";
+  if (input.cli_policy.has_value()) {
+    policy_text = input.cli_policy;
+    policy_name = "--slab-eviction-policy";
+    result.source = DiskEvictionPolicySource::kCommandLine;
+  } else if (input.env_policy.has_value()) {
+    policy_text = input.env_policy;
+    result.source = DiskEvictionPolicySource::kEnvironment;
+  }
+  const std::string_view selected_policy_text = policy_text.value_or("");
+  if (policy_text.has_value()) {
+    result.policy = ParseDiskEvictionPolicy(*policy_text);
+    if (result.policy == DiskEvictionPolicy::kInvalid) {
+      result.status = Status::kInvalid;
+      result.error = std::string(policy_name) + "='" +
+                     std::string(selected_policy_text) +
+                     "' must be 'legacy' or 'lifetime'";
+      return result;
+    }
+  }
+
+  if (result.engine == DiskEvictionEngine::kFile && policy_text.has_value() &&
+      result.policy == DiskEvictionPolicy::kLifetime) {
+    result.status = Status::kInvalid;
+    result.error = std::string(policy_name) + "='" +
+                   std::string(selected_policy_text) +
+                   "' requires the slab store engine";
+  }
+  return result;
+}
 
 DiskCacheGroup::DiskCacheGroup(Options opt) {
   auto fail = [&](std::string error) {
