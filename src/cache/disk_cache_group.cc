@@ -3,16 +3,20 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "cache/disk_slab_store.h"
 #include "common/config_dump.h"
@@ -340,6 +344,31 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   const size_t n = opt.cache_dirs.size();
   const uint64_t base_capacity = opt.capacity_bytes / n;
   const uint64_t capacity_remainder = opt.capacity_bytes % n;
+  std::vector<DiskSlabStore::Options> slab_options;
+  // Validate every real slab's geometry before opening even the first one.
+  // Custom factories own their geometry; file stores do not use slab limits.
+  if (use_slab && !opt.engine_factory) {
+    slab_options.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+      DiskSlabStore::Options so;
+      so.dir = opt.cache_dirs[i];
+      so.capacity_bytes = base_capacity + (i < capacity_remainder ? 1 : 0);
+      so.direct_writes = slab_direct;
+      if (slab_gran) so.slot_granularity = slab_gran;
+      so.table_sync_ms = sync_ms;
+      so.reclaim_interval_ms = reclaim_ms;
+      std::string error;
+      if (!DiskSlabStore::ValidateGeometry(so, &error)) {
+        fail(so.dir + ": " + error +
+             " (capacity_bytes=" + std::to_string(so.capacity_bytes) +
+             ", extent_bytes=" + std::to_string(so.extent_bytes) +
+             ", slot_granularity=" + std::to_string(so.slot_granularity) + ")");
+        DFKV_LOG_ERROR(startup_error_);
+        return;
+      }
+      slab_options.push_back(std::move(so));
+    }
+  }
   write_mode_ = use_slab ? "direct" : "";
   for (size_t i = 0; i < n; ++i) {
     const std::string& dir = opt.cache_dirs[i];
@@ -349,14 +378,8 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     if (opt.engine_factory) {
       store = opt.engine_factory(dir, disk_capacity);
     } else if (use_slab) {
-      DiskSlabStore::Options so;
-      so.dir = dir;
-      so.capacity_bytes = disk_capacity;
-      so.direct_writes = slab_direct;
-      if (slab_gran) so.slot_granularity = slab_gran;
-      so.table_sync_ms = sync_ms;
-      so.reclaim_interval_ms = reclaim_ms;
-      auto slab = std::make_unique<DiskSlabStore>(so);
+      std::unique_ptr<DiskSlabStore> slab =
+          std::make_unique<DiskSlabStore>(std::move(slab_options[i]));
       slabs_.push_back(slab.get());
       if (!slab->DirectWritesActive()) write_mode_ = "buffered";
       store = std::move(slab);

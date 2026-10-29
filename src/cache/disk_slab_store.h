@@ -158,6 +158,11 @@ class DiskSlabStore : public StoreEngine {
   explicit DiskSlabStore(Options opt, bool* ok = nullptr);
   ~DiskSlabStore();
 
+  // Pure configuration check, shared by single-store and all-disk startup.
+  // Does not inspect or modify disk files. error must be non-null; it is
+  // cleared on success and receives a diagnostic on failure.
+  static bool ValidateGeometry(const Options& options, std::string* error);
+
   DiskSlabStore(const DiskSlabStore&) = delete;
   DiskSlabStore& operator=(const DiskSlabStore&) = delete;
 
