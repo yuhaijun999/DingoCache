@@ -642,6 +642,55 @@ TEST_F(DiskGroupTest, InvalidSecondTableDoesNotOpenFirstDisk) {
   EXPECT_FALSE(fs::exists(table));
 }
 
+TEST_F(DiskGroupTest, NonzeroResumeTableDoesNotOpenFirstDisk) {
+  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY");
+  const std::vector<std::string> dirs = Dirs(2);
+  {
+    const DiskCacheGroup initialized({dirs, 2ull << 30, "slab"});
+    ASSERT_TRUE(initialized.Healthy()) << initialized.StartupError();
+  }
+  const auto read = [](const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    EXPECT_TRUE(input.is_open());
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
+  };
+  const fs::path first_state = fs::path(dirs[0]) / "slab_state";
+  const std::string before = read(first_state);
+  ASSERT_EQ(before.size(), 64U);
+  const fs::path second = dirs[1];
+  std::string marker = read(second / "slab_meta");
+  ASSERT_EQ(marker.size(), 64U);
+  const uint32_t marker_magic = 0x49424C53;
+  std::memcpy(marker.data(), &marker_magic, sizeof(marker_magic));
+  {
+    std::ofstream output(second / "slab_initializing", std::ios::binary);
+    output.write(marker.data(), static_cast<std::streamsize>(marker.size()));
+    ASSERT_TRUE(output.good());
+  }
+  ASSERT_TRUE(fs::remove(second / "slab_state"));
+  {
+    std::fstream table(second / "slots.tbl",
+                       std::ios::binary | std::ios::in | std::ios::out);
+    table.put('x');
+    ASSERT_TRUE(table.good());
+  }
+  const std::string table_before = read(second / "slots.tbl");
+  ASSERT_FALSE(table_before.empty());
+  const DiskCacheGroup refused({dirs, 2ull << 30, "slab"});
+  EXPECT_FALSE(refused.Healthy());
+  EXPECT_EQ(refused.DiskCount(), 0U);
+  EXPECT_NE(refused.StartupError().find(dirs[1]), std::string::npos);
+  EXPECT_NE(refused.StartupError().find("slots.tbl contains data"),
+            std::string::npos);
+  EXPECT_EQ(read(first_state), before);
+  EXPECT_EQ(read(second / "slots.tbl"), table_before);
+  EXPECT_EQ(read(second / "slab_initializing"), marker);
+  EXPECT_FALSE(fs::exists(second / "slab_state"));
+}
+
 TEST_F(DiskGroupTest, SlabGeometryLimitsDoNotApplyToFileEngine) {
   const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
   const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "6000");

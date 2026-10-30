@@ -128,6 +128,28 @@ bool ValidateTableShape(int fd, uint64_t bytes, std::string* error) {
   return true;
 }
 
+// No request can run before slab_state exists. A nonzero table proves this
+// is not pristine initialization, even if an initialization marker is present.
+// Borrows fd and never modifies the table.
+bool ValidateEmptyTable(int fd, uint64_t bytes, std::string* error) {
+  if (!ValidateTableShape(fd, bytes, error)) return false;
+  char chunk[4096];
+  for (uint64_t offset = 0; offset < bytes; offset += sizeof(chunk)) {
+    const size_t n = std::min<uint64_t>(sizeof(chunk), bytes - offset);
+    if (!PreadAll(fd, chunk, n, offset)) {
+      *error = StartupErrnoMessage("cannot read incomplete slots.tbl", errno);
+      return false;
+    }
+    if (std::any_of(chunk, chunk + n, [](char c) { return c != 0; })) {
+      *error =
+          "cannot resume incomplete slab: slots.tbl contains data; "
+          "preserve the existing store";
+      return false;
+    }
+  }
+  return true;
+}
+
 bool ReadAndValidateMeta(const DiskSlabStore::Options& options, bool no_follow,
                          bool* exists, std::string* error) {
   const auto fail = [error](std::string message, int saved_errno = 0) {
@@ -604,7 +626,8 @@ bool DiskSlabStore::ValidateExistingTable(const Options& options,
   const uint64_t bytes = (options.capacity_bytes / options.extent_bytes) *
                          (options.extent_bytes / options.slot_granularity) *
                          kRecBytes;
-  const bool valid = ValidateTableShape(fd, bytes, error);
+  const bool valid = resume ? ValidateEmptyTable(fd, bytes, error)
+                            : ValidateTableShape(fd, bytes, error);
   ::close(fd);
   return valid;
 }
@@ -747,24 +770,13 @@ bool DiskSlabStore::OpenOrInit() {
   }
 
   if (resume) {
-    // No request can run before slab_state exists. A nonzero table proves this
-    // is not a pristine initialization, even if a marker happens to be present.
     table_fd_ = ::open(tbl_path.c_str(), O_RDWR | O_NONBLOCK | O_NOFOLLOW);
     if (table_fd_ < 0 && errno != ENOENT)
       return SetStartupErrno("cannot open incomplete slots.tbl", errno);
     if (table_fd_ >= 0) {
       std::string error;
-      if (!ValidateTableShape(table_fd_, tbl_bytes, &error))
+      if (!ValidateEmptyTable(table_fd_, tbl_bytes, &error))
         return SetStartupError(std::move(error));
-      char chunk[4096];
-      for (uint64_t off = 0; off < tbl_bytes; off += sizeof(chunk)) {
-        const size_t n = std::min<uint64_t>(sizeof(chunk), tbl_bytes - off);
-        if (!PreadAll(table_fd_, chunk, n, off))
-          return SetStartupErrno("cannot read incomplete slots.tbl", errno);
-        if (std::any_of(chunk, chunk + n, [](char c) { return c != 0; }))
-          return SetStartupError("cannot resume incomplete slab: slots.tbl contains "
-                                 "data; preserve the existing store");
-      }
     }
   }
   if (table_fd_ < 0 && initializing_ && !state_exists) {
