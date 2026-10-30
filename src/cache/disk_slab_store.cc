@@ -114,6 +114,20 @@ std::string StartupErrnoMessage(std::string message, int saved_errno) {
   return message;
 }
 
+// Borrows fd; both startup paths use the same geometry/type rule.
+bool ValidateTableShape(int fd, uint64_t bytes, std::string* error) {
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    *error = StartupErrnoMessage("cannot inspect slots.tbl", errno);
+    return false;
+  }
+  if (!S_ISREG(st.st_mode) || st.st_size != static_cast<off_t>(bytes)) {
+    *error = "slots.tbl size/type differs from slab geometry";
+    return false;
+  }
+  return true;
+}
+
 bool ReadAndValidateMeta(const DiskSlabStore::Options& options, bool no_follow,
                          bool* exists, std::string* error) {
   const auto fail = [error](std::string message, int saved_errno = 0) {
@@ -556,6 +570,45 @@ bool DiskSlabStore::ValidateExistingEpoch(const Options& options,
   return valid;
 }
 
+bool DiskSlabStore::ValidateExistingTable(const Options& options,
+                                          std::string* error) {
+  if (!ValidateGeometry(options, error)) return false;
+  bool meta_exists = false;
+  if (!ReadAndValidateMeta(options, false, &meta_exists, error)) return false;
+  // Missing metadata belongs to the fresh/resume layout classification.
+  if (!meta_exists) return true;
+  bool initializing = false;
+  if (!ReadAndValidateInitMarker(options, &initializing, error)) return false;
+  bool resume = false;
+  if (initializing) {
+    const std::string state = (fs::path(options.dir) / "slab_state").string();
+    const int fd = ::open(state.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+    if (fd >= 0) {
+      ::close(fd);
+    } else if (errno == ENOENT) {
+      resume = true;
+    } else {
+      *error = StartupErrnoMessage("cannot inspect slab_state", errno);
+      return false;
+    }
+  }
+  const std::string path = (fs::path(options.dir) / "slots.tbl").string();
+  const int fd =
+      ::open(path.c_str(), O_RDONLY | O_NONBLOCK | (resume ? O_NOFOLLOW : 0));
+  if (fd < 0) {
+    const int saved_errno = errno;
+    if (resume && saved_errno == ENOENT) return true;
+    *error = StartupErrnoMessage("cannot open slots.tbl", saved_errno);
+    return false;
+  }
+  const uint64_t bytes = (options.capacity_bytes / options.extent_bytes) *
+                         (options.extent_bytes / options.slot_granularity) *
+                         kRecBytes;
+  const bool valid = ValidateTableShape(fd, bytes, error);
+  ::close(fd);
+  return valid;
+}
+
 bool DiskSlabStore::ValidateOptions() {
   std::string error;
   if (!ValidateGeometry(opt_, &error)) return SetStartupError(error);
@@ -696,16 +749,13 @@ bool DiskSlabStore::OpenOrInit() {
   if (resume) {
     // No request can run before slab_state exists. A nonzero table proves this
     // is not a pristine initialization, even if a marker happens to be present.
-    table_fd_ = ::open(tbl_path.c_str(), O_RDWR | O_NOFOLLOW);
+    table_fd_ = ::open(tbl_path.c_str(), O_RDWR | O_NONBLOCK | O_NOFOLLOW);
     if (table_fd_ < 0 && errno != ENOENT)
       return SetStartupErrno("cannot open incomplete slots.tbl", errno);
     if (table_fd_ >= 0) {
-      struct stat st {};
-      if (::fstat(table_fd_, &st) != 0)
-        return SetStartupErrno("cannot inspect incomplete slots.tbl", errno);
-      if (!S_ISREG(st.st_mode) || st.st_size != static_cast<off_t>(tbl_bytes))
-        return SetStartupError("cannot resume incomplete slab: slots.tbl size/type "
-                               "differs from geometry");
+      std::string error;
+      if (!ValidateTableShape(table_fd_, tbl_bytes, &error))
+        return SetStartupError(std::move(error));
       char chunk[4096];
       for (uint64_t off = 0; off < tbl_bytes; off += sizeof(chunk)) {
         const size_t n = std::min<uint64_t>(sizeof(chunk), tbl_bytes - off);
@@ -726,13 +776,11 @@ bool DiskSlabStore::OpenOrInit() {
     if (::fdatasync(table_fd_) != 0)
       return SetStartupErrno("cannot persist slots.tbl", errno);
   } else if (table_fd_ < 0) {
-    table_fd_ = ::open(tbl_path.c_str(), O_RDWR);
+    table_fd_ = ::open(tbl_path.c_str(), O_RDWR | O_NONBLOCK);
     if (table_fd_ < 0) return SetStartupErrno("cannot open slots.tbl", errno);
-    struct stat st {};
-    if (::fstat(table_fd_, &st) != 0)
-      return SetStartupErrno("cannot inspect slots.tbl", errno);
-    if (st.st_size != static_cast<off_t>(tbl_bytes))
-      return SetStartupError("slots.tbl size differs from slab geometry");
+    std::string error;
+    if (!ValidateTableShape(table_fd_, tbl_bytes, &error))
+      return SetStartupError(std::move(error));
   }
   if (fresh) {
     int wfd = ::open(meta_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
