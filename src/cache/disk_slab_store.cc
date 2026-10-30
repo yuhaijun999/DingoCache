@@ -98,6 +98,11 @@ void EncodeGeometryMeta(const DiskSlabStore::Options& options,
       static_cast<uint32_t>(options.capacity_bytes / options.extent_bytes));
 }
 
+void EncodeInitMarker(const DiskSlabStore::Options& options, uint8_t* record) {
+  EncodeGeometryMeta(options, record);
+  net::PutU32(reinterpret_cast<char*>(record), kInitMagic);
+}
+
 std::string StartupErrnoMessage(std::string message, int saved_errno) {
   message += ": " +
              std::error_code(saved_errno, std::generic_category()).message() +
@@ -149,6 +154,49 @@ bool ReadAndValidateMeta(const DiskSlabStore::Options& options, bool no_follow,
   EncodeGeometryMeta(options, expected);
   if (std::memcmp(meta, expected, 28) != 0)
     return fail("existing slab layout differs from requested geometry");
+  return true;
+}
+
+bool ReadAndValidateInitMarker(const DiskSlabStore::Options& options,
+                               bool* exists, std::string* error) {
+  const auto fail = [error](std::string message, int saved_errno = 0) {
+    *error = saved_errno == 0
+                 ? std::move(message)
+                 : StartupErrnoMessage(std::move(message), saved_errno);
+    return false;
+  };
+  *exists = false;
+  const std::string path =
+      (fs::path(options.dir) / "slab_initializing").string();
+  // O_NONBLOCK lets fstat reject a FIFO rather than waiting for a writer.
+  const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+  if (fd < 0) {
+    const int saved_errno = errno;
+    if (saved_errno == ENOENT) return true;
+    return fail("cannot open slab initialization marker", saved_errno);
+  }
+  *exists = true;
+  uint8_t persisted[64];
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    const int saved_errno = errno;
+    ::close(fd);
+    return fail("cannot inspect slab initialization marker", saved_errno);
+  }
+  if (!S_ISREG(st.st_mode) ||
+      st.st_size != static_cast<off_t>(sizeof(persisted))) {
+    ::close(fd);
+    return fail("slab initialization marker size/type invalid");
+  }
+  const bool read_ok = PreadAll(fd, persisted, sizeof(persisted), 0);
+  const int read_errno = errno;
+  ::close(fd);
+  if (!read_ok)
+    return fail("cannot read slab initialization marker", read_errno);
+  uint8_t expected[64];
+  EncodeInitMarker(options, expected);
+  if (std::memcmp(persisted, expected, sizeof(persisted)) != 0)
+    return fail("slab initialization marker geometry mismatch");
   return true;
 }
 
@@ -482,6 +530,13 @@ bool DiskSlabStore::ValidateExistingMeta(const Options& options,
   return ReadAndValidateMeta(options, false, &exists, error);
 }
 
+bool DiskSlabStore::ValidateExistingInitMarker(const Options& options,
+                                               std::string* error) {
+  if (!ValidateGeometry(options, error)) return false;
+  bool exists = false;
+  return ReadAndValidateInitMarker(options, &exists, error);
+}
+
 bool DiskSlabStore::ValidateExistingEpoch(const Options& options,
                                           std::string* error) {
   if (!ValidateGeometry(options, error)) return false;
@@ -528,34 +583,10 @@ bool DiskSlabStore::OpenOrInit() {
   uint8_t expected_meta[64];
   EncodeGeometryMeta(opt_, expected_meta);
   uint8_t marker_record[64];
-  std::memcpy(marker_record, expected_meta, sizeof(marker_record));
-  net::PutU32(reinterpret_cast<char*>(marker_record), kInitMagic);
-
-  int marker_fd = ::open(marker_path.c_str(), O_RDONLY | O_NOFOLLOW);
-  if (marker_fd >= 0) {
-    uint8_t persisted[64];
-    struct stat st {};
-    if (::fstat(marker_fd, &st) != 0) {
-      const int saved_errno = errno;
-      ::close(marker_fd);
-      return SetStartupErrno("cannot inspect slab initialization marker", saved_errno);
-    }
-    if (!S_ISREG(st.st_mode) ||
-        st.st_size != static_cast<off_t>(sizeof(persisted))) {
-      ::close(marker_fd);
-      return SetStartupError("slab initialization marker size/type invalid");
-    }
-    const bool read_ok = PreadAll(marker_fd, persisted, sizeof(persisted), 0);
-    const int read_errno = errno;
-    ::close(marker_fd);
-    if (!read_ok)
-      return SetStartupErrno("cannot read slab initialization marker", read_errno);
-    if (std::memcmp(persisted, marker_record, sizeof(persisted)) != 0)
-      return SetStartupError("slab initialization marker geometry mismatch");
-    initializing_ = true;
-  } else if (errno != ENOENT) {
-    return SetStartupErrno("cannot open slab initialization marker", errno);
-  }
+  EncodeInitMarker(opt_, marker_record);
+  std::string marker_error;
+  if (!ReadAndValidateInitMarker(opt_, &initializing_, &marker_error))
+    return SetStartupError(std::move(marker_error));
 
   // Only a marker created before any layout file can distinguish an interrupted
   // first initialization from a pre-epoch populated store whose state is missing.
