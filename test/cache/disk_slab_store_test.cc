@@ -3,30 +3,39 @@
 // strict startup geometry, fail-closed metadata I/O, and reclaimer safety.
 #include "cache/disk_slab_store.h"
 
-#include <gtest/gtest.h>
 #include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
+// glibc's POSIX wait-status macros are provided directly by this C header.
+#include <gtest/gtest.h>
+#include <stdlib.h>  // NOLINT(hicpp-deprecated-headers,modernize-deprecated-headers)
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <ios>
+#include <iterator>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 #ifdef DFKV_WITH_URING
 #include <liburing.h>
 #endif
 
-#include <cerrno>
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <string>
-#include <functional>
-#include <mutex>
-#include <thread>
-#include <vector>
+#include "common/status.h"
 
 using dfkv::BlockKey;
 using dfkv::DiskSlabStore;
@@ -88,6 +97,12 @@ class DiskSlabStoreTestPeer {
   static bool MarkCleanNow(DiskSlabStore* store) {
     return store->MarkCleanEpoch();
   }
+  // Produce records with the existing encoder and valid CRC, including values
+  // a normal running store would never publish. This is only a disk fixture.
+  static bool WriteEpochNow(DiskSlabStore* store, uint32_t state,
+                            uint64_t epoch) {
+    return store->WriteEpochState(state, epoch);
+  }
 };
 }  // namespace dfkv
 
@@ -143,6 +158,12 @@ class DiskSlabTest : public ::testing::Test {
     return error;
   }
   fs::path dir_;
+  std::string ReadFileBytes(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    EXPECT_TRUE(input.is_open()) << path;
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
+  }
 };
 BlockKey K(uint64_t id) { return BlockKey{id, 0}; }
 struct HookGate {
@@ -821,6 +842,115 @@ TEST_F(DiskSlabTest, DirtyEpochColdResetsAfterProcessCrash) {
   ASSERT_EQ(clean_reopen.Range(K(71), 0, survivor.size(), &out),
             Status::kOk);
   EXPECT_EQ(out, survivor);
+}
+
+TEST_F(DiskSlabTest, EpochPreflightChecksRecordsWithoutWriting) {
+  DiskSlabStore::Options options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  std::string error = "old diagnostic";
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingEpoch(options, &error)) << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(fs::exists(dir_));
+  fs::create_directories(dir_);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingEpoch(options, &error)) << error;
+  const fs::path state_path = dir_ / "slab_state";
+  {
+    DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy()) << store.StartupError();
+    for (const uint32_t state : {1U, 2U}) {
+      for (const uint64_t epoch : {uint64_t{0}, uint64_t{42},
+                                   std::numeric_limits<uint64_t>::max() - 1}) {
+        ASSERT_TRUE(
+            dfkv::DiskSlabStoreTestPeer::WriteEpochNow(&store, state, epoch));
+        const std::string before = ReadFileBytes(state_path);
+        EXPECT_TRUE(DiskSlabStore::ValidateExistingEpoch(options, &error))
+            << error;
+        EXPECT_TRUE(error.empty());
+        EXPECT_EQ(ReadFileBytes(state_path), before);
+      }
+    }
+    ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::WriteEpochNow(&store, 99, 1));
+    const std::string invalid_state = ReadFileBytes(state_path);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingEpoch(options, &error));
+    EXPECT_NE(error.find("invalid epoch state"), std::string::npos);
+    EXPECT_EQ(ReadFileBytes(state_path), invalid_state);
+    ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::WriteEpochNow(
+        &store, 2, std::numeric_limits<uint64_t>::max()));
+    const std::string exhausted = ReadFileBytes(state_path);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingEpoch(options, &error));
+    EXPECT_NE(error.find("epoch exhausted"), std::string::npos);
+    EXPECT_EQ(ReadFileBytes(state_path), exhausted);
+
+    ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::WriteEpochNow(&store, 1, 1));
+    const std::string valid = ReadFileBytes(state_path);
+    for (const size_t offset : {0U, 4U, 24U}) {
+      std::string bad = valid;
+      bad[offset] ^= 1;  // Offset 24 changes only CRC-covered padding.
+      {
+        std::ofstream output(state_path, std::ios::binary | std::ios::trunc);
+        output.write(bad.data(), static_cast<std::streamsize>(bad.size()));
+        ASSERT_TRUE(output.good());
+      }
+      EXPECT_FALSE(DiskSlabStore::ValidateExistingEpoch(options, &error));
+      EXPECT_NE(error.find("checksum or format mismatch"), std::string::npos);
+      EXPECT_EQ(ReadFileBytes(state_path), bad);
+    }
+    for (const size_t length : {0U, 1U, 63U, 65U}) {
+      const std::string bad(length, '\0');
+      {
+        std::ofstream output(state_path, std::ios::binary | std::ios::trunc);
+        output.write(bad.data(), static_cast<std::streamsize>(bad.size()));
+        ASSERT_TRUE(output.good());
+      }
+      EXPECT_FALSE(DiskSlabStore::ValidateExistingEpoch(options, &error));
+      EXPECT_NE(error.find("size/type"), std::string::npos);
+      EXPECT_EQ(ReadFileBytes(state_path), bad);
+    }
+  }
+  ASSERT_TRUE(fs::remove(state_path));
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingEpoch(options, &error)) << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(fs::exists(state_path));  // Do not perform the migration here.
+  fs::create_symlink("missing-epoch", state_path);
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingEpoch(options, &error));
+  EXPECT_NE(error.find("cannot open slab_state"), std::string::npos);
+  EXPECT_TRUE(fs::is_symlink(state_path));
+}
+
+TEST_F(DiskSlabTest, ExhaustedDirtyEpochDoesNotResetTable) {
+  DiskSlabStore::Options options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  // LLVM 17 maps glibc's guarded pid_t typedef to time.h even though the
+  // correct POSIX sys/types.h is directly included above.
+  const pid_t child = ::fork();  // NOLINT(misc-include-cleaner)
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    DiskSlabStore store(options);
+    const std::string value(4096, 'e');
+    const bool ready =
+        store.Healthy() &&
+        store.Cache(K(74), value.data(), value.size()) == Status::kOk &&
+        dfkv::DiskSlabStoreTestPeer::WriteEpochNow(
+            &store, 2, std::numeric_limits<uint64_t>::max());
+    ::_exit(ready ? 0
+                  : 1);  // Preserve a real dirty table and a valid-CRC epoch.
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
+  const std::string table = ReadFileBytes(dir_ / "slots.tbl");
+  ASSERT_NE(table.find_first_not_of('\0'), std::string::npos);
+  const std::string state = ReadFileBytes(dir_ / "slab_state");
+  {
+    const DiskSlabStore store(options);
+    EXPECT_FALSE(store.Healthy());
+    EXPECT_NE(store.StartupError().find("epoch exhausted"), std::string::npos);
+  }
+  EXPECT_EQ(ReadFileBytes(dir_ / "slots.tbl"), table);
+  EXPECT_EQ(ReadFileBytes(dir_ / "slab_state"), state);
 }
 
 TEST_F(DiskSlabTest, CorruptEpochStateFailsClosed) {
