@@ -559,6 +559,12 @@ TEST_F(DiskSlabTest, InterruptedHighIndexExtentKeepsCanonicalName) {
   struct stat before {};
   ASSERT_EQ(::stat(high_extent.c_str(), &before), 0);
 
+  const DiskSlabStore::Options options = Opts(kExtents * 4096, 4096, 4096);
+  std::string preflight_error;
+  EXPECT_TRUE(
+      DiskSlabStore::ValidateExistingDataFiles(options, &preflight_error))
+      << preflight_error;
+
   // The limited child must get past the canonical 6-digit extent, then fail
   // on its own descriptor limit instead of rejecting a valid existing extent.
   const std::string error = InterruptedFirstStartup(kExtents);
@@ -1086,8 +1092,10 @@ TEST_F(DiskSlabTest, ExtentPreflightChecksFilesWithoutWriting) {
       << error;
   EXPECT_TRUE(error.empty());
   EXPECT_FALSE(fs::exists(extents));
-  fs::create_directory(dir_ / "other_extents");
-  fs::create_directory_symlink("other_extents", extents);
+  // Link to a real directory without adding an unrelated root entry that
+  // could mask the directory-symlink rejection once resume checks the
+  // whitelist.
+  fs::create_directory_symlink(".", extents);
   EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
   EXPECT_TRUE(fs::is_symlink(extents));
   EXPECT_EQ(ReadFileBytes(dir_ / "slab_initializing"), marker);
@@ -1184,6 +1192,77 @@ TEST_F(DiskSlabTest, MissingMetaResumePreflightChecksDataWithoutWriting) {
   const DiskSlabStore resumed(options);
   EXPECT_TRUE(resumed.Healthy()) << resumed.StartupError();
   EXPECT_TRUE(fs::exists(table));
+  EXPECT_TRUE(fs::exists(dir_ / "slab_meta"));
+  EXPECT_TRUE(fs::exists(dir_ / "slab_state"));
+  EXPECT_FALSE(fs::exists(dir_ / "slab_initializing"));
+}
+
+TEST_F(DiskSlabTest, ResumePreflightChecksWhitelistWithoutWriting) {
+  DiskSlabStore::Options options = Opts(96 * 4096, 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  {
+    const DiskSlabStore initialized(options);
+    ASSERT_TRUE(initialized.Healthy()) << initialized.StartupError();
+  }
+  const std::string meta = ReadFileBytes(dir_ / "slab_meta");
+  const std::string table = ReadFileBytes(dir_ / "slots.tbl");
+  std::string marker = meta;
+  const uint32_t marker_magic = 0x49424C53;
+  std::memcpy(marker.data(), &marker_magic, sizeof(marker_magic));
+  std::string error;
+  const fs::path extra = dir_ / "keep.data";
+  WriteFileBytes(extra, "normal");
+  // Ordinary and stale-marker layouts are not subject to the resume whitelist.
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  WriteFileBytes(dir_ / "slab_initializing", marker);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_EQ(ReadFileBytes(extra), "normal");
+  ASSERT_TRUE(fs::remove(extra));
+  ASSERT_TRUE(fs::remove(dir_ / "slab_state"));
+  const fs::path extents = dir_ / "extents";
+  const std::vector<fs::path> unexpected_paths = {extra,
+                                                  extents / "junk",
+                                                  extents / "E0000",
+                                                  extents / "E000000",
+                                                  extents / "E00096",
+                                                  extents / "E-0001",
+                                                  extents / "E0000x",
+                                                  extents / "E4294967296",
+                                                  extents / "E00000.tmp",
+                                                  extents / "E00000000000"};
+  for (const bool meta_exists : {true, false}) {
+    SCOPED_TRACE(meta_exists);
+    if (!meta_exists) {
+      ASSERT_TRUE(fs::remove(dir_ / "slab_meta"));
+    }
+    EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+        << error;
+    for (const fs::path& unexpected : unexpected_paths) {
+      SCOPED_TRACE(unexpected.string());
+      WriteFileBytes(unexpected, "preserve");
+      EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+      EXPECT_NE(error.find("unexpected"), std::string::npos);
+      EXPECT_EQ(ReadFileBytes(unexpected), "preserve");
+      EXPECT_EQ(ReadFileBytes(dir_ / "slots.tbl"), table);
+      EXPECT_EQ(ReadFileBytes(dir_ / "slab_initializing"), marker);
+      EXPECT_EQ(fs::exists(dir_ / "slab_meta"), meta_exists);
+      EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
+      ASSERT_TRUE(fs::remove(unexpected));
+    }
+    const fs::path directory = dir_ / "unknown-dir";
+    fs::create_directory(directory);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+    EXPECT_TRUE(fs::is_directory(directory));
+    ASSERT_TRUE(fs::remove(directory));
+    EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+        << error;
+    EXPECT_TRUE(error.empty());
+  }
+  const DiskSlabStore resumed(options);
+  EXPECT_TRUE(resumed.Healthy()) << resumed.StartupError();
   EXPECT_TRUE(fs::exists(dir_ / "slab_meta"));
   EXPECT_TRUE(fs::exists(dir_ / "slab_state"));
   EXPECT_FALSE(fs::exists(dir_ / "slab_initializing"));

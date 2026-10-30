@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preflight interrupted-initialization directory whitelists before opening any
+  disk. Reject resume roots that are symlinks, unexpected root entries and
+  noncanonical/out-of-range extent names using the same rules as normal startup.
+  Ordinary stores and stale initialization markers retain their existing rules.
+
 - Preflight missing `slab_meta` layouts before opening any disk: reject existing
   state or unmarked nonempty directories without recreating metadata. Fresh
   directories remain supported; marked interrupted initialization still checks

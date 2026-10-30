@@ -255,6 +255,70 @@ bool ValidateMissingMeta(const fs::path& root, bool initializing,
   return false;
 }
 
+// A marked, state-less initialization may resume only within this whitelist.
+// Shared with normal startup so preflight cannot bless an unknown layout.
+bool ValidateResumeLayout(const DiskSlabStore::Options& options,
+                          std::string* error) {
+  const auto fail = [error](std::string message, int saved_errno = 0) {
+    *error = saved_errno == 0
+                 ? std::move(message)
+                 : StartupErrnoMessage(std::move(message), saved_errno);
+    return false;
+  };
+  const fs::path root(options.dir);
+  const fs::path extents_dir = root / "extents";
+  std::error_code ec;
+  if (fs::symlink_status(root, ec).type() != fs::file_type::directory || ec)
+    return fail("cannot safely resume through cache directory symlink");
+  for (fs::directory_iterator it(root, ec), end; !ec && it != end;
+       it.increment(ec)) {
+    const std::string name = it->path().filename().string();
+    if (name != "slab_initializing" && name != "slab_meta" &&
+        name != "slots.tbl" && name != "extents")
+      return fail("cannot resume incomplete slab: unexpected file " + name);
+  }
+  if (ec) return fail("cannot inspect cache directory: " + ec.message());
+  const fs::file_type type = fs::symlink_status(extents_dir, ec).type();
+  if (type != fs::file_type::not_found && type != fs::file_type::directory)
+    return fail("cannot resume incomplete slab: extents is not a directory");
+  if (ec && ec != std::errc::no_such_file_or_directory)
+    return fail("cannot inspect extents directory: " + ec.message());
+  if (type == fs::file_type::not_found) return true;
+  ec.clear();
+  const uint32_t count =
+      static_cast<uint32_t>(options.capacity_bytes / options.extent_bytes);
+  for (fs::directory_iterator it(extents_dir, ec), end; !ec && it != end;
+       it.increment(ec)) {
+    const std::string name = it->path().filename().string();
+    if (name.size() < 6 || name.size() > 11 || name[0] != 'E')
+      return fail("cannot resume incomplete slab: unexpected extent " + name);
+    uint32_t index = 0;
+    const std::from_chars_result parsed =
+        std::from_chars(name.data() + 1, name.data() + name.size(), index);
+    if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size())
+      return fail("cannot resume incomplete slab: unexpected extent " + name);
+    char canonical[32];
+    const int length =
+        std::snprintf(canonical, sizeof(canonical), "E%05u", index);
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(canonical))
+      return fail("cannot format extent filename");
+    if (index >= count || name != canonical)
+      return fail("cannot resume incomplete slab: unexpected extent " + name);
+    const std::string path = it->path().string();
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) != 0)
+      return fail("cannot inspect extent " + path, errno);
+    if (!S_ISREG(st.st_mode) ||
+        st.st_size != static_cast<off_t>(options.extent_bytes))
+      return fail(
+          "cannot resume incomplete slab: extent size/type differs from "
+          "geometry: " +
+          path);
+  }
+  if (ec) return fail("cannot inspect extents: " + ec.message());
+  return true;
+}
+
 bool ReadAndValidateMeta(const DiskSlabStore::Options& options, bool no_follow,
                          bool* exists, std::string* error) {
   const auto fail = [error](std::string message, int saved_errno = 0) {
@@ -706,6 +770,7 @@ bool DiskSlabStore::ValidateExistingDataFiles(const Options& options,
   bool state_exists = false;
   if (!InspectExistingState(root, &state_exists, error)) return false;
   const bool resume = initializing && !state_exists;
+  if (resume && !ValidateResumeLayout(options, error)) return false;
   bool meta_exists = false;
   if (!ReadAndValidateMeta(options, resume, &meta_exists, error)) return false;
   if (!meta_exists) {
@@ -773,55 +838,9 @@ bool DiskSlabStore::OpenOrInit() {
   if (!InspectExistingState(root, &state_exists, &state_error))
     return SetStartupError(std::move(state_error));
   const bool resume = initializing_ && !state_exists;
-  if (resume) {
-    if (fs::symlink_status(root, ec).type() != fs::file_type::directory || ec)
-      return SetStartupError("cannot safely resume through cache directory symlink");
-    ec.clear();
-    for (fs::directory_iterator it(root, ec), end; !ec && it != end;
-         it.increment(ec)) {
-      const auto name = it->path().filename().string();
-      if (name != "slab_initializing" && name != "slab_meta" &&
-          name != "slots.tbl" && name != "extents")
-        return SetStartupError("cannot resume incomplete slab: unexpected file " + name);
-    }
-    if (ec) return SetStartupError("cannot inspect cache directory: " + ec.message());
-    ec.clear();
-    const auto type = fs::symlink_status(extents_dir, ec).type();
-    if (type != fs::file_type::not_found && type != fs::file_type::directory)
-      return SetStartupError("cannot resume incomplete slab: extents is not a directory");
-    if (ec && ec != std::errc::no_such_file_or_directory)
-      return SetStartupError("cannot inspect extents directory: " + ec.message());
-    ec.clear();
-    if (type == fs::file_type::directory) {
-      for (fs::directory_iterator it(extents_dir, ec), end; !ec && it != end;
-           it.increment(ec)) {
-        const std::string name = it->path().filename().string();
-        if (name.size() < 6 || name.size() > 11 || name[0] != 'E')
-          return SetStartupError("cannot resume incomplete slab: unexpected extent " +
-                                 name);
-        uint32_t index = 0;
-        const auto [parse_end, parse_error] =
-            std::from_chars(name.data() + 1, name.data() + name.size(), index);
-        if (parse_error != std::errc{} ||
-            parse_end != name.data() + name.size())
-          return SetStartupError("cannot resume incomplete slab: unexpected extent " +
-                                 name);
-        char canonical[32];
-        std::snprintf(canonical, sizeof(canonical), "E%05u", index);
-        if (index >= num_extents_ || name != canonical)
-          return SetStartupError("cannot resume incomplete slab: unexpected extent " +
-                                 name);
-        struct stat st {};
-        if (::lstat(it->path().c_str(), &st) != 0)
-          return SetStartupErrno("cannot inspect extent " + name, errno);
-        if (!S_ISREG(st.st_mode) ||
-            st.st_size != static_cast<off_t>(opt_.extent_bytes))
-          return SetStartupError("cannot resume incomplete slab: extent size/type "
-                                 "differs from geometry: " + name);
-      }
-      if (ec) return SetStartupError("cannot inspect extents: " + ec.message());
-    }
-  }
+  std::string layout_error;
+  if (resume && !ValidateResumeLayout(opt_, &layout_error))
+    return SetStartupError(std::move(layout_error));
 
   bool meta_exists = false;
   std::string meta_error;

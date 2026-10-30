@@ -183,8 +183,8 @@ class DiskSlabStore : public StoreEngine {
   // Read-only fresh/resume/existing layout guard and table/extent check.
   // Missing meta requires a missing/empty root or a valid initialization marker
   // without state. Resume requires zero table content and rejects data-file
-  // symlinks, but permits missing files. Unexpected resume names remain for
-  // normal startup's whitelist check.
+  // symlinks, but permits missing files. Resume also requires a real root
+  // directory and only known root entries and canonical in-range extent names.
   // error must be non-null, cleared on success.
   static bool ValidateExistingDataFiles(const Options& options,
                                         std::string* error);
