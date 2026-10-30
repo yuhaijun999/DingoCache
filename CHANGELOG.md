@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Check every real slab store's existing `slab_meta` header read-only before
+  opening the first store, so a later disk's incompatible persisted geometry
+  cannot trigger recovery or epoch changes on earlier disks. Full table,
+  initialization-marker and epoch preflight is not yet implemented.
+
+- Validate all real slab stores' requested capacity and slot geometry before
+  constructing the first disk store. Existing on-disk layout checks still run
+  when each store opens; this is not a transactional startup guarantee.
+
+- Validate disk eviction policy options and `DFKV_SLAB_EVICTION_POLICY` before
+  constructing disk stores. Explicit `legacy` remains available; explicit
+  `lifetime` is rejected until the implementation is ready. An unspecified
+  policy preserves legacy behavior. `--slab-eviction-policy` overrides the
+  environment without treating an explicit empty value as missing.
+
 - Save vLLM connector recurrent-state (Mamba) objects only from the blocks
   the engine hands off for committed boundaries (`kv_connector_block_state`),
   instead of locating them by position in an append-only mirror of the
