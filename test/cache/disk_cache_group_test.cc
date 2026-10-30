@@ -568,6 +568,40 @@ TEST_F(DiskGroupTest, ValidSlabGeometriesOpenAllDisks) {
   }
 }
 
+TEST_F(DiskGroupTest, InvalidSecondInitMarkerDoesNotOpenFirstDisk) {
+  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY");
+  const std::vector<std::string> dirs = Dirs(2);
+  {
+    const DiskCacheGroup initialized({dirs, 2ull << 30, "slab"});
+    ASSERT_TRUE(initialized.Healthy()) << initialized.StartupError();
+  }
+
+  const fs::path first_state = fs::path(dirs[0]) / "slab_state";
+  std::ifstream before_input(first_state, std::ios::binary);
+  ASSERT_TRUE(before_input.is_open());
+  const std::string before{std::istreambuf_iterator<char>(before_input),
+                           std::istreambuf_iterator<char>()};
+
+  // A slab_meta record has the right size and geometry but the wrong marker
+  // magic. Disk B must be rejected before disk A can advance its epoch.
+  fs::copy_file(fs::path(dirs[1]) / "slab_meta",
+                fs::path(dirs[1]) / "slab_initializing");
+  const DiskCacheGroup refused({dirs, 2ull << 30, "slab"});
+  EXPECT_FALSE(refused.Healthy());
+  EXPECT_EQ(refused.DiskCount(), 0U);
+  EXPECT_NE(refused.StartupError().find(dirs[1]), std::string::npos);
+  EXPECT_NE(refused.StartupError().find("initialization marker"),
+            std::string::npos);
+
+  std::ifstream after_input(first_state, std::ios::binary);
+  ASSERT_TRUE(after_input.is_open());
+  const std::string after{std::istreambuf_iterator<char>(after_input),
+                          std::istreambuf_iterator<char>()};
+  EXPECT_EQ(after, before);
+}
+
 TEST_F(DiskGroupTest, SlabGeometryLimitsDoNotApplyToFileEngine) {
   const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
   const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "6000");

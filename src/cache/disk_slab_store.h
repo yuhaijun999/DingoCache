@@ -169,6 +169,12 @@ class DiskSlabStore : public StoreEngine {
   // error must be non-null; it is cleared on success.
   static bool ValidateExistingMeta(const Options& options, std::string* error);
 
+  // Read-only slab_initializing format/geometry check. ENOENT is normal; an
+  // existing marker is never removed or repaired by this check.
+  // error must be non-null; it is cleared on success.
+  static bool ValidateExistingInitMarker(const Options& options,
+                                         std::string* error);
+
   // Read-only slab_state format/CRC/state/epoch-range check. ENOENT is left to
   // the existing migration/resume path; it does not create or repair files.
   // error must be non-null; it is cleared on success.

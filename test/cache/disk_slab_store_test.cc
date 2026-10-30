@@ -164,6 +164,12 @@ class DiskSlabTest : public ::testing::Test {
     return std::string(std::istreambuf_iterator<char>(input),
                        std::istreambuf_iterator<char>());
   }
+  void WriteFileBytes(const fs::path& path, const std::string& bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(output.is_open()) << path;
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    ASSERT_TRUE(output.good()) << path;
+  }
 };
 BlockKey K(uint64_t id) { return BlockKey{id, 0}; }
 struct HookGate {
@@ -916,6 +922,54 @@ TEST_F(DiskSlabTest, EpochPreflightChecksRecordsWithoutWriting) {
   EXPECT_FALSE(DiskSlabStore::ValidateExistingEpoch(options, &error));
   EXPECT_NE(error.find("cannot open slab_state"), std::string::npos);
   EXPECT_TRUE(fs::is_symlink(state_path));
+}
+
+TEST_F(DiskSlabTest, InitMarkerPreflightChecksFullRecordWithoutWriting) {
+  DiskSlabStore::Options options = Opts(96 * 4096, 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  std::string error = "old diagnostic";
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingInitMarker(options, &error))
+      << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(fs::exists(dir_));
+
+  struct rlimit limit {};
+  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limit), 0);
+  if (limit.rlim_cur < 40) GTEST_SKIP() << "requires at least 40 descriptors";
+  ASSERT_NE(InterruptedFirstStartup().find("errno 24"), std::string::npos);
+  const fs::path marker = dir_ / "slab_initializing";
+  const std::string valid = ReadFileBytes(marker);
+  ASSERT_EQ(valid.size(), 64U);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingInitMarker(options, &error))
+      << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_EQ(ReadFileBytes(marker), valid);
+
+  for (const size_t offset : {0U, 4U, 8U, 16U, 24U, 63U}) {
+    SCOPED_TRACE(offset);
+    std::string corrupted = valid;
+    corrupted[offset] ^= 1;
+    WriteFileBytes(marker, corrupted);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingInitMarker(options, &error));
+    EXPECT_NE(error.find("geometry mismatch"), std::string::npos);
+    EXPECT_EQ(ReadFileBytes(marker), corrupted);
+  }
+  for (const size_t length : {0U, 1U, 63U, 65U}) {
+    SCOPED_TRACE(length);
+    const std::string corrupted(length, '\0');
+    WriteFileBytes(marker, corrupted);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingInitMarker(options, &error));
+    EXPECT_NE(error.find("size/type"), std::string::npos);
+    EXPECT_EQ(ReadFileBytes(marker), corrupted);
+  }
+
+  ASSERT_TRUE(fs::remove(marker));
+  fs::create_symlink("missing-marker", marker);
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingInitMarker(options, &error));
+  EXPECT_NE(error.find("cannot open slab initialization marker"),
+            std::string::npos);
+  EXPECT_TRUE(fs::is_symlink(marker));
 }
 
 TEST_F(DiskSlabTest, ExhaustedDirtyEpochDoesNotResetTable) {
