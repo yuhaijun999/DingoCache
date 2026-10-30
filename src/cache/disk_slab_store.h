@@ -163,6 +163,12 @@ class DiskSlabStore : public StoreEngine {
   // cleared on success and receives a diagnostic on failure.
   static bool ValidateGeometry(const Options& options, std::string* error);
 
+  // Read-only geometry/header check of slab_meta, sharing normal startup's
+  // decoder. Missing metadata is left to fresh/resume/migration handling.
+  // Not a full layout/epoch check or a guarantee against later I/O failures.
+  // error must be non-null; it is cleared on success.
+  static bool ValidateExistingMeta(const Options& options, std::string* error);
+
   DiskSlabStore(const DiskSlabStore&) = delete;
   DiskSlabStore& operator=(const DiskSlabStore&) = delete;
 

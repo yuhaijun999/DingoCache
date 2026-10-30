@@ -368,6 +368,16 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       }
       slab_options.push_back(std::move(so));
     }
+    // Inspect every existing header before any earlier disk can recover or
+    // write its epoch. Normal startup rechecks; this does not prevent races.
+    for (const DiskSlabStore::Options& so : slab_options) {
+      std::string error;
+      if (!DiskSlabStore::ValidateExistingMeta(so, &error)) {
+        fail(so.dir + ": " + error);
+        DFKV_LOG_ERROR(startup_error_);
+        return;
+      }
+    }
   }
   write_mode_ = use_slab ? "direct" : "";
   for (size_t i = 0; i < n; ++i) {
