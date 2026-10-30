@@ -929,7 +929,8 @@ TEST_F(DiskSlabTest, TablePreflightChecksShapeWithoutWriting) {
   options.table_sync_ms = 0;
   options.reclaim_interval_ms = 0;
   std::string error = "old diagnostic";
-  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
   EXPECT_TRUE(error.empty());
   EXPECT_FALSE(fs::exists(dir_));
   {
@@ -939,34 +940,36 @@ TEST_F(DiskSlabTest, TablePreflightChecksShapeWithoutWriting) {
   const fs::path table = dir_ / "slots.tbl";
   const std::string valid = ReadFileBytes(table);
   const std::string state = ReadFileBytes(dir_ / "slab_state");
-  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
   EXPECT_EQ(ReadFileBytes(table), valid);
   EXPECT_EQ(ReadFileBytes(dir_ / "slab_state"), state);
   for (const size_t size : {size_t{0}, valid.size() - 1, valid.size() + 1}) {
     SCOPED_TRACE(size);
     const std::string bytes(size, '\0');
     WriteFileBytes(table, bytes);
-    EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
     EXPECT_NE(error.find("size/type"), std::string::npos);
     EXPECT_EQ(ReadFileBytes(table), bytes);
   }
   ASSERT_TRUE(fs::remove(table));
   fs::create_directory(table);
-  EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
   EXPECT_TRUE(fs::is_directory(table));
   ASSERT_TRUE(fs::remove(table));
   ASSERT_EQ(::mkfifo(table.c_str(), 0600), 0);
-  EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
   EXPECT_NE(error.find("size/type"), std::string::npos);
   ASSERT_TRUE(fs::remove(table));
-  EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
   EXPECT_FALSE(fs::exists(table));
 
   // Migration without slab_state still requires the old table, not a new one.
   ASSERT_TRUE(fs::remove(dir_ / "slab_state"));
-  EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
   WriteFileBytes(table, valid);
-  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
   EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
 
   // A valid marker with no state permits a missing table during first init.
@@ -975,18 +978,20 @@ TEST_F(DiskSlabTest, TablePreflightChecksShapeWithoutWriting) {
   std::memcpy(marker.data(), &marker_magic, sizeof(marker_magic));
   WriteFileBytes(dir_ / "slab_initializing", marker);
   ASSERT_TRUE(fs::remove(table));
-  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
   EXPECT_TRUE(error.empty());
   EXPECT_FALSE(fs::exists(table));
   WriteFileBytes(table, valid);
-  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
   // Scan all chunks, including the final byte, without repairing data.
   for (const size_t offset : {size_t{0}, valid.size() - 1}) {
     SCOPED_TRACE(offset);
     std::string nonzero = valid;
     nonzero[offset] = 'x';
     WriteFileBytes(table, nonzero);
-    EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
     EXPECT_NE(error.find("slots.tbl contains data"), std::string::npos);
     EXPECT_EQ(ReadFileBytes(table), nonzero);
     EXPECT_EQ(ReadFileBytes(dir_ / "slab_initializing"), marker);
@@ -995,16 +1000,99 @@ TEST_F(DiskSlabTest, TablePreflightChecksShapeWithoutWriting) {
   // Existing and migrating stores may contain records; only resume requires
   // zero.
   WriteFileBytes(dir_ / "slab_state", state);
-  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
   ASSERT_TRUE(fs::remove(dir_ / "slab_initializing"));
   ASSERT_TRUE(fs::remove(dir_ / "slab_state"));
-  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
   WriteFileBytes(dir_ / "slab_initializing", marker);
   // A stale marker beside a committed state cannot authorize table recreation.
   WriteFileBytes(dir_ / "slab_state", state);
   ASSERT_TRUE(fs::remove(table));
-  EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
   EXPECT_FALSE(fs::exists(table));
+}
+
+TEST_F(DiskSlabTest, ExtentPreflightChecksFilesWithoutWriting) {
+  DiskSlabStore::Options options = Opts(96 * 4096, 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  std::string error = "old diagnostic";
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(fs::exists(dir_));
+  {
+    const DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy()) << store.StartupError();
+  }
+  const std::string state = ReadFileBytes(dir_ / "slab_state");
+  const std::string table = ReadFileBytes(dir_ / "slots.tbl");
+  const fs::path extents = dir_ / "extents";
+  // Use the last extent to prove the whole expected range is inspected.
+  const fs::path extent = extents / "E00095";
+  const std::string data(4096, 'x');
+  WriteFileBytes(extent, data);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_EQ(ReadFileBytes(extent), data);
+  for (const uintmax_t bytes : {0U, 4095U, 4097U}) {
+    SCOPED_TRACE(bytes);
+    fs::resize_file(extent, bytes);
+    const std::string before = ReadFileBytes(extent);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+    EXPECT_NE(error.find(extent.string()), std::string::npos);
+    EXPECT_EQ(ReadFileBytes(extent), before);
+  }
+  ASSERT_TRUE(fs::remove(extent));
+  fs::create_directory(extent);
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+  EXPECT_TRUE(fs::is_directory(extent));
+  ASSERT_TRUE(fs::remove(extent));
+  ASSERT_EQ(::mkfifo(extent.c_str(), 0600), 0);
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+  EXPECT_NE(error.find("not a regular file"), std::string::npos);
+  ASSERT_TRUE(fs::remove(extent));
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+  EXPECT_FALSE(fs::exists(extent));
+  EXPECT_EQ(ReadFileBytes(dir_ / "slab_state"), state);
+  EXPECT_EQ(ReadFileBytes(dir_ / "slots.tbl"), table);
+
+  // Preserve existing non-resume symlink and pre-epoch migration semantics.
+  fs::create_symlink("E00094", extent);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_TRUE(fs::is_symlink(extent));
+  ASSERT_TRUE(fs::remove(dir_ / "slab_state"));
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
+
+  std::string marker = ReadFileBytes(dir_ / "slab_meta");
+  const uint32_t marker_magic = 0x49424C53;
+  std::memcpy(marker.data(), &marker_magic, sizeof(marker_magic));
+  WriteFileBytes(dir_ / "slab_initializing", marker);
+  // Resume rejects symlinks but may create absent extents, without doing so
+  // here.
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+  EXPECT_TRUE(fs::is_symlink(extent));
+  ASSERT_TRUE(fs::remove(extent));
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_FALSE(fs::exists(extent));
+  fs::remove_all(extents);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(fs::exists(extents));
+  fs::create_directory(dir_ / "other_extents");
+  fs::create_directory_symlink("other_extents", extents);
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+  EXPECT_TRUE(fs::is_symlink(extents));
+  EXPECT_EQ(ReadFileBytes(dir_ / "slab_initializing"), marker);
+  EXPECT_EQ(ReadFileBytes(dir_ / "slots.tbl"), table);
+  EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
 }
 
 TEST_F(DiskSlabTest, InitMarkerPreflightChecksFullRecordWithoutWriting) {
