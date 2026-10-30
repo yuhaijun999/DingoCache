@@ -212,6 +212,49 @@ bool ReadAndValidateExtents(const DiskSlabStore::Options& options, bool resume,
   return true;
 }
 
+// Probe presence without creating migration state or following state symlinks.
+bool InspectExistingState(const fs::path& root, bool* exists,
+                          std::string* error) {
+  const int fd =
+      ::open((root / "slab_state").c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+  *exists = fd >= 0;
+  if (fd >= 0) {
+    ::close(fd);
+    return true;
+  }
+  const int saved_errno = errno;
+  if (saved_errno == ENOENT) return true;
+  *error = StartupErrnoMessage("cannot inspect slab_state", saved_errno);
+  return false;
+}
+
+// Missing metadata is safe only for a fresh directory or marked initialization.
+// Both preflight and normal startup use this guard, without creating any files.
+bool ValidateMissingMeta(const fs::path& root, bool initializing,
+                         bool state_exists, std::string* error) {
+  if (state_exists) {
+    *error =
+        "slab_meta missing from an existing store; no automatic "
+        "reinitialization";
+    return false;
+  }
+  if (initializing) return true;  // Resume still validates table and extents.
+  std::error_code ec;
+  const fs::file_status status = fs::symlink_status(root, ec);
+  if (status.type() == fs::file_type::not_found &&
+      (!ec || ec == std::errc::no_such_file_or_directory))
+    return true;  // First startup creates the directory, never preflight.
+  if (!ec) {
+    const fs::directory_iterator it(root, ec);
+    if (!ec && it == fs::directory_iterator()) return true;
+  }
+  *error = ec ? "cannot inspect cache directory: " + ec.message()
+              : "cache directory contains a different or incomplete store "
+                "layout; inspect the files, do not delete existing data "
+                "automatically";
+  return false;
+}
+
 bool ReadAndValidateMeta(const DiskSlabStore::Options& options, bool no_follow,
                          bool* exists, std::string* error) {
   const auto fail = [error](std::string message, int saved_errno = 0) {
@@ -657,24 +700,19 @@ bool DiskSlabStore::ValidateExistingEpoch(const Options& options,
 bool DiskSlabStore::ValidateExistingDataFiles(const Options& options,
                                               std::string* error) {
   if (!ValidateGeometry(options, error)) return false;
-  bool meta_exists = false;
-  if (!ReadAndValidateMeta(options, false, &meta_exists, error)) return false;
-  // Missing metadata belongs to the fresh/resume layout classification.
-  if (!meta_exists) return true;
+  const fs::path root(options.dir);
   bool initializing = false;
   if (!ReadAndValidateInitMarker(options, &initializing, error)) return false;
-  bool resume = false;
-  if (initializing) {
-    const std::string state = (fs::path(options.dir) / "slab_state").string();
-    const int fd = ::open(state.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
-    if (fd >= 0) {
-      ::close(fd);
-    } else if (errno == ENOENT) {
-      resume = true;
-    } else {
-      *error = StartupErrnoMessage("cannot inspect slab_state", errno);
+  bool state_exists = false;
+  if (!InspectExistingState(root, &state_exists, error)) return false;
+  const bool resume = initializing && !state_exists;
+  bool meta_exists = false;
+  if (!ReadAndValidateMeta(options, resume, &meta_exists, error)) return false;
+  if (!meta_exists) {
+    if (!ValidateMissingMeta(root, initializing, state_exists, error))
       return false;
-    }
+    if (!resume)
+      return true;  // Fresh missing/empty directory, no data to check.
   }
   const std::string path = (fs::path(options.dir) / "slots.tbl").string();
   const int fd =
@@ -730,12 +768,10 @@ bool DiskSlabStore::OpenOrInit() {
   // Only a marker created before any layout file can distinguish an interrupted
   // first initialization from a pre-epoch populated store whose state is missing.
   // A marker never survives into request serving; slab_state is persisted first.
-  const int state_check =
-      ::open((root / "slab_state").c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
-  const bool state_exists = state_check >= 0;
-  if (state_exists) ::close(state_check);
-  else if (errno != ENOENT)
-    return SetStartupErrno("cannot inspect slab_state", errno);
+  bool state_exists = false;
+  std::string state_error;
+  if (!InspectExistingState(root, &state_exists, &state_error))
+    return SetStartupError(std::move(state_error));
   const bool resume = initializing_ && !state_exists;
   if (resume) {
     if (fs::symlink_status(root, ec).type() != fs::file_type::directory || ec)
@@ -800,17 +836,11 @@ bool DiskSlabStore::OpenOrInit() {
                                ec.message());
     }
   } else {
-    if (state_exists)
-      return SetStartupError("slab_meta missing from an existing store; no automatic "
-                             "reinitialization");
+    std::string error;
+    if (!ValidateMissingMeta(root, initializing_, state_exists, &error))
+      return SetStartupError(std::move(error));
     fresh = true;
     if (!initializing_) {
-      fs::directory_iterator root_it(root, ec);
-      if (ec) return SetStartupError("cannot inspect cache directory: " + ec.message());
-      if (root_it != fs::directory_iterator())
-        return SetStartupError(
-            "cache directory contains a different or incomplete store layout; "
-            "inspect the files, do not delete existing data automatically");
       int fd = ::open(marker_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
                       0644);
       if (fd < 0)

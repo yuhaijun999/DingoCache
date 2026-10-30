@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preflight missing `slab_meta` layouts before opening any disk: reject existing
+  state or unmarked nonempty directories without recreating metadata. Fresh
+  directories remain supported; marked interrupted initialization still checks
+  table/extent contents and geometry even when metadata has not been created.
+
 - Preflight expected extent files read-only for stores with existing slab
   metadata, before opening any disk. Reject missing, non-regular or incorrectly
   sized extents; interrupted first initialization may still create missing ones.

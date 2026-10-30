@@ -180,10 +180,11 @@ class DiskSlabStore : public StoreEngine {
   // error must be non-null; it is cleared on success.
   static bool ValidateExistingEpoch(const Options& options, std::string* error);
 
-  // Read-only table/extent check when slab_meta exists: size/type, plus zero
-  // table content during interrupted initialization (marker, no state). Only
-  // that recovery path permits missing data files; it rejects their symlinks.
-  // Missing meta and unexpected resume names remain for layout classification.
+  // Read-only fresh/resume/existing layout guard and table/extent check.
+  // Missing meta requires a missing/empty root or a valid initialization marker
+  // without state. Resume requires zero table content and rejects data-file
+  // symlinks, but permits missing files. Unexpected resume names remain for
+  // normal startup's whitelist check.
   // error must be non-null, cleared on success.
   static bool ValidateExistingDataFiles(const Options& options,
                                         std::string* error);

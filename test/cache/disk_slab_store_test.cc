@@ -1095,6 +1095,100 @@ TEST_F(DiskSlabTest, ExtentPreflightChecksFilesWithoutWriting) {
   EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
 }
 
+TEST_F(DiskSlabTest, MissingMetaPreflightChecksFreshAndUnknownLayouts) {
+  DiskSlabStore::Options options = Opts(96 * 4096, 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  std::string error = "old diagnostic";
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(fs::exists(dir_));
+  fs::create_directory(dir_);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_TRUE(fs::is_empty(dir_));
+  const fs::path unknown = dir_ / "old-cache-data";
+  WriteFileBytes(unknown, "preserve me");
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+  EXPECT_NE(error.find("incomplete store layout"), std::string::npos);
+  EXPECT_EQ(ReadFileBytes(unknown), "preserve me");
+  EXPECT_FALSE(fs::exists(dir_ / "slab_meta"));
+  EXPECT_FALSE(fs::exists(dir_ / "slab_initializing"));
+  ASSERT_TRUE(fs::remove(unknown));
+  WriteFileBytes(dir_ / "slab_state", "existing state");
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+  EXPECT_NE(error.find("slab_meta missing"), std::string::npos);
+  EXPECT_EQ(ReadFileBytes(dir_ / "slab_state"), "existing state");
+  ASSERT_TRUE(fs::remove(dir_ / "slab_state"));
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_TRUE(fs::is_empty(dir_));
+  // The same guard still permits normal first creation of the empty directory.
+  const DiskSlabStore created(options);
+  EXPECT_TRUE(created.Healthy()) << created.StartupError();
+}
+
+TEST_F(DiskSlabTest, MissingMetaResumePreflightChecksDataWithoutWriting) {
+  DiskSlabStore::Options options = Opts(96 * 4096, 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  {
+    const DiskSlabStore initialized(options);
+    ASSERT_TRUE(initialized.Healthy()) << initialized.StartupError();
+  }
+  std::string marker = ReadFileBytes(dir_ / "slab_meta");
+  const uint32_t marker_magic = 0x49424C53;
+  std::memcpy(marker.data(), &marker_magic, sizeof(marker_magic));
+  WriteFileBytes(dir_ / "slab_initializing", marker);
+  ASSERT_TRUE(fs::remove(dir_ / "slab_meta"));
+  ASSERT_TRUE(fs::remove(dir_ / "slab_state"));
+  const fs::path table = dir_ / "slots.tbl";
+  const std::string zeros = ReadFileBytes(table);
+  ASSERT_FALSE(zeros.empty());
+  std::string error;
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_EQ(ReadFileBytes(table), zeros);
+  for (const size_t offset : {size_t{0}, zeros.size() - 1}) {
+    SCOPED_TRACE(offset);
+    std::string nonzero = zeros;
+    nonzero[offset] = 'x';
+    WriteFileBytes(table, nonzero);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+    EXPECT_NE(error.find("slots.tbl contains data"), std::string::npos);
+    EXPECT_EQ(ReadFileBytes(table), nonzero);
+  }
+  WriteFileBytes(table, zeros);
+  const fs::path extent = dir_ / "extents" / "E00095";
+  fs::resize_file(extent, 1);
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+  EXPECT_NE(error.find(extent.string()), std::string::npos);
+  EXPECT_EQ(fs::file_size(extent), 1U);
+  ASSERT_TRUE(fs::remove(table));
+  // A missing table must not bypass validation of extents that are present.
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingDataFiles(options, &error));
+  EXPECT_FALSE(fs::exists(table));
+  fs::remove_all(dir_ / "extents");
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingDataFiles(options, &error))
+      << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(fs::exists(table));
+  EXPECT_FALSE(fs::exists(dir_ / "extents"));
+  EXPECT_FALSE(fs::exists(dir_ / "slab_meta"));
+  EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
+  EXPECT_EQ(ReadFileBytes(dir_ / "slab_initializing"), marker);
+  // This permitted interrupted layout must actually resume, not merely
+  // preflight.
+  const DiskSlabStore resumed(options);
+  EXPECT_TRUE(resumed.Healthy()) << resumed.StartupError();
+  EXPECT_TRUE(fs::exists(table));
+  EXPECT_TRUE(fs::exists(dir_ / "slab_meta"));
+  EXPECT_TRUE(fs::exists(dir_ / "slab_state"));
+  EXPECT_FALSE(fs::exists(dir_ / "slab_initializing"));
+}
+
 TEST_F(DiskSlabTest, InitMarkerPreflightChecksFullRecordWithoutWriting) {
   DiskSlabStore::Options options = Opts(96 * 4096, 4096, 4096);
   options.table_sync_ms = 0;
