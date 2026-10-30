@@ -374,7 +374,8 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       std::string error;
       if (!DiskSlabStore::ValidateExistingMeta(so, &error) ||
           !DiskSlabStore::ValidateExistingInitMarker(so, &error) ||
-          !DiskSlabStore::ValidateExistingEpoch(so, &error)) {
+          !DiskSlabStore::ValidateExistingEpoch(so, &error) ||
+          !DiskSlabStore::ValidateExistingTable(so, &error)) {
         fail(so.dir + ": " + error);
         DFKV_LOG_ERROR(startup_error_);
         return;
