@@ -2,10 +2,15 @@
 
 ## Unreleased
 
+- Preflight existing slab epoch records before opening any disk. Corrupt,
+  invalid-state or exhausted epochs are rejected read-only; missing epoch
+  records still use the existing cold-migration path. Reject exhausted dirty
+  epochs before recovery can clear their slot tables.
+
 - Check every real slab store's existing `slab_meta` header read-only before
   opening the first store, so a later disk's incompatible persisted geometry
-  cannot trigger recovery or epoch changes on earlier disks. Full table,
-  initialization-marker and epoch preflight is not yet implemented.
+  cannot trigger recovery or epoch changes on earlier disks. Full table and
+  initialization-marker preflight is not yet implemented.
 
 - Validate all real slab stores' requested capacity and slot geometry before
   constructing the first disk store. Existing on-disk layout checks still run

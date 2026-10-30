@@ -372,7 +372,8 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     // write its epoch. Normal startup rechecks; this does not prevent races.
     for (const DiskSlabStore::Options& so : slab_options) {
       std::string error;
-      if (!DiskSlabStore::ValidateExistingMeta(so, &error)) {
+      if (!DiskSlabStore::ValidateExistingMeta(so, &error) ||
+          !DiskSlabStore::ValidateExistingEpoch(so, &error)) {
         fail(so.dir + ": " + error);
         DFKV_LOG_ERROR(startup_error_);
         return;
