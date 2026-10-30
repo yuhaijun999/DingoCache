@@ -169,6 +169,11 @@ class DiskSlabStore : public StoreEngine {
   // error must be non-null; it is cleared on success.
   static bool ValidateExistingMeta(const Options& options, std::string* error);
 
+  // Read-only slab_state format/CRC/state/epoch-range check. ENOENT is left to
+  // the existing migration/resume path; it does not create or repair files.
+  // error must be non-null; it is cleared on success.
+  static bool ValidateExistingEpoch(const Options& options, std::string* error);
+
   DiskSlabStore(const DiskSlabStore&) = delete;
   DiskSlabStore& operator=(const DiskSlabStore&) = delete;
 

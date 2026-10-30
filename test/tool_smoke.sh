@@ -305,3 +305,40 @@ timeout --kill-after=2s 3s "$BUILD/dfkv_server" --dir "$D/fifo-meta" \
 [ "$rc" = 1 ]
 grep -q 'slab_meta size/type invalid' "$D/fifo-meta.out"
 echo "non-regular slab_meta refusal smoke OK"
+
+# Keep B's layout compatible; corrupt only its epoch CRC-covered padding so
+# slab_meta preflight alone cannot mask a missing all-disk epoch check.
+rc=0
+timeout --kill-after=2s 3s "$BUILD/dfkv_server" --dir "$D/bad-epoch" \
+  --cap 1073741824 --store-engine slab --slab-write buffered \
+  --slab-granularity 1048576 --slab-eviction-policy legacy \
+  >"$D/epoch-create.out" 2>&1 || rc=$?
+[ "$rc" = 124 ]
+grep -q '^PORT ' "$D/epoch-create.out"
+printf '\001' | dd of="$D/bad-epoch/slab_state" bs=1 seek=24 conv=notrunc status=none
+for first in "$D/policy-slab" "$D/cache"; do
+  policy_metadata "$first" >"$D/epoch-first.before"
+  policy_metadata "$D/bad-epoch" >"$D/epoch-second.before"
+  rc=0
+  timeout --kill-after=2s 3s "$BUILD/dfkv_server" \
+    --dir "$first,$D/bad-epoch" --cap 2147483648 --port 0 \
+    --store-engine slab --slab-write buffered --slab-granularity 1048576 \
+    --slab-eviction-policy legacy >"$D/epoch-reject.out" 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { cat "$D/epoch-reject.out"; exit 1; }
+  grep -qF "$D/bad-epoch: slab_state checksum or format mismatch" \
+    "$D/epoch-reject.out"
+  policy_metadata "$first" >"$D/epoch-first.after"
+  policy_metadata "$D/bad-epoch" >"$D/epoch-second.after"
+  cmp "$D/epoch-first.before" "$D/epoch-first.after"
+  cmp "$D/epoch-second.before" "$D/epoch-second.after"
+done
+echo "all-disk epoch preflight smoke OK"
+mkdir "$D/fifo-epoch"
+mkfifo "$D/fifo-epoch/slab_state"
+rc=0
+timeout --kill-after=2s 3s "$BUILD/dfkv_server" --dir "$D/fifo-epoch" \
+  --store-engine slab --slab-write buffered --slab-granularity 1048576 \
+  --slab-eviction-policy legacy >"$D/fifo-epoch.out" 2>&1 || rc=$?
+[ "$rc" = 1 ]
+grep -q 'slab_state is truncated or has unexpected size/type' "$D/fifo-epoch.out"
+echo "non-regular slab_state refusal smoke OK"

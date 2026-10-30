@@ -152,6 +152,45 @@ bool ReadAndValidateMeta(const DiskSlabStore::Options& options, bool no_follow,
   return true;
 }
 
+// fd is borrowed. Decode completely before publishing either output so a
+// failed read cannot leave a partially accepted epoch.
+bool ReadAndValidateEpoch(int fd, uint64_t* epoch, bool* unclean,
+                          std::string* error) {
+  const auto fail = [error](std::string message, int saved_errno = 0) {
+    *error = saved_errno == 0
+                 ? std::move(message)
+                 : StartupErrnoMessage(std::move(message), saved_errno);
+    return false;
+  };
+  struct stat st {};
+  uint8_t record[64];
+  if (::fstat(fd, &st) != 0) {
+    const int saved_errno = errno;
+    return fail("cannot inspect slab_state", saved_errno);
+  }
+  if (!S_ISREG(st.st_mode) || st.st_size != static_cast<off_t>(sizeof(record)))
+    return fail("slab_state is truncated or has unexpected size/type");
+  if (!PreadAll(fd, record, sizeof(record), 0)) {
+    const int saved_errno = errno;
+    return fail("cannot read slab_state", saved_errno);
+  }
+  if (net::GetU32(reinterpret_cast<char*>(record)) != kStateMagic ||
+      net::GetU32(reinterpret_cast<char*>(record) + 4) != kFormatVersion ||
+      net::GetU32(reinterpret_cast<char*>(record) + 60) != Crc32(record, 60))
+    return fail("slab_state checksum or format mismatch");
+  const uint32_t state = net::GetU32(reinterpret_cast<char*>(record) + 16);
+  if (state != kStateClean && state != kStateDirty)
+    return fail("slab_state contains an invalid epoch state");
+  const uint64_t value = net::GetU64(reinterpret_cast<char*>(record) + 8);
+  // Reject before recovery can clear a dirty table; MarkDirtyEpoch also keeps
+  // its defensive guard. Zero and MAX-1 remain valid stored epochs.
+  if (value == std::numeric_limits<uint64_t>::max())
+    return fail("slab_state epoch exhausted");
+  *epoch = value;
+  *unclean = state == kStateDirty;
+  return true;
+}
+
 #ifdef DFKV_WITH_URING
 // Per-thread batched-write submission ring. DiskCacheGroup may invoke batches
 // from transient per-disk workers, so thread exit must retire the ring instead
@@ -443,6 +482,25 @@ bool DiskSlabStore::ValidateExistingMeta(const Options& options,
   return ReadAndValidateMeta(options, false, &exists, error);
 }
 
+bool DiskSlabStore::ValidateExistingEpoch(const Options& options,
+                                          std::string* error) {
+  if (!ValidateGeometry(options, error)) return false;
+  const std::string path = (fs::path(options.dir) / "slab_state").string();
+  const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+  if (fd < 0) {
+    const int saved_errno = errno;
+    if (saved_errno == ENOENT)
+      return true;  // Existing migration/resume owns it.
+    *error = StartupErrnoMessage("cannot open slab_state", saved_errno);
+    return false;
+  }
+  uint64_t epoch = 0;
+  bool unclean = false;
+  const bool valid = ReadAndValidateEpoch(fd, &epoch, &unclean, error);
+  ::close(fd);
+  return valid;
+}
+
 bool DiskSlabStore::ValidateOptions() {
   std::string error;
   if (!ValidateGeometry(opt_, &error)) return SetStartupError(error);
@@ -502,7 +560,8 @@ bool DiskSlabStore::OpenOrInit() {
   // Only a marker created before any layout file can distinguish an interrupted
   // first initialization from a pre-epoch populated store whose state is missing.
   // A marker never survives into request serving; slab_state is persisted first.
-  int state_check = ::open((root / "slab_state").c_str(), O_RDONLY | O_NOFOLLOW);
+  const int state_check =
+      ::open((root / "slab_state").c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
   const bool state_exists = state_check >= 0;
   if (state_exists) ::close(state_check);
   else if (errno != ENOENT)
@@ -753,7 +812,7 @@ bool DiskSlabStore::OpenEpochState(bool fresh) {
     return true;
   }
 
-  state_fd_ = ::open(path.c_str(), O_RDWR);
+  state_fd_ = ::open(path.c_str(), O_RDWR | O_NONBLOCK);
   if (state_fd_ < 0 && errno == ENOENT) {
     // Safe migration from the pre-epoch format: assume the prior process died
     // uncleanly, persist that fact first, then cold-reset slots.tbl.
@@ -768,24 +827,9 @@ bool DiskSlabStore::OpenEpochState(bool fresh) {
   }
   if (state_fd_ < 0) return SetStartupErrno("cannot open slab_state", errno);
 
-  struct stat st {};
-  uint8_t record[64] = {0};
-  if (::fstat(state_fd_, &st) != 0)
-    return SetStartupErrno("cannot inspect slab_state", errno);
-  if (st.st_size != static_cast<off_t>(sizeof(record)))
-    return SetStartupError("slab_state is truncated or has unexpected size");
-  if (!PreadAll(state_fd_, record, sizeof(record), 0))
-    return SetStartupErrno("cannot read slab_state", errno);
-  if (net::GetU32(reinterpret_cast<char*>(record)) != kStateMagic ||
-      net::GetU32(reinterpret_cast<char*>(record) + 4) != kFormatVersion ||
-      net::GetU32(reinterpret_cast<char*>(record) + 60) != Crc32(record, 60))
-    return SetStartupError("slab_state checksum or format mismatch");
-  const uint32_t state =
-      net::GetU32(reinterpret_cast<char*>(record) + 16);
-  if (state != kStateClean && state != kStateDirty)
-    return SetStartupError("slab_state contains an invalid epoch state");
-  run_epoch_ = net::GetU64(reinterpret_cast<char*>(record) + 8);
-  unclean_start_ = state == kStateDirty;
+  std::string error;
+  if (!ReadAndValidateEpoch(state_fd_, &run_epoch_, &unclean_start_, &error))
+    return SetStartupError(std::move(error));
   return true;
 }
 
