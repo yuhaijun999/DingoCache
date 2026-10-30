@@ -180,6 +180,13 @@ class DiskSlabStore : public StoreEngine {
   // error must be non-null; it is cleared on success.
   static bool ValidateExistingEpoch(const Options& options, std::string* error);
 
+  // Read-only slots.tbl size/type check when slab_meta exists. A missing table
+  // is allowed only during interrupted initialization (marker, no state).
+  // Does not check resume zero-content or the remaining layout; missing meta
+  // is left to layout classification. error must be non-null, cleared on
+  // success.
+  static bool ValidateExistingTable(const Options& options, std::string* error);
+
   DiskSlabStore(const DiskSlabStore&) = delete;
   DiskSlabStore& operator=(const DiskSlabStore&) = delete;
 

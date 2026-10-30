@@ -924,6 +924,69 @@ TEST_F(DiskSlabTest, EpochPreflightChecksRecordsWithoutWriting) {
   EXPECT_TRUE(fs::is_symlink(state_path));
 }
 
+TEST_F(DiskSlabTest, TablePreflightChecksShapeWithoutWriting) {
+  DiskSlabStore::Options options = Opts(96 * 4096, 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  std::string error = "old diagnostic";
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(fs::exists(dir_));
+  {
+    const DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy()) << store.StartupError();
+  }
+  const fs::path table = dir_ / "slots.tbl";
+  const std::string valid = ReadFileBytes(table);
+  const std::string state = ReadFileBytes(dir_ / "slab_state");
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_EQ(ReadFileBytes(table), valid);
+  EXPECT_EQ(ReadFileBytes(dir_ / "slab_state"), state);
+  for (const size_t size : {size_t{0}, valid.size() - 1, valid.size() + 1}) {
+    SCOPED_TRACE(size);
+    const std::string bytes(size, '\0');
+    WriteFileBytes(table, bytes);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+    EXPECT_NE(error.find("size/type"), std::string::npos);
+    EXPECT_EQ(ReadFileBytes(table), bytes);
+  }
+  ASSERT_TRUE(fs::remove(table));
+  fs::create_directory(table);
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+  EXPECT_TRUE(fs::is_directory(table));
+  ASSERT_TRUE(fs::remove(table));
+  ASSERT_EQ(::mkfifo(table.c_str(), 0600), 0);
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+  EXPECT_NE(error.find("size/type"), std::string::npos);
+  ASSERT_TRUE(fs::remove(table));
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+  EXPECT_FALSE(fs::exists(table));
+
+  // Migration without slab_state still requires the old table, not a new one.
+  ASSERT_TRUE(fs::remove(dir_ / "slab_state"));
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+  WriteFileBytes(table, valid);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
+
+  // A valid marker with no state permits a missing table during first init.
+  std::string marker = ReadFileBytes(dir_ / "slab_meta");
+  const uint32_t marker_magic = 0x49424C53;
+  std::memcpy(marker.data(), &marker_magic, sizeof(marker_magic));
+  WriteFileBytes(dir_ / "slab_initializing", marker);
+  ASSERT_TRUE(fs::remove(table));
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(fs::exists(table));
+  WriteFileBytes(table, valid);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  // A stale marker beside a committed state cannot authorize table recreation.
+  WriteFileBytes(dir_ / "slab_state", state);
+  ASSERT_TRUE(fs::remove(table));
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+  EXPECT_FALSE(fs::exists(table));
+}
+
 TEST_F(DiskSlabTest, InitMarkerPreflightChecksFullRecordWithoutWriting) {
   DiskSlabStore::Options options = Opts(96 * 4096, 4096, 4096);
   options.table_sync_ms = 0;
