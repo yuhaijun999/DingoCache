@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Check resume tables for nonzero bytes during all-disk read-only preflight
+  when slab metadata exists. A marker without an epoch cannot authorize recovery
+  of populated tables; normal and pre-epoch migration tables retain their data.
+
 - Preflight `slots.tbl` size/type for stores with existing slab metadata before
   opening any disk. Missing tables are rejected except during interrupted first
   initialization; fresh stores remain supported. Share the shape check with
@@ -14,8 +18,7 @@
 
 - Check every real slab store's existing `slab_meta` header read-only before
   opening the first store, so a later disk's incompatible persisted geometry
-  cannot trigger recovery or epoch changes on earlier disks. Initialization markers are also checked read-only. Full layout and
-  resume table-content preflight is not yet implemented.
+  cannot trigger recovery or epoch changes on earlier disks. Initialization markers are also checked read-only. Full layout preflight is not yet implemented.
 
 - Validate all real slab stores' requested capacity and slot geometry before
   constructing the first disk store. Existing on-disk layout checks still run
