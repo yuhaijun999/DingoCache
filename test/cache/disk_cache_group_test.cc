@@ -16,6 +16,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <ios>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -573,6 +575,69 @@ TEST_F(DiskGroupTest, SlabGeometryLimitsDoNotApplyToFileEngine) {
   const DiskCacheGroup group({dirs, 8193, "file"});
   EXPECT_TRUE(group.Healthy()) << group.StartupError();
   EXPECT_EQ(group.DiskCount(), 2U);
+}
+
+TEST_F(DiskGroupTest, ExistingMetaPreflightIsReadOnly) {
+  DiskSlabStore::Options options;
+  options.dir = base_.string();
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  std::string error = "old diagnostic";
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingMeta(options, &error)) << error;
+  EXPECT_TRUE(error.empty());
+  EXPECT_FALSE(fs::exists(base_));
+  DiskSlabStore::Options invalid = options;
+  invalid.extent_bytes = 0;
+  EXPECT_FALSE(DiskSlabStore::ValidateExistingMeta(invalid, &error));
+  fs::create_directories(base_);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingMeta(options, &error)) << error;
+  {
+    const DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy()) << store.StartupError();
+  }
+  const auto read = [](const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    EXPECT_TRUE(input.is_open());
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
+  };
+  const std::string original = read(base_ / "slab_meta");
+  const std::string state = read(base_ / "slab_state");
+  const std::string table = read(base_ / "slots.tbl");
+  ASSERT_EQ(original.size(), 64U);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingMeta(options, &error)) << error;
+  EXPECT_EQ(read(base_ / "slab_meta"), original);
+  EXPECT_EQ(read(base_ / "slab_state"), state);
+  EXPECT_EQ(read(base_ / "slots.tbl"), table);
+
+  const auto write_meta = [&](const std::string& bytes) {
+    std::ofstream output(base_ / "slab_meta",
+                         std::ios::binary | std::ios::trunc);
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    ASSERT_TRUE(output.good());
+  };
+  for (const size_t offset : {0U, 4U, 8U, 16U, 24U}) {
+    SCOPED_TRACE(offset);
+    std::string corrupted = original;
+    corrupted[offset] ^= 1;
+    write_meta(corrupted);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingMeta(options, &error));
+    EXPECT_FALSE(error.empty());
+    EXPECT_EQ(read(base_ / "slab_meta"), corrupted);
+    EXPECT_EQ(read(base_ / "slab_state"), state);
+    EXPECT_EQ(read(base_ / "slots.tbl"), table);
+  }
+  for (const size_t length : {0U, 1U, 63U, 65U}) {
+    SCOPED_TRACE(length);
+    const std::string corrupted(length, '\0');
+    write_meta(corrupted);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingMeta(options, &error));
+    EXPECT_NE(error.find("size/type"), std::string::npos);
+    EXPECT_EQ(read(base_ / "slab_meta"), corrupted);
+  }
+  write_meta(original);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingMeta(options, &error)) << error;
+  EXPECT_TRUE(error.empty());
 }
 
 TEST_F(DiskGroupTest, SpreadsBlocksAcrossAllDisks) {

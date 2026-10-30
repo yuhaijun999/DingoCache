@@ -280,7 +280,7 @@ WantedBy=multi-user.target
 >   新键成功提交可在近期压力状态下重新触发回收；非活跃且连续 128 次无新提交观察后，历史压力失效。
 >   每 tick 由 `DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK`（默认 256，范围 1～1024）限制移除对象数，扫描上限为其 4 倍。旧 `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` 不再读取，升级时须迁移配置。
 > - `--slab-reclaim-ms <n>` / `--ram-reclaim-ms <n>`（默认 50 / 10，`0`=关）：后台预回收和类再平衡。allocator 按 useful bytes + decayed read heat 选择 donor，跳过 pinned extent；通常保留默认。
-> - `--slab-granularity <bytes>`（默认 1 MiB）：最小 slot 量子。现有 `slots.tbl` 的 format/geometry 不匹配会 fail closed；修改必须换空目录，服务不会原地冷重建或忽略旧数据。
+> - `--slab-granularity <bytes>`（默认 1 MiB）：最小 slot 量子。各盘请求容量及粒度，以及已有 `slab_meta` 头部几何，在第一块 slab 盘构造前统一只读检查。缺失 meta 的布局分类及 table、初始化标记、epoch 等完整检查仍在逐盘打开时执行，不保证这些错误或后续 I/O 失败时前盘无变化。现有 `slots.tbl` 的 format/geometry 不匹配会 fail closed；修改必须换空目录，服务不会原地冷重建或忽略旧数据。
 > - `--put-inflight-limit <n>`（默认 0=关）：在 RAM 接纳或直接盘写之前原子限制前台 PUT 并发；超限返回 `kCacheFull`，不接纳数据、不进入 peer cooldown。TCP 与 RDMA direct PUT 共用此门；后台 flusher 不受限制。已接纳写入和同 key 重复请求仍等待原写入的终态，不以超时将另一份 payload 送入盘写路径。该参数限制接纳量，不是磁盘 I/O 超时保证。
 > - `--tcp-max-conns <n>` / `DFKV_TCP_MAX_CONNS`（默认 512，硬上限 4096）限制
 >   TCP handler/FD；`--tcp-io-timeout-s <n>` / `DFKV_TCP_IO_TIMEOUT_S`（默认
@@ -462,6 +462,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--metrics-bind` | `0.0.0.0` | metrics/health 绑 IP（内网收敛） |
 | `--mds-registration-timeout-ms` / `DFKV_MDS_REGISTRATION_TIMEOUT_MS` | `60000` | 首次 MDS 注册截止（1000–600000） |
 | `--store-engine` / `DFKV_STORE_ENGINE` | `slab` | `slab` 为默认；`file` 为显式诊断 fallback |
+| `--slab-eviction-policy` / `DFKV_SLAB_EVICTION_POLICY` | 未设置时保持 legacy 运行 | 命令行优先且保留显式空；当前可显式设置 `legacy`。空值、未知值及尚未就绪的显式 `lifetime` 在开盘前拒绝 |
 | `--slab-write` / `DFKV_SLAB_WRITE` | `direct` | slab 数据面 O_DIRECT / buffered；文件系统不支持 DIO 时整店回退 buffered 并以 `wr=` 上报 |
 | `--ram-tier` / `DFKV_RAM_TIER` | `off` | RAM 热层（写穿+RDMA zero-copy GET） |
 | `--ram-tier-bytes` / `DFKV_RAM_TIER_BYTES` | `16 GiB` | arena 预算（pin 一次即注册） |

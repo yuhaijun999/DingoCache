@@ -23,7 +23,8 @@ D=$(mktemp -d)
 mkdir "$D/cache"
 : > "$D/srv.out"   # pre-create so the awk below can't fail on a missing file under `set -e`
 env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_SLAB_EVICTION_POLICY "$BUILD/dfkv_server" \
-  --dir "$D/cache" --port 0 --cap 1073741824 >>"$D/srv.out" 2>&1 &
+  --dir "$D/cache" --port 0 --cap 1073741824 --slab-granularity 1048576 \
+  >>"$D/srv.out" 2>&1 &
 PID=$!
 trap 'if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; fi; rm -rf "$D"' EXIT
 P=""
@@ -198,6 +199,7 @@ for engine in slab file; do
     timeout --kill-after=2s 3s "$BUILD/dfkv_server" \
     --dir "$D/policy-$engine" --port 0 --cap 1073741824 \
     --store-engine "$engine" --slab-eviction-policy LeGaCy \
+    --slab-granularity 1048576 \
     >"$D/policy-$engine.out" 2>&1 || rc=$?
   [ "$rc" = 124 ] || { cat "$D/policy-$engine.out"; exit 1; }
   grep -q '^PORT ' "$D/policy-$engine.out"
@@ -265,3 +267,41 @@ for policy in '' unknown lifetime; do
   cmp "$D/dirty.before" "$D/dirty.after"
 done
 echo "eviction-policy CLI and clean/dirty refusal smoke OK"
+
+# B is a real clean store with a different persisted slot quantum. Detect its
+# incompatible slab_meta before A can increment its epoch or reset dirty data.
+rc=0
+timeout --kill-after=2s 3s "$BUILD/dfkv_server" \
+  --dir "$D/different-geometry" --port 0 --cap 1073741824 \
+  --store-engine slab --slab-write buffered --slab-granularity 2097152 \
+  --slab-eviction-policy legacy >"$D/different-geometry.out" 2>&1 || rc=$?
+[ "$rc" = 124 ]
+grep -q '^PORT ' "$D/different-geometry.out"
+for first in "$D/policy-slab" "$D/cache"; do
+  policy_metadata "$first" >"$D/first.before"
+  policy_metadata "$D/different-geometry" >"$D/second.before"
+  rc=0
+  timeout --kill-after=2s 3s "$BUILD/dfkv_server" \
+    --dir "$first,$D/different-geometry" --port 0 --cap 2147483648 \
+    --store-engine slab --slab-write buffered --slab-granularity 1048576 \
+    --slab-eviction-policy legacy >"$D/layout-reject.out" 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { cat "$D/layout-reject.out"; exit 1; }
+  grep -qF "$D/different-geometry: existing slab layout differs" \
+    "$D/layout-reject.out"
+  policy_metadata "$first" >"$D/first.after"
+  policy_metadata "$D/different-geometry" >"$D/second.after"
+  cmp "$D/first.before" "$D/first.after"
+  cmp "$D/second.before" "$D/second.after"
+done
+echo "all-disk slab_meta preflight smoke OK"
+
+# A non-regular metadata file must fail promptly, not block in open(FIFO).
+mkdir "$D/fifo-meta"
+mkfifo "$D/fifo-meta/slab_meta"
+rc=0
+timeout --kill-after=2s 3s "$BUILD/dfkv_server" --dir "$D/fifo-meta" \
+  --store-engine slab --slab-write buffered --slab-eviction-policy legacy \
+  >"$D/fifo-meta.out" 2>&1 || rc=$?
+[ "$rc" = 1 ]
+grep -q 'slab_meta size/type invalid' "$D/fifo-meta.out"
+echo "non-regular slab_meta refusal smoke OK"

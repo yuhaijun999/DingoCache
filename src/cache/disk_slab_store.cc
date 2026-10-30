@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <limits>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "utils/net_util.h"
@@ -79,6 +81,74 @@ bool PreadAll(int fd, void* buf, size_t n, uint64_t off) {
     if (r == 0) { errno = EIO; return false; }  // short/EOF
     done += static_cast<size_t>(r);
   }
+  return true;
+}
+
+// Shared by read-only preflight and normal startup. Keep the persisted
+// geometry encoding in one place; callers first validate Options.
+void EncodeGeometryMeta(const DiskSlabStore::Options& options,
+                        uint8_t* record) {
+  std::memset(record, 0, 64);
+  net::PutU32(reinterpret_cast<char*>(record), kMetaMagic);
+  net::PutU32(reinterpret_cast<char*>(record) + 4, kFormatVersion);
+  net::PutU64(reinterpret_cast<char*>(record) + 8, options.extent_bytes);
+  net::PutU64(reinterpret_cast<char*>(record) + 16, options.slot_granularity);
+  net::PutU32(
+      reinterpret_cast<char*>(record) + 24,
+      static_cast<uint32_t>(options.capacity_bytes / options.extent_bytes));
+}
+
+std::string StartupErrnoMessage(std::string message, int saved_errno) {
+  message += ": " +
+             std::error_code(saved_errno, std::generic_category()).message() +
+             " (errno " + std::to_string(saved_errno) + ")";
+  if (saved_errno == EMFILE)
+    message +=
+        "; raise the process soft RLIMIT_NOFILE (systemd LimitNOFILE) "
+        "above the resident extent descriptor count";
+  return message;
+}
+
+bool ReadAndValidateMeta(const DiskSlabStore::Options& options, bool no_follow,
+                         bool* exists, std::string* error) {
+  const auto fail = [error](std::string message, int saved_errno = 0) {
+    *error = saved_errno == 0
+                 ? std::move(message)
+                 : StartupErrnoMessage(std::move(message), saved_errno);
+    return false;
+  };
+  *exists = false;
+  const std::string path = (fs::path(options.dir) / "slab_meta").string();
+  // O_NONBLOCK lets fstat reject a FIFO rather than waiting for a writer.
+  const int fd = ::open(path.c_str(),
+                        O_RDONLY | O_NONBLOCK | (no_follow ? O_NOFOLLOW : 0));
+  if (fd < 0) {
+    const int saved_errno = errno;
+    if (saved_errno == ENOENT) return true;
+    return fail("cannot open slab_meta", saved_errno);
+  }
+  *exists = true;
+  uint8_t meta[64];
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    const int saved_errno = errno;
+    ::close(fd);
+    return fail("cannot inspect slab_meta", saved_errno);
+  }
+  if (!S_ISREG(st.st_mode) || st.st_size != static_cast<off_t>(sizeof(meta))) {
+    ::close(fd);
+    return fail("slab_meta size/type invalid (truncated or unknown)");
+  }
+  const bool read_ok = PreadAll(fd, meta, sizeof(meta), 0);
+  const int read_errno = errno;
+  ::close(fd);
+  if (!read_ok) return fail("cannot read slab_meta", read_errno);
+  if (net::GetU32(reinterpret_cast<char*>(meta)) != kMetaMagic)
+    return fail("slab_meta magic mismatch");
+  uint8_t expected[64];
+  EncodeGeometryMeta(options, expected);
+  if (std::memcmp(meta, expected, 28) != 0)
+    return fail("existing slab layout differs from requested geometry");
   return true;
 }
 
@@ -308,12 +378,7 @@ bool DiskSlabStore::SetStartupError(std::string error) {
 }
 
 bool DiskSlabStore::SetStartupErrno(std::string error, int saved_errno) {
-  error += ": " + std::error_code(saved_errno, std::generic_category()).message() +
-           " (errno " + std::to_string(saved_errno) + ")";
-  if (saved_errno == EMFILE)
-    error += "; raise the process soft RLIMIT_NOFILE (systemd LimitNOFILE) "
-             "above the resident extent descriptor count";
-  return SetStartupError(std::move(error));
+  return SetStartupError(StartupErrnoMessage(std::move(error), saved_errno));
 }
 
 bool DiskSlabStore::ClearInitMarker() {
@@ -371,6 +436,13 @@ bool DiskSlabStore::ValidateGeometry(const Options& options,
   return true;
 }
 
+bool DiskSlabStore::ValidateExistingMeta(const Options& options,
+                                         std::string* error) {
+  if (!ValidateGeometry(options, error)) return false;
+  bool exists = false;
+  return ReadAndValidateMeta(options, false, &exists, error);
+}
+
 bool DiskSlabStore::ValidateOptions() {
   std::string error;
   if (!ValidateGeometry(opt_, &error)) return SetStartupError(error);
@@ -395,12 +467,8 @@ bool DiskSlabStore::OpenOrInit() {
   const std::string marker_path = (root / "slab_initializing").string();
   const uint64_t tbl_bytes =
       static_cast<uint64_t>(num_extents_) * max_slots_per_extent_ * kRecBytes;
-  uint8_t expected_meta[64] = {0};
-  net::PutU32(reinterpret_cast<char*>(expected_meta), kMetaMagic);
-  net::PutU32(reinterpret_cast<char*>(expected_meta) + 4, kFormatVersion);
-  net::PutU64(reinterpret_cast<char*>(expected_meta) + 8, opt_.extent_bytes);
-  net::PutU64(reinterpret_cast<char*>(expected_meta) + 16, opt_.slot_granularity);
-  net::PutU32(reinterpret_cast<char*>(expected_meta) + 24, num_extents_);
+  uint8_t expected_meta[64];
+  EncodeGeometryMeta(opt_, expected_meta);
   uint8_t marker_record[64];
   std::memcpy(marker_record, expected_meta, sizeof(marker_record));
   net::PutU32(reinterpret_cast<char*>(marker_record), kInitMagic);
@@ -490,29 +558,12 @@ bool DiskSlabStore::OpenOrInit() {
     }
   }
 
-  uint8_t meta[64];
+  bool meta_exists = false;
+  std::string meta_error;
+  if (!ReadAndValidateMeta(opt_, resume, &meta_exists, &meta_error))
+    return SetStartupError(std::move(meta_error));
   bool fresh = false;
-  int mfd = ::open(meta_path.c_str(), O_RDONLY | (resume ? O_NOFOLLOW : 0));
-  if (mfd >= 0) {
-    struct stat st {};
-    if (::fstat(mfd, &st) != 0) {
-      const int saved_errno = errno;
-      ::close(mfd);
-      return SetStartupErrno("cannot inspect slab_meta", saved_errno);
-    }
-    if (!S_ISREG(st.st_mode) ||
-        st.st_size != static_cast<off_t>(sizeof(meta))) {
-      ::close(mfd);
-      return SetStartupError("slab_meta size/type invalid (truncated or unknown)");
-    }
-    const bool read_ok = PreadAll(mfd, meta, sizeof(meta), 0);
-    const int read_errno = errno;
-    ::close(mfd);
-    if (!read_ok) return SetStartupErrno("cannot read slab_meta", read_errno);
-    if (net::GetU32(reinterpret_cast<char*>(meta)) != kMetaMagic)
-      return SetStartupError("slab_meta magic mismatch");
-    if (std::memcmp(meta, expected_meta, 28) != 0)
-      return SetStartupError("existing slab layout differs from requested geometry");
+  if (meta_exists) {
     if (!resume) {
       ec.clear();
       if (!fs::is_directory(extents_dir, ec) || ec)
@@ -520,9 +571,6 @@ bool DiskSlabStore::OpenOrInit() {
                                ec.message());
     }
   } else {
-    const int saved_errno = errno;
-    if (saved_errno != ENOENT)
-      return SetStartupErrno("cannot open slab_meta", saved_errno);
     if (state_exists)
       return SetStartupError("slab_meta missing from an existing store; no automatic "
                              "reinitialization");
