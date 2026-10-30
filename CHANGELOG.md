@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preflight expected extent files read-only for stores with existing slab
+  metadata, before opening any disk. Reject missing, non-regular or incorrectly
+  sized extents; interrupted first initialization may still create missing ones.
+  Share type/size validation with normal startup and avoid blocking on FIFOs.
+
 - Check resume tables for nonzero bytes during all-disk read-only preflight
   when slab metadata exists. A marker without an epoch cannot authorize recovery
   of populated tables; normal and pre-epoch migration tables retain their data.
