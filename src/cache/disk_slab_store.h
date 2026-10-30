@@ -180,12 +180,13 @@ class DiskSlabStore : public StoreEngine {
   // error must be non-null; it is cleared on success.
   static bool ValidateExistingEpoch(const Options& options, std::string* error);
 
-  // Read-only slots.tbl check when slab_meta exists: size/type, plus zero
-  // content during interrupted initialization (marker, no state). Only that
-  // recovery path permits a missing table. Missing meta and the remaining
-  // layout are left to layout classification. error must be non-null, cleared
-  // on success.
-  static bool ValidateExistingTable(const Options& options, std::string* error);
+  // Read-only table/extent check when slab_meta exists: size/type, plus zero
+  // table content during interrupted initialization (marker, no state). Only
+  // that recovery path permits missing data files; it rejects their symlinks.
+  // Missing meta and unexpected resume names remain for layout classification.
+  // error must be non-null, cleared on success.
+  static bool ValidateExistingDataFiles(const Options& options,
+                                        std::string* error);
 
   DiskSlabStore(const DiskSlabStore&) = delete;
   DiskSlabStore& operator=(const DiskSlabStore&) = delete;

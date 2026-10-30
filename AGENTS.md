@@ -1,7 +1,7 @@
 <claude-mem-context>
 # Memory Context
 
-# [DingoCache/launch-feat-wip-evict-v1] recent context, 2026-10-28 7:42pm PDT
+# [DingoCache/launch-feat-wip-evict-v1] recent context, 2026-10-30 12:31am PDT
 
 No previous sessions found.
 </claude-mem-context>
@@ -78,6 +78,8 @@ ctest --test-dir build --output-on-failure
 
 ## 提交与文档
 
+- **代码审查默认范围**：用户未另行指定时，以当前 `HEAD` 为基线审查本次未提交改动（含暂存和未暂存），不重复询问基线；用户明确给出的范围或基线优先。与任务无关的自动上下文、个人工具文件不纳入功能审查。
+- **审查后的测试说明**：每次 review 结束都报告实际构建目录、构建与测试命令、通过/失败/跳过数量及日志位置；区分本轮重新执行与沿用的历史证据，不只写“单测通过”。
 - 动手前检查 `git status`、相关代码和测试，保留用户已有修改。只暂存本任务文件，不提交凭据、构建产物、缓存、压缩包、个人笔记或本地分析材料。
 - 一次提交围绕一个完整逻辑变更，包含其单元测试和必要文档；不要把紧耦合测试/说明机械拆开，也不要混入无关重构、格式化和发版。
 - 新提交标题使用 `type(scope): 英文祈使句摘要`，scope 可省略；常见 type 为 `fix`、`feat`、`perf`、`test`、`docs`、`ci`、`build`、`refactor`、`chore`。历史命名不完全统一，目前没有 commitlint 自动门禁。

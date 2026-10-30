@@ -691,6 +691,46 @@ TEST_F(DiskGroupTest, NonzeroResumeTableDoesNotOpenFirstDisk) {
   EXPECT_FALSE(fs::exists(second / "slab_state"));
 }
 
+TEST_F(DiskGroupTest, InvalidSecondExtentDoesNotOpenFirstDisk) {
+  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY");
+  const std::vector<std::string> dirs = Dirs(2);
+  {
+    const DiskCacheGroup initialized({dirs, 2ull << 30, "slab"});
+    ASSERT_TRUE(initialized.Healthy()) << initialized.StartupError();
+  }
+  const fs::path first_state = fs::path(dirs[0]) / "slab_state";
+  const auto read_state = [&first_state]() {
+    std::ifstream input(first_state, std::ios::binary);
+    EXPECT_TRUE(input.is_open());
+    return std::string(std::istreambuf_iterator<char>(input),
+                       std::istreambuf_iterator<char>());
+  };
+  const std::string before = read_state();
+  ASSERT_EQ(before.size(), 64U);
+  const fs::path extent = fs::path(dirs[1]) / "extents" / "E00000";
+  const uintmax_t extent_bytes = fs::file_size(extent);
+  for (const uintmax_t bytes :
+       {uintmax_t{0}, extent_bytes - 1, extent_bytes + 1}) {
+    SCOPED_TRACE(bytes);
+    fs::resize_file(extent, bytes);
+    const DiskCacheGroup refused({dirs, 2ull << 30, "slab"});
+    EXPECT_FALSE(refused.Healthy());
+    EXPECT_EQ(refused.DiskCount(), 0U);
+    EXPECT_NE(refused.StartupError().find(extent.string()), std::string::npos);
+    EXPECT_EQ(read_state(), before);
+    EXPECT_EQ(fs::file_size(extent), bytes);
+  }
+  ASSERT_TRUE(fs::remove(extent));
+  const DiskCacheGroup refused({dirs, 2ull << 30, "slab"});
+  EXPECT_FALSE(refused.Healthy());
+  EXPECT_EQ(refused.DiskCount(), 0U);
+  EXPECT_NE(refused.StartupError().find(extent.string()), std::string::npos);
+  EXPECT_EQ(read_state(), before);
+  EXPECT_FALSE(fs::exists(extent));
+}
+
 TEST_F(DiskGroupTest, SlabGeometryLimitsDoNotApplyToFileEngine) {
   const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
   const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "6000");

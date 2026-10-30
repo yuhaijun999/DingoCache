@@ -17,6 +17,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -146,6 +147,67 @@ bool ValidateEmptyTable(int fd, uint64_t bytes, std::string* error) {
           "preserve the existing store";
       return false;
     }
+  }
+  return true;
+}
+
+// Borrows fd. Created extents must be sized before this common check.
+bool ValidateExtentShape(int fd, uint64_t bytes, const std::string& path,
+                         std::string* error) {
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    *error = StartupErrnoMessage("cannot inspect extent " + path, errno);
+    return false;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    *error = "extent is not a regular file: " + path;
+    return false;
+  }
+  if (st.st_size != static_cast<off_t>(bytes)) {
+    *error = "extent size differs from slab geometry: " + path;
+    return false;
+  }
+  return true;
+}
+
+bool ReadAndValidateExtents(const DiskSlabStore::Options& options, bool resume,
+                            std::string* error) {
+  const fs::path directory = fs::path(options.dir) / "extents";
+  std::error_code ec;
+  const fs::file_status status =
+      resume ? fs::symlink_status(directory, ec) : fs::status(directory, ec);
+  // Only interrupted first initialization may create missing extents later.
+  if (resume && status.type() == fs::file_type::not_found &&
+      (!ec || ec == std::errc::no_such_file_or_directory))
+    return true;
+  if (ec || status.type() != fs::file_type::directory) {
+    *error = "extents directory is missing or not a directory: " +
+             directory.string();
+    if (ec) *error += ": " + ec.message();
+    return false;
+  }
+  const uint32_t count =
+      static_cast<uint32_t>(options.capacity_bytes / options.extent_bytes);
+  for (uint32_t index = 0; index < count; ++index) {
+    char name[32];
+    const int length = std::snprintf(name, sizeof(name), "E%05u", index);
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(name)) {
+      *error = "cannot format extent filename";
+      return false;
+    }
+    const std::string path = (directory / name).string();
+    const int fd =
+        ::open(path.c_str(), O_RDONLY | O_NONBLOCK | (resume ? O_NOFOLLOW : 0));
+    if (fd < 0) {
+      const int saved_errno = errno;
+      if (resume && saved_errno == ENOENT) continue;
+      *error = StartupErrnoMessage("cannot open extent " + path, saved_errno);
+      return false;
+    }
+    const bool valid =
+        ValidateExtentShape(fd, options.extent_bytes, path, error);
+    ::close(fd);
+    if (!valid) return false;
   }
   return true;
 }
@@ -592,8 +654,8 @@ bool DiskSlabStore::ValidateExistingEpoch(const Options& options,
   return valid;
 }
 
-bool DiskSlabStore::ValidateExistingTable(const Options& options,
-                                          std::string* error) {
+bool DiskSlabStore::ValidateExistingDataFiles(const Options& options,
+                                              std::string* error) {
   if (!ValidateGeometry(options, error)) return false;
   bool meta_exists = false;
   if (!ReadAndValidateMeta(options, false, &meta_exists, error)) return false;
@@ -619,7 +681,8 @@ bool DiskSlabStore::ValidateExistingTable(const Options& options,
       ::open(path.c_str(), O_RDONLY | O_NONBLOCK | (resume ? O_NOFOLLOW : 0));
   if (fd < 0) {
     const int saved_errno = errno;
-    if (resume && saved_errno == ENOENT) return true;
+    if (resume && saved_errno == ENOENT)
+      return ReadAndValidateExtents(options, resume, error);
     *error = StartupErrnoMessage("cannot open slots.tbl", saved_errno);
     return false;
   }
@@ -629,7 +692,7 @@ bool DiskSlabStore::ValidateExistingTable(const Options& options,
   const bool valid = resume ? ValidateEmptyTable(fd, bytes, error)
                             : ValidateTableShape(fd, bytes, error);
   ::close(fd);
-  return valid;
+  return valid && ReadAndValidateExtents(options, resume, error);
 }
 
 bool DiskSlabStore::ValidateOptions() {
@@ -817,31 +880,25 @@ bool DiskSlabStore::OpenOrInit() {
     char name[32];
     std::snprintf(name, sizeof(name), "E%05u", e);
     const std::string ep = (extents_dir / name).string();
-    int fd = ::open(ep.c_str(), O_RDWR | (resume ? O_NOFOLLOW : 0));
+    int fd =
+        ::open(ep.c_str(), O_RDWR | O_NONBLOCK | (resume ? O_NOFOLLOW : 0));
     bool created = false;
     if (fd < 0 && (fresh || resume) && errno == ENOENT) {
       fd = ::open(ep.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
       created = fd >= 0;
     }
     if (fd < 0) return SetStartupErrno("cannot open extent " + ep, errno);
-    struct stat st {};
-    if (::fstat(fd, &st) != 0) {
-      const int saved_errno = errno;
-      ::close(fd);
-      return SetStartupErrno("cannot inspect extent " + ep, saved_errno);
-    }
-    if (!S_ISREG(st.st_mode)) {
-      ::close(fd);
-      return SetStartupError("extent is not a regular file: " + ep);
-    }
+    // O_EXCL above guarantees a newly created regular file. Size it before
+    // applying the same type/size check used by read-only preflight.
     if (created && ::ftruncate(fd, static_cast<off_t>(opt_.extent_bytes)) != 0) {
       const int saved_errno = errno;
       ::close(fd);
       return SetStartupErrno("cannot size extent " + ep, saved_errno);
     }
-    if (!created && st.st_size != static_cast<off_t>(opt_.extent_bytes)) {
+    std::string error;
+    if (!ValidateExtentShape(fd, opt_.extent_bytes, ep, &error)) {
       ::close(fd);
-      return SetStartupError("extent size differs from slab geometry: " + ep);
+      return SetStartupError(std::move(error));
     }
     // Materialize each fresh extent idempotently. Direct overwrites of allocated
     // unwritten ranges parallelize on XFS; allocating writes into ftruncate
