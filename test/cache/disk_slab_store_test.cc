@@ -980,6 +980,26 @@ TEST_F(DiskSlabTest, TablePreflightChecksShapeWithoutWriting) {
   EXPECT_FALSE(fs::exists(table));
   WriteFileBytes(table, valid);
   EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  // Scan all chunks, including the final byte, without repairing data.
+  for (const size_t offset : {size_t{0}, valid.size() - 1}) {
+    SCOPED_TRACE(offset);
+    std::string nonzero = valid;
+    nonzero[offset] = 'x';
+    WriteFileBytes(table, nonzero);
+    EXPECT_FALSE(DiskSlabStore::ValidateExistingTable(options, &error));
+    EXPECT_NE(error.find("slots.tbl contains data"), std::string::npos);
+    EXPECT_EQ(ReadFileBytes(table), nonzero);
+    EXPECT_EQ(ReadFileBytes(dir_ / "slab_initializing"), marker);
+    EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
+  }
+  // Existing and migrating stores may contain records; only resume requires
+  // zero.
+  WriteFileBytes(dir_ / "slab_state", state);
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  ASSERT_TRUE(fs::remove(dir_ / "slab_initializing"));
+  ASSERT_TRUE(fs::remove(dir_ / "slab_state"));
+  EXPECT_TRUE(DiskSlabStore::ValidateExistingTable(options, &error)) << error;
+  WriteFileBytes(dir_ / "slab_initializing", marker);
   // A stale marker beside a committed state cannot authorize table recreation.
   WriteFileBytes(dir_ / "slab_state", state);
   ASSERT_TRUE(fs::remove(table));
