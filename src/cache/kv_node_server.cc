@@ -21,6 +21,7 @@
 #include "cache/store_engine.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
+#include "common/status.h"
 #include "transport/wire.h"
 #include "utils/log.h"
 #include "utils/net_util.h"
@@ -1158,7 +1159,44 @@ std::vector<Status> KvNodeServer::CacheDirectBatchForKeys(
     if (used_stripes[stripe])
       locks[stripe] = std::unique_lock<std::mutex>(mutation_key_mu_[stripe]);
   }
-  return group_.CacheDirectBatch(items);
+  // A stripe may contain duplicate or colliding keys. Open it once, not per
+  // item: toggling twice would allow promotion during an unfinished batch.
+  const auto advance_fences = [&] {
+    for (size_t stripe = 0; stripe < kMutationKeyStripes; ++stripe) {
+      if (!used_stripes[stripe]) continue;
+      ReadPublicationFence& fence = read_publication_[stripe];
+      const std::lock_guard<std::mutex> lock(fence.mutex);
+      if (fence.epoch != std::numeric_limits<uint64_t>::max()) ++fence.epoch;
+    }
+  };
+  advance_fences();
+  std::vector<Status> results(items.size(), Status::kInvalid);
+  std::vector<StoreEngine::CacheBatchItem> disk_items;
+  std::vector<size_t> disk_indexes;
+  for (size_t index = 0; index < items.size(); ++index) {
+    const StoreEngine::CacheBatchItem& item = items[index];
+    if (item.data == nullptr || item.len == 0) continue;
+    if (ram_) ram_->RetireDurableForPut(item.key);
+    if (ram_ && ram_write_back_ &&
+        group_.TenantQuotaBytes(item.key.tenant_hash) == 0) {
+      // Batch has always been disk-complete, even under single-PUT RAM ACK.
+      // Join only an existing dirty owner; never create a new RAM flush that
+      // could overtake an earlier duplicate queued for the disk batch.
+      const RamTier::PutResult result =
+          ram_->PrepareDirectPut(item.key, item.data, item.len);
+      if (result.disposition != RamTier::PutDisposition::kBypass) {
+        results[index] = result.status;
+        continue;
+      }
+    }
+    disk_items.push_back(item);
+    disk_indexes.push_back(index);
+  }
+  const std::vector<Status> disk_results = group_.CacheDirectBatch(disk_items);
+  for (size_t index = 0; index < disk_indexes.size(); ++index)
+    results[disk_indexes[index]] = disk_results[index];
+  advance_fences();  // Close failed/invalid generations as well as successes.
+  return results;
 }
 
 Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,

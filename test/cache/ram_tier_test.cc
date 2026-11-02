@@ -1374,3 +1374,60 @@ TEST(RamTier, RemovedPinnedDirtyOwnerRejectsRatherThanBypassing) {
   sink.open();
   ASSERT_TRUE(rt.WaitForDrain(std::chrono::seconds(2)));
 }
+
+TEST(RamTier, PrepareDirectPutDoesNotAdmitOrProbeMissingKeys) {
+  FlushSink sink;
+  std::atomic<uint64_t> probes{0};
+  RamTier::Options options = Opts(16 * 4096);
+  options.reclaim_interval_ms = 0;
+  options.is_persisted = [&probes](const BlockKey&) {
+    probes.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  };
+  RamTier rt(options, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  for (const uint64_t id : {207, 208, 207}) {
+    rt.RetireDurableForPut(K(id));
+    const RamTier::PutResult result = rt.PrepareDirectPut(K(id), "new", 3);
+    EXPECT_EQ(result.status, Status::kCacheFull);
+    EXPECT_EQ(result.disposition, RamTier::PutDisposition::kBypass);
+    EXPECT_FALSE(rt.Contains(K(id)));
+  }
+  EXPECT_EQ(probes.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(rt.UsedBytes(), 0u);
+  EXPECT_EQ(rt.FlushBacklog(), 0u);
+  EXPECT_EQ(rt.PutBypass(), 0u);  // Direct routing is not capacity rejection.
+  const std::lock_guard<std::mutex> lock(sink.m);
+  EXPECT_EQ(sink.calls, 0);
+}
+
+TEST(RamTier, PrepareDirectPutBypassesCanceledPromotionWithoutReusingItsPin) {
+  FlushSink sink;
+  std::atomic<uint64_t> probes{0};
+  RamTier::Options options = Opts(16 * 4096);
+  options.reclaim_interval_ms = 0;
+  options.is_persisted = [&probes](const BlockKey&) {
+    probes.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  };
+  RamTier rt(options, sink.fn());
+  RamTier::DurableReservation reservation;
+  ASSERT_TRUE(rt.ReserveDurable(K(209), 4096, &reservation));
+  std::memset(reservation.data(), 'o', 4096);
+  const uint64_t used = rt.UsedBytes();
+  rt.RetireDurableForPut(K(209));
+  const RamTier::PutResult result = rt.PrepareDirectPut(K(209), "new", 3);
+  EXPECT_EQ(result.status, Status::kCacheFull);
+  EXPECT_EQ(result.disposition, RamTier::PutDisposition::kBypass);
+  EXPECT_EQ(probes.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(rt.PutBypass(), 0u);
+  EXPECT_EQ(rt.FlushBacklog(), 0u);
+  EXPECT_EQ(rt.UsedBytes(), used);
+  EXPECT_FALSE(reservation.Commit());
+  EXPECT_FALSE(rt.Contains(K(209)));
+  EXPECT_EQ(std::string(reservation.data(), 4096), std::string(4096, 'o'));
+  reservation = RamTier::DurableReservation{};
+  EXPECT_EQ(rt.UsedBytes(), 0u);
+  const std::lock_guard<std::mutex> lock(sink.m);
+  EXPECT_EQ(sink.calls, 0);
+}
