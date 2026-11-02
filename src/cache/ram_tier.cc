@@ -12,6 +12,7 @@
 
 #include "common/config_dump.h"
 #include "common/kv_types.h"
+#include "common/status.h"
 #include "utils/log.h"
 #include "utils/numa_util.h"
 #include "utils/thread_name.h"
@@ -471,7 +472,7 @@ Status RamTier::WaitPut(const std::shared_ptr<PutCompletion>& completion) {
 
 RamTier::Admission RamTier::Admit(
     const BlockKey& key, const void* data, size_t len, bool client_ack,
-    std::shared_ptr<PutCompletion>* out_completion) {
+    std::shared_ptr<PutCompletion>* out_completion, bool admit_new) {
   if (out_completion) out_completion->reset();
   if (!arena_ || len == 0 || data == nullptr) return Admission::kBypass;
   uint64_t requested_cap = 0;
@@ -515,6 +516,10 @@ RamTier::Admission RamTier::Admit(
         return Admission::kDuplicate;
       }
     }
+    // Direct batches only join an accepted owner. New keys keep the disk
+    // batch's allocation, per-item status and disk-complete ACK semantics.
+    // This deliberate forwarding is not a RAM capacity-bypass metric.
+    if (!admit_new) return Admission::kBypass;
     if (opt_.is_persisted && opt_.is_persisted(key))
       return Admission::kPersisted;
     if (client_ack && opt_.ack_high_watermark_pct != 0) {
@@ -675,6 +680,17 @@ RamTier::PutResult RamTier::PutCommitted(
   std::shared_ptr<PutCompletion> completion;
   const Admission admission = Admit(key, data, len, false, &completion);
   if (admission == Admission::kPersisted) return {Status::kOk};
+  if (admission == Admission::kBypass)
+    return {Status::kCacheFull, PutDisposition::kBypass};
+  if (admission == Admission::kRejected) return {Status::kIOError};
+  return {WaitPut(completion)};
+}
+
+RamTier::PutResult RamTier::PrepareDirectPut(const BlockKey& key,
+                                             const void* data, size_t len) {
+  std::shared_ptr<PutCompletion> completion;
+  const Admission admission =
+      Admit(key, data, len, false, &completion, /*admit_new=*/false);
   if (admission == Admission::kBypass)
     return {Status::kCacheFull, PutDisposition::kBypass};
   if (admission == Admission::kRejected) return {Status::kIOError};

@@ -1,6 +1,10 @@
 // RamTier wiring into KvNodeServer: with DFKV_RAM_TIER=1, PUT is write-through
 // to RAM (sync-visible, async-flushed) and GET is served from RAM; disabled by
-// default the node behaves exactly as before. End-to-end over the TCP transport.
+// default the node behaves exactly as before. End-to-end over the TCP
+// transport. POSIX setenv/unsetenv are not C++ standard-library functions.
+// Include their declaring C header directly; keep the exception local to this
+// header.
+#include <stdlib.h>  // NOLINT(hicpp-deprecated-headers,modernize-deprecated-headers)
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -82,6 +86,9 @@ class KvNodeServerWiringTestPeer {
                                       std::function<void()> hook) {
     server.before_disk_remove_hook_for_test_ = std::move(hook);
   }
+  static void SetRamAck(KvNodeServer& server, bool enabled) {
+    server.ram_ack_enabled_ = enabled;
+  }
   static void SetWriteBack(KvNodeServer& server, bool enabled) {
     server.ram_write_back_ = enabled;
   }
@@ -146,6 +153,29 @@ class CountingStore : public KVStore {
 
  private:
   std::atomic<size_t>& calls_;
+};
+
+// Restore the caller's configuration even when a fatal assertion exits a test.
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_old_ = true;
+      old_ = old;
+    }
+    ::setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_old_)
+      ::setenv(name_.c_str(), old_.c_str(), 1);
+    else
+      ::unsetenv(name_.c_str());
+  }
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
 };
 
 struct FlushBarrier {
@@ -1799,6 +1829,435 @@ TEST(RamTierWiring, RetiredPinnedRamCannotBypassPositiveDirtyWatermark) {
   old_send = PreparedRead{};
   flush.Open();
   EXPECT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, BatchPutRetiresSurvivingDurableRamCopy) {
+  for (int mode = 0; mode < 3; ++mode) {
+    for (const bool pinned : {false, true}) {
+      SCOPED_TRACE("mode=" + std::to_string(mode) +
+                   " pinned=" + std::to_string(pinned));
+      const fs::path dir = fs::temp_directory_path() / "dfkv_batch_old_ram";
+      fs::remove_all(dir);
+      fs::create_directories(dir);
+      DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+      std::unique_ptr<KvNodeServer> server =
+          KvNodeServerWiringTestPeer::Create(std::move(options));
+      KvNodeServer* const node = server.get();
+      KvNodeServerWiringTestPeer::SetRam(
+          *server,
+          [node](const BlockKey& key, char* data, size_t len, size_t) {
+            return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+                   Status::kOk;
+          },
+          mode == 1);
+      KvNodeServerWiringTestPeer::SetWriteBack(*server, mode != 2);
+      const BlockKey key{9800, 0};
+      ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, "old", 3),
+                Status::kOk);
+      alignas(4096) char staging[4096]{};
+      const char* data = nullptr;
+      size_t length = 0;
+      ASSERT_EQ(server->RangeDirectForKey(key, 0, 3, staging, sizeof(staging),
+                                          &data, &length),
+                Status::kOk);
+      ASSERT_TRUE(KvNodeServerWiringTestPeer::Resident(*server, key));
+      PreparedRead old_send;
+      if (pinned) {
+        old_send =
+            server->PrepareReadForKey(key, 0, 3, staging, sizeof(staging));
+        ASSERT_EQ(old_send.status(), Status::kOk);
+        ASSERT_TRUE(old_send.source_registered());
+      }
+      // Remove only the independent backing copy, not the RAM resident.
+      ASSERT_EQ(KvNodeServerWiringTestPeer::DropDisk(*server, key),
+                Status::kOk);
+      alignas(4096) char incoming[4096] = "new";
+      FlushBarrier done;
+      std::vector<Status> results;
+      std::thread writer([&] {
+        results = server->CacheDirectBatchForKeys(
+            {{key, incoming, 3, sizeof(incoming)}});
+        done.Block();
+      });
+      const bool completed_with_pin = done.AwaitEntry();
+      EXPECT_TRUE(completed_with_pin) << "Batch must not wait for an old SEND";
+      if (!completed_with_pin) old_send = PreparedRead{};
+      done.Open();
+      writer.join();
+      EXPECT_EQ(results, std::vector<Status>{Status::kOk});
+      std::string persisted, visible;
+      EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &persisted),
+                Status::kOk);
+      EXPECT_EQ(persisted, "new");
+      EXPECT_EQ(
+          server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                       key, 0, 0, nullptr, 0, &visible),
+          Status::kOk);
+      EXPECT_EQ(visible, persisted);
+      if (pinned && completed_with_pin) {
+        EXPECT_EQ(std::string(old_send.data(), old_send.payload_len()), "old");
+      }
+      old_send = PreparedRead{};
+      server.reset();
+      fs::remove_all(dir);
+    }
+  }
+}
+
+TEST(RamTierWiring, BatchPutJoinsDirtyFirstOwnerAndWaitsForDisk) {
+  for (const bool ram_ack : {false, true}) {
+    for (const bool flush_success : {false, true}) {
+      SCOPED_TRACE("ram_ack=" + std::to_string(ram_ack) +
+                   " flush_success=" + std::to_string(flush_success));
+      const fs::path dir = fs::temp_directory_path() / "dfkv_batch_dirty_owner";
+      fs::remove_all(dir);
+      fs::create_directories(dir);
+      FlushBarrier flush, done;
+      std::atomic<size_t> writes{0};
+      DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+      options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+        return std::make_unique<CountingStore>(path, capacity, writes);
+      };
+      std::unique_ptr<KvNodeServer> server =
+          KvNodeServerWiringTestPeer::Create(std::move(options));
+      const OpenFlushOnExit cleanup{flush};
+      KvNodeServer* const node = server.get();
+      KvNodeServerWiringTestPeer::SetRam(
+          *server,
+          [node, &flush, flush_success](const BlockKey& key, char* data,
+                                        size_t len, size_t) {
+            flush.Block();
+            return flush_success && KvNodeServerWiringTestPeer::Persist(
+                                        *node, key, data, len) == Status::kOk;
+          },
+          true);
+      const BlockKey key{9801, 0};
+      std::string ignored;
+      ASSERT_EQ(
+          server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                       key, 0, 0, "first", 5, &ignored),
+          Status::kOk);
+      ASSERT_TRUE(flush.AwaitEntry());
+      // Only the foreground policy changes, between requests. The already
+      // accepted owner and its actual blocked flusher remain the same.
+      KvNodeServerWiringTestPeer::SetRamAck(*server, ram_ack);
+      alignas(4096) char conflicting[4096] = "second";
+      std::vector<Status> results;
+      std::thread writer([&] {
+        results = server->CacheDirectBatchForKeys(
+            {{key, conflicting, 6, sizeof(conflicting)}});
+        done.Block();
+      });
+      // Batch completion means disk completion even when single PUTs use RAM
+      // ACK.
+      EXPECT_FALSE(done.AwaitEntry());
+      EXPECT_EQ(writes.load(std::memory_order_relaxed), 0u);
+      flush.Open();
+      done.Open();
+      writer.join();
+      EXPECT_EQ(results, std::vector<Status>{flush_success ? Status::kOk
+                                                           : Status::kIOError});
+      EXPECT_EQ(writes.load(std::memory_order_relaxed),
+                flush_success ? 1u : 0u);
+      std::string persisted;
+      EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &persisted),
+                flush_success ? Status::kOk : Status::kNotFound);
+      if (flush_success) {
+        EXPECT_EQ(persisted, "first");
+      }
+      EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, key) & 1, 0u);
+      server.reset();
+      fs::remove_all(dir);
+    }
+  }
+}
+
+TEST(RamTierWiring, BatchPutKeepsDiskCompletionAndOrderedItemResults) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_batch_item_results";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  FlushBarrier flush, done;
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  std::unique_ptr<KvNodeServer> server =
+      KvNodeServerWiringTestPeer::Create(std::move(options));
+  const OpenFlushOnExit cleanup{flush};
+  KvNodeServer* const node = server.get();
+  KvNodeServerWiringTestPeer::SetRam(
+      *server,
+      [node, &flush](const BlockKey& key, char* data, size_t len, size_t) {
+        flush.Block();
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+               Status::kOk;
+      },
+      true, 6);
+  const BlockKey dirty{9802, 0}, fresh{9803, 0}, collision{9803 + 1024, 0};
+  const std::string first(4096, 'f');
+  std::string ignored;
+  ASSERT_EQ(
+      server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache), dirty,
+                                   0, 0, first.data(), first.size(), &ignored),
+      Status::kOk);
+  ASSERT_TRUE(flush.AwaitEntry());
+  alignas(4096) char incoming[4096] = "new";
+  alignas(4096) char duplicate[4096] = "duplicate";
+  const std::vector<StoreEngine::CacheBatchItem> items{
+      {fresh, incoming, 3, sizeof(incoming)},
+      {fresh, nullptr, 3, 0},
+      {dirty, incoming, 3, sizeof(incoming)},
+      {collision, incoming, 3, sizeof(incoming)},
+      {fresh, duplicate, 9, sizeof(duplicate)}};
+  const uint64_t fresh_epoch =
+      KvNodeServerWiringTestPeer::ReadEpoch(*server, fresh);
+  const uint64_t dirty_epoch =
+      KvNodeServerWiringTestPeer::ReadEpoch(*server, dirty);
+  const uint64_t collision_epoch =
+      KvNodeServerWiringTestPeer::ReadEpoch(*server, collision);
+  std::vector<Status> results;
+  std::thread writer([&] {
+    results = server->CacheDirectBatchForKeys(items);
+    done.Block();
+  });
+  EXPECT_FALSE(done.AwaitEntry())
+      << "Batch must not early-ACK at the watermark";
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::MutationLockHeld(*server, fresh));
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, fresh),
+            fresh_epoch + 1);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, dirty),
+            dirty_epoch + 1);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, collision),
+            collision_epoch + 1);
+  flush.Open();
+  done.Open();
+  writer.join();
+  EXPECT_EQ(results,
+            (std::vector<Status>{Status::kOk, Status::kInvalid, Status::kOk,
+                                 Status::kOk, Status::kOk}));
+  for (const BlockKey& key : {fresh, dirty, collision}) {
+    std::string persisted;
+    EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &persisted),
+              Status::kOk);
+    EXPECT_EQ(persisted, key == dirty ? first : "new");
+    EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, key) & 1, 0u);
+  }
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, fresh),
+            fresh_epoch + 2);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, dirty),
+            dirty_epoch + 2);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, collision),
+            collision_epoch + 2);
+  EXPECT_TRUE(server->CacheDirectBatchForKeys({}).empty());
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, LateDiskReadCannotRepublishAcrossBatchPut) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_batch_late_read";
+  FlushBarrier old_read;
+  std::unique_ptr<KvNodeServer> server = ReadFenceServer(dir, true, &old_read);
+  const BlockKey key{9804, 0};
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, "old", 3),
+            Status::kOk);
+  alignas(4096) char staging[4096]{};
+  Status result = Status::kInvalid;
+  std::string bytes;
+  std::thread reader([&] {
+    const char* data = nullptr;
+    size_t length = 0;
+    result = server->RangeDirectForKey(key, 0, 3, staging, sizeof(staging),
+                                       &data, &length);
+    if (result == Status::kOk) bytes.assign(data, length);
+  });
+  EXPECT_TRUE(old_read.AwaitEntry());
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DropDisk(*server, key), Status::kOk);
+  alignas(4096) char incoming[4096] = "new";
+  EXPECT_EQ(
+      server->CacheDirectBatchForKeys({{key, incoming, 3, sizeof(incoming)}}),
+      std::vector<Status>{Status::kOk});
+  old_read.Open();
+  reader.join();
+  EXPECT_EQ(result, Status::kOk);
+  EXPECT_EQ(bytes, "old");
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+  std::string visible;
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                         key, 0, 0, nullptr, 0, &visible),
+            Status::kOk);
+  EXPECT_EQ(visible, "new");
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, BatchPutDoesNotJoinOldPromotionCompletion) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_batch_old_promotion";
+  std::unique_ptr<KvNodeServer> server = ReadFenceServer(dir, true);
+  KvNodeServerWiringTestPeer::SetWriteBack(*server, true);
+  const BlockKey key{9805, 0};
+  const std::string original(4096, 'o');
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, original.data(),
+                                                original.size()),
+            Status::kOk);
+  alignas(4096) char staging[4096]{};
+  PreparedRead old_read = server->PrepareReadForKey(key, 0, original.size(),
+                                                    staging, sizeof(staging));
+  ASSERT_EQ(old_read.status(), Status::kOk);
+  ASSERT_TRUE(old_read.source_registered());
+  ASSERT_EQ(::pread(old_read.fd(), old_read.staging(), old_read.aligned_len(),
+                    static_cast<off_t>(old_read.aligned_off())),
+            static_cast<ssize_t>(old_read.aligned_len()));
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DropDisk(*server, key), Status::kOk);
+  alignas(4096) char incoming[4096]{};
+  std::memset(incoming, 'n', sizeof(incoming));
+  FlushBarrier done;
+  std::vector<Status> results;
+  std::thread writer([&] {
+    results = server->CacheDirectBatchForKeys(
+        {{key, incoming, sizeof(incoming), sizeof(incoming)}});
+    done.Block();
+  });
+  EXPECT_TRUE(done.AwaitEntry()) << "Batch must not wait for an old promotion";
+  EXPECT_TRUE(old_read.Commit(Status::kOk, old_read.payload_len(), 0.0));
+  done.Open();
+  writer.join();
+  EXPECT_EQ(results, std::vector<Status>{Status::kOk});
+  std::string visible;
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                         key, 0, 0, nullptr, 0, &visible),
+            Status::kOk);
+  EXPECT_EQ(visible, std::string(sizeof(incoming), 'n'));
+  EXPECT_EQ(std::string(old_read.data(), old_read.payload_len()), original);
+  old_read = PreparedRead{};
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, BatchPutKeepsFirstPayloadAcrossCapacityBypass) {
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_batch_bypass_duplicate";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  std::unique_ptr<KvNodeServer> server =
+      KvNodeServerWiringTestPeer::Create(std::move(options));
+  KvNodeServer* const node = server.get();
+  KvNodeServerWiringTestPeer::SetRam(
+      *server, [node](const BlockKey& key, char* data, size_t len, size_t) {
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+               Status::kOk;
+      });
+  const BlockKey key{9806, 0}, collision{9806 + 1024, 0};
+  // The first payload exceeds the entire 64 KiB RAM budget. A later fitting
+  // duplicate must not flush its different bytes ahead of this disk bypass.
+  alignas(4096) char oversized[68 * 1024];
+  std::memset(oversized, 'f', sizeof(oversized));
+  alignas(4096) char conflicting[4096] = "second";
+  const std::vector<StoreEngine::CacheBatchItem> items{
+      {key, oversized, sizeof(oversized), sizeof(oversized)},
+      {key, conflicting, 6, sizeof(conflicting)},
+      {collision, conflicting, 6, sizeof(conflicting)}};
+  EXPECT_EQ(server->CacheDirectBatchForKeys(items),
+            std::vector<Status>(3, Status::kOk));
+  std::string persisted, visible;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &persisted),
+            Status::kOk);
+  EXPECT_EQ(persisted, std::string(sizeof(oversized), 'f'));
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                         key, 0, 0, nullptr, 0, &visible),
+            Status::kOk);
+  EXPECT_EQ(visible, persisted);
+  EXPECT_EQ(
+      KvNodeServerWiringTestPeer::DiskRead(*server, collision, &persisted),
+      Status::kOk);
+  EXPECT_EQ(persisted, "second");
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, key) & 1, 0u);
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, BatchPutPreservesTypedDiskFailuresWithoutRamFlush) {
+  class FaultStore : public KVStore {
+   public:
+    using KVStore::KVStore;
+    Status CacheDirect(const BlockKey& key, char* data, size_t len,
+                       size_t cap) override {
+      if (key.digest_hi == 9810) return Status::kIOError;
+      if (key.digest_hi == 9811) return Status::kCacheFull;
+      return KVStore::CacheDirect(key, data, len, cap);
+    }
+  };
+  const fs::path dir = fs::temp_directory_path() / "dfkv_batch_typed_failures";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  options.engine_factory = [](const std::string& path, uint64_t capacity) {
+    return std::make_unique<FaultStore>(KVStore::Options{path, capacity});
+  };
+  std::unique_ptr<KvNodeServer> server =
+      KvNodeServerWiringTestPeer::Create(std::move(options));
+  std::atomic<size_t> flushes{0};
+  KvNodeServerWiringTestPeer::SetRam(
+      *server,
+      [&flushes](const BlockKey&, char*, size_t, size_t) {
+        flushes.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      },
+      true);
+  alignas(4096) char incoming[4096] = "new";
+  const BlockKey io_error{9810, 0}, full{9811, 0}, invalid{9812, 0},
+      ok{9813, 0};
+  const std::vector<StoreEngine::CacheBatchItem> items{
+      {io_error, incoming, 3, sizeof(incoming)},
+      {ok, incoming, 3, sizeof(incoming)},
+      {invalid, nullptr, 3, 0},
+      {full, incoming, 3, sizeof(incoming)}};
+  EXPECT_EQ(server->CacheDirectBatchForKeys(items),
+            (std::vector<Status>{Status::kIOError, Status::kOk,
+                                 Status::kInvalid, Status::kCacheFull}));
+  std::string persisted;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, ok, &persisted),
+            Status::kOk);
+  EXPECT_EQ(persisted, "new");
+  for (const BlockKey& key : {io_error, full, invalid})
+    EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &persisted),
+              Status::kNotFound);
+  EXPECT_EQ(flushes.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(server->RamUsedBytes(), 0u);
+  EXPECT_EQ(MetricVal(server->MetricsText(), "dfkv_ram_flush_backlog"), 0);
+  EXPECT_TRUE(server->Healthy());
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, BatchPutWithRamPreservesTenantQuotaAndDuplicateOrder) {
+  const ScopedEnv quota("DFKV_TENANT_DEFAULT_QUOTA_BYTES", "3");
+  const ScopedEnv overrides("DFKV_TENANT_QUOTAS_FILE", "");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_batch_ram_quota";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  std::unique_ptr<KvNodeServer> server =
+      KvNodeServerWiringTestPeer::Create(std::move(options));
+  KvNodeServerWiringTestPeer::SetRam(
+      *server, [](const BlockKey&, char*, size_t, size_t) { return false; },
+      true);
+  const BlockKey first{9820, 0, 41}, rejected{9821, 0, 41};
+  alignas(4096) char incoming[4096] = "new";
+  alignas(4096) char conflicting[4096] = "other";
+  EXPECT_EQ(
+      server->CacheDirectBatchForKeys(
+          {{first, incoming, 3, sizeof(incoming)},
+           {rejected, incoming, 3, sizeof(incoming)},
+           {first, conflicting, 5, sizeof(conflicting)}}),
+      (std::vector<Status>{Status::kOk, Status::kQuotaExceeded, Status::kOk}));
+  std::string persisted;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, first, &persisted),
+            Status::kOk);
+  EXPECT_EQ(persisted, "new");
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, rejected, &persisted),
+            Status::kNotFound);
+  EXPECT_EQ(server->RamUsedBytes(), 0u);
+  EXPECT_TRUE(server->Healthy());
   server.reset();
   fs::remove_all(dir);
 }

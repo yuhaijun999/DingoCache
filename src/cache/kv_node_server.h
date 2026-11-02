@@ -124,6 +124,8 @@ class KvNodeServer {
   // value bytes. Writes without a payload-sized CPU copy.
   Status CacheDirectForKey(const BlockKey& key, char* data, size_t len,
                            size_t cap);
+  // Disk-complete batch, independent of single-PUT RAM ACK configuration.
+  // Existing dirty PUT owners resolve first; unowned items remain disk-batched.
   std::vector<Status> CacheDirectBatchForKeys(
       const std::vector<StoreEngine::CacheBatchItem>& items);
 
@@ -190,7 +192,8 @@ class KvNodeServer {
   uint64_t CaptureReadEpoch(const BlockKey& key);
   // Caller holds the foreground mutation lock. Advance at both ends of single
   // PUT/Remove, never while holding a RAM/disk lock or waiting for a
-  // completion.
+  // completion. Batches advance each unique stripe once instead of calling per
+  // item.
   void AdvanceReadEpoch(const BlockKey& key);
   void PromoteRead(const BlockKey& key, uint64_t epoch, const char* data,
                    size_t len);
