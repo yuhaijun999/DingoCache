@@ -20,9 +20,12 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -517,7 +520,10 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   // inline fdatasync) so a crash right after the rebind can't see old records;
   // rebinds are rare (workload-mix shifts), so the ms-scale sync under the
   // allocator lock is acceptable.
+  // Work admitted before a deferred invalidation failed may reach these
+  // callbacks later. Recheck isolation here before clearing/reusing residents.
   ao.on_extent_bind = [this](uint32_t e) {
+    if (!Healthy()) return false;
     if (!PwriteAll(table_fd_, zero_extent_records_.data(),
                    zero_extent_records_.size(), TableOffset(e, 0)))
       return FailMetadata();
@@ -527,6 +533,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   };
   ao.on_extent_evict =
       [this](uint32_t extent, uint32_t, uint32_t residents) {
+        if (!Healthy()) return false;
         if (!PwriteAll(table_fd_, zero_extent_records_.data(),
                        zero_extent_records_.size(),
                        TableOffset(extent, 0)))
@@ -543,6 +550,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
         return true;
       };
   ao.on_slot_evict = [this](const SlabAllocator::SlotRef& ref) {
+    if (!Healthy()) return false;
     const uint8_t zero[kRecBytes] = {0};
     if (!PwriteAll(table_fd_, zero, sizeof(zero),
                    TableOffset(ref.extent, ref.slot)))
@@ -1908,12 +1916,17 @@ bool DiskSlabStore::AcquireForRead(const BlockKey& key, const std::string& fn,
                                    SlabAllocator::SlotRef* ref,
                                    uint32_t* plen) {
   if (!Healthy()) return false;
-  std::lock_guard<std::mutex> lk(mu_);
-  auto it = payload_len_.find(fn);
-  if (it == payload_len_.end()) return false;  // in-flight write / removed: no commit
-  if (!alloc_->GetAndPin(key, ref)) return false;
-  *plen = it->second;
-  inflight_[fn]++;
+  {
+    const std::lock_guard<std::mutex> lock(mu_);
+    const std::unordered_map<std::string, uint32_t>::const_iterator it =
+        payload_len_.find(fn);
+    if (it == payload_len_.end())
+      return false;  // No committed visible payload.
+    if (!alloc_->GetAndPin(key, ref)) return false;
+    *plen = it->second;
+    inflight_[fn]++;
+  }
+  if (read_acquired_hook_for_test_) read_acquired_hook_for_test_();
   return true;
 }
 
@@ -2076,8 +2089,11 @@ uint64_t DiskSlabStore::EvictedBytes() const {
 // of the insert rate, capped at 1/4 of bound capacity) in bounded batches per
 // lock hold, so Put never waits behind an inline CLOCK sweep.
 void DiskSlabStore::ReclaimTick(
-    const std::function<void()>& after_watermark_evict) {
+    const std::function<void()>& after_watermark_evict,
+    const std::function<void()>& before_lock_for_test) {
   if (!Healthy()) return;
+  // Private test seam: pause work already admitted, before acquiring mu_.
+  if (before_lock_for_test) before_lock_for_test();
   // Successful NEW commits renew pressure eligibility. Inactive history
   // expires after 128 quiet observations; required active drain is preserved.
   // Sampling and composite mutation share mu_.
