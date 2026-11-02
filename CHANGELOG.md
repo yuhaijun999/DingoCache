@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep allocator persistence callbacks fail-closed after a disk metadata error.
+  Reclaim work admitted before a deferred Remove's final invalidation fails can
+  no longer clear/release that resident or rebind its extent after isolation.
+  Logical removal accounting stays hidden while physical occupancy is retained;
+  healthy legacy victim order and the existing dirty-restart contract are unchanged.
+
 - Report requested/effective disk eviction policy, engine, staging and actual
   flag/env/API/default provenance through the existing startup config dump.
   All nine lifetime-only parameters are explicitly inactive in staged legacy,
