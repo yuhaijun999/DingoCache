@@ -1,7 +1,8 @@
 // RamTier wiring into KvNodeServer: with DFKV_RAM_TIER=1, PUT is write-through
 // to RAM (sync-visible, async-flushed) and GET is served from RAM; disabled by
 // default the node behaves exactly as before. End-to-end over the TCP transport.
-#include <gtest/gtest.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -19,8 +21,12 @@
 #include <utility>
 #include <vector>
 
+// Third-party headers.
+#include <gtest/gtest.h>
+
 #include "cache/disk_cache_group.h"
 #include "cache/kv_node_server.h"
+#include "cache/kv_store.h"
 #include "cache/ram_tier.h"
 #include "cache/store_engine.h"
 #include "client/key_map.h"
@@ -45,6 +51,16 @@ class KvNodeServerWiringTestPeer {
   }
   static void SetCoalescing(KvNodeServer& server, bool enabled) {
     server.coalesce_enabled_ = enabled;
+  }
+  static void SetReadEpoch(KvNodeServer& server, const BlockKey& key,
+                           uint64_t epoch) {
+    KvNodeServer::ReadPublicationFence& fence =
+        server.read_publication_[server.MutationKeyStripe(key)];
+    const std::lock_guard<std::mutex> lock(fence.mutex);
+    fence.epoch = epoch;
+  }
+  static uint64_t ReadEpoch(KvNodeServer& server, const BlockKey& key) {
+    return server.CaptureReadEpoch(key);
   }
   static bool Begin(KvNodeServer& server) { return server.TryBeginPut(); }
   static void End(KvNodeServer& server) { server.EndPut(); }
@@ -179,6 +195,60 @@ class BlockingBypassStore : public KVStore {
  private:
   FlushBarrier& barrier_;
 };
+
+// Block outside the real store read, so Remove can finish while its old
+// bytes are still awaiting publication; preparation blocks before acquiring
+// the lease to expose reads whose epoch was captured before Remove.
+class ReadBarrierStore : public KVStore {
+ public:
+  ReadBarrierStore(const std::string& path, uint64_t capacity,
+                   FlushBarrier* after_read, FlushBarrier* before_prep)
+      : KVStore(Options{path, capacity}),
+        after_read_(after_read),
+        before_prep_(before_prep) {}
+  Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
+                     char* buffer, size_t capacity, const char** data,
+                     size_t* size, size_t* value_len) override {
+    const Status result = KVStore::RangeDirect(key, offset, length, buffer,
+                                               capacity, data, size, value_len);
+    if (after_read_ != nullptr) after_read_->Block();
+    return result;
+  }
+  Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
+                         size_t capacity, ReadLease* lease) override {
+    if (before_prep_ != nullptr) before_prep_->Block();
+    return KVStore::RangeDirectPrep(key, offset, length, capacity, lease);
+  }
+
+  Status Remove(const BlockKey& key) override {
+    return fail_remove_ ? Status::kIOError : KVStore::Remove(key);
+  }
+  bool fail_remove_ = false;
+
+ private:
+  FlushBarrier* after_read_;
+  FlushBarrier* before_prep_;
+};
+
+std::unique_ptr<KvNodeServer> ReadFenceServer(
+    const fs::path& dir, bool coalesce, FlushBarrier* after_read = nullptr,
+    FlushBarrier* before_prep = nullptr) {
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  options.engine_factory = [after_read, before_prep](const std::string& path,
+                                                     uint64_t capacity) {
+    return std::make_unique<ReadBarrierStore>(path, capacity, after_read,
+                                              before_prep);
+  };
+  std::unique_ptr<KvNodeServer> server =
+      KvNodeServerWiringTestPeer::Create(std::move(options));
+  KvNodeServerWiringTestPeer::SetRam(
+      *server, [](const BlockKey&, char*, size_t, size_t) { return false; });
+  KvNodeServerWiringTestPeer::SetWriteBack(*server, false);
+  KvNodeServerWiringTestPeer::SetCoalescing(*server, coalesce);
+  return server;
+}
 
 // Extract a single-sample counter/gauge value from Prometheus text (line
 // "<name>{...} <v>" or "<name> <v>"); returns -1 if absent.
@@ -415,7 +485,7 @@ TEST(RamTierWiring, ColdDirectSliceDoesNotReplaceWholeValue) {
   std::string value(8192 + 317, '\0');
   for (size_t i = 0; i < value.size(); ++i)
     value[i] = static_cast<char>('!' + i % 90);
-  for (bool coalesce : {false, true}) {
+  for (const bool coalesce : {false, true}) {
     for (size_t offset : {size_t{0}, size_t{73}, value.size() - 121}) {
       SCOPED_TRACE("coalesce=" + std::to_string(coalesce) +
                    " offset=" + std::to_string(offset));
@@ -489,7 +559,7 @@ TEST(RamTierWiring, ColdDirectSliceDoesNotReplaceWholeValue) {
 }
 
 TEST(RamTierWiring, ColdWholeDirectReadPromotesWithoutLengthOutput) {
-  for (bool coalesce : {false, true}) {
+  for (const bool coalesce : {false, true}) {
     SCOPED_TRACE("coalesce=" + std::to_string(coalesce));
     const auto dir = fs::temp_directory_path() /
         ("dfkv_direct_whole_" + std::to_string(coalesce));
@@ -1143,6 +1213,350 @@ TEST(RamTierWiring, OverlappingBatchesAcceptOppositeInputOrder) {
   EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, second, &persisted),
             Status::kOk);
   EXPECT_EQ(persisted, "same");
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, LateSynchronousReadCannotRepublishAfterRemove) {
+  for (const bool coalesce : {false, true}) {
+    for (const bool replace : {false, true}) {
+      SCOPED_TRACE("coalesce=" + std::to_string(coalesce) +
+                   " replace=" + std::to_string(replace));
+      const fs::path dir = fs::temp_directory_path() / "dfkv_late_sync_read";
+      FlushBarrier old_read;
+      std::unique_ptr<KvNodeServer> server =
+          ReadFenceServer(dir, coalesce, &old_read);
+      const BlockKey key{9600, 0};
+      ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, "old", 3),
+                Status::kOk);
+      alignas(4096) char buffer[4096]{};
+      Status result = Status::kInvalid;
+      std::string bytes;
+      std::thread reader([&] {
+        const char* data = nullptr;
+        size_t length = 0;
+        result = server->RangeDirectForKey(key, 0, 3, buffer, sizeof(buffer),
+                                           &data, &length);
+        if (result == Status::kOk) bytes.assign(data, length);
+      });
+      EXPECT_TRUE(old_read.AwaitEntry());
+      std::string ignored;
+      EXPECT_EQ(
+          server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                       key, 0, 0, nullptr, 0, &ignored),
+          Status::kOk);
+      if (replace) {
+        EXPECT_EQ(
+            server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                         key, 0, 0, "new", 3, &ignored),
+            Status::kOk);
+      }
+      old_read.Open();
+      reader.join();
+      EXPECT_EQ(result, Status::kOk);
+      EXPECT_EQ(bytes, "old");  // The already-read reply remains valid.
+      EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+      EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &ignored),
+                replace ? Status::kOk : Status::kNotFound);
+      if (replace) {
+        EXPECT_EQ(ignored, "new");
+        const char* data = nullptr;
+        size_t length = 0;
+        EXPECT_EQ(server->RangeDirectForKey(key, 0, 3, buffer, sizeof(buffer),
+                                            &data, &length),
+                  Status::kOk);
+        EXPECT_NE(data, nullptr);
+        if (data != nullptr) {
+          EXPECT_EQ(std::string(data, length), "new");
+        }
+        EXPECT_TRUE(KvNodeServerWiringTestPeer::Resident(*server, key));
+      }
+      server.reset();
+      fs::remove_all(dir);
+    }
+  }
+}
+
+TEST(RamTierWiring, ReadDuringRemoveGapDoesNotBecomeRamResident) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_read_remove_gap";
+  FlushBarrier remove_gap;
+  std::unique_ptr<KvNodeServer> server = ReadFenceServer(dir, true);
+  const BlockKey key{9601, 0};
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, "old", 3),
+            Status::kOk);
+  KvNodeServerWiringTestPeer::SetBeforeDiskRemoveHook(
+      *server, [&] { remove_gap.Block(); });
+  Status removed = Status::kInvalid;
+  std::thread remover([&] {
+    std::string ignored;
+    removed = server->ProcessRequestForKey(
+        static_cast<uint8_t>(WireOp::kRemove), key, 0, 0, nullptr, 0, &ignored);
+  });
+  EXPECT_TRUE(remove_gap.AwaitEntry());
+  alignas(4096) char buffer[4096]{};
+  const char* data = nullptr;
+  size_t length = 0;
+  EXPECT_EQ(server->RangeDirectForKey(key, 0, 3, buffer, sizeof(buffer), &data,
+                                      &length),
+            Status::kOk);
+  EXPECT_NE(data, nullptr);
+  if (data != nullptr) {
+    EXPECT_EQ(std::string(data, length), "old");
+  }
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+  remove_gap.Open();
+  remover.join();
+  EXPECT_EQ(removed, Status::kOk);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+  std::string out;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &out),
+            Status::kNotFound);
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, RegisteredPromotionCompletesWhileRemoveWaits) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_remove_reserved_read";
+  std::unique_ptr<KvNodeServer> server = ReadFenceServer(dir, true);
+  const BlockKey key{9602, 0};
+  const std::string value(4096, 'r');
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, value.data(),
+                                                value.size()),
+            Status::kOk);
+  alignas(4096) char staging[4096]{};
+  PreparedRead read =
+      server->PrepareReadForKey(key, 0, value.size(), staging, sizeof(staging));
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_TRUE(read.source_registered());
+  ASSERT_EQ(::pread(read.fd(), read.staging(), read.aligned_len(),
+                    static_cast<off_t>(read.aligned_off())),
+            static_cast<ssize_t>(read.aligned_len()));
+  FlushBarrier disk_remove;
+  KvNodeServerWiringTestPeer::SetBeforeDiskRemoveHook(
+      *server, [&] { disk_remove.Block(); });
+  std::atomic<bool> done{false};
+  Status removed = Status::kInvalid;
+  std::thread remover([&] {
+    std::string ignored;
+    removed = server->ProcessRequestForKey(
+        static_cast<uint8_t>(WireOp::kRemove), key, 0, 0, nullptr, 0, &ignored);
+    done.store(true, std::memory_order_release);
+  });
+  EXPECT_TRUE(WaitFor([&] {
+    return KvNodeServerWiringTestPeer::MutationLockHeld(*server, key);
+  }));
+  // Remove owns its foreground stripe but cannot reach disk removal until
+  // the registered promotion completes. The barrier is a phase oracle;
+  // actual completion, deletion, and retained bytes are checked below.
+  EXPECT_FALSE(disk_remove.AwaitEntry());
+  EXPECT_FALSE(done.load(std::memory_order_acquire));
+  EXPECT_TRUE(read.Commit(Status::kOk, read.payload_len(), 0.0));
+  EXPECT_TRUE(disk_remove.AwaitEntry());
+  disk_remove.Open();
+  remover.join();
+  EXPECT_EQ(removed, Status::kOk);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+  std::string disk;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &disk),
+            Status::kNotFound);
+  // Logical deletion cannot invalidate the still-owned SEND source.
+  EXPECT_EQ(std::string(read.data(), read.payload_len()), value);
+  read = PreparedRead{};
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, ReadCapturedBeforeRemoveCannotRegisterLatePromotion) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_late_read_prep";
+  FlushBarrier preparation;
+  std::unique_ptr<KvNodeServer> server =
+      ReadFenceServer(dir, true, nullptr, &preparation);
+  const BlockKey key{9603, 0};
+  const std::string original(4096, 'o'), replacement(4096, 'n');
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, original.data(),
+                                                original.size()),
+            Status::kOk);
+  alignas(4096) char staging[4096]{};
+  PreparedRead read;
+  std::thread reader([&] {
+    read = server->PrepareReadForKey(key, 0, replacement.size(), staging,
+                                     sizeof(staging));
+  });
+  EXPECT_TRUE(preparation.AwaitEntry());
+  std::string ignored;
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                         key, 0, 0, nullptr, 0, &ignored),
+            Status::kOk);
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                         key, 0, 0, replacement.data(),
+                                         replacement.size(), &ignored),
+            Status::kOk);
+  preparation.Open();
+  reader.join();
+  ASSERT_EQ(read.status(), Status::kOk);
+  EXPECT_FALSE(read.source_registered());
+  ASSERT_EQ(::pread(read.fd(), read.staging(), read.aligned_len(),
+                    static_cast<off_t>(read.aligned_off())),
+            static_cast<ssize_t>(read.aligned_len()));
+  EXPECT_TRUE(read.Commit(Status::kOk, read.payload_len(), 0.0));
+  EXPECT_EQ(std::string(read.data(), read.payload_len()), replacement);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+  read = PreparedRead{};
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, LateStagingCompletionCannotRepublishAfterRemove) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_late_staging_read";
+  std::unique_ptr<KvNodeServer> server = ReadFenceServer(dir, true);
+  const BlockKey key{9604, 0}, filler{9605, 0};
+  const std::string value(4096, 's'), full_arena(16 * 4096, 'f');
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, value.data(),
+                                                value.size()),
+            Status::kOk);
+  ASSERT_TRUE(
+      KvNodeServerWiringTestPeer::InstallDurable(*server, filler, full_arena));
+  alignas(4096) char staging[4096]{};
+  PreparedRead pinned =
+      server->PrepareReadForKey(filler, 0, 4096, staging, sizeof(staging));
+  ASSERT_EQ(pinned.status(), Status::kOk);
+  PreparedRead read =
+      server->PrepareReadForKey(key, 0, value.size(), staging, sizeof(staging));
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_FALSE(read.source_registered());  // Pinned filler forces staging.
+  ASSERT_EQ(::pread(read.fd(), read.staging(), read.aligned_len(),
+                    static_cast<off_t>(read.aligned_off())),
+            static_cast<ssize_t>(read.aligned_len()));
+  std::string ignored;
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                         key, 0, 0, nullptr, 0, &ignored),
+            Status::kOk);
+  // A different thread avoids the coalescer's same-thread recursion fallback.
+  // These reads must miss independently, not join the still-live old flight and
+  // obtain NotFound only after its timeout fallback.
+  const long timeouts =
+      MetricVal(server->MetricsText(), "dfkv_read_coalesce_timeouts_total");
+  std::thread following_reader([&] {
+    alignas(4096) char following[4096]{};
+    size_t following_length = 0;
+    const char* following_data = nullptr;
+    EXPECT_EQ(server->RangeIntoForKey(key, 0, value.size(), following,
+                                      sizeof(following), &following_length),
+              Status::kNotFound);
+    EXPECT_EQ(server->RangeDirectForKey(key, 0, value.size(), following,
+                                        sizeof(following), &following_data,
+                                        &following_length),
+              Status::kNotFound);
+    std::string output;
+    EXPECT_EQ(
+        server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange), key,
+                                     0, value.size(), nullptr, 0, &output),
+        Status::kNotFound);
+    const PreparedRead following_read = server->PrepareReadForKey(
+        key, 0, value.size(), following, sizeof(following));
+    EXPECT_EQ(following_read.status(), Status::kNotFound);
+  });
+  following_reader.join();
+  EXPECT_EQ(
+      MetricVal(server->MetricsText(), "dfkv_read_coalesce_timeouts_total"),
+      timeouts);
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::DropRam(*server, filler));
+  pinned = PreparedRead{};  // Space is available when the old read completes.
+  EXPECT_TRUE(read.Commit(Status::kOk, read.payload_len(), 0.0));
+  EXPECT_EQ(std::string(read.data(), read.payload_len()), value);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+  read = PreparedRead{};
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, ExhaustedReadEpochNeverWrapsOrPromotes) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_read_epoch_limit";
+  std::unique_ptr<KvNodeServer> server = ReadFenceServer(dir, true);
+  const BlockKey key{9606, 0};
+  const std::string value(4096, 'e');
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, value.data(),
+                                                value.size()),
+            Status::kOk);
+  const uint64_t exhausted = std::numeric_limits<uint64_t>::max();
+  KvNodeServerWiringTestPeer::SetReadEpoch(*server, key, exhausted - 1);
+  std::string ignored;
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                         key, 0, 0, nullptr, 0, &ignored),
+            Status::kOk);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, key), exhausted);
+  ASSERT_EQ(
+      server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache), key, 0,
+                                   0, value.data(), value.size(), &ignored),
+      Status::kOk);
+  alignas(4096) char staging[4096]{};
+  const char* data = nullptr;
+  size_t length = 0;
+  ASSERT_EQ(server->RangeDirectForKey(key, 0, value.size(), staging,
+                                      sizeof(staging), &data, &length),
+            Status::kOk);
+  EXPECT_EQ(std::string(data, length), value);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+  PreparedRead read =
+      server->PrepareReadForKey(key, 0, value.size(), staging, sizeof(staging));
+  ASSERT_EQ(read.status(), Status::kOk);
+  EXPECT_FALSE(read.source_registered());
+  ASSERT_EQ(::pread(read.fd(), read.staging(), read.aligned_len(),
+                    static_cast<off_t>(read.aligned_off())),
+            static_cast<ssize_t>(read.aligned_len()));
+  EXPECT_TRUE(read.Commit(Status::kOk, read.payload_len(), 0.0));
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+  read = PreparedRead{};
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                         key, 0, 0, nullptr, 0, &ignored),
+            Status::kOk);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, key), exhausted);
+  EXPECT_TRUE(server->Healthy());
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, FailedAndMissingRemoveCloseSharedStripeEpoch) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_remove_epoch_errors";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  ReadBarrierStore* store = nullptr;
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+    std::unique_ptr<ReadBarrierStore> backend =
+        std::make_unique<ReadBarrierStore>(path, capacity, nullptr, nullptr);
+    store = backend.get();
+    return backend;
+  };
+  std::unique_ptr<KvNodeServer> server =
+      KvNodeServerWiringTestPeer::Create(std::move(options));
+  KvNodeServerWiringTestPeer::SetRam(
+      *server, [](const BlockKey&, char*, size_t, size_t) { return false; });
+  const BlockKey absent{9607, 0}, collision{10631, 0};
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, collision, "kept", 4),
+            Status::kOk);
+  std::string ignored;
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                         absent, 0, 0, nullptr, 0, &ignored),
+            Status::kNotFound);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, collision), 2u);
+  ASSERT_NE(store, nullptr);
+  store->fail_remove_ = true;
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                         collision, 0, 0, nullptr, 0, &ignored),
+            Status::kIOError);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadEpoch(*server, absent), 4u);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, collision, &ignored),
+            Status::kOk);
+  EXPECT_EQ(ignored, "kept");
+  alignas(4096) char buffer[4096]{};
+  const char* data = nullptr;
+  size_t length = 0;
+  ASSERT_EQ(server->RangeDirectForKey(collision, 0, 4, buffer, sizeof(buffer),
+                                      &data, &length),
+            Status::kOk);
+  EXPECT_EQ(std::string(data, length), "kept");
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::Resident(*server, collision));
   server.reset();
   fs::remove_all(dir);
 }

@@ -155,7 +155,9 @@ class ReadCoalescer {
   // waiters are handed a copy of the payload; direct-publication waiters use
   // the RAM slot committed before this call. On any other status (or abort:
   // data==nullptr), waiters fall back to their own disk reads. Returns true if
-  // at least one waiter had joined and fills *key / *whole from registration.
+  // at least one waiter had joined. Optional outputs describe the original
+  // registration (including its fence epoch), not a newer read of the key.
+  // Unknown/already-completed tokens leave those outputs unchanged.
   // A successful staged whole-value completion with NO waiter leaves a
   // recurrence tombstone (key fingerprint, not payload) for RecurMs(): a
   // second identical read inside that window is recurrence evidence, so ITS
@@ -164,7 +166,8 @@ class ReadCoalescer {
   // mechanism.
   bool CompleteAsync(uint64_t token, Status st, const char* data, size_t len,
                      BlockKey* key = nullptr, bool* whole = nullptr,
-                     bool* recurrent = nullptr) {
+                     bool* recurrent = nullptr,
+                     uint64_t* fence_epoch = nullptr) {
     std::shared_ptr<Flight> f;
     bool waiters = false;
     {
@@ -213,6 +216,7 @@ class ReadCoalescer {
           BlockKey{f->key.digest_hi, f->key.digest_lo, f->key.tenant_hash};
     if (whole) *whole = f->whole;
     if (recurrent) *recurrent = f->recurrent;
+    if (fence_epoch) *fence_epoch = f->key.fence_epoch;
     return waiters;
   }
 

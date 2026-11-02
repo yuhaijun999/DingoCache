@@ -2,10 +2,15 @@
 
 ## Unreleased
 
+- Fence disk-read RAM publication and coalescing across Remove, including reads
+  whose reservation or staging completion arrives late. Registered reservations
+  retain their existing cancellation and SEND-pin lifetime protocol. PUT versus
+  surviving durable RAM and full batch cross-tier ordering remain separate work.
+
 - Serialize foreground PUT and Remove across RAM and disk in every write mode,
   including direct batches with ordered, deduplicated key-stripe locking. A new
   PUT cannot enter Remove's gap between the two tiers. Background flushes remain
-  independent so disk-ACK waiters can finish. Read-promotion fencing is separate.
+  independent so disk-ACK waiters can finish.
 
 - Keep allocator persistence callbacks fail-closed after a disk metadata error.
   Reclaim work admitted before a deferred Remove's final invalidation fails can
