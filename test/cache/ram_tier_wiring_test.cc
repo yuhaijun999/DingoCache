@@ -1560,3 +1560,245 @@ TEST(RamTierWiring, FailedAndMissingRemoveCloseSharedStripeEpoch) {
   server.reset();
   fs::remove_all(dir);
 }
+
+TEST(RamTierWiring, ForegroundPutRetiresSurvivingDurableRamCopy) {
+  for (int mode = 0; mode < 3; ++mode) {
+    for (const bool direct : {false, true}) {
+      for (const bool pinned : {false, true}) {
+        for (const bool disk_retained : {false, true}) {
+          SCOPED_TRACE("mode=" + std::to_string(mode) +
+                       " direct=" + std::to_string(direct) +
+                       " pinned=" + std::to_string(pinned) +
+                       " disk_retained=" + std::to_string(disk_retained));
+          const fs::path dir =
+              fs::temp_directory_path() / "dfkv_put_surviving_durable_ram";
+          fs::remove_all(dir);
+          fs::create_directories(dir);
+          DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+          std::unique_ptr<KvNodeServer> server =
+              KvNodeServerWiringTestPeer::Create(std::move(options));
+          KvNodeServer* const node = server.get();
+          KvNodeServerWiringTestPeer::SetRam(
+              *server,
+              [node](const BlockKey& key, char* data, size_t len, size_t) {
+                return KvNodeServerWiringTestPeer::Persist(*node, key, data,
+                                                           len) == Status::kOk;
+              },
+              mode == 1);
+          KvNodeServerWiringTestPeer::SetWriteBack(*server, mode != 2);
+          const BlockKey key{9700, 0};
+          const std::string original = "original", replacement = "modified";
+          ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(
+                        *server, key, original.data(), original.size()),
+                    Status::kOk);
+          // A real whole disk read creates the durable RAM copy. Disk-only
+          // removal models its independently evictable backing copy; it is not
+          // a claim that this test exercises allocator pressure itself.
+          alignas(4096) char staging[4096]{};
+          const char* data = nullptr;
+          size_t length = 0;
+          ASSERT_EQ(server->RangeDirectForKey(key, 0, original.size(), staging,
+                                              sizeof(staging), &data, &length),
+                    Status::kOk);
+          ASSERT_TRUE(KvNodeServerWiringTestPeer::Resident(*server, key));
+          PreparedRead old_send;
+          if (pinned) {
+            old_send = server->PrepareReadForKey(key, 0, original.size(),
+                                                 staging, sizeof(staging));
+            ASSERT_EQ(old_send.status(), Status::kOk);
+            ASSERT_TRUE(old_send.source_registered());
+          }
+          if (!disk_retained) {
+            ASSERT_EQ(KvNodeServerWiringTestPeer::DropDisk(*server, key),
+                      Status::kOk);
+          }
+          alignas(4096) char incoming[4096]{};
+          std::memcpy(incoming, replacement.data(), replacement.size());
+          FlushBarrier put_done;
+          Status status = Status::kInvalid;
+          std::thread writer([&] {
+            std::string ignored;
+            status = direct ? server->CacheDirectForKey(key, incoming,
+                                                        replacement.size(),
+                                                        sizeof(incoming))
+                            : server->ProcessRequestForKey(
+                                  static_cast<uint8_t>(WireOp::kCache), key, 0,
+                                  0, incoming, replacement.size(), &ignored);
+            put_done.Block();
+          });
+          const bool completed_with_send_pin = put_done.AwaitEntry();
+          EXPECT_TRUE(completed_with_send_pin)
+              << "A foreground PUT must not wait for an old SEND release";
+          // Recover a broken implementation's wait before joining its thread.
+          if (!completed_with_send_pin) old_send = PreparedRead{};
+          put_done.Open();
+          writer.join();
+          EXPECT_EQ(status, Status::kOk);
+          ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+          const std::string& expected = disk_retained ? original : replacement;
+          std::string persisted, visible;
+          EXPECT_EQ(
+              KvNodeServerWiringTestPeer::DiskRead(*server, key, &persisted),
+              Status::kOk);
+          EXPECT_EQ(persisted, expected);
+          EXPECT_EQ(
+              server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                           key, 0, 0, nullptr, 0, &visible),
+              Status::kOk);
+          EXPECT_EQ(visible, expected);
+          if (pinned && completed_with_send_pin) {
+            EXPECT_EQ(std::string(old_send.data(), old_send.payload_len()),
+                      original);
+          }
+          old_send = PreparedRead{};
+          EXPECT_TRUE(server->Healthy());
+          server.reset();
+          fs::remove_all(dir);
+        }
+      }
+    }
+  }
+}
+
+TEST(RamTierWiring, LateDiskReadCannotRepublishAcrossForegroundPut) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_put_late_disk_read";
+  FlushBarrier old_read;
+  std::unique_ptr<KvNodeServer> server = ReadFenceServer(dir, true, &old_read);
+  const BlockKey key{9701, 0};
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, "old", 3),
+            Status::kOk);
+  alignas(4096) char staging[4096]{};
+  Status result = Status::kInvalid;
+  std::string bytes;
+  std::thread reader([&] {
+    const char* data = nullptr;
+    size_t length = 0;
+    result = server->RangeDirectForKey(key, 0, 3, staging, sizeof(staging),
+                                       &data, &length);
+    if (result == Status::kOk) bytes.assign(data, length);
+  });
+  EXPECT_TRUE(old_read.AwaitEntry());
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DropDisk(*server, key), Status::kOk);
+  std::string output;
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                         key, 0, 0, "new", 3, &output),
+            Status::kOk);
+  old_read.Open();
+  reader.join();
+  EXPECT_EQ(result, Status::kOk);
+  EXPECT_EQ(bytes, "old");
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                         key, 0, 0, nullptr, 0, &output),
+            Status::kOk);
+  EXPECT_EQ(output, "new");
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, ForegroundPutDoesNotJoinOldPromotionCompletion) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_put_old_promotion";
+  std::unique_ptr<KvNodeServer> server = ReadFenceServer(dir, true);
+  KvNodeServer* const node = server.get();
+  KvNodeServerWiringTestPeer::SetRam(
+      *server, [node](const BlockKey& key, char* data, size_t len, size_t) {
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+               Status::kOk;
+      });
+  const BlockKey key{9702, 0};
+  const std::string original(4096, 'o'), replacement(4096, 'n');
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, original.data(),
+                                                original.size()),
+            Status::kOk);
+  alignas(4096) char staging[4096]{};
+  PreparedRead old_read = server->PrepareReadForKey(key, 0, original.size(),
+                                                    staging, sizeof(staging));
+  ASSERT_EQ(old_read.status(), Status::kOk);
+  ASSERT_TRUE(old_read.source_registered());
+  ASSERT_EQ(::pread(old_read.fd(), old_read.staging(), old_read.aligned_len(),
+                    static_cast<off_t>(old_read.aligned_off())),
+            static_cast<ssize_t>(old_read.aligned_len()));
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DropDisk(*server, key), Status::kOk);
+  FlushBarrier put_done;
+  Status status = Status::kInvalid;
+  std::thread writer([&] {
+    std::string ignored;
+    status = server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                          key, 0, 0, replacement.data(),
+                                          replacement.size(), &ignored);
+    put_done.Block();
+  });
+  EXPECT_TRUE(put_done.AwaitEntry())
+      << "New PUT must not share a read-promotion completion";
+  // Complete even after a failed progress assertion to release a broken waiter.
+  EXPECT_TRUE(old_read.Commit(Status::kOk, old_read.payload_len(), 0.0));
+  put_done.Open();
+  writer.join();
+  EXPECT_EQ(status, Status::kOk);
+  std::string visible;
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                         key, 0, 0, nullptr, 0, &visible),
+            Status::kOk);
+  EXPECT_EQ(visible, replacement);
+  EXPECT_EQ(std::string(old_read.data(), old_read.payload_len()), original);
+  old_read = PreparedRead{};
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, RetiredPinnedRamCannotBypassPositiveDirtyWatermark) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_put_retired_watermark";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  FlushBarrier flush;
+  std::atomic<size_t> writes{0};
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+    return std::make_unique<CountingStore>(path, capacity, writes);
+  };
+  std::unique_ptr<KvNodeServer> server =
+      KvNodeServerWiringTestPeer::Create(std::move(options));
+  const OpenFlushOnExit cleanup{flush};
+  KvNodeServer* const node = server.get();
+  KvNodeServerWiringTestPeer::SetRam(
+      *server,
+      [node, &flush](const BlockKey& key, char* data, size_t len, size_t) {
+        flush.Block();
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+               Status::kOk;
+      },
+      true, 6);
+  const BlockKey retired{9703, 0}, dirty{9704, 0};
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, retired, "old", 3),
+            Status::kOk);
+  ASSERT_TRUE(
+      KvNodeServerWiringTestPeer::InstallDurable(*server, retired, "old"));
+  alignas(4096) char staging[4096]{};
+  PreparedRead old_send =
+      server->PrepareReadForKey(retired, 0, 3, staging, sizeof(staging));
+  ASSERT_EQ(old_send.status(), Status::kOk);
+  ASSERT_TRUE(old_send.source_registered());
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DropDisk(*server, retired),
+            Status::kOk);
+  const std::string dirty_value(4096, 'd');
+  std::string ignored;
+  ASSERT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                         dirty, 0, 0, dirty_value.data(),
+                                         dirty_value.size(), &ignored),
+            Status::kOk);
+  ASSERT_TRUE(flush.AwaitEntry());
+  const size_t writes_before = writes.load(std::memory_order_relaxed);
+  EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                         retired, 0, 0, "new", 3, &ignored),
+            Status::kCacheFull);
+  EXPECT_EQ(writes.load(std::memory_order_relaxed), writes_before);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, retired, &ignored),
+            Status::kNotFound);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, retired));
+  EXPECT_EQ(std::string(old_send.data(), old_send.payload_len()), "old");
+  old_send = PreparedRead{};
+  flush.Open();
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+  server.reset();
+  fs::remove_all(dir);
+}

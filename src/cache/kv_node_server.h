@@ -188,8 +188,9 @@ class KvNodeServer {
   static size_t MutationKeyStripe(const BlockKey& key);
   std::unique_lock<std::mutex> LockMutationKey(const BlockKey& key);
   uint64_t CaptureReadEpoch(const BlockKey& key);
-  // Caller holds the foreground mutation lock. Advance at both ends of Remove,
-  // never while holding a RAM/disk lock or waiting for a completion.
+  // Caller holds the foreground mutation lock. Advance at both ends of single
+  // PUT/Remove, never while holding a RAM/disk lock or waiting for a
+  // completion.
   void AdvanceReadEpoch(const BlockKey& key);
   void PromoteRead(const BlockKey& key, uint64_t epoch, const char* data,
                    size_t len);
@@ -225,8 +226,9 @@ class KvNodeServer {
   std::mutex mutation_key_mu_[kMutationKeyStripes];
   struct ReadPublicationFence {
     std::mutex mutex;
-    // Even: stable; odd: Remove in progress. Saturation permanently disables
-    // new promotion/coalescing for this stripe instead of reusing an identity.
+    // Even: stable; odd: single PUT/Remove in progress. Saturation permanently
+    // disables new promotion/coalescing for this stripe instead of reusing an
+    // identity.
     uint64_t epoch = 0;
   };
   // Independent of mutation locks: completion must progress while Remove waits.

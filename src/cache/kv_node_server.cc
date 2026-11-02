@@ -907,6 +907,8 @@ Status KvNodeServer::ProcessRequestForKey(
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
       const std::unique_lock<std::mutex> key_lock = LockMutationKey(key);
+      AdvanceReadEpoch(key);
+      if (ram_) ram_->RetireDurableForPut(key);
       // RAM-ACK publishes a flush-pinned copy. A reached positive watermark
       // rejects new keys before admission; only a capacity bypass may take
       // the normal disk path, never a terminal watermark rejection.
@@ -935,6 +937,7 @@ Status KvNodeServer::ProcessRequestForKey(
         }
       }
       if (samp) put_lat_.Observe(NowSec() - t0);
+      AdvanceReadEpoch(key);
       EndPut();
       break;
     }
@@ -1168,6 +1171,8 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   const std::unique_lock<std::mutex> key_lock = LockMutationKey(key);
+  AdvanceReadEpoch(key);
+  if (ram_) ram_->RetireDurableForPut(key);
   // PUT write-around: write directly to disk, skip the synchronous 1 MiB
   // arena memcpy. The arena is filled lazily by read-promotion on GET miss
   // (RangeDirectForKey), so hot keys still get zero-copy RDMA GET from the
@@ -1206,6 +1211,7 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
     }
   }
   if (samp) put_lat_.Observe(NowSec() - t0);
+  AdvanceReadEpoch(key);
   EndPut();
   return st;
 }
