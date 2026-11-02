@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -16,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "cache/ram_tier.h"
 #include "cache/store_engine.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
@@ -144,6 +146,28 @@ size_t KvNodeServer::MutationKeyStripe(const BlockKey& key) {
 std::unique_lock<std::mutex> KvNodeServer::LockMutationKey(
     const BlockKey& key) {
   return std::unique_lock<std::mutex>(mutation_key_mu_[MutationKeyStripe(key)]);
+}
+
+uint64_t KvNodeServer::CaptureReadEpoch(const BlockKey& key) {
+  ReadPublicationFence& fence = read_publication_[MutationKeyStripe(key)];
+  const std::lock_guard<std::mutex> lock(fence.mutex);
+  return fence.epoch;
+}
+
+void KvNodeServer::AdvanceReadEpoch(const BlockKey& key) {
+  ReadPublicationFence& fence = read_publication_[MutationKeyStripe(key)];
+  const std::lock_guard<std::mutex> lock(fence.mutex);
+  if (fence.epoch != std::numeric_limits<uint64_t>::max()) ++fence.epoch;
+}
+
+void KvNodeServer::PromoteRead(const BlockKey& key, uint64_t epoch,
+                               const char* data, size_t len) {
+  if (!ram_ || (epoch & 1) != 0) return;
+  ReadPublicationFence& fence = read_publication_[MutationKeyStripe(key)];
+  const std::lock_guard<std::mutex> lock(fence.mutex);
+  // Validation and publication are atomic with Remove's opening fence. A
+  // publication that wins this lock is subsequently hidden by RAM Remove.
+  if (fence.epoch == epoch) ram_->PutDurable(key, data, len);
 }
 
 void KvNodeServer::InitRamTier() {
@@ -930,10 +954,11 @@ Status KvNodeServer::ProcessRequestForKey(
         }
       }
       if (!ram_served) {
+        const uint64_t read_epoch = CaptureReadEpoch(key);
         // length==0 stays on the plain path: its scratch would have to be
         // sized at the max-value worst case (a 64 MiB zeroed allocation per
         // request), which costs more than the duplicate read it would save.
-        if (coalesce_enabled_ && length > 0) {
+        if (coalesce_enabled_ && (read_epoch & 1) == 0 && length > 0) {
           // TCP convoy collapse: leader reads via group_.Range into a scratch
           // string sized by the store; followers copy the shared bytes.
           //
@@ -975,7 +1000,8 @@ Status KvNodeServer::ProcessRequestForKey(
                     *on = m;
                   }
                   return s;
-                });
+                },
+                nullptr, read_epoch);
             out_data->resize(st == Status::kOk ? n : 0);
           }
         } else {
@@ -1020,6 +1046,9 @@ Status KvNodeServer::ProcessRequestForKey(
     }
     case WireOp::kRemove: {
       const std::unique_lock<std::mutex> key_lock = LockMutationKey(key);
+      // Block new promotion before hiding RAM. Never hold the publication
+      // mutex across Remove's completion wait: the read must be able to finish.
+      AdvanceReadEpoch(key);
       // RamTier hides the key first and waits out/cancels any flush. The disk
       // remove therefore compensates a flush that reached durable storage just
       // before the fence; prior queued/flushing PUTs cannot republish later.
@@ -1027,6 +1056,7 @@ Status KvNodeServer::ProcessRequestForKey(
       if (before_disk_remove_hook_for_test_)
         before_disk_remove_hook_for_test_();
       const Status disk_status = group_.Remove(key);
+      AdvanceReadEpoch(key);  // Also finish failed/NotFound Remove generations.
       if (disk_status == Status::kOk ||
           (disk_status == Status::kNotFound && ram_had)) {
         st = Status::kOk;
@@ -1085,14 +1115,16 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
       return Status::kOk;
     }
   }
+  const uint64_t read_epoch = CaptureReadEpoch(key);
   Status st;
-  if (coalesce_enabled_) {
+  if (coalesce_enabled_ && (read_epoch & 1) == 0) {
     st = read_coalescer_.Read(
         key, offset, length, dst, dst_cap, out_len, value_len,
         [&](char* buf, size_t cap, size_t* n, size_t* stored_len) {
           return group_.RangeInto(key, offset, length, buf, cap, n,
                                   stored_len);
-        });
+        },
+        nullptr, read_epoch);
   } else {
     st = group_.RangeInto(key, offset, length, dst, dst_cap, out_len,
                           value_len);
@@ -1218,8 +1250,9 @@ Status KvNodeServer::RangeDirectForKey(
   // Promotion needs the same read's full length even when the caller omits it.
   size_t stored_len = 0;
   if (value_len == nullptr) value_len = &stored_len;
+  const uint64_t read_epoch = CaptureReadEpoch(key);
   Status st;
-  if (coalesce_enabled_) {
+  if (coalesce_enabled_ && (read_epoch & 1) == 0) {
     // Leader reads into the shared scratch, every rank's convoy copy lands in
     // its own registered io_buf; *out_data must point at io_buf either way.
     st = read_coalescer_.Read(
@@ -1235,7 +1268,8 @@ Status KvNodeServer::RangeDirectForKey(
           if (s == Status::kOk && p && p != buf && *n > 0)
             std::memmove(buf, p, *n < cap ? *n : cap);
           return s;
-        });
+        },
+        nullptr, read_epoch);
     if (st == Status::kOk && out_data) *out_data = io_buf;
   } else {
     st = group_.RangeDirect(key, offset, length, io_buf, io_cap, out_data,
@@ -1249,7 +1283,7 @@ Status KvNodeServer::RangeDirectForKey(
     // Best-effort: the data is already durable, so no flush is needed.
     if (ram_ && offset == 0 && *out_data && *out_len > 0 &&
         *out_len == *value_len)
-      ram_->PutDurable(key, *out_data, *out_len);
+      PromoteRead(key, read_epoch, *out_data, *out_len);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else if (st == Status::kIOError) {
@@ -1290,14 +1324,17 @@ PreparedRead KvNodeServer::PrepareReadForKey(
   PreparedRead resident = prepare_ram_hit();
   if (resident.status() == Status::kOk) return resident;
 
+  const uint64_t read_epoch = CaptureReadEpoch(key);
+  const bool can_coalesce = coalesce_enabled_ && (read_epoch & 1) == 0;
+
   // A direct-to-RAM leader publishes before waking its no-copy followers.
   // A successful follower acquires its own send pin; timeout, failure, or a
   // same-thread duplicate must issue an independent read instead of waiting a
   // second time in the synchronous coalescer fallback.
   bool force_independent_read = false;
-  if (ram_ && coalesce_enabled_) {
+  if (ram_ && can_coalesce) {
     const ReadCoalescer::PublishedWait waited =
-        read_coalescer_.WaitForPublished(key, offset, length);
+        read_coalescer_.WaitForPublished(key, offset, length, read_epoch);
     if (waited != ReadCoalescer::PublishedWait::kNotEligible) {
       if (waited == ReadCoalescer::PublishedWait::kReady) {
         resident = prepare_ram_hit();
@@ -1312,8 +1349,8 @@ PreparedRead KvNodeServer::PrepareReadForKey(
 
   // A normal async leader is joined by the synchronous copy-follower path.
   // Direct-flight timeout/failure/self-recursion bypasses that second wait.
-  if (!force_independent_read && coalesce_enabled_ &&
-      read_coalescer_.InFlight(key, offset, length))
+  if (!force_independent_read && can_coalesce &&
+      read_coalescer_.InFlight(key, offset, length, read_epoch))
     return PreparedRead::Result(Status::kInvalid);
 
   ReadLease lease;
@@ -1334,19 +1371,25 @@ PreparedRead KvNodeServer::PrepareReadForKey(
   // successful completion will publish a durable RAM entry before wakeup.
   RamTier::DurableReservation reservation;
   bool direct_reservation = false;
-  if (ram_ && whole && lease.head == 0 &&
-      ram_->ReserveDurable(key, lease.value_len, &reservation)) {
-    direct_reservation = lease.aligned_len <= reservation.capacity();
-    if (!direct_reservation)
-      reservation = RamTier::DurableReservation{};
+  if (ram_ && whole && lease.head == 0 && (read_epoch & 1) == 0) {
+    ReadPublicationFence& fence = read_publication_[MutationKeyStripe(key)];
+    const std::lock_guard<std::mutex> lock(fence.mutex);
+    // Register under the same fence as Remove. Once registered, RAM's own
+    // cancel/Commit protocol hides the old bytes and completes Remove's wait.
+    if (fence.epoch == read_epoch &&
+        ram_->ReserveDurable(key, lease.value_len, &reservation)) {
+      direct_reservation = lease.aligned_len <= reservation.capacity();
+      if (!direct_reservation) reservation = RamTier::DurableReservation{};
+    }
   }
 
   uint64_t flight = 0;
-  if (!force_independent_read && coalesce_enabled_ && lease.fd() >= 0 &&
+  if (!force_independent_read && can_coalesce && lease.fd() >= 0 &&
       lease.payload_len != 0 && lease.aligned_len <= staging_cap &&
       lease.aligned_len <= std::numeric_limits<unsigned>::max()) {
-    flight = read_coalescer_.TryRegisterAsync(
-        key, offset, length, whole, lease.value_len, direct_reservation);
+    flight = read_coalescer_.TryRegisterAsync(key, offset, length, whole,
+                                              lease.value_len,
+                                              direct_reservation, read_epoch);
     if (flight == 0) {
       // The lease and any hidden reservation release on return.
       return PreparedRead::Result(Status::kInvalid);
@@ -1395,11 +1438,12 @@ void KvNodeServer::FinishDiskRead(
     BlockKey key;
     bool whole = false;
     bool recurrent = false;
+    uint64_t read_epoch = 0;
     (void)server->read_coalescer_.CompleteAsync(
         flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, &key,
-        &whole, &recurrent);
+        &whole, &recurrent, &read_epoch);
     if (ok && whole && server->ram_ && data && bytes_read) {
-      server->ram_->PutDurable(key, data, bytes_read);
+      server->PromoteRead(key, read_epoch, data, bytes_read);
     }
   }
   if (server->lat_sampler_.ShouldSample())
@@ -1421,8 +1465,10 @@ void KvNodeServer::FinishPromotedDiskRead(
 
   const bool ok = result == Status::kOk;
   if (ok) {
-    // Commit keeps the reservation's allocator pin as a send pin. The
-    // PreparedRead post-read hold releases it only after SEND completion.
+    // Always finish registered reservations, even across Remove: cancellation
+    // prevents publication but must wake Remove without waiting for SEND.
+    // Commit keeps the physical pin until the PreparedRead post-read hold is
+    // released.
     (void)promoted->reservation.Commit();
     server->cache_hit_.fetch_add(1, std::memory_order_relaxed);
     server->bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);

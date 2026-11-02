@@ -411,8 +411,15 @@ TEST(ReadCoalescer, FenceEpochSeparatesAsyncTokensAndRecurrence) {
       coalescer.TryRegisterAsync(key, 0, 3, true, 3, false, 24);
   ASSERT_NE(next_token, 0u);
   bool recurrent = true;
+  uint64_t completed_epoch = 0;
   EXPECT_FALSE(coalescer.CompleteAsync(next_token, Status::kOk, "now", 3,
-                                       nullptr, nullptr, &recurrent));
+                                       nullptr, nullptr, &recurrent,
+                                       &completed_epoch));
+  EXPECT_EQ(completed_epoch, 24u);
+  EXPECT_FALSE(coalescer.CompleteAsync(next_token, Status::kOk, "now", 3,
+                                       nullptr, nullptr, nullptr,
+                                       &completed_epoch));
+  EXPECT_EQ(completed_epoch, 24u);  // Retired tokens cannot rewrite identity.
   EXPECT_FALSE(recurrent) << "an old generation is not recurrence evidence";
   const uint64_t repeat_token =
       coalescer.TryRegisterAsync(key, 0, 3, true, 3, false, 24);
