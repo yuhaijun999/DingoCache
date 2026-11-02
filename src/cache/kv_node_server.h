@@ -187,6 +187,12 @@ class KvNodeServer {
   void EndPut();
   static size_t MutationKeyStripe(const BlockKey& key);
   std::unique_lock<std::mutex> LockMutationKey(const BlockKey& key);
+  uint64_t CaptureReadEpoch(const BlockKey& key);
+  // Caller holds the foreground mutation lock. Advance at both ends of Remove,
+  // never while holding a RAM/disk lock or waiting for a completion.
+  void AdvanceReadEpoch(const BlockKey& key);
+  void PromoteRead(const BlockKey& key, uint64_t epoch, const char* data,
+                   size_t len);
   // Test-only seam: installed before requests; production leaves empty.
   // Runs after RAM hiding/waiting and before disk removal.
   std::function<void()> before_disk_remove_hook_for_test_;
@@ -217,6 +223,16 @@ class KvNodeServer {
   // Remove may hold one while waiting for those workers' completion.
   static constexpr size_t kMutationKeyStripes = 1024;
   std::mutex mutation_key_mu_[kMutationKeyStripes];
+  struct ReadPublicationFence {
+    std::mutex mutex;
+    // Even: stable; odd: Remove in progress. Saturation permanently disables
+    // new promotion/coalescing for this stripe instead of reusing an identity.
+    uint64_t epoch = 0;
+  };
+  // Independent of mutation locks: completion must progress while Remove waits.
+  // Held only for epoch access and RAM registration/publication, never disk I/O
+  // or completion/SEND waits. RAM allocation/copy is not constant-time.
+  ReadPublicationFence read_publication_[kMutationKeyStripes];
   std::atomic<size_t> open_connections_{0};
   static constexpr size_t kDefaultTcpMaxConnections = 512;
   static constexpr size_t kHardTcpMaxConnections = 4096;
