@@ -31,6 +31,7 @@
 
 #include "cache/disk_slab_store.h"
 #include "cache/kv_node_server.h"
+#include "common/config_dump.h"
 #include "common/kv_types.h"
 #include "common/status.h"
 
@@ -389,6 +390,110 @@ class DiskGroupTest : public ::testing::Test {
   }
   fs::path base_;
 };
+
+TEST_F(DiskGroupTest, ConfigDumpReportsPolicyAndInactiveLifetimeValues) {
+  const ScopedEnv base_unset("DFKV_SLAB_LIFE_BASE_SEC");
+  const ScopedEnv max_reads("DFKV_SLAB_LIFE_MAX_READS", "not-a-number");
+  const ScopedEnv protect("DFKV_SLAB_PROTECT_SEC", "0");
+  const ScopedEnv boost("DFKV_SLAB_PROTECT_BOOST_SEC", "-1");
+  const ScopedEnv keep("DFKV_SLAB_KEEP_SCORE_SEC", "");
+  const ScopedEnv buckets("DFKV_SLAB_BUCKET_COUNT", "invalid");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "1048576");
+  for (const std::string engine : {"slab", "file"}) {
+    for (const std::string source : {"default", "env", "arg"}) {
+      SCOPED_TRACE(engine + ":" + source);
+      const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
+      if (source == "default") ::unsetenv("DFKV_SLAB_EVICTION_POLICY");
+      DiskCacheGroup::Options options;
+      options.cache_dirs = {(base_ / (engine + "-" + source)).string()};
+      options.capacity_bytes = 1ull << 30;
+      options.engine = engine;
+      if (source == "arg") {
+        options.eviction_policy = "LeGaCy";
+        ::setenv("DFKV_SLAB_EVICTION_POLICY", "lifetime", 1);
+      }
+      config_dump::ResetForTest();
+      testing::internal::CaptureStderr();
+      const DiskCacheGroup group(options);
+      config_dump::Emit("disk-policy-test");
+      const std::string output = testing::internal::GetCapturedStderr();
+      ASSERT_TRUE(group.Healthy()) << group.StartupError();
+      const auto expect_entry = [&output](const char* name,
+                                          const std::string& tail) {
+        const size_t begin = output.find(name);
+        ASSERT_NE(begin, std::string::npos) << name << "\n" << output;
+        const size_t end = output.find('\n', begin);
+        EXPECT_NE(output.substr(begin, end - begin).find(tail),
+                  std::string::npos)
+            << name << ": " << tail;
+      };
+      const bool is_default = source == "default";
+      expect_entry("DFKV_STORE_ENGINE", " = " + engine + "  (arg)");
+      expect_entry("disk_eviction_requested",
+                   std::string(" = ") + (is_default ? "lifetime" : "legacy") +
+                       "  (" + source + ")");
+      expect_entry("disk_eviction_effective",
+                   engine == "slab" ? " = legacy" : " = not_applicable");
+      expect_entry("disk_eviction_staged",
+                   engine == "slab" && is_default ? " = true" : " = false");
+      for (const char* name :
+           {"DFKV_SLAB_LIFE_BASE_SEC", "DFKV_SLAB_LIFE_READ_BONUS_SEC",
+            "DFKV_SLAB_LIFE_MAX_READS", "DFKV_SLAB_PROTECT_SEC",
+            "DFKV_SLAB_PROTECT_SLOWDOWN", "DFKV_SLAB_PROTECT_BOOST_SEC",
+            "DFKV_SLAB_KEEP_SCORE_SEC", "DFKV_SLAB_BUCKET_SEC",
+            "DFKV_SLAB_BUCKET_COUNT"}) {
+        expect_entry(name, " = inactive");
+      }
+      expect_entry("DFKV_SLAB_LIFE_BASE_SEC", " = inactive  (default)");
+      expect_entry("DFKV_SLAB_LIFE_MAX_READS",
+                   " = inactive (configured='not-a-number')  (env)");
+      expect_entry("DFKV_SLAB_KEEP_SCORE_SEC",
+                   " = inactive (configured='')  (env)");
+      EXPECT_NE(output.find("configured lifetime-only parameters are inactive"),
+                std::string::npos);
+    }
+  }
+}
+
+TEST_F(DiskGroupTest,
+       InvalidApplicableEnvLogsNameValueAndConstraintBeforeOpen) {
+  const ScopedEnv policy("DFKV_SLAB_EVICTION_POLICY", "legacy");
+  const ScopedEnv weight("DFKV_DISK_HASH_WEIGHT", "10");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "1048576");
+  const ScopedEnv sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  struct InvalidEnv {
+    const char* name;
+    const char* value;
+    const char* constraint;
+  };
+  const InvalidEnv cases[] = {
+      {"DFKV_DISK_HASH_WEIGHT", "65", "integer in [1,64]"},
+      {"DFKV_SLAB_WRITE", "wrong", "'direct' or 'buffered'"},
+      {"DFKV_SLAB_GRANULARITY", "0", "positive uint32"},
+      {"DFKV_SLAB_GRANULARITY", "oops", "positive uint32"},
+      {"DFKV_SLAB_TABLE_SYNC_MS", "-1", "uint32"},
+      {"DFKV_SLAB_RECLAIM_MS", "oops", "uint32"}};
+  for (const InvalidEnv& invalid : cases) {
+    SCOPED_TRACE(invalid.name);
+    const ScopedEnv env(invalid.name, invalid.value);
+    testing::internal::CaptureStderr();
+    const DiskCacheGroup group(
+        {{(base_ / "a").string(), (base_ / "b").string()}, 2ull << 30, "slab"});
+    const std::string output = testing::internal::GetCapturedStderr();
+    EXPECT_FALSE(group.Healthy());
+    EXPECT_EQ(group.DiskCount(), 0U);
+    EXPECT_FALSE(fs::exists(base_));
+    const std::string parameter =
+        std::string(invalid.name) + "='" + invalid.value + "'";
+    EXPECT_NE(group.StartupError().find(parameter), std::string::npos);
+    EXPECT_NE(output.find("[ERROR]"), std::string::npos);
+    EXPECT_NE(output.find(parameter), std::string::npos);
+    EXPECT_NE(output.find(invalid.constraint), std::string::npos);
+  }
+}
 
 TEST_F(DiskGroupTest, InvalidPolicyRejectsBeforeAnyDiskFactory) {
   for (const std::string engine : {"slab", "file"}) {

@@ -346,10 +346,6 @@ int main(int argc, char** argv) {
     cd::Record("DFKV_MDS_REGISTRATION_TIMEOUT_MS",
                std::to_string(mds_registration_timeout_ms),
                mds_registration_timeout_source);
-    if (args.Has("--slab-eviction-policy")) {
-      cd::Record("DFKV_SLAB_EVICTION_POLICY",
-                 args.Get("--slab-eviction-policy", ""), cd::Source::kFlag);
-    }
   }
   std::signal(SIGINT, OnSig);
   std::signal(SIGTERM, OnSig);
@@ -631,6 +627,24 @@ int main(int argc, char** argv) {
                   " id=" + node_id + " advertise=" + advertise);
   }
 
+  // The library sees caller arguments; only main knows they came from flags.
+  // Startup has validated the policy, so preserve its canonical requested
+  // value.
+  {
+    namespace cd = dfkv::config_dump;
+    if (!store_engine.empty())
+      cd::Record("DFKV_STORE_ENGINE", store_engine, cd::Source::kFlag);
+    if (args.Has("--slab-eviction-policy")) {
+      const std::string policy = args.Get("--slab-eviction-policy", "");
+      cd::Record("DFKV_SLAB_EVICTION_POLICY", policy, cd::Source::kFlag);
+      cd::Record("disk_eviction_requested",
+                 dfkv::ParseDiskEvictionPolicy(policy) ==
+                         dfkv::DiskEvictionPolicy::kLegacy
+                     ? "legacy"
+                     : "lifetime",
+                 cd::Source::kFlag);
+    }
+  }
   dfkv::config_dump::Emit("server");
   ready_flag->store(true, std::memory_order_release);
   DFKV_LOG_INFO(mds.empty()

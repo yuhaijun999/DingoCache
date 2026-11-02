@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Report requested/effective disk eviction policy, engine, staging and actual
+  flag/env/API/default provenance through the existing startup config dump.
+  All nine lifetime-only parameters are explicitly inactive in staged legacy,
+  explicit legacy and file mode; configured values are shown as ignored, without
+  validation. Explicit lifetime remains unavailable until stage 4.5.
+- Log the first disk-group startup failure at ERROR. Invalid hash weight and
+  slab write/granularity/sync/reclaim values now include the parameter, raw input
+  and constraint before opening stores instead of only a generic startup error.
+
 - Preflight interrupted-initialization directory whitelists before opening any
   disk. Reject resume roots that are symlinks, unexpected root entries and
   noncanonical/out-of-range extent names using the same rules as normal startup.
