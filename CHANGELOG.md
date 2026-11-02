@@ -2,10 +2,16 @@
 
 ## Unreleased
 
+- Retire obsolete durable RAM copies before foreground single PUTs, preserving
+  dirty PUT ownership and dirty-watermark rejection. Old SEND pins retain their
+  bytes; canceled read promotions cannot stand in for a new PUT or republish late.
+  An old durable pin may cause disk fallback without waiting for SEND. Existing
+  disk values still keep the first payload. Batch cross-tier ordering is separate.
+
 - Fence disk-read RAM publication and coalescing across Remove, including reads
   whose reservation or staging completion arrives late. Registered reservations
-  retain their existing cancellation and SEND-pin lifetime protocol. PUT versus
-  surviving durable RAM and full batch cross-tier ordering remain separate work.
+  retain their existing cancellation and SEND-pin lifetime protocol. Full batch
+  cross-tier ordering remains separate work.
 
 - Serialize foreground PUT and Remove across RAM and disk in every write mode,
   including direct batches with ordered, deduplicated key-stripe locking. A new

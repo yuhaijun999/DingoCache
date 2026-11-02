@@ -9,14 +9,17 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstring>
 #include <condition_variable>
+#include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include "common/status.h"
 
 using dfkv::BlockKey;
 using dfkv::RamTier;
@@ -253,14 +256,19 @@ TEST(RamTier, PositiveWatermarkRejectsNewKeysButPreservesExistingOwners) {
   EXPECT_EQ(rt.PutBypass(), 0u);
   EXPECT_EQ(rt.AckBackpressure(), 1u);
 
-  // Tombstones also resolve before the watermark and retain their error.
+  // A removed durable copy is not a failed PUT owner. Its pinned allocation
+  // must obey the same positive watermark as every other unadmitted request.
   ASSERT_TRUE(rt.PutDurable(K(107), first.data(), first.size()));
   RamTier::Hit pin;
   ASSERT_TRUE(rt.GetPrep(K(107), 0, 0, &pin));
   ASSERT_TRUE(rt.Remove(K(107)));
-  const auto removed = rt.PutWriteBack(K(107), different.data(), different.size());
-  EXPECT_EQ(removed.status, Status::kIOError);
-  EXPECT_EQ(removed.disposition, RamTier::PutDisposition::kComplete);
+  const RamTier::PutResult removed =
+      rt.PutWriteBack(K(107), different.data(), different.size());
+  EXPECT_EQ(removed.status, Status::kCacheFull);
+  EXPECT_EQ(removed.disposition, RamTier::PutDisposition::kBackpressure);
+  EXPECT_EQ(rt.PutBypass(), 0u);
+  EXPECT_EQ(rt.AckBackpressure(), 2u);
+  EXPECT_EQ(std::string(pin.ptr, pin.len), first);
   pin = RamTier::Hit{};
   ASSERT_TRUE(rt.GetPrep(K(105), 0, 0, &pin));
   EXPECT_EQ(std::string(pin.ptr, pin.len), first);
@@ -586,7 +594,7 @@ TEST(RamTier, RemoveCancelsQueuedGenerationBeforeReinsert) {
   EXPECT_EQ(sink.values.at(K(34).Filename()), new_value);
 }
 
-TEST(RamTier, RemovedPinnedGenerationRejectsRatherThanBypassing) {
+TEST(RamTier, RemovedPinnedDurableCopyAllowsBypass) {
   FlushSink sink;
   RamTier::Options options = Opts(8 * 4096);
   options.large_reserve_bytes = 0;
@@ -598,13 +606,23 @@ TEST(RamTier, RemovedPinnedGenerationRejectsRatherThanBypassing) {
   ASSERT_TRUE(rt.GetPrep(K(35), 0, 0, &pinned));
   ASSERT_TRUE(rt.Remove(K(35)));
   EXPECT_FALSE(rt.Contains(K(35)));
-  // Physical ownership has not retired: neither payload size nor ACK mode
-  // permits a direct-disk fallback while the old generation is still pinned.
-  EXPECT_EQ(rt.PutCommitted(K(35), conflicting.data(), conflicting.size()).status,
-            Status::kIOError);
-  EXPECT_EQ(rt.PutWriteBack(K(35), conflicting.data(), conflicting.size()).status,
-            Status::kIOError);
-  EXPECT_EQ(rt.PutBypass(), 0u);
+  // A retired durable cache copy does not own a new PUT. It may bypass RAM
+  // without waiting for SEND, but must not overwrite or release its old slot.
+  const uint64_t used = rt.UsedBytes();
+  const RamTier::PutResult disk_ack =
+      rt.PutCommitted(K(35), conflicting.data(), conflicting.size());
+  const RamTier::PutResult ram_ack =
+      rt.PutWriteBack(K(35), conflicting.data(), conflicting.size());
+  EXPECT_EQ(disk_ack.status, Status::kCacheFull);
+  EXPECT_EQ(disk_ack.disposition, RamTier::PutDisposition::kBypass);
+  EXPECT_EQ(ram_ack.status, Status::kCacheFull);
+  EXPECT_EQ(ram_ack.disposition, RamTier::PutDisposition::kBypass);
+  EXPECT_EQ(rt.PutBypass(), 2u);
+  EXPECT_EQ(rt.UsedBytes(), used);
+  {
+    const std::lock_guard<std::mutex> lock(sink.m);
+    EXPECT_EQ(sink.calls, 0);
+  }
   EXPECT_EQ(std::string(pinned.ptr, pinned.len), first);
   pinned = RamTier::Hit{};
   EXPECT_EQ(rt.UsedBytes(), 0u);
@@ -1198,4 +1216,161 @@ TEST(RamTier, PutDurableDedupsAgainstResident) {
   EXPECT_TRUE(rt.PutDurable(K(91), v.data(), v.size()));  // resident -> no-op true
   EXPECT_EQ(rt.UsedBytes(), used);                        // no second slot
   EXPECT_EQ(rt.Promoted(), 0u);                           // dedup is not a promotion
+}
+
+TEST(RamTier, RetireDurableForPutPreservesPinnedBytes) {
+  for (const bool pinned : {false, true}) {
+    SCOPED_TRACE(pinned);
+    FlushSink sink;
+    RamTier::Options options = Opts(16 * 4096);
+    options.reclaim_interval_ms = 0;
+    RamTier rt(options, sink.fn());
+    const std::string value(4096, 'o');
+    rt.RetireDurableForPut(K(200));  // Absent keys require no cleanup.
+    ASSERT_TRUE(rt.PutDurable(K(200), value.data(), value.size()));
+    RamTier::Hit hit;
+    if (pinned) {
+      ASSERT_TRUE(rt.GetPrep(K(200), 0, 0, &hit));
+    }
+    const uint64_t used = rt.UsedBytes();
+    rt.RetireDurableForPut(K(200));
+    rt.RetireDurableForPut(K(200));  // Retirement is idempotent.
+    EXPECT_FALSE(rt.Contains(K(200)));
+    EXPECT_EQ(rt.UsedBytes(), pinned ? used : 0u);
+    if (pinned) {
+      const RamTier::PutResult result =
+          rt.PutCommitted(K(200), "replacement", 11);
+      EXPECT_EQ(result.disposition, RamTier::PutDisposition::kBypass);
+      EXPECT_EQ(result.status, Status::kCacheFull);
+      EXPECT_EQ(std::string(hit.ptr, hit.len), value);
+    }
+    hit = RamTier::Hit{};
+    EXPECT_EQ(rt.UsedBytes(), 0u);
+  }
+}
+
+TEST(RamTier, RetireDurableForPutCancelsHiddenPromotionWithoutJoiningIt) {
+  FlushSink sink;
+  RamTier rt(Opts(16 * 4096), sink.fn());
+  const std::string value(4096, 'p');
+  RamTier::DurableReservation reservation;
+  ASSERT_TRUE(rt.ReserveDurable(K(201), value.size(), &reservation));
+  std::memcpy(reservation.data(), value.data(), value.size());
+  const uint64_t used = rt.UsedBytes();
+  rt.RetireDurableForPut(K(201));
+  RamTierTestPeer::Completion completion;
+  EXPECT_EQ(RamTierTestPeer::Admit(rt, K(201), "replacement", &completion),
+            RamTierTestPeer::Admission::kBypass);
+  EXPECT_EQ(completion, nullptr);
+  EXPECT_FALSE(reservation.Commit());
+  EXPECT_FALSE(rt.Contains(K(201)));
+  EXPECT_EQ(rt.UsedBytes(), used);
+  EXPECT_EQ(std::string(reservation.data(), value.size()), value);
+  reservation = RamTier::DurableReservation{};
+  EXPECT_EQ(rt.UsedBytes(), 0u);
+}
+
+TEST(RamTier, RetireDurableForPutKeepsDirtyFirstOwnerAndCompletion) {
+  FlushSink sink;
+  sink.close();
+  RamTier rt(Opts(16 * 4096), sink.fn());
+  const OpenFlushOnExit cleanup{sink};
+  const std::string value(4096, 'd');
+  RamTierTestPeer::Completion first, duplicate;
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(202), value, &first),
+            RamTierTestPeer::Admission::kAccepted);
+  ASSERT_TRUE(sink.await_calls(1));
+  rt.RetireDurableForPut(K(202));
+  EXPECT_EQ(RamTierTestPeer::Admit(rt, K(202), "different", &duplicate),
+            RamTierTestPeer::Admission::kDuplicate);
+  EXPECT_EQ(duplicate, first);
+  EXPECT_FALSE(RamTierTestPeer::Done(first));
+  RamTier::Hit hit;
+  ASSERT_TRUE(rt.GetPrep(K(202), 0, 0, &hit));
+  EXPECT_EQ(std::string(hit.ptr, hit.len), value);
+  hit = RamTier::Hit{};
+  sink.open();
+  ASSERT_TRUE(RamTierTestPeer::AwaitDone(first));
+  EXPECT_EQ(RamTierTestPeer::Wait(first), Status::kOk);
+  EXPECT_EQ(RamTierTestPeer::Wait(duplicate), Status::kOk);
+}
+
+TEST(RamTier, RetiredCopyCannotBypassPositiveDirtyWatermark) {
+  for (const bool promotion : {false, true}) {
+    SCOPED_TRACE(promotion);
+    FlushSink sink;
+    sink.close();
+    RamTier::Options options = Opts(16 * 4096);
+    options.ack_high_watermark_pct = 1;
+    options.reclaim_interval_ms = 0;
+    RamTier rt(options, sink.fn());
+    const OpenFlushOnExit cleanup{sink};
+    const std::string value(4096, 'w');
+    RamTier::DurableReservation reservation;
+    RamTier::Hit pinned;
+    if (promotion) {
+      ASSERT_TRUE(rt.ReserveDurable(K(203), value.size(), &reservation));
+    } else {
+      ASSERT_TRUE(rt.PutDurable(K(203), value.data(), value.size()));
+      ASSERT_TRUE(rt.GetPrep(K(203), 0, 0, &pinned));
+    }
+    ASSERT_EQ(rt.PutWriteBack(K(204), value.data(), value.size()).status,
+              Status::kOk);
+    ASSERT_TRUE(sink.await_calls(1));
+    rt.RetireDurableForPut(K(203));
+    const RamTier::PutResult result =
+        rt.PutWriteBack(K(203), value.data(), value.size());
+    EXPECT_EQ(result.status, Status::kCacheFull);
+    EXPECT_EQ(result.disposition, RamTier::PutDisposition::kBackpressure);
+    EXPECT_EQ(rt.PutBypass(), 0u);
+    EXPECT_EQ(rt.AckBackpressure(), 1u);
+    EXPECT_FALSE(rt.Contains(K(203)));
+    if (promotion) {
+      EXPECT_FALSE(reservation.Commit());
+    } else {
+      EXPECT_EQ(std::string(pinned.ptr, pinned.len), value);
+    }
+    sink.open();
+    ASSERT_TRUE(rt.WaitForDrain(std::chrono::seconds(2)));
+  }
+}
+
+TEST(RamTier, RemovedPinnedDirtyOwnerRejectsRatherThanBypassing) {
+  FlushSink sink;
+  sink.close();
+  RamTier::Options options = Opts(8 * 4096);
+  options.large_reserve_bytes = 0;
+  options.reclaim_interval_ms = 0;
+  RamTier rt(options, sink.fn());
+  const OpenFlushOnExit cleanup{sink};
+  const std::string value(4096, 'd');
+  ASSERT_TRUE(rt.Put(K(205), value.data(), value.size()));
+  ASSERT_TRUE(sink.await_calls(1));  // Keep the only flusher off the next key.
+  RamTierTestPeer::Completion completion;
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(206), value, &completion),
+            RamTierTestPeer::Admission::kAccepted);
+  RamTier::Hit pinned;
+  ASSERT_TRUE(rt.GetPrep(K(206), 0, 0, &pinned));
+  ASSERT_TRUE(rt.Remove(K(206)));  // Queued cancellation completes immediately.
+  EXPECT_EQ(RamTierTestPeer::Wait(completion), Status::kIOError);
+  rt.RetireDurableForPut(K(206));
+  const uint64_t used = rt.UsedBytes();
+  const RamTier::PutResult disk_ack = rt.PutCommitted(K(206), "different", 9);
+  const RamTier::PutResult ram_ack = rt.PutWriteBack(K(206), "different", 9);
+  EXPECT_EQ(disk_ack.status, Status::kIOError);
+  EXPECT_EQ(disk_ack.disposition, RamTier::PutDisposition::kComplete);
+  EXPECT_EQ(ram_ack.status, Status::kIOError);
+  EXPECT_EQ(ram_ack.disposition, RamTier::PutDisposition::kComplete);
+  EXPECT_EQ(rt.PutBypass(), 0u);
+  EXPECT_EQ(rt.UsedBytes(), used);
+  EXPECT_EQ(std::string(pinned.ptr, pinned.len), value);
+  pinned = RamTier::Hit{};
+  EXPECT_LT(rt.UsedBytes(), used);
+  EXPECT_FALSE(rt.Contains(K(206)));
+  {
+    const std::lock_guard<std::mutex> lock(sink.m);
+    EXPECT_EQ(sink.calls, 1);  // The canceled value was never flushed.
+  }
+  sink.open();
+  ASSERT_TRUE(rt.WaitForDrain(std::chrono::seconds(2)));
 }
