@@ -22,7 +22,7 @@ help_error=$("$BUILD/dfkv_server" --help 2>&1 >/dev/full) || rc=$?
 D=$(mktemp -d)
 mkdir "$D/cache"
 : > "$D/srv.out"   # pre-create so the awk below can't fail on a missing file under `set -e`
-env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_SLAB_EVICTION_POLICY "$BUILD/dfkv_server" \
+env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_SLAB_EVICTION_POLICY DFKV_LOG=info "$BUILD/dfkv_server" \
   --dir "$D/cache" --port 0 --cap 1073741824 --slab-granularity 1048576 \
   >>"$D/srv.out" 2>&1 &
 PID=$!
@@ -46,6 +46,15 @@ got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get k
 [ "$got" = "v12345" ] || { echo "get mismatch: '$got'"; exit 1; }
 "$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" exist k | grep -q true
 "$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -q dfkv_cache_put_total
+# Wait for the config dump rather than racing the earlier PORT announcement.
+for i in $(seq 1 100); do
+  grep -q 'disk_eviction_staged' "$D/srv.out" && break
+  sleep 0.05
+done
+grep -qE 'DFKV_STORE_ENGINE[[:space:]]*= slab[[:space:]]+[(]default[)]' "$D/srv.out"
+grep -qE 'disk_eviction_requested[[:space:]]*= lifetime[[:space:]]+[(]default[)]' "$D/srv.out"
+grep -qE 'disk_eviction_effective[[:space:]]*= legacy' "$D/srv.out"
+grep -qE 'disk_eviction_staged[[:space:]]*= true' "$D/srv.out"
 echo "tool_smoke OK (port $P)"
 
 # Strict arg parsing: an unknown flag / bad number / bad --advertise must fail
@@ -195,19 +204,102 @@ echo "mds etcd-probe smoke OK"
 # parser or an env rewrite. Conflicting invalid env must not win over the flag.
 for engine in slab file; do
   rc=0
-  DFKV_SLAB_EVICTION_POLICY=unknown DFKV_SLAB_WRITE=buffered \
+  DFKV_LOG=info DFKV_SLAB_EVICTION_POLICY=unknown DFKV_SLAB_WRITE=buffered \
+    DFKV_SLAB_LIFE_MAX_READS=0 DFKV_PUT_ACK_MODE=ram \
+    DFKV_RAM_TIER_SHARDS=1 DFKV_RAM_FLUSH_THREADS=1 \
     timeout --kill-after=2s 3s "$BUILD/dfkv_server" \
     --dir "$D/policy-$engine" --port 0 --cap 1073741824 \
     --store-engine "$engine" --slab-eviction-policy LeGaCy \
-    --slab-granularity 1048576 \
+    --slab-granularity 1048576 --ram-tier on --ram-tier-bytes 67108864 \
+    --ram-write-mode writeback \
     >"$D/policy-$engine.out" 2>&1 || rc=$?
   [ "$rc" = 124 ] || { cat "$D/policy-$engine.out"; exit 1; }
   grep -q '^PORT ' "$D/policy-$engine.out"
   grep -qE 'DFKV_SLAB_EVICTION_POLICY[[:space:]]*= LeGaCy[[:space:]]+[(]flag[)]' \
     "$D/policy-$engine.out"
+  grep -qE "DFKV_STORE_ENGINE[[:space:]]*= $engine[[:space:]]+[(]flag[)]" "$D/policy-$engine.out"
+  grep -qE 'disk_eviction_requested[[:space:]]*= legacy[[:space:]]+[(]flag[)]' "$D/policy-$engine.out"
+  grep -qE 'disk_eviction_staged[[:space:]]*= false' "$D/policy-$engine.out"
+  grep -qE 'DFKV_SLAB_LIFE_MAX_READS[[:space:]]*= inactive' "$D/policy-$engine.out"
+  grep -qE 'DFKV_PUT_ACK_MODE[[:space:]]*= ram' "$D/policy-$engine.out"
 done
 [ -f "$D/policy-slab/slots.tbl" ]
 [ ! -e "$D/policy-file/slots.tbl" ]
+
+# Actual slab/file startup with inactive invalid lifetime numbers must preserve
+# legacy writeback + RAM-ACK (both default ACK and explicitly configured RAM).
+for engine in slab file; do
+  for source in default env; do
+    selected=()
+    if [ "$source" = env ]; then
+      selected=(DFKV_SLAB_EVICTION_POLICY=LeGaCy DFKV_PUT_ACK_MODE=ram)
+    fi
+    log="$D/config-$engine-$source.out"
+    rc=0
+    env -u DFKV_SLAB_EVICTION_POLICY -u DFKV_PUT_ACK_MODE \
+      "${selected[@]}" DFKV_LOG=info DFKV_SLAB_WRITE=buffered \
+      DFKV_SLAB_LIFE_BASE_SEC=-1 DFKV_SLAB_LIFE_READ_BONUS_SEC=oops \
+      DFKV_SLAB_LIFE_MAX_READS=0 DFKV_SLAB_PROTECT_SEC=0 \
+      DFKV_SLAB_PROTECT_SLOWDOWN=0 DFKV_SLAB_PROTECT_BOOST_SEC=-1 \
+      DFKV_SLAB_KEEP_SCORE_SEC= DFKV_SLAB_BUCKET_SEC=0 DFKV_SLAB_BUCKET_COUNT=0 \
+      DFKV_RAM_TIER_SHARDS=1 DFKV_RAM_FLUSH_THREADS=1 \
+      timeout --kill-after=2s 3s "$BUILD/dfkv_server" \
+      --dir "$D/config-$engine-$source" --port 0 --cap 1073741824 \
+      --store-engine "$engine" --slab-granularity 1048576 \
+      --ram-tier on --ram-tier-bytes 67108864 --ram-write-mode writeback \
+      >"$log" 2>&1 || rc=$?
+    [ "$rc" = 124 ] || { cat "$log"; exit 1; }
+    grep -q '^PORT ' "$log"
+    grep -qE "DFKV_STORE_ENGINE[[:space:]]*= $engine[[:space:]]+[(]flag[)]" "$log"
+    requested=legacy; staged=false; effective=not_applicable
+    [ "$source" = default ] && requested=lifetime
+    if [ "$engine" = slab ]; then
+      effective=legacy
+      [ "$source" = default ] && staged=true
+      [ -f "$D/config-$engine-$source/slots.tbl" ]
+    else
+      [ ! -e "$D/config-$engine-$source/slots.tbl" ]
+    fi
+    grep -qE "disk_eviction_requested[[:space:]]*= $requested[[:space:]]+[(]$source[)]" "$log"
+    grep -qE "disk_eviction_effective[[:space:]]*= $effective" "$log"
+    grep -qE "disk_eviction_staged[[:space:]]*= $staged" "$log"
+    grep -qE 'DFKV_RAM_TIER[[:space:]]*= on' "$log"
+    grep -qE 'DFKV_RAM_WRITE_MODE[[:space:]]*= writeback' "$log"
+    grep -qE 'DFKV_PUT_ACK_MODE[[:space:]]*= ram' "$log"
+    for name in LIFE_BASE_SEC LIFE_READ_BONUS_SEC LIFE_MAX_READS PROTECT_SEC \
+                PROTECT_SLOWDOWN PROTECT_BOOST_SEC KEEP_SCORE_SEC BUCKET_SEC BUCKET_COUNT; do
+      grep -qE "DFKV_SLAB_$name[[:space:]]*= inactive" "$log"
+    done
+    grep -q 'configured lifetime-only parameters are inactive' "$log"
+  done
+done
+
+# No flag: the env value itself must be diagnosed and cannot create a directory.
+for engine in slab file; do
+  rc=0
+  DFKV_SLAB_EVICTION_POLICY=lifetime DFKV_RAM_TIER=0 \
+    timeout --kill-after=2s 3s "$BUILD/dfkv_server" \
+    --dir "$D/env-lifetime-$engine" --port 0 --store-engine "$engine" \
+    >"$D/env-lifetime-$engine.out" 2>&1 || rc=$?
+  [ "$rc" = 1 ]
+  grep -q "ERROR.*DFKV_SLAB_EVICTION_POLICY='lifetime'" "$D/env-lifetime-$engine.out"
+  [ ! -e "$D/env-lifetime-$engine" ]
+done
+
+for pair in DFKV_DISK_HASH_WEIGHT=65 DFKV_SLAB_WRITE=wrong \
+            DFKV_SLAB_GRANULARITY=oops DFKV_SLAB_TABLE_SYNC_MS=-1 DFKV_SLAB_RECLAIM_MS=oops; do
+  name="${pair%%=*}"; value="${pair#*=}"
+  rc=0
+  env -u DFKV_SLAB_GRANULARITY -u DFKV_SLAB_TABLE_SYNC_MS -u DFKV_SLAB_RECLAIM_MS \
+    DFKV_DISK_HASH_WEIGHT=10 DFKV_SLAB_WRITE=buffered DFKV_RAM_TIER=0 "$pair" \
+    timeout --kill-after=2s 3s "$BUILD/dfkv_server" --dir "$D/bad-$name" \
+    --port 0 --store-engine slab --slab-eviction-policy legacy \
+    >"$D/bad-$name.out" 2>&1 || rc=$?
+  [ "$rc" = 1 ]
+  grep -q "ERROR.*$name='$value'.*must be" "$D/bad-$name.out"
+  [ ! -e "$D/bad-$name" ]
+done
+echo "stage-0 effective policy, inactive LIFE and diagnostics smoke OK"
 
 rc=0
 "$BUILD/dfkv_server" --dir "$D/missing-policy-value" \

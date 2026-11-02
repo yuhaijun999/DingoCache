@@ -17,6 +17,17 @@ DingoCache's **dfkv** is a standalone distributed KV cache for LLM inference. Ca
 - **Fit different inference stacks.** SGLang uses a dynamic HiCache plugin, LMCache uses its remote connector (or MP-server L2 adapter), and vLLM uses a direct `KVConnectorBase_V1` connector. All three share the `libdfkv.so` client and its raw-value contract.
 - **Operate a changing ring.** Stateless `dfkv_mds` instances use etcd leases for membership; clients discover the ring and rebuild their route on placement changes. Per-node and client metrics, readiness endpoints, and `dfkvctl` help inspect it.
 
+### Development-branch disk eviction status
+
+The development branch is preparing a lifetime policy; it is **not active yet**.
+For slab, an unspecified policy reports `requested=lifetime`, `effective=legacy`,
+`staged=true`; file reports `effective=not_applicable`. Explicit `legacy` remains
+available, while explicit `lifetime` is rejected before storage opens. Startup
+logs label lifetime-only values `inactive`; they do not change legacy or file
+behavior. See [deployment configuration](docs/DEPLOY.md#当前磁盘淘汰策略请求值不等于生效值)
+for the fields and source labels. This does not describe the pinned release
+binary used in the quickstart below.
+
 ## Architecture at a glance
 
 ```mermaid
