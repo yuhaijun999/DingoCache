@@ -36,6 +36,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -65,10 +66,11 @@ class ReadCoalescer {
     uint64_t tenant_hash;
     uint64_t offset;
     uint64_t length;
+    uint64_t fence_epoch = 0;
     bool operator==(const Key& other) const {
       return digest_hi == other.digest_hi && digest_lo == other.digest_lo &&
              tenant_hash == other.tenant_hash && offset == other.offset &&
-             length == other.length;
+             length == other.length && fence_epoch == other.fence_epoch;
     }
   };
   struct KeyHash {
@@ -81,14 +83,23 @@ class ReadCoalescer {
       combine(std::hash<uint64_t>()(key.tenant_hash));
       combine(std::hash<uint64_t>()(key.offset));
       combine(std::hash<uint64_t>()(key.length));
+      combine(std::hash<uint64_t>()(key.fence_epoch));
       return hash;
     }
   };
 
+  // The caller captures fence_epoch before reading and advances it across
+  // same-key mutations. Different epochs never join or share recurrence hints.
+  // This tag orders cross-layer work; it is NOT a disk resident identity and
+  // does not itself prevent late RAM publication (the caller must revalidate).
+  // Zero preserves existing callers until they adopt the ordering protocol.
+
   // True if an identical read is currently in flight (used by the async-prep
   // path as a cheap early decline, before the index lookup + fd open).
-  bool InFlight(const BlockKey& bk, uint64_t offset, uint64_t length) {
-    Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
+  bool InFlight(const BlockKey& bk, uint64_t offset, uint64_t length,
+                uint64_t fence_epoch = 0) {
+    const Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash,
+                offset,       length,       fence_epoch};
     std::lock_guard<std::mutex> lk(mu_);
     return map_.find(k) != map_.end();
   }
@@ -107,9 +118,10 @@ class ReadCoalescer {
   // the bytes before waking no-copy followers.
   uint64_t TryRegisterAsync(const BlockKey& bk, uint64_t offset,
                             uint64_t length, bool whole_value,
-                            size_t value_len = 0,
-                            bool publishes_to_ram = false) {
-    Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
+                            size_t value_len = 0, bool publishes_to_ram = false,
+                            uint64_t fence_epoch = 0) {
+    const Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash,
+                offset,       length,       fence_epoch};
     std::lock_guard<std::mutex> lk(mu_);
     if (map_.find(k) != map_.end()) return 0;
     auto f = std::make_shared<Flight>();
@@ -209,8 +221,9 @@ class ReadCoalescer {
   // copy-follower path. kFallback tells the caller not to wait a second time:
   // issue an independent disk read after timeout, failure, or self-recursion.
   PublishedWait WaitForPublished(const BlockKey& bk, uint64_t offset,
-                                 uint64_t length) {
-    Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
+                                 uint64_t length, uint64_t fence_epoch = 0) {
+    const Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash,
+                offset,       length,       fence_epoch};
     std::shared_ptr<Flight> f;
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -251,8 +264,10 @@ class ReadCoalescer {
   // snapshot as the bytes; followers never perform a racy second lookup.
   Status Read(const BlockKey& bk, uint64_t offset, uint64_t length, char* dst,
               size_t dst_cap, size_t* out_len, size_t* out_value_len,
-              const FillWithMetadata& fill, Outcome* oc = nullptr) {
-    Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
+              const FillWithMetadata& fill, Outcome* oc = nullptr,
+              uint64_t fence_epoch = 0) {
+    const Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash,
+                offset,       length,       fence_epoch};
     std::shared_ptr<Flight> f;
     bool leader = false;
     {
@@ -331,7 +346,6 @@ class ReadCoalescer {
     coalesced_.fetch_add(1, std::memory_order_relaxed);
     return Status::kOk;
   }
-
 
   size_t leaders() const { return leaders_.load(std::memory_order_relaxed); }
   size_t coalesced() const { return coalesced_.load(std::memory_order_relaxed); }
