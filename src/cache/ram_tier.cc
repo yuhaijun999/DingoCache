@@ -1,15 +1,20 @@
 #include "cache/ram_tier.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
-#include "utils/log.h"
 #include "common/config_dump.h"
-#include "utils/thread_name.h"
+#include "common/kv_types.h"
+#include "utils/log.h"
 #include "utils/numa_util.h"
+#include "utils/thread_name.h"
 
 namespace dfkv {
 namespace {
@@ -477,20 +482,38 @@ RamTier::Admission RamTier::Admit(
   // releasing and immediately reacquiring this shard only adds contention.
   std::unique_lock<std::mutex> admission_lock(s.mu);
   {
-    auto existing = s.index.find(key);
+    bool ram_blocked = false;
+    const std::unordered_map<BlockKey, Entry, KeyHash>::iterator existing =
+        s.index.find(key);
     if (existing != s.index.end()) {
-      if (existing->second.remove_pending) return Admission::kRejected;
-      if (!existing->second.completion) {
-        existing->second.completion = std::make_shared<PutCompletion>();
-        CompletePut(existing->second.completion, existing->second.durable);
+      Entry& entry = existing->second;
+      if (entry.durable && entry.remove_pending) {
+        ram_blocked = true;  // Old SEND still owns the retired physical slot.
+      } else {
+        if (entry.remove_pending) return Admission::kRejected;
+        if (!entry.completion) {
+          entry.completion = std::make_shared<PutCompletion>();
+          CompletePut(entry.completion, entry.durable);
+        }
+        if (out_completion) *out_completion = entry.completion;
+        return Admission::kDuplicate;
       }
-      if (out_completion) *out_completion = existing->second.completion;
-      return Admission::kDuplicate;
     }
-    auto writing = s.writing.find(key);
+    const std::unordered_map<BlockKey, std::shared_ptr<PutCompletion>,
+                             KeyHash>::iterator writing = s.writing.find(key);
     if (writing != s.writing.end()) {
-      if (out_completion) *out_completion = writing->second;
-      return Admission::kDuplicate;
+      bool canceled_promotion = false;
+      {
+        const std::lock_guard<std::mutex> lock(writing->second->mu);
+        canceled_promotion =
+            writing->second->promotion && writing->second->canceled;
+      }
+      if (canceled_promotion) {
+        ram_blocked = true;
+      } else {
+        if (out_completion) *out_completion = writing->second;
+        return Admission::kDuplicate;
+      }
     }
     if (opt_.is_persisted && opt_.is_persisted(key))
       return Admission::kPersisted;
@@ -503,6 +526,12 @@ RamTier::Admission RamTier::Admit(
         ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
         return Admission::kBackpressure;
       }
+    }
+    // A retired copy may prevent allocation until its old SEND finishes, but
+    // it must not waive the positive dirty watermark above or claim this PUT.
+    if (ram_blocked) {
+      put_bypass_.fetch_add(1, std::memory_order_relaxed);
+      return Admission::kBypass;
     }
     // An oversized conflicting duplicate must still join the first value,
     // rather than bypassing RAM with different bytes.
@@ -666,7 +695,8 @@ bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
 
   const size_t shard_index = KeyHash{}(key) % shards_.size();
   Shard& s = *shards_[shard_index];
-  auto completion = std::make_shared<PutCompletion>();
+  std::shared_ptr<PutCompletion> completion = std::make_shared<PutCompletion>();
+  completion->promotion = true;
   uint64_t offset = 0;
   uint64_t cap = requested_cap;
   SlabAllocator::SlotHandle slot_handle;
@@ -826,7 +856,9 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
   uint64_t cap = requested_cap;
   AlignedBuffer dedicated;
   SlabAllocator::SlotHandle slot_handle;
-  auto completion = std::make_shared<PutCompletion>();
+  const std::shared_ptr<PutCompletion> completion =
+      std::make_shared<PutCompletion>();
+  completion->promotion = true;
 
   if (large) {
     {
@@ -925,6 +957,27 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
   }
   promotes_.fetch_add(1, std::memory_order_relaxed);
   return true;
+}
+
+void RamTier::RetireDurableForPut(const BlockKey& key) {
+  if (shards_.empty()) return;
+  Shard& shard = ShardFor(key);
+  const std::lock_guard<std::mutex> lock(shard.mu);
+  const std::unordered_map<BlockKey, std::shared_ptr<PutCompletion>,
+                           KeyHash>::iterator writing = shard.writing.find(key);
+  if (writing != shard.writing.end() && writing->second->promotion) {
+    const std::lock_guard<std::mutex> state_lock(writing->second->mu);
+    // Its owner must still complete/abort and release its own physical pin.
+    // Do not join this completion as if its old read were the new PUT.
+    writing->second->canceled = true;
+  }
+  const std::unordered_map<BlockKey, Entry, KeyHash>::iterator existing =
+      shard.index.find(key);
+  if (existing != shard.index.end() && existing->second.durable) {
+    // DropLocked hides pinned copies and defers physical release. Non-durable
+    // entries are the first accepted PUT, including terminal failure states.
+    DropLocked(shard, key);
+  }
 }
 
 bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,

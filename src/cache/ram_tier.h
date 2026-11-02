@@ -205,6 +205,12 @@ class RamTier {
   // never crowd out the write path's flush resources.
   bool PutDurable(const BlockKey& key, const void* data, size_t len);
 
+  // Before a serialized foreground PUT, hide durable cache copies and cancel
+  // promotion writers; keep dirty/failed PUT owners and all physical SEND pins.
+  // No completion/SEND waits. Caller fences read publication through the PUT;
+  // subsequent admission still enforces its normal backing/watermark rules.
+  void RetireDurableForPut(const BlockKey& key);
+
   // Reserve a registered-arena slot before an O_DIRECT read, so the read can
   // populate the durable RAM entry in place. Oversized values live outside the
   // registered arena and intentionally decline this zero-copy path.
@@ -284,6 +290,8 @@ class RamTier {
     bool done = false;
     bool success = false;
     bool canceled = false;
+    // Immutable after registration: a read copy is not an accepted PUT owner.
+    bool promotion = false;
   };
   struct Entry {
     BlockKey key;
