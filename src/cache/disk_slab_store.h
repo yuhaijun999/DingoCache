@@ -346,6 +346,10 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> metadata_io_errors_{0};
   std::function<bool()> payload_write_hook_for_test_;
   std::function<bool()> record_write_hook_for_test_;
+  // Set before I/O starts, never concurrently modified; production leaves
+  // empty. Runs after read pin/inflight acquisition and after mu_ has been
+  // released.
+  std::function<void()> read_acquired_hook_for_test_;
   // Test-only seam (never set in production; same discipline as the hooks
   // above): when set, replaces EVERY CQE reap of the batched io_uring write
   // path -- the blocking wait AND the post-failure non-blocking drain -- so
@@ -378,8 +382,8 @@ class DiskSlabStore : public StoreEngine {
   // Background free-slot reclaimer (see Options::reclaim_interval_ms): runs
   // ReclaimTick every interval, evicting ahead of demand in bounded batches
   // and rebalancing extents from cold classes to hot ones on a full store.
-  void ReclaimTick(
-      const std::function<void()>& after_watermark_evict = {});
+  void ReclaimTick(const std::function<void()>& after_watermark_evict = {},
+                   const std::function<void()>& before_lock_for_test = {});
   // Rebalance rate cap: extents moved per tick per hot class. Each move evicts
   // a donor extent's residents + wipes its table region under the lock, so it
   // is deliberately slow-drip (converges in seconds at the 50 ms tick).

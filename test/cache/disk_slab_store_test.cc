@@ -30,11 +30,14 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #ifdef DFKV_WITH_URING
 #include <liburing.h>
 #endif
 
+#include "cache/store_engine.h"
+#include "common/kv_types.h"
 #include "common/status.h"
 
 using dfkv::BlockKey;
@@ -48,6 +51,25 @@ class DiskSlabStoreTestPeer {
   static void ReclaimNow(DiskSlabStore* store,
                          const std::function<void()>& after_watermark_evict) {
     store->ReclaimTick(after_watermark_evict);
+  }
+  static void ReclaimAfterAdmission(DiskSlabStore* store,
+                                    const std::function<void()>& before_lock) {
+    store->ReclaimTick({}, before_lock);
+  }
+  static void EnableWatermark(DiskSlabStore* store) {
+    store->evict_high_bytes_ = store->opt_.capacity_bytes / 10;
+    store->evict_low_bytes_ = 0;
+  }
+  // The actual selected-donor operation used by GROW, after
+  // admission/selection.
+  static bool StealAfterAdmission(DiskSlabStore* store,
+                                  std::vector<BlockKey>* evicted) {
+    const std::lock_guard<std::mutex> lock(store->mu_);
+    return store->alloc_->StealFrom(0, 1, evicted);
+  }
+  static void SetReadAcquiredHook(DiskSlabStore* store,
+                                  std::function<void()> hook) {
+    store->read_acquired_hook_for_test_ = std::move(hook);
   }
   static void BreakTableFd(DiskSlabStore* store) {
     if (store->table_fd_ >= 0) ::close(store->table_fd_);
@@ -188,6 +210,11 @@ struct HookGate {
   void WaitEntered() {
     std::unique_lock<std::mutex> lk(mu);
     cv.wait(lk, [this] { return entered; });
+  }
+  bool WaitEnteredFor() {
+    std::unique_lock<std::mutex> lock(mu);
+    return cv.wait_for(lock, std::chrono::seconds(5),
+                       [this] { return entered; });
   }
   void Release(bool value) {
     {
@@ -1860,6 +1887,326 @@ TEST_F(DiskSlabTest, RecordWriteFailureFailsStoreClosed) {
   std::string out;
   EXPECT_EQ(s.Range(K(1), 0, 0, &out), Status::kIOError);
   EXPECT_EQ(s.Remove(K(1)), Status::kIOError);
+}
+
+TEST_F(DiskSlabTest, FailedDeferredRemoveBlocksAlreadyAdmittedReclaim) {
+  for (const size_t residents : {1U, 2U}) {
+    SCOPED_TRACE(residents);
+    fs::remove_all(dir_);
+    DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+    options.table_sync_ms = 0;
+    options.reclaim_interval_ms = 0;
+    const BlockKey removed{810, 0, 1};
+    const BlockKey other{811, 0, 2};
+    const std::string value(3000, 'r');
+    DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy());
+    ASSERT_EQ(store.Cache(removed, value.data(), value.size()), Status::kOk);
+    dfkv::ReadLease lease;
+    ASSERT_EQ(store.RangeDirectPrep(removed, 0, 0, 4096, &lease), Status::kOk);
+    ASSERT_EQ(store.Remove(removed), Status::kOk);
+    dfkv::ReadLease other_lease;
+    if (residents == 2) {
+      ASSERT_EQ(store.Cache(other, value.data(), value.size()), Status::kOk);
+      // Keep B pinned: even though release touches A's CLOCK position, A is
+      // the only eligible victim and must take the partial-slot callback.
+      ASSERT_EQ(store.RangeDirectPrep(other, 0, 0, 4096, &other_lease),
+                Status::kOk);
+    }
+    ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::SyncTableNow(&store));
+    const std::string table = ReadFileBytes(dir_ / "slots.tbl");
+    const uint64_t allocated = store.UsedBytes();
+    EXPECT_EQ(store.TenantUsedBytes(removed.tenant_hash), 0U);
+    dfkv::DiskSlabStoreTestPeer::EnableWatermark(&store);
+    dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&store,
+                                                    [] { return false; });
+    HookGate gate;
+    std::thread reclaim([&] {
+      dfkv::DiskSlabStoreTestPeer::ReclaimAfterAdmission(&store,
+                                                         [&] { gate.Run(); });
+    });
+    EXPECT_TRUE(gate.WaitEnteredFor());
+    lease = dfkv::ReadLease{};  // last pin: tombstone fails with the real table
+                                // fd intact
+    EXPECT_FALSE(store.Healthy());
+    EXPECT_EQ(store.Count(), residents);
+    EXPECT_EQ(store.UsedBytes(), allocated);
+    EXPECT_EQ(ReadFileBytes(dir_ / "slots.tbl"), table);
+    EXPECT_EQ(store.Cache(removed, value.data(), value.size()),
+              Status::kIOError);
+    gate.Release(true);
+    reclaim.join();
+    // One resident exercises whole-extent clear; two exercise slot clear.
+    EXPECT_EQ(store.Count(), residents);
+    EXPECT_EQ(store.UsedBytes(), allocated);
+    EXPECT_EQ(ReadFileBytes(dir_ / "slots.tbl"), table);
+    EXPECT_EQ(store.GetStats().payload_bytes, (residents - 1) * value.size());
+    EXPECT_EQ(store.TenantUsedBytes(removed.tenant_hash), 0U);
+    lease = dfkv::ReadLease{};  // duplicate storage release must not free or
+                                // debit twice
+    EXPECT_EQ(store.Count(), residents);
+    EXPECT_EQ(store.Remove(removed), Status::kIOError);
+    EXPECT_EQ(store.Evictions(), 0U);
+    EXPECT_EQ(store.GetStats().watermark_record_clear_bytes, 0U);
+  }
+}
+
+TEST_F(DiskSlabTest, FailedDeferredRemoveBlocksAdmittedExtentRebind) {
+  DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  DiskSlabStore store(options);
+  ASSERT_TRUE(store.Healthy());
+  const BlockKey key{812, 0, 3};
+  const std::string value(3000, 'b');
+  ASSERT_EQ(store.Cache(key, value.data(), value.size()), Status::kOk);
+  dfkv::ReadLease lease;
+  ASSERT_EQ(store.RangeDirectPrep(key, 0, 0, 4096, &lease), Status::kOk);
+  ASSERT_EQ(store.Remove(key), Status::kOk);
+  const std::string table = ReadFileBytes(dir_ / "slots.tbl");
+  const uint64_t binds = store.GetStats().bind_wipes;
+  dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&store, [] { return false; });
+  lease = dfkv::ReadLease{};
+  ASSERT_FALSE(store.Healthy());
+  std::vector<BlockKey> evicted;
+  EXPECT_FALSE(
+      dfkv::DiskSlabStoreTestPeer::StealAfterAdmission(&store, &evicted));
+  EXPECT_TRUE(evicted.empty());
+  EXPECT_EQ(store.Count(), 1U);
+  EXPECT_EQ(store.UsedBytes(), 4096U);
+  EXPECT_EQ(store.GetStats().bind_wipes, binds);
+  EXPECT_EQ(ReadFileBytes(dir_ / "slots.tbl"), table);
+  EXPECT_EQ(store.GetStats().payload_bytes, 0U);
+  EXPECT_EQ(store.TenantUsedBytes(key.tenant_hash), 0U);
+}
+
+enum class DeferredReadPath : unsigned char {
+  kRange = 0,
+  kRangeInto = 1,
+  kRangeDirect = 2
+};
+
+class DeferredReadTest
+    : public DiskSlabTest,
+      public ::testing::WithParamInterface<DeferredReadPath> {
+ protected:
+  void SetUp() override {
+    DiskSlabTest::SetUp();
+    dir_ += "_read_" + std::to_string(static_cast<unsigned char>(GetParam()));
+    fs::remove_all(dir_);
+  }
+};
+
+TEST_P(DeferredReadTest, FinalStatusIncludesDeferredInvalidation) {
+  for (const bool fail_invalidation : {false, true}) {
+    SCOPED_TRACE(fail_invalidation);
+    fs::remove_all(dir_);
+    DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+    options.direct_writes = GetParam() == DeferredReadPath::kRangeDirect;
+    options.table_sync_ms = 0;
+    options.reclaim_interval_ms = 0;
+    DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy());
+    if (options.direct_writes && !store.DirectWritesActive())
+      GTEST_SKIP()
+          << "filesystem rejected O_DIRECT; direct branch not exercised";
+    const BlockKey key{813, 0, 4};
+    const std::string value(3000, 'd');
+    ASSERT_EQ(store.Cache(key, value.data(), value.size()), Status::kOk);
+    HookGate gate;
+    dfkv::DiskSlabStoreTestPeer::SetReadAcquiredHook(&store,
+                                                     [&] { gate.Run(); });
+    dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(
+        &store, [fail_invalidation] { return !fail_invalidation; });
+    Status status = Status::kInvalid;
+    std::string output;
+    alignas(4096) char buffer[4096] = {};
+    const char* direct = nullptr;
+    size_t length = 99;
+    size_t value_length = 99;
+    std::thread reader([&] {
+      switch (GetParam()) {
+        case DeferredReadPath::kRange:
+          status = store.Range(key, 0, 0, &output, &value_length);
+          break;
+        case DeferredReadPath::kRangeInto:
+          status = store.RangeInto(key, 0, 0, buffer, sizeof(buffer), &length,
+                                   &value_length);
+          break;
+        case DeferredReadPath::kRangeDirect:
+          status = store.RangeDirect(key, 0, 0, buffer, sizeof(buffer), &direct,
+                                     &length, &value_length);
+          break;
+      }
+    });
+    EXPECT_TRUE(gate.WaitEnteredFor());
+    EXPECT_EQ(store.Remove(key), Status::kOk);
+    EXPECT_EQ(store.GetStats().committed_objects, 0U);
+    EXPECT_EQ(store.GetStats().payload_bytes, 0U);
+    EXPECT_EQ(store.TenantUsedBytes(key.tenant_hash), 0U);
+    EXPECT_EQ(store.Count(), 1U);  // still pinned and physically occupied
+    gate.Release(true);
+    reader.join();
+    EXPECT_EQ(status, fail_invalidation ? Status::kIOError : Status::kOk);
+    EXPECT_EQ(store.Healthy(), !fail_invalidation);
+    EXPECT_EQ(store.Count(), fail_invalidation ? 1U : 0U);
+    EXPECT_EQ(store.UsedBytes(), fail_invalidation ? 4096U : 0U);
+    EXPECT_EQ(store.GetStats().inflight, 0U);
+    EXPECT_EQ(store.GetStats().payload_bytes, 0U);
+    EXPECT_EQ(store.TenantUsedBytes(key.tenant_hash), 0U);
+    EXPECT_EQ(value_length, fail_invalidation ? 99U : value.size());
+    // The real read copied valid bytes before last release changed its status.
+    EXPECT_EQ(GetParam() == DeferredReadPath::kRange
+                  ? output
+                  : std::string(buffer, value.size()),
+              value);
+    if (GetParam() != DeferredReadPath::kRange) {
+      EXPECT_EQ(length, fail_invalidation ? 0U : value.size());
+    }
+    if (GetParam() == DeferredReadPath::kRangeDirect) {
+      EXPECT_EQ(direct, fail_invalidation ? nullptr : buffer);
+    }
+    EXPECT_EQ(store.Remove(key),
+              fail_invalidation ? Status::kIOError : Status::kNotFound);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(DeferredReadPaths, DeferredReadTest,
+                         ::testing::Values(DeferredReadPath::kRange,
+                                           DeferredReadPath::kRangeInto,
+                                           DeferredReadPath::kRangeDirect));
+
+TEST_F(DiskSlabTest,
+       DeferredWriteDoesNotPublishOrFreeAfterInvalidationFailure) {
+  for (const bool batch : {false, true}) {
+    for (const bool fail_invalidation : {false, true}) {
+      SCOPED_TRACE(batch);
+      SCOPED_TRACE(fail_invalidation);
+      fs::remove_all(dir_);
+      DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+      options.table_sync_ms = 0;
+      options.reclaim_interval_ms = 0;
+      DiskSlabStore store(options);
+      ASSERT_TRUE(store.Healthy());
+      const BlockKey key{814, 0, 5};
+      alignas(4096) char value[4096] = {};
+      std::memset(value, 'w', 3000);
+      HookGate gate;
+      dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(
+          &store, [&] { return gate.Run(); });
+      unsigned records = 0;
+      dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(
+          &store, [&] { return ++records == 1 || !fail_invalidation; });
+      Status status = Status::kInvalid;
+      std::thread writer([&] {
+        if (batch) {
+          const std::vector<Status> result =
+              store.CacheDirectBatch({{key, value, 3000, sizeof(value)}});
+          status = result[0];
+        } else {
+          status = store.Cache(key, value, 3000);
+        }
+      });
+      EXPECT_TRUE(gate.WaitEnteredFor());
+      EXPECT_EQ(store.Remove(key), Status::kOk);
+      EXPECT_EQ(store.GetStats().committed_objects, 0U);
+      gate.Release(true);
+      writer.join();
+      EXPECT_EQ(records, 2U);  // valid record followed by deferred tombstone
+      EXPECT_EQ(status, fail_invalidation ? Status::kIOError : Status::kOk);
+      EXPECT_EQ(store.Count(), fail_invalidation ? 1U : 0U);
+      EXPECT_EQ(store.UsedBytes(), fail_invalidation ? 4096U : 0U);
+      EXPECT_EQ(store.GetStats().committed_objects, 0U);
+      EXPECT_EQ(store.GetStats().payload_bytes, 0U);
+      EXPECT_EQ(store.GetStats().inflight, 0U);
+      EXPECT_EQ(store.TenantUsedBytes(key.tenant_hash), 0U);
+      // No second owner may publish after a failed remove; successful removal
+      // permits a new committed write (disable this test's hooks first).
+      dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(&store, {});
+      dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&store, {});
+      EXPECT_EQ(store.Cache(key, "new", 3),
+                fail_invalidation ? Status::kIOError : Status::kOk);
+      EXPECT_EQ(store.TenantUsedBytes(key.tenant_hash),
+                fail_invalidation ? 0U : 3U);
+    }
+  }
+}
+
+TEST_F(DiskSlabTest, DeferredRemoveCleanAndFaultedCloseRecoverCorrectly) {
+  enum class Failure : unsigned char {
+    kNone = 0,
+    kInvalidation = 1,
+    kSync = 2
+  };
+  const auto epoch_state = [this] {
+    const std::string bytes = ReadFileBytes(dir_ / "slab_state");
+    EXPECT_EQ(bytes.size(), 64U);
+    uint32_t state = 0;
+    if (bytes.size() >= 20)
+      std::memcpy(&state, bytes.data() + 16, sizeof(state));
+    return state;
+  };
+  for (const Failure failure :
+       {Failure::kNone, Failure::kInvalidation, Failure::kSync}) {
+    SCOPED_TRACE(static_cast<unsigned char>(failure));
+    fs::remove_all(dir_);
+    DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+    options.table_sync_ms = 0;
+    options.reclaim_interval_ms = 0;
+    const BlockKey removed{815, 0, 6};
+    const BlockKey survivor{816, 0, 7};
+    const std::string value(3000, 's');
+    uint64_t epoch = 0;
+    {
+      DiskSlabStore store(options);
+      ASSERT_TRUE(store.Healthy());
+      epoch = store.GetWatermarkObservation().run_epoch;
+      ASSERT_EQ(store.Cache(removed, value.data(), value.size()), Status::kOk);
+      ASSERT_EQ(store.Cache(survivor, value.data(), value.size()), Status::kOk);
+      ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::SyncTableNow(&store));
+      dfkv::ReadLease lease;
+      ASSERT_EQ(store.RangeDirectPrep(removed, 0, 0, 4096, &lease),
+                Status::kOk);
+      ASSERT_EQ(store.Remove(removed), Status::kOk);
+      if (failure == Failure::kInvalidation) {
+        dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&store,
+                                                        [] { return false; });
+      }
+      lease = dfkv::ReadLease{};
+      EXPECT_EQ(store.Count(), failure == Failure::kInvalidation ? 2U : 1U);
+      EXPECT_EQ(store.GetStats().payload_bytes, value.size());
+      EXPECT_EQ(store.TenantUsedBytes(removed.tenant_hash), 0U);
+      EXPECT_EQ(store.TenantUsedBytes(survivor.tenant_hash), value.size());
+      lease = dfkv::ReadLease{};
+      if (failure == Failure::kSync) {
+        dfkv::DiskSlabStoreTestPeer::BreakTableFd(&store);
+        EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::SyncTableNow(&store));
+      }
+      EXPECT_EQ(store.Healthy(), failure == Failure::kNone);
+      EXPECT_EQ(epoch_state(), 2U);  // process has not closed cleanly yet
+    }
+    EXPECT_EQ(epoch_state(), failure == Failure::kNone ? 1U : 2U);
+    DiskSlabStore reopened(options);
+    ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+    EXPECT_EQ(reopened.GetWatermarkObservation().run_epoch, epoch + 1);
+    EXPECT_EQ(reopened.GetStats().unclean_resets,
+              failure == Failure::kNone ? 0U : 1U);
+    std::string output;
+    EXPECT_EQ(reopened.Range(removed, 0, 0, &output), Status::kNotFound);
+    EXPECT_EQ(reopened.Range(survivor, 0, 0, &output),
+              failure == Failure::kNone ? Status::kOk : Status::kNotFound);
+    if (failure == Failure::kNone) {
+      EXPECT_EQ(output, value);
+    }
+    EXPECT_EQ(reopened.Count(), failure == Failure::kNone ? 1U : 0U);
+    EXPECT_EQ(reopened.UsedBytes(), failure == Failure::kNone ? 4096U : 0U);
+    EXPECT_EQ(reopened.TenantUsedBytes(removed.tenant_hash), 0U);
+    EXPECT_EQ(reopened.TenantUsedBytes(survivor.tenant_hash),
+              failure == Failure::kNone ? value.size() : 0U);
+    ASSERT_EQ(reopened.Cache(removed, "new", 3), Status::kOk);
+    ASSERT_EQ(reopened.Range(removed, 0, 0, &output), Status::kOk);
+    EXPECT_EQ(output, "new");
+  }
 }
 
 TEST_F(DiskSlabTest, TombstoneWriteFailureKeepsSlotAndFailsClosed) {
