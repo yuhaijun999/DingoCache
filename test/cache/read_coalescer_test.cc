@@ -10,10 +10,16 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "common/kv_types.h"
+#include "common/status.h"
 
 using dfkv::BlockKey;
 using dfkv::ReadCoalescer;
@@ -321,4 +327,173 @@ TEST(ReadCoalescer, NoTombstoneForPartialFailedOrFannedReads) {
   uint64_t t4 = c.TryRegisterAsync(K(23), 0, 8, true);
   c.CompleteAsync(t4, Status::kOk, v, 8, nullptr, nullptr, &recur);
   EXPECT_FALSE(recur);
+}
+
+// The ordering tag belongs to the caller's cross-layer fence, not the disk
+// resident identity. Keep an old read alive while a post-mutation read starts.
+TEST(ReadCoalescer, FenceEpochSeparatesSynchronousFlights) {
+  ReadCoalescer coalescer;
+  const BlockKey key = K(800);
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool entered = false;
+  bool released = false;
+  char old_data[3] = {};
+  size_t old_len = 0;
+  Status old_status = Status::kInvalid;
+  std::thread old_reader([&] {
+    old_status = coalescer.Read(
+        key, 0, 3, old_data, sizeof(old_data), &old_len, nullptr,
+        [&](char* destination, size_t, size_t* length, size_t* value_len) {
+          std::unique_lock<std::mutex> lock(mutex);
+          entered = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return released; });
+          std::memcpy(destination, "old", 3);
+          *length = 3;
+          if (value_len != nullptr) *value_len = 3;
+          return Status::kOk;
+        },
+        nullptr, 10);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(2), [&] { return entered; }));
+  }
+  EXPECT_TRUE(coalescer.InFlight(key, 0, 3, 10));
+  EXPECT_FALSE(coalescer.InFlight(key, 0, 3, 12));
+  char new_data[3] = {};
+  size_t new_len = 0;
+  ReadCoalescer::Outcome outcome;
+  EXPECT_EQ(
+      coalescer.Read(
+          key, 0, 3, new_data, sizeof(new_data), &new_len, nullptr,
+          [](char* destination, size_t, size_t* length, size_t* value_len) {
+            std::memcpy(destination, "new", 3);
+            *length = 3;
+            if (value_len != nullptr) *value_len = 3;
+            return Status::kOk;
+          },
+          &outcome, 12),
+      Status::kOk);
+  EXPECT_TRUE(outcome.leader);
+  EXPECT_EQ(coalescer.timeouts(), 0u);
+  EXPECT_EQ(std::string(new_data, new_len), "new");
+  EXPECT_TRUE(coalescer.InFlight(key, 0, 3, 10));
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    released = true;
+  }
+  cv.notify_all();
+  old_reader.join();
+  EXPECT_EQ(old_status, Status::kOk);
+  EXPECT_EQ(std::string(old_data, old_len), "old");
+  EXPECT_FALSE(coalescer.InFlight(key, 0, 3, 10));
+}
+
+TEST(ReadCoalescer, FenceEpochSeparatesAsyncTokensAndRecurrence) {
+  ReadCoalescer coalescer;
+  const BlockKey key = K(801);
+  const uint64_t old_token =
+      coalescer.TryRegisterAsync(key, 0, 3, true, 3, false, 20);
+  ASSERT_NE(old_token, 0u);
+  EXPECT_EQ(coalescer.TryRegisterAsync(key, 0, 3, true, 3, false, 20), 0u);
+  const uint64_t new_token =
+      coalescer.TryRegisterAsync(key, 0, 3, true, 3, false, 22);
+  ASSERT_NE(new_token, 0u);
+  EXPECT_FALSE(coalescer.CompleteAsync(old_token, Status::kOk, "old", 3));
+  // Completing the old token must not erase the replacement generation.
+  EXPECT_TRUE(coalescer.InFlight(key, 0, 3, 22));
+  EXPECT_FALSE(coalescer.InFlight(key, 0, 3, 20));
+  EXPECT_FALSE(coalescer.CompleteAsync(new_token, Status::kOk, "new", 3));
+  const uint64_t next_token =
+      coalescer.TryRegisterAsync(key, 0, 3, true, 3, false, 24);
+  ASSERT_NE(next_token, 0u);
+  bool recurrent = true;
+  EXPECT_FALSE(coalescer.CompleteAsync(next_token, Status::kOk, "now", 3,
+                                       nullptr, nullptr, &recurrent));
+  EXPECT_FALSE(recurrent) << "an old generation is not recurrence evidence";
+  const uint64_t repeat_token =
+      coalescer.TryRegisterAsync(key, 0, 3, true, 3, false, 24);
+  ASSERT_NE(repeat_token, 0u);
+  recurrent = false;
+  EXPECT_FALSE(coalescer.CompleteAsync(repeat_token, Status::kOk, "now", 3,
+                                       nullptr, nullptr, &recurrent));
+  EXPECT_TRUE(recurrent) << "same-generation recurrence remains supported";
+}
+
+TEST(ReadCoalescer, FenceEpochSeparatesPublishedWaits) {
+  ReadCoalescer coalescer;
+  const BlockKey key = K(802);
+  const uint64_t token =
+      coalescer.TryRegisterAsync(key, 0, 3, true, 3, true, 30);
+  ASSERT_NE(token, 0u);
+  EXPECT_EQ(coalescer.WaitForPublished(key, 0, 3, 32),
+            ReadCoalescer::PublishedWait::kNotEligible);
+  // Same-thread followers still decline rather than waiting on themselves.
+  EXPECT_EQ(coalescer.WaitForPublished(key, 0, 3, 30),
+            ReadCoalescer::PublishedWait::kFallback);
+  EXPECT_TRUE(coalescer.InFlight(key, 0, 3, 30));
+  EXPECT_FALSE(coalescer.CompleteAsync(token, Status::kOk, "old", 3));
+}
+
+TEST(ReadCoalescer, DefaultFenceEpochPreservesExistingCallers) {
+  ReadCoalescer coalescer;
+  const BlockKey key = K(803);
+  const uint64_t token = coalescer.TryRegisterAsync(key, 0, 3, false);
+  ASSERT_NE(token, 0u);
+  EXPECT_TRUE(coalescer.InFlight(key, 0, 3, 0));
+  EXPECT_EQ(coalescer.TryRegisterAsync(key, 0, 3, false, 0, false, 0), 0u);
+  EXPECT_FALSE(coalescer.CompleteAsync(token, Status::kIOError, nullptr, 0));
+}
+
+TEST(ReadCoalescer, NewEpochReadDoesNotJoinOldAsyncFlight) {
+  ReadCoalescer coalescer;
+  const BlockKey key = K(804);
+  uint64_t old_token = 0;
+  // Registration on another thread prevents the same-thread fallback from
+  // masking an incorrect cross-epoch join. No physical I/O is mocked as heat.
+  std::thread registrar([&] {
+    old_token = coalescer.TryRegisterAsync(key, 0, 3, true, 77, false, 40);
+  });
+  registrar.join();
+  ASSERT_NE(old_token, 0u);
+  char data[3] = {};
+  size_t length = 0;
+  size_t value_len = 0;
+  ReadCoalescer::Outcome outcome;
+  EXPECT_EQ(
+      coalescer.Read(
+          key, 0, 3, data, sizeof(data), &length, &value_len,
+          [](char* destination, size_t, size_t* bytes, size_t* stored_len) {
+            std::memcpy(destination, "new", 3);
+            *bytes = 3;
+            *stored_len = 99;
+            return Status::kOk;
+          },
+          &outcome, 42),
+      Status::kOk);
+  EXPECT_TRUE(outcome.leader);
+  EXPECT_EQ(coalescer.timeouts(), 0u);
+  EXPECT_EQ(std::string(data, length), "new");
+  EXPECT_EQ(value_len, 99u);
+  EXPECT_TRUE(coalescer.InFlight(key, 0, 3, 40));
+  EXPECT_FALSE(coalescer.CompleteAsync(old_token, Status::kOk, "old", 3));
+}
+
+TEST(ReadCoalescer, AbortingOldEpochDoesNotRetireNewFlight) {
+  ReadCoalescer coalescer;
+  const BlockKey key = K(805);
+  const uint64_t old_token =
+      coalescer.TryRegisterAsync(key, 0, 3, true, 3, false, 50);
+  const uint64_t new_token =
+      coalescer.TryRegisterAsync(key, 0, 3, true, 3, false, 52);
+  ASSERT_NE(old_token, 0u);
+  ASSERT_NE(new_token, 0u);
+  EXPECT_FALSE(
+      coalescer.CompleteAsync(old_token, Status::kIOError, nullptr, 0));
+  EXPECT_TRUE(coalescer.InFlight(key, 0, 3, 52));
+  EXPECT_FALSE(coalescer.InFlight(key, 0, 3, 50));
+  EXPECT_FALSE(coalescer.CompleteAsync(new_token, Status::kOk, "new", 3));
 }
