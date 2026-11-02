@@ -190,6 +190,12 @@ class RamTier {
   // Admitted failures/cancellations return kIOError, never disk fallback.
   PutResult PutCommitted(const BlockKey& key, const void* data, size_t len);
 
+  // Disk-direct batch preparation: join an existing PUT's terminal result,
+  // otherwise return kBypass without allocating RAM or probing disk. Caller
+  // serializes foreground mutations, fences read publication and first calls
+  // RetireDurableForPut. Only kBypass permits writing the caller's payload.
+  PutResult PrepareDirectPut(const BlockKey& key, const void* data, size_t len);
+
   // Cache RAM-ACK contract: acknowledge a visible, flush-pinned copy. A
   // positive dirty watermark rejects new keys before admission, without disk
   // fallback. Duplicates join their first owner's terminal completion; zero
@@ -208,7 +214,8 @@ class RamTier {
   // Before a serialized foreground PUT, hide durable cache copies and cancel
   // promotion writers; keep dirty/failed PUT owners and all physical SEND pins.
   // No completion/SEND waits. Caller fences read publication through the PUT;
-  // subsequent admission still enforces its normal backing/watermark rules.
+  // subsequent write-back admission enforces normal backing/watermark rules;
+  // disk-direct batches instead use PrepareDirectPut without new admission.
   void RetireDurableForPut(const BlockKey& key);
 
   // Reserve a registered-arena slot before an O_DIRECT read, so the read can
@@ -356,8 +363,8 @@ class RamTier {
     kAccepted, kDuplicate, kPersisted, kBypass, kRejected, kBackpressure
   };
   Admission Admit(const BlockKey& key, const void* data, size_t len,
-                  bool client_ack,
-                  std::shared_ptr<PutCompletion>* completion);
+                  bool client_ack, std::shared_ptr<PutCompletion>* completion,
+                  bool admit_new = true);
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           bool success);
   static Status WaitPut(const std::shared_ptr<PutCompletion>& completion);
