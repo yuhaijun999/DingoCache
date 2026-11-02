@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Serialize foreground PUT and Remove across RAM and disk in every write mode,
+  including direct batches with ordered, deduplicated key-stripe locking. A new
+  PUT cannot enter Remove's gap between the two tiers. Background flushes remain
+  independent so disk-ACK waiters can finish. Read-promotion fencing is separate.
+
 - Keep allocator persistence callbacks fail-closed after a disk metadata error.
   Reclaim work admitted before a deferred Remove's final invalidation fails can
   no longer clear/release that resident or rebind its extent after isolation.

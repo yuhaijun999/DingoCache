@@ -1,25 +1,30 @@
 #include "cache/kv_node_server.h"
 
-#include <chrono>
-#include <cerrno>
-#include <cstdlib>
-#include <cstring>
-#include <limits>
-#include <string>
-
-#include <vector>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "cache/store_engine.h"
 #include "common/config_dump.h"
+#include "common/kv_types.h"
+#include "transport/wire.h"
 #include "utils/log.h"
 #include "utils/net_util.h"
+#include "utils/prom_escape.h"
 #include "utils/thread_name.h"
 #include "utils/wire_limits.h"
-#include "utils/prom_escape.h"
-#include "transport/transport.h"
 
 namespace dfkv {
 
@@ -131,10 +136,14 @@ void KvNodeServer::EndPut() {
     put_inflight_.fetch_sub(1, std::memory_order_relaxed);
 }
 
-std::unique_lock<std::mutex> KvNodeServer::LockPutKey(const BlockKey& key) {
-  if (!ram_write_back_ || !ram_) return {};
-  const uint64_t stripe = key.digest_hi ^ key.digest_lo ^ key.tenant_hash;
-  return std::unique_lock<std::mutex>(put_key_mu_[stripe % kPutKeyStripes]);
+size_t KvNodeServer::MutationKeyStripe(const BlockKey& key) {
+  return static_cast<size_t>((key.digest_hi ^ key.digest_lo ^ key.tenant_hash) %
+                             kMutationKeyStripes);
+}
+
+std::unique_lock<std::mutex> KvNodeServer::LockMutationKey(
+    const BlockKey& key) {
+  return std::unique_lock<std::mutex>(mutation_key_mu_[MutationKeyStripe(key)]);
 }
 
 void KvNodeServer::InitRamTier() {
@@ -873,7 +882,7 @@ Status KvNodeServer::ProcessRequestForKey(
       }
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
-      auto key_lock = LockPutKey(key);
+      const std::unique_lock<std::mutex> key_lock = LockMutationKey(key);
       // RAM-ACK publishes a flush-pinned copy. A reached positive watermark
       // rejects new keys before admission; only a capacity bypass may take
       // the normal disk path, never a terminal watermark rejection.
@@ -1010,10 +1019,13 @@ Status KvNodeServer::ProcessRequestForKey(
       break;
     }
     case WireOp::kRemove: {
+      const std::unique_lock<std::mutex> key_lock = LockMutationKey(key);
       // RamTier hides the key first and waits out/cancels any flush. The disk
       // remove therefore compensates a flush that reached durable storage just
-      // before the fence; after it returns no later RAM worker can republish.
+      // before the fence; prior queued/flushing PUTs cannot republish later.
       const bool ram_had = ram_ && ram_->Remove(key);
+      if (before_disk_remove_hook_for_test_)
+        before_disk_remove_hook_for_test_();
       const Status disk_status = group_.Remove(key);
       if (disk_status == Status::kOk ||
           (disk_status == Status::kNotFound && ram_had)) {
@@ -1100,6 +1112,17 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
 
 std::vector<Status> KvNodeServer::CacheDirectBatchForKeys(
     const std::vector<StoreEngine::CacheBatchItem>& items) {
+  // Take every required foreground stripe before entering the disk group.
+  // Ascending unique acquisition prevents batch/batch ABBA and self-deadlock
+  // on duplicate keys or hash collisions. The flusher bypasses this wrapper.
+  std::array<bool, kMutationKeyStripes> used_stripes{};
+  for (const StoreEngine::CacheBatchItem& item : items)
+    used_stripes[MutationKeyStripe(item.key)] = true;
+  std::array<std::unique_lock<std::mutex>, kMutationKeyStripes> locks;
+  for (size_t stripe = 0; stripe < kMutationKeyStripes; ++stripe) {
+    if (used_stripes[stripe])
+      locks[stripe] = std::unique_lock<std::mutex>(mutation_key_mu_[stripe]);
+  }
   return group_.CacheDirectBatch(items);
 }
 
@@ -1112,7 +1135,7 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
   if (!TryBeginPut()) return Status::kCacheFull;
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
-  auto key_lock = LockPutKey(key);
+  const std::unique_lock<std::mutex> key_lock = LockMutationKey(key);
   // PUT write-around: write directly to disk, skip the synchronous 1 MiB
   // arena memcpy. The arena is filled lazily by read-promotion on GET miss
   // (RangeDirectForKey), so hot keys still get zero-copy RDMA GET from the
