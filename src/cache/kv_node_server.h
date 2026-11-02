@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -20,6 +21,7 @@
 #include "cache/disk_cache_group.h"
 #include "cache/ram_tier.h"
 #include "cache/read_coalescer.h"
+#include "common/kv_types.h"
 #include "utils/latency_hist.h"
 
 namespace dfkv {
@@ -183,7 +185,11 @@ class KvNodeServer {
   void InitAdmission();   // read DFKV_PUT_INFLIGHT_LIMIT (0 = gate off)
   bool TryBeginPut();
   void EndPut();
-  std::unique_lock<std::mutex> LockPutKey(const BlockKey& key);
+  static size_t MutationKeyStripe(const BlockKey& key);
+  std::unique_lock<std::mutex> LockMutationKey(const BlockKey& key);
+  // Test-only seam: installed before requests; production leaves empty.
+  // Runs after RAM hiding/waiting and before disk removal.
+  std::function<void()> before_disk_remove_hook_for_test_;
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   void InitTcpListenerConfig();
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
@@ -205,10 +211,12 @@ class KvNodeServer {
   bool ram_write_back_ = true;  // default write-back; DFKV_RAM_WRITE_MODE=writearound switches
   std::atomic<size_t> put_inflight_{0};
   std::atomic<size_t> put_busy_{0};
-  // Cover the gap between RAM capacity bypass and the backing-store commit.
-  // Flush workers and Remove never acquire these foreground-only locks.
-  static constexpr size_t kPutKeyStripes = 1024;
-  std::mutex put_key_mu_[kPutKeyStripes];
+  // Serialize foreground PUT/Remove across both tiers in every write mode.
+  // Batches acquire unique stripes in ascending order before entering a tier.
+  // Flush workers and promotion completions never take these locks: PUT and
+  // Remove may hold one while waiting for those workers' completion.
+  static constexpr size_t kMutationKeyStripes = 1024;
+  std::mutex mutation_key_mu_[kMutationKeyStripes];
   std::atomic<size_t> open_connections_{0};
   static constexpr size_t kDefaultTcpMaxConnections = 512;
   static constexpr size_t kHardTcpMaxConnections = 4096;

@@ -486,6 +486,18 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--max-msg`（或 `DFKV_RDMA_MAX_PAYLOAD_BYTES`） | `32 MiB` | 单笔 payload 硬上限（RDMA 与 TCP 数据路径同受此限） |
 | `--version, -V` / `--help` | — | 打印版本/帮助并退出 |
 
+##### 前台 PUT 与 Remove 排序
+
+同 key 的前台 PUT（普通、direct、direct batch）与 Remove 使用同一组协调锁，
+覆盖 write-back、write-around 和无 RAM 模式。Remove 完成 RAM 隐藏/等待与磁盘
+删除之前，新的同 key PUT 不会进入两层之间的间隙。批量按锁档升序去重加锁，
+批次内输入顺序与逐项结果保持原样。
+
+磁盘 ACK 的前台 PUT 可能持锁等待写回；flusher 不取这些锁，因此不会因随后
+等待该锁的 Remove 而停止。已返回 RAM ACK 的在途写回仍按现有取消/等待协议处理。
+不同 key 哈希到同一档也会串行，尚未测量其性能成本。本次不改变批量入口的
+直写磁盘语义，也尚未接入读回填/读合并代号围栏，不能视为所有跨层竞态已修复。
+
 ##### 在途 Remove 与元数据故障
 
 在途读/写仍持有 pin 时，Remove 可以先隐藏索引并返回成功；这不等于延期的记录

@@ -1,24 +1,33 @@
 // RamTier wiring into KvNodeServer: with DFKV_RAM_TIER=1, PUT is write-through
 // to RAM (sync-visible, async-flushed) and GET is served from RAM; disabled by
 // default the node behaves exactly as before. End-to-end over the TCP transport.
-#include "cache/kv_node_server.h"
-#include "client/key_map.h"
-#include "transport/tcp_transport.h"
-#include "transport/transport.h"
-
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-#include <cstring>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <atomic>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#include "cache/disk_cache_group.h"
+#include "cache/kv_node_server.h"
+#include "cache/ram_tier.h"
+#include "cache/store_engine.h"
+#include "client/key_map.h"
+#include "common/kv_types.h"
+#include "common/status.h"
+#include "transport/tcp_transport.h"
+#include "transport/wire.h"
 
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
@@ -53,6 +62,23 @@ class KvNodeServerWiringTestPeer {
     server.ram_write_back_ = true;
     server.ram_ack_enabled_ = ram_ack;
   }
+  static void SetBeforeDiskRemoveHook(KvNodeServer& server,
+                                      std::function<void()> hook) {
+    server.before_disk_remove_hook_for_test_ = std::move(hook);
+  }
+  static void SetWriteBack(KvNodeServer& server, bool enabled) {
+    server.ram_write_back_ = enabled;
+  }
+  static bool InstallDurable(KvNodeServer& server, const BlockKey& key,
+                             const std::string& value) {
+    return server.ram_->PutDurable(key, value.data(), value.size());
+  }
+  static bool MutationLockHeld(KvNodeServer& server, const BlockKey& key) {
+    std::mutex& mutex = server.mutation_key_mu_[server.MutationKeyStripe(key)];
+    if (!mutex.try_lock()) return true;
+    mutex.unlock();
+    return false;
+  }
   static bool Resident(KvNodeServer& server, const BlockKey& key) {
     return server.ram_->Contains(key);
   }
@@ -63,6 +89,9 @@ class KvNodeServerWiringTestPeer {
   static Status DiskRead(KvNodeServer& server, const BlockKey& key,
                          std::string* out) {
     return server.group_.Range(key, 0, 0, out);
+  }
+  static Status DropDisk(KvNodeServer& server, const BlockKey& key) {
+    return server.group_.Remove(key);
   }
   static bool Drain(KvNodeServer& server) {
     return server.ram_->WaitForDrain(2s);
@@ -809,5 +838,311 @@ TEST(RamTierWiring, PreparedReadCountsRamMissesAndOwnsRamPin) {
   s.reset();
   ::unsetenv("DFKV_RAM_TIER");
   ::unsetenv("DFKV_RAM_TIER_BYTES");
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, RemoveGapDoesNotDeleteFollowingPut) {
+  for (int path = 0; path < 3; ++path) {
+    SCOPED_TRACE(path);  // TCP single, direct single, direct batch.
+    const fs::path dir =
+        fs::temp_directory_path() / ("dfkv_remove_gap_" + std::to_string(path));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    FlushBarrier remove_gap, put_finished;
+    DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+    std::unique_ptr<KvNodeServer> server =
+        KvNodeServerWiringTestPeer::Create(std::move(options));
+    KvNodeServer* const node = server.get();
+    KvNodeServerWiringTestPeer::SetRam(
+        *node, [node](const BlockKey& key, char* data, size_t len, size_t) {
+          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+                 Status::kOk;
+        });
+    const BlockKey key{9100, 0};
+    // Persist, promote, then remove only the disk copy to construct a valid
+    // RAM survivor. This is not an allocator eviction-policy test.
+    ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*node, key, "old", 3),
+              Status::kOk);
+    ASSERT_TRUE(KvNodeServerWiringTestPeer::InstallDurable(*node, key, "old"));
+    ASSERT_EQ(KvNodeServerWiringTestPeer::DropDisk(*node, key), Status::kOk);
+    KvNodeServerWiringTestPeer::SetBeforeDiskRemoveHook(
+        *node, [&] { remove_gap.Block(); });
+    Status removed = Status::kInvalid;
+    std::thread remover([&] {
+      std::string ignored;
+      removed =
+          node->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove), key,
+                                     0, 0, nullptr, 0, &ignored);
+    });
+    EXPECT_TRUE(remove_gap.AwaitEntry());
+    EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*node, key));
+    EXPECT_TRUE(KvNodeServerWiringTestPeer::MutationLockHeld(*node, key));
+    alignas(4096) char value[4096] = "new";
+    Status written = Status::kInvalid;
+    std::thread writer([&] {
+      if (path == 0) {
+        std::string ignored;
+        written =
+            node->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                       key, 0, 0, value, 3, &ignored);
+      } else if (path == 1) {
+        written = node->CacheDirectForKey(key, value, 3, sizeof(value));
+      } else {
+        const std::vector<StoreEngine::CacheBatchItem> items{
+            {key, value, 3, sizeof(value)}};
+        const std::vector<Status> results =
+            node->CacheDirectBatchForKeys(items);
+        EXPECT_EQ(results.size(), 1u);
+        if (!results.empty()) written = results[0];
+      }
+      put_finished.Block();
+    });
+    // Red implementation finishes the new PUT inside this held Remove gap;
+    // the repaired one waits for Remove's mutation lock. This bounded wait is
+    // not the sole oracle: lock ownership and actual RAM/disk bytes are
+    // checked.
+    (void)put_finished.AwaitEntry();
+    remove_gap.Open();
+    put_finished.Open();
+    remover.join();
+    writer.join();
+    EXPECT_EQ(removed, Status::kOk);
+    EXPECT_EQ(written, Status::kOk);
+    std::string disk, visible;
+    EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node, key, &disk),
+              Status::kOk);
+    EXPECT_EQ(node->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                         key, 0, 0, nullptr, 0, &visible),
+              Status::kOk);
+    EXPECT_EQ(disk, "new");
+    EXPECT_EQ(visible, disk);
+    server.reset();
+    fs::remove_all(dir);
+  }
+}
+
+TEST(RamTierWiring, ForegroundDiskWritesHoldMutationLocksInEveryMode) {
+  for (int mode = 0; mode < 3; ++mode) {
+    for (int path = 0; path < 3; ++path) {
+      SCOPED_TRACE("mode=" + std::to_string(mode) +
+                   " path=" + std::to_string(path));
+      const fs::path dir = fs::temp_directory_path() /
+                           ("dfkv_mutation_modes_" + std::to_string(mode) +
+                            "_" + std::to_string(path));
+      fs::remove_all(dir);
+      fs::create_directories(dir);
+      FlushBarrier disk;
+      DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+      options.engine_factory = [&](const std::string& name, uint64_t capacity) {
+        return std::make_unique<BlockingBypassStore>(name, capacity, disk);
+      };
+      std::unique_ptr<KvNodeServer> server =
+          KvNodeServerWiringTestPeer::Create(std::move(options));
+      if (mode != 0) {
+        KvNodeServerWiringTestPeer::SetRam(
+            *server,
+            [](const BlockKey&, char*, size_t, size_t) { return false; });
+        KvNodeServerWiringTestPeer::SetWriteBack(*server, mode == 2);
+      }
+      // No RAM / writearound / writeback capacity bypass. Two keys collide in
+      // the foreground stripe; duplicate keys must not recursively lock it.
+      const BlockKey first{9200, 0}, second{9201, 0}, collision{10224, 0};
+      alignas(4096) char value[128 * 1024];
+      std::memset(value, 'v', sizeof(value));
+      alignas(4096) char small[4096] = "abc";
+      std::vector<Status> results;
+      Status single = Status::kInvalid;
+      std::thread writer([&] {
+        if (path == 0) {
+          std::string ignored;
+          single = server->ProcessRequestForKey(
+              static_cast<uint8_t>(WireOp::kCache), first, 0, 0, value,
+              sizeof(value), &ignored);
+        } else if (path == 1) {
+          single = server->CacheDirectForKey(first, value, sizeof(value),
+                                             sizeof(value));
+        } else {
+          const std::vector<StoreEngine::CacheBatchItem> items{
+              {first, value, sizeof(value), sizeof(value)},
+              {second, small, 3, sizeof(small)},
+              {collision, small, 3, sizeof(small)},
+              {first, small, 3, sizeof(small)},
+              {second, small, 0, sizeof(small)}};
+          results = server->CacheDirectBatchForKeys(items);
+        }
+      });
+      EXPECT_TRUE(disk.AwaitEntry());
+      EXPECT_TRUE(KvNodeServerWiringTestPeer::MutationLockHeld(*server, first));
+      if (path == 2) {
+        EXPECT_TRUE(
+            KvNodeServerWiringTestPeer::MutationLockHeld(*server, second));
+        EXPECT_TRUE(
+            KvNodeServerWiringTestPeer::MutationLockHeld(*server, collision));
+      }
+      disk.Open();
+      writer.join();
+      if (path == 2) {
+        ASSERT_EQ(results.size(), 5u);
+        for (size_t i = 0; i < 4; ++i) EXPECT_EQ(results[i], Status::kOk);
+        EXPECT_EQ(results[4], Status::kInvalid);
+      } else {
+        EXPECT_EQ(single, Status::kOk);
+      }
+      EXPECT_FALSE(
+          KvNodeServerWiringTestPeer::MutationLockHeld(*server, first));
+      std::string persisted;
+      EXPECT_EQ(
+          KvNodeServerWiringTestPeer::DiskRead(*server, first, &persisted),
+          Status::kOk);
+      ASSERT_EQ(persisted.size(), sizeof(value));
+      EXPECT_EQ(std::memcmp(persisted.data(), value, sizeof(value)), 0);
+      server.reset();
+      fs::remove_all(dir);
+    }
+  }
+}
+
+TEST(RamTierWiring, DiskAckPutAndRemoveLeaveFlusherUngated) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_remove_flush_wait";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  FlushBarrier flush;
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  std::unique_ptr<KvNodeServer> server =
+      KvNodeServerWiringTestPeer::Create(std::move(options));
+  KvNodeServer* const node = server.get();
+  KvNodeServerWiringTestPeer::SetRam(
+      *node, [&, node](const BlockKey& key, char* data, size_t len, size_t) {
+        flush.Block();
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+               Status::kOk;
+      });
+  const BlockKey key{9300, 0};
+  const std::string value = "disk-ack";
+  Status written = Status::kInvalid, removed = Status::kInvalid;
+  std::thread writer([&] {
+    std::string ignored;
+    written =
+        node->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache), key, 0,
+                                   0, value.data(), value.size(), &ignored);
+  });
+  EXPECT_TRUE(flush.AwaitEntry());
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::MutationLockHeld(*node, key));
+  std::thread remover([&] {
+    std::string ignored;
+    removed = node->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                         key, 0, 0, nullptr, 0, &ignored);
+  });
+  flush.Open();
+  writer.join();
+  remover.join();
+  EXPECT_EQ(written, Status::kOk);
+  EXPECT_EQ(removed, Status::kOk);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*node, key));
+  std::string out;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node, key, &out),
+            Status::kNotFound);
+  EXPECT_TRUE(node->Healthy());
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, RamAckRemoveWaitsForFlushWithoutHoldingRamShard) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_ram_ack_remove_wait";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  FlushBarrier flush;
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  std::unique_ptr<KvNodeServer> server =
+      KvNodeServerWiringTestPeer::Create(std::move(options));
+  KvNodeServer* const node = server.get();
+  KvNodeServerWiringTestPeer::SetRam(
+      *node,
+      [&, node](const BlockKey& key, char* data, size_t len, size_t) {
+        flush.Block();
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+               Status::kOk;
+      },
+      true);
+  const BlockKey key{9400, 0};
+  const std::string value = "ram-ack";
+  std::string ignored;
+  EXPECT_EQ(
+      node->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache), key, 0,
+                                 0, value.data(), value.size(), &ignored),
+      Status::kOk);
+  EXPECT_TRUE(flush.AwaitEntry());
+  Status removed = Status::kInvalid;
+  std::atomic<bool> done{false};
+  std::thread remover([&] {
+    std::string output;
+    removed = node->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                         key, 0, 0, nullptr, 0, &output);
+    done.store(true, std::memory_order_release);
+  });
+  // This observes the actual visibility fence, not an assumed scheduling delay.
+  EXPECT_TRUE(WaitFor(
+      [&] { return !KvNodeServerWiringTestPeer::Resident(*node, key); }));
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::MutationLockHeld(*node, key));
+  EXPECT_FALSE(done.load(std::memory_order_acquire));
+  flush.Open();
+  remover.join();
+  EXPECT_EQ(removed, Status::kOk);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*node, key));
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node, key, &ignored),
+            Status::kNotFound);
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, OverlappingBatchesAcceptOppositeInputOrder) {
+  const fs::path dir = fs::temp_directory_path() / "dfkv_mutation_batch_order";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  std::unique_ptr<KvNodeServer> server =
+      KvNodeServerWiringTestPeer::Create(std::move(options));
+  const BlockKey first{9500, 0}, second{9501, 0};
+  alignas(4096) char value[4096] = "same";
+  const std::vector<StoreEngine::CacheBatchItem> forward{
+      {first, value, 4, sizeof(value)}, {second, value, 4, sizeof(value)}};
+  const std::vector<StoreEngine::CacheBatchItem> reverse{
+      {second, value, 4, sizeof(value)}, {first, value, 4, sizeof(value)}};
+  std::mutex mutex;
+  std::condition_variable cv;
+  size_t ready = 0;
+  bool start = false;
+  std::vector<Status> first_results, second_results;
+  const auto run = [&](const std::vector<StoreEngine::CacheBatchItem>& items,
+                       std::vector<Status>* results) {
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      ++ready;
+      cv.notify_all();
+      cv.wait(lock, [&] { return start; });
+    }
+    *results = server->CacheDirectBatchForKeys(items);
+  };
+  std::thread one([&] { run(forward, &first_results); });
+  std::thread two([&] { run(reverse, &second_results); });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(
+        cv.wait_for(lock, std::chrono::seconds(2), [&] { return ready == 2; }));
+    start = true;
+  }
+  cv.notify_all();
+  one.join();
+  two.join();
+  EXPECT_EQ(first_results, std::vector<Status>(2, Status::kOk));
+  EXPECT_EQ(second_results, std::vector<Status>(2, Status::kOk));
+  std::string persisted;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, first, &persisted),
+            Status::kOk);
+  EXPECT_EQ(persisted, "same");
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, second, &persisted),
+            Status::kOk);
+  EXPECT_EQ(persisted, "same");
+  server.reset();
   fs::remove_all(dir);
 }
