@@ -462,7 +462,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--metrics-bind` | `0.0.0.0` | metrics/health 绑 IP（内网收敛） |
 | `--mds-registration-timeout-ms` / `DFKV_MDS_REGISTRATION_TIMEOUT_MS` | `60000` | 首次 MDS 注册截止（1000–600000） |
 | `--store-engine` / `DFKV_STORE_ENGINE` | `slab` | `slab` 为默认；`file` 为显式诊断 fallback |
-| `--slab-eviction-policy` / `DFKV_SLAB_EVICTION_POLICY` | 未设置时保持 legacy 运行 | 命令行优先且保留显式空；当前可显式设置 `legacy`。空值、未知值及尚未就绪的显式 `lifetime` 在开盘前拒绝 |
+| `--slab-eviction-policy` / `DFKV_SLAB_EVICTION_POLICY` | 请求 lifetime，实际 staged legacy | 命令行优先且保留显式空；当前可显式设置 `legacy`。空值、未知值及尚未就绪的显式 `lifetime` 在开盘前拒绝 |
 | `--slab-write` / `DFKV_SLAB_WRITE` | `direct` | slab 数据面 O_DIRECT / buffered；文件系统不支持 DIO 时整店回退 buffered 并以 `wr=` 上报 |
 | `--ram-tier` / `DFKV_RAM_TIER` | `off` | RAM 热层（写穿+RDMA zero-copy GET） |
 | `--ram-tier-bytes` / `DFKV_RAM_TIER_BYTES` | `16 GiB` | arena 预算（pin 一次即注册） |
@@ -485,6 +485,36 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--log` / `DFKV_LOG` | `INFO` | INFO/DEBUG/WARN/ERROR |
 | `--max-msg`（或 `DFKV_RDMA_MAX_PAYLOAD_BYTES`） | `32 MiB` | 单笔 payload 硬上限（RDMA 与 TCP 数据路径同受此限） |
 | `--version, -V` / `--help` | — | 打印版本/帮助并退出 |
+
+##### 当前磁盘淘汰策略：请求值不等于生效值
+
+阶段 0 尚未开放 lifetime，启动配置通过已有 `effective config (server)` 输出：
+
+| 引擎/输入 | `disk_eviction_requested` | `disk_eviction_effective` | `disk_eviction_staged` |
+|---|---|---|---|
+| slab，未指定策略 | lifetime | legacy | true |
+| slab，显式 legacy | legacy | legacy | false |
+| file，未指定策略 | lifetime | not_applicable | false |
+| file，显式 legacy | legacy | not_applicable | false |
+
+`DFKV_STORE_ENGINE` 显示实际引擎。请求来源按 `flag > env > default` 决定；库直接
+传入 Options 的来源显示 `arg`，不能伪称 CLI flag。实际 CLI flag 在服务入口标为
+`flag`；原始策略文本仍保留在 `DFKV_SLAB_EVICTION_POLICY` 行。effective/staged 的
+`(default)` 表示内建阶段闸门的决定，不是可独立设置的环境变量。不要只看请求值
+就把 staged legacy 或 file 当作新算法运行样本。
+
+以下九项仅供 lifetime 使用，目前全部导出 `inactive`，不会解析、校验或生效：
+`DFKV_SLAB_LIFE_BASE_SEC`、`DFKV_SLAB_LIFE_READ_BONUS_SEC`、
+`DFKV_SLAB_LIFE_MAX_READS`、`DFKV_SLAB_PROTECT_SEC`、
+`DFKV_SLAB_PROTECT_SLOWDOWN`、`DFKV_SLAB_PROTECT_BOOST_SEC`、
+`DFKV_SLAB_KEEP_SCORE_SEC`、`DFKV_SLAB_BUCKET_SEC`、`DFKV_SLAB_BUCKET_COUNT`。
+显式残留会显示为 `inactive (configured='原值')` 并提示已忽略；空值、非数字及越界
+值都不能因此阻断 staged/explicit legacy 或 file。已有的水位、victim 上限及 slab
+几何等旧参数不属于这个名单，仍按原规则校验。旧模式/file 的 RAM write-back 默认
+RAM-ACK 和显式 RAM-ACK 不受未来 lifetime 的 disk-ACK 新闸门影响。
+
+显式 `lifetime` 在阶段 4.5 前始终于开盘前拒启，不静默回退；file 显式 lifetime
+始终不适用。后续开放显式策略和最终默认切换是不同步骤，不能提前用于正式 A/B。
 
 #### b. RDMA 传输面（server/client 读取方见各项说明）
 

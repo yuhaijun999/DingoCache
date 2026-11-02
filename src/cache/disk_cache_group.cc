@@ -41,6 +41,57 @@ bool MatchesPolicyName(std::string_view text, std::string_view expected) {
   return true;
 }
 
+// Report the settled request and Stage 0 gate without parsing inactive values.
+// Only the entrypoint can later refine an API argument's provenance to a flag.
+void RecordDiskEvictionConfig(const DiskEvictionConfigResult& config,
+                              const DiskEvictionConfigInput& input) {
+  namespace cd = config_dump;
+  cd::Source policy_source = cd::Source::kDefault;
+  if (config.source == DiskEvictionPolicySource::kCommandLine) {
+    policy_source = cd::Source::kArg;
+  } else if (config.source == DiskEvictionPolicySource::kEnvironment) {
+    policy_source = cd::Source::kEnv;
+  }
+  cd::Source engine_source = cd::Source::kDefault;
+  if (input.cli_engine.has_value()) {
+    engine_source = cd::Source::kArg;
+  } else if (input.env_engine.has_value() && !input.env_engine->empty()) {
+    engine_source = cd::Source::kEnv;
+  }
+  const bool slab = config.engine == DiskEvictionEngine::kSlab;
+  const std::string requested =
+      config.policy == DiskEvictionPolicy::kLegacy ? "legacy" : "lifetime";
+  const std::string_view selected =
+      input.cli_policy.value_or(input.env_policy.value_or(requested));
+  cd::Record("DFKV_STORE_ENGINE", slab ? "slab" : "file", engine_source);
+  cd::Record("DFKV_SLAB_EVICTION_POLICY", std::string(selected), policy_source);
+  cd::Record("disk_eviction_requested", requested, policy_source);
+  // These are built-in readiness decisions, not independently configurable
+  // knobs.
+  cd::Record("disk_eviction_effective", slab ? "legacy" : "not_applicable",
+             cd::Source::kDefault);
+  cd::Record("disk_eviction_staged",
+             slab && requested == "lifetime" ? "true" : "false",
+             cd::Source::kDefault);
+  bool configured = false;
+  for (const char* name :
+       {"DFKV_SLAB_LIFE_BASE_SEC", "DFKV_SLAB_LIFE_READ_BONUS_SEC",
+        "DFKV_SLAB_LIFE_MAX_READS", "DFKV_SLAB_PROTECT_SEC",
+        "DFKV_SLAB_PROTECT_SLOWDOWN", "DFKV_SLAB_PROTECT_BOOST_SEC",
+        "DFKV_SLAB_KEEP_SCORE_SEC", "DFKV_SLAB_BUCKET_SEC",
+        "DFKV_SLAB_BUCKET_COUNT"}) {
+    const char* value = std::getenv(name);
+    const std::string inactive =
+        value ? "inactive (configured='" + std::string(value) + "')"
+              : "inactive";
+    cd::Record(name, inactive, value ? cd::Source::kEnv : cd::Source::kDefault);
+    configured = configured || value != nullptr;
+  }
+  if (configured)
+    DFKV_LOG_INFO(
+        "configured lifetime-only parameters are inactive; values are ignored");
+}
+
 bool ParseUnsigned(const char* text, uint64_t max, uint64_t* out) {
   if (text == nullptr || *text == '\0') return false;
   uint64_t value = 0;
@@ -186,7 +237,10 @@ DiskEvictionConfigResult ResolveDiskEvictionConfig(
 DiskCacheGroup::DiskCacheGroup(Options opt) {
   auto fail = [&](std::string error) {
     healthy_ = false;
-    if (startup_error_.empty()) startup_error_ = std::move(error);
+    if (startup_error_.empty()) {
+      startup_error_ = std::move(error);
+      DFKV_LOG_ERROR(startup_error_);
+    }
   };
   if (opt.cache_dirs.empty()) {
     fail("no cache directories configured");
@@ -254,7 +308,6 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       ResolveDiskEvictionConfig(config_input);
   if (config.status != Status::kOk) {
     fail(config.error);
-    DFKV_LOG_ERROR(startup_error_);
     return;
   }
   // Parsing a lifetime request is valid, but opening storage with it must wait
@@ -269,7 +322,6 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
         config_input.cli_policy.value_or(config_input.env_policy.value_or(""));
     fail(std::string(name) + "='" + std::string(value) +
          "' is not ready before stage 4.5; use 'legacy'");
-    DFKV_LOG_ERROR(startup_error_);
     return;
   }
   const bool use_slab = config.engine == DiskEvictionEngine::kSlab;
@@ -277,7 +329,9 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
 
   int disk_weight = 1;
   if (!ResolveDiskHashWeight(&disk_weight)) {
-    fail("DFKV_DISK_HASH_WEIGHT must be an integer in [1,64]");
+    const char* value = std::getenv("DFKV_DISK_HASH_WEIGHT");
+    fail("DFKV_DISK_HASH_WEIGHT='" + std::string(value ? value : "") +
+         "' must be an integer in [1,64]");
     return;
   }
 
@@ -288,7 +342,8 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     } else if (std::strcmp(mode, "buffered") == 0) {
       slab_direct = false;
     } else if (use_slab) {
-      fail("DFKV_SLAB_WRITE must be 'direct' or 'buffered'");
+      fail("DFKV_SLAB_WRITE='" + std::string(mode) +
+           "' must be 'direct' or 'buffered'");
       return;
     }
   }
@@ -298,7 +353,8 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
                        &slab_gran) ||
         slab_gran == 0) {
       if (use_slab) {
-        fail("DFKV_SLAB_GRANULARITY must be a positive uint32");
+        fail("DFKV_SLAB_GRANULARITY='" + std::string(value) +
+             "' must be a positive uint32");
         return;
       }
       slab_gran = 0;
@@ -309,7 +365,8 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   if (const char* value = std::getenv("DFKV_SLAB_TABLE_SYNC_MS")) {
     if (!ParseUnsigned(value, std::numeric_limits<uint32_t>::max(), &parsed)) {
       if (use_slab) {
-        fail("DFKV_SLAB_TABLE_SYNC_MS must be a uint32");
+        fail("DFKV_SLAB_TABLE_SYNC_MS='" + std::string(value) +
+             "' must be a uint32");
         return;
       }
     } else {
@@ -320,7 +377,8 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   if (const char* value = std::getenv("DFKV_SLAB_RECLAIM_MS")) {
     if (!ParseUnsigned(value, std::numeric_limits<uint32_t>::max(), &parsed)) {
       if (use_slab) {
-        fail("DFKV_SLAB_RECLAIM_MS must be a uint32");
+        fail("DFKV_SLAB_RECLAIM_MS='" + std::string(value) +
+             "' must be a uint32");
         return;
       }
     } else {
@@ -328,7 +386,6 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     }
   }
 
-  config_dump::RecordResolved("DFKV_STORE_ENGINE", engine_);
   config_dump::RecordResolved("DFKV_DISK_HASH_WEIGHT",
                               std::to_string(disk_weight));
   config_dump::RecordResolved("DFKV_SLAB_WRITE",
@@ -363,7 +420,6 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
              " (capacity_bytes=" + std::to_string(so.capacity_bytes) +
              ", extent_bytes=" + std::to_string(so.extent_bytes) +
              ", slot_granularity=" + std::to_string(so.slot_granularity) + ")");
-        DFKV_LOG_ERROR(startup_error_);
         return;
       }
       slab_options.push_back(std::move(so));
@@ -377,7 +433,6 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
           !DiskSlabStore::ValidateExistingEpoch(so, &error) ||
           !DiskSlabStore::ValidateExistingDataFiles(so, &error)) {
         fail(so.dir + ": " + error);
-        DFKV_LOG_ERROR(startup_error_);
         return;
       }
     }
@@ -406,13 +461,12 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     }
     if (!store->Healthy()) {
       fail(dir + ": " + store->StartupError());
-      DFKV_LOG_ERROR("disk store startup failed: " + dir + ": " +
-                     store->StartupError());
     }
     by_id_[dir] = i;
     disks_.push_back(std::move(store));
     ring_.AddNode(dir, disk_weight);
   }
+  if (healthy_) RecordDiskEvictionConfig(config, config_input);
   ring_.Build();
   if (disks_.size() > 1) {
     auto points = ring_.NodePointCounts();
