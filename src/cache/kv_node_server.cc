@@ -1517,6 +1517,10 @@ void KvNodeServer::FinishPromotedDiskRead(
     server->cache_hit_.fetch_add(1, std::memory_order_relaxed);
     server->bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
   } else {
+    // I/O is terminal: finish the hidden writer before a queued mutation can
+    // wait on it. Successful reads retain their source until the post-read
+    // owner releases it (including a PULL grant that outlives its READY SEND).
+    promoted->reservation = RamTier::DurableReservation{};
     server->get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
   if (flight) {
