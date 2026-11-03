@@ -359,6 +359,14 @@ class RamTier {
 
   friend class KvNodeServer;
   friend class RamTierTestPeer;
+  enum class AdmitTestPhase : unsigned char {
+    kBeforeCancelCheck = 0,
+    kAfterCancelCheck = 1,
+  };
+  // Test-only observation after copy and immediately after reading canceled.
+  // Reports actual publication-lock ownership. Set before starting callers and
+  // clear after joining them; the locked callback must not re-enter RamTier.
+  std::function<void(AdmitTestPhase, bool)> admit_test_hook_;
   void ReleaseToken(uint64_t token);
   bool TryReserve(uint64_t bytes);
   bool TryReserveLarge(uint64_t bytes);
