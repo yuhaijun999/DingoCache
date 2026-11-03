@@ -1396,6 +1396,66 @@ TEST(RamTierWiring, RegisteredPromotionCompletesWhileRemoveWaits) {
   fs::remove_all(dir);
 }
 
+TEST(RamTierWiring,
+     FailedPromotionReleasesReservationBeforeReadOwnerDestruction) {
+  for (const bool coalesce : {false, true}) {
+    SCOPED_TRACE(coalesce);
+    const fs::path dir =
+        fs::temp_directory_path() / "dfkv_failed_reserved_read";
+    std::unique_ptr<KvNodeServer> server = ReadFenceServer(dir, coalesce);
+    const BlockKey key{9607, 0};
+    const std::string value(4096, 'f');
+    ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, value.data(),
+                                                  value.size()),
+              Status::kOk);
+    alignas(4096) char staging[4096]{};
+    PreparedRead read = server->PrepareReadForKey(key, 0, value.size(), staging,
+                                                  sizeof(staging));
+    ASSERT_EQ(read.status(), Status::kOk);
+    ASSERT_TRUE(read.needs_io());
+    ASSERT_TRUE(read.source_registered());
+    ASSERT_EQ(::pread(read.fd(), read.staging(), read.aligned_len(),
+                      static_cast<off_t>(read.aligned_off())),
+              static_cast<ssize_t>(read.aligned_len()));
+    ASSERT_GT(server->RamUsedBytes(), 0u);
+
+    // The storage operation has drained. Reporting its terminal failure must
+    // finish the hidden RAM writer now, not when this queued read is destroyed.
+    ASSERT_TRUE(read.Commit(Status::kIOError, 0, 0.0));
+    EXPECT_FALSE(read.owns_cleanup());
+    EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+    EXPECT_EQ(server->RamUsedBytes(), 0u);
+
+    FlushBarrier removal_done;
+    Status removed = Status::kInvalid;
+    std::thread remover([&] {
+      std::string ignored;
+      removed =
+          server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                       key, 0, 0, nullptr, 0, &ignored);
+      removal_done.Block();
+    });
+    const bool completed_with_read_retained = removal_done.AwaitEntry();
+    EXPECT_TRUE(completed_with_read_retained)
+        << "Failed IO must not leave Remove waiting for the queued read owner";
+    // Release a broken implementation's hidden completion before joining.
+    // The successful path proves progress without this extra cleanup call.
+    if (!completed_with_read_retained) read.Abort();
+    removal_done.Open();
+    remover.join();
+    EXPECT_EQ(removed, Status::kOk);
+    EXPECT_EQ(server->RamUsedBytes(), 0u);
+    std::string disk;
+    EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &disk),
+              Status::kNotFound);
+    EXPECT_FALSE(read.Abort());
+    read = PreparedRead{};
+    EXPECT_TRUE(server->Healthy());
+    server.reset();
+    fs::remove_all(dir);
+  }
+}
+
 TEST(RamTierWiring, ReadCapturedBeforeRemoveCannotRegisterLatePromotion) {
   const fs::path dir = fs::temp_directory_path() / "dfkv_late_read_prep";
   FlushBarrier preparation;

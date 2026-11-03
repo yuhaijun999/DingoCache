@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Defer RDMA io_uring-path mutations behind local disk reads and preserve the
+  resulting request-order barrier while allowing grant releases to progress.
+  Failed registered reads now finish their hidden RAM writer before the queued
+  read owner is destroyed; successful SEND-source lifetimes are unchanged.
+
 - Run RAM backing-index probes outside the RAM shard lock, preserving first-PUT
   ownership with a separate admission gate. RAM reads, SEND releases and prior
   flush completions can progress during the probe. Best-effort read promotion

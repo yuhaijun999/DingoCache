@@ -1,4 +1,3 @@
-#include "common/config_dump.h"
 #include "cache/rdma_server.h"
 
 #include <arpa/inet.h>
@@ -10,26 +9,31 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <deque>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
-#include "utils/log.h"          // DFKV_LOG_WARN (uring init fallback)
-#include "utils/prom_escape.h"
-#include "utils/net_util.h"     // ReadAll / WriteAll / Get*/Put*
-#include "utils/thread_name.h"
-#include "utils/numa_util.h"    // pin serve thread to the device's NUMA node
-#include "utils/wire_limits.h"  // ResolveMaxPayload (shared with the TCP path)
-#include "transport/rdma_verbs.h"   // RcEndpoint, QpInfo
+#include "cache/rdma_request_order.h"
+#include "cache/uring_reader.h"  // io_uring async-GET path (DFKV_WITH_URING only)
+#include "common/config_dump.h"
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_topology.h"
-#include "transport/transport.h"    // wire framing and transport structures
-#include "cache/uring_reader.h" // io_uring async-GET path (DFKV_WITH_URING only)
+#include "transport/rdma_verbs.h"  // RcEndpoint, QpInfo
+#include "transport/transport.h"   // wire framing and transport structures
+#include "transport/wire.h"
+#include "utils/log.h"        // DFKV_LOG_WARN (uring init fallback)
+#include "utils/net_util.h"   // ReadAll / WriteAll / Get*/Put*
+#include "utils/numa_util.h"  // pin serve thread to the device's NUMA node
+#include "utils/prom_escape.h"
+#include "utils/thread_name.h"
+#include "utils/wire_limits.h"  // ResolveMaxPayload (shared with the TCP path)
 
 namespace dfkv {
 
@@ -1690,6 +1694,24 @@ void RdmaServer::Serve(int boot_fd) {
       qd.recv_slot = request.recv_slot;
       const ReqFields& fields = request.fields;
 
+      const bool pending_disk_reads =
+          std::any_of(queue.begin(), queue.end(), [](const Queued& earlier) {
+            return earlier.disk_state == DiskState::kWaiting ||
+                   earlier.disk_state == DiskState::kInflight;
+          });
+      // Never wait for a reservation whose I/O only this Serve can advance.
+      // Establish the barrier before even RAM-hit/preparation paths: later
+      // requests must not overtake an already deferred mutation. Releases and
+      // SEND completions remain runnable so grants can retire independently.
+      if (ShouldDeferRdmaRequest(static_cast<WireOp>(fields.op),
+                                 pending_disk_reads, has_sync_fallbacks)) {
+        qd.disk_state = DiskState::kSyncFallback;
+        has_sync_fallbacks = true;
+        qd.request = request;
+        queue.push_back(std::move(qd));
+        return true;
+      }
+
       bool handled = false;
       rdma::PullPrepareControl control;
       if (fields.op == static_cast<uint8_t>(WireOp::kPullRange) &&
@@ -1765,10 +1787,7 @@ void RdmaServer::Serve(int boot_fd) {
         // leader whose completion only this Serve thread can advance.
         const bool waiting_for_disk =
             fields.op == static_cast<uint8_t>(WireOp::kPullRange) &&
-            std::any_of(queue.begin(), queue.end(), [](const Queued& earlier) {
-              return earlier.disk_state == DiskState::kWaiting ||
-                     earlier.disk_state == DiskState::kInflight;
-            });
+            pending_disk_reads;
         if (waiting_for_disk) {
           qd.disk_state = DiskState::kSyncFallback;
           has_sync_fallbacks = true;
