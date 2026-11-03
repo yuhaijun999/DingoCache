@@ -479,8 +479,12 @@ RamTier::Admission RamTier::Admit(
 
   Shard& s = ShardFor(key);
   std::shared_ptr<PutCompletion> completion;
-  // Keep admission and the first arena reservation in one critical section;
-  // releasing and immediately reacquiring this shard only adds contention.
+  // Serialize owner selection across the unlocked backing probe. Every new
+  // PUT/promotion registration uses this gate, but existing completions do not.
+  // A dirty flusher cannot hide behind an absent owner: its entry stays indexed
+  // until completion. This prevents another writer invalidating a negative
+  // disk observation without nesting the disk lock under the RAM shard lock.
+  std::unique_lock<std::mutex> admission_gate(s.admission_mu);
   std::unique_lock<std::mutex> admission_lock(s.mu);
   {
     bool ram_blocked = false;
@@ -520,8 +524,17 @@ RamTier::Admission RamTier::Admit(
     // batch's allocation, per-item status and disk-complete ACK semantics.
     // This deliberate forwarding is not a RAM capacity-bypass metric.
     if (!admit_new) return Admission::kBypass;
-    if (opt_.is_persisted && opt_.is_persisted(key))
-      return Admission::kPersisted;
+    if (opt_.is_persisted) {
+      admission_lock.unlock();
+      const bool persisted = opt_.is_persisted(key);
+      admission_lock.lock();
+      // The gate excludes new owners. Concurrent cancellation/release can
+      // only retire the old canceled promotion or durable SEND obstruction;
+      // retaining ram_blocked in that case merely takes a conservative bypass.
+      // Remove before this unregistered PUT is a valid standalone ordering;
+      // the server separately serializes the entire two-tier mutation.
+      if (persisted) return Admission::kPersisted;
+    }
     if (client_ack && opt_.ack_high_watermark_pct != 0) {
       const uint64_t high =
           opt_.bytes * std::min<uint32_t>(opt_.ack_high_watermark_pct, 100) / 100;
@@ -548,6 +561,7 @@ RamTier::Admission RamTier::Admit(
     completion = std::make_shared<PutCompletion>();
     s.writing.emplace(key, completion);
   }
+  admission_gate.unlock();  // Completion identity now owns this attempt.
   if (out_completion) *out_completion = completion;
 
   const bool large = static_cast<uint64_t>(len) > extent_bytes_;
@@ -720,6 +734,10 @@ bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
 
   for (int attempt = 0; attempt < 2 && !admitted; ++attempt) {
     {
+      // Best-effort read publication must not wait behind a disk probe while
+      // the caller holds its publication fence.
+      const std::unique_lock<std::mutex> gate(s.admission_mu, std::try_to_lock);
+      if (!gate.owns_lock()) return false;
       std::lock_guard<std::mutex> lk(s.mu);
       auto existing = s.index.find(key);
       if (existing != s.index.end() || s.writing.count(key)) return false;
@@ -878,6 +896,8 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
 
   if (large) {
     {
+      const std::unique_lock<std::mutex> gate(s.admission_mu, std::try_to_lock);
+      if (!gate.owns_lock()) return false;
       std::lock_guard<std::mutex> lk(s.mu);
       auto existing = s.index.find(key);
       if (existing != s.index.end())
@@ -907,6 +927,9 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
     bool admitted = false;
     for (int attempt = 0; attempt < 2 && !admitted; ++attempt) {
       {
+        const std::unique_lock<std::mutex> gate(s.admission_mu,
+                                                std::try_to_lock);
+        if (!gate.owns_lock()) return false;
         std::lock_guard<std::mutex> lk(s.mu);
         auto existing = s.index.find(key);
         if (existing != s.index.end())

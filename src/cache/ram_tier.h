@@ -93,7 +93,8 @@ class RamTier {
     // 0 explicitly selects synchronous disk-ACK, not perpetual rejection.
     uint32_t ack_high_watermark_pct = 80;
     // Optional backing-index check for a key without a RAM owner. Invoked
-    // under its RAM shard lock; must be metadata-only and must not reenter RAM.
+    // without the RAM shard lock, with new admission serialized. Must be
+    // metadata-only and must not recursively admit or register promotions.
     // An existing disk value is authoritative after RAM eviction.
     std::function<bool(const BlockKey&)> is_persisted;
   };
@@ -341,6 +342,11 @@ class RamTier {
   struct Shard {
     uint64_t base_off = 0;
     std::unique_ptr<SlabAllocator> alloc;
+    // Take before mu when registering a writer. Admit holds across the backing
+    // probe, then releases before payload allocation/copy/completion waits.
+    // Promotion only tries the gate for initial slot reservation/registration.
+    // Remove/SEND release/flusher completion never use it.
+    std::mutex admission_mu;
     mutable std::mutex mu;
     std::unordered_map<BlockKey, Entry, KeyHash> index;
     std::unordered_map<BlockKey, std::shared_ptr<PutCompletion>, KeyHash> writing;

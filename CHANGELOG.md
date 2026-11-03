@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Run RAM backing-index probes outside the RAM shard lock, preserving first-PUT
+  ownership with a separate admission gate. RAM reads, SEND releases and prior
+  flush completions can progress during the probe. Best-effort read promotion
+  declines a busy gate instead of waiting under the publication fence.
+
 - Preserve cross-tier ownership for direct batch PUTs: retire stale durable RAM
   copies, fence late read promotion, and wait for existing dirty PUT results
   without writing conflicting payloads. Batches remain disk-complete even when
