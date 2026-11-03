@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <mutex>
 #include <set>
 #include <string>
@@ -1430,4 +1431,194 @@ TEST(RamTier, PrepareDirectPutBypassesCanceledPromotionWithoutReusingItsPin) {
   EXPECT_EQ(rt.UsedBytes(), 0u);
   const std::lock_guard<std::mutex> lock(sink.m);
   EXPECT_EQ(sink.calls, 0);
+}
+
+TEST(RamTier, BackingProbeDoesNotBlockRamReadsSendReleaseOrFlushCompletion) {
+  FlushSink sink;
+  sink.close();
+  std::promise<void> entered, release, observed;
+  const std::future<void> probe_entered = entered.get_future();
+  const std::shared_future<void> probe_release = release.get_future().share();
+  const std::future<void> observation_done = observed.get_future();
+  RamTier::Options options = Opts(16 * 4096);
+  options.reclaim_interval_ms = 0;
+  options.is_persisted = [&](const BlockKey& key) {
+    if (key == K(211)) {
+      entered.set_value();
+      probe_release.wait();
+    }
+    return false;
+  };
+  RamTier rt(options, sink.fn());
+  const OpenFlushOnExit cleanup{sink};
+  RamTierTestPeer::Completion dirty;
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(210), "old", &dirty),
+            RamTierTestPeer::Admission::kAccepted);
+  ASSERT_TRUE(sink.await_calls(1));
+  RamTier::Hit old_send;
+  ASSERT_TRUE(rt.GetPrep(K(210), 0, 0, &old_send));
+  Status status = Status::kInvalid;
+  std::thread writer(
+      [&] { status = rt.PutCommitted(K(211), "new", 3).status; });
+  EXPECT_EQ(probe_entered.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  std::thread observer([&] {
+    EXPECT_TRUE(rt.Contains(K(210)));
+    size_t length = 0;
+    EXPECT_TRUE(rt.Lookup(K(210), &length));
+    EXPECT_EQ(length, 3u);
+    RamTier::Hit hit;
+    EXPECT_TRUE(rt.GetPrep(K(210), 0, 0, &hit));
+    if (hit.ptr != nullptr) {
+      EXPECT_EQ(std::string(hit.ptr, hit.len), "old");
+    }
+    hit = RamTier::Hit{};
+    old_send = RamTier::Hit{};
+    sink.open();
+    EXPECT_TRUE(RamTierTestPeer::AwaitDone(dirty));
+    observed.set_value();
+  });
+  // A failed implementation must still be released before joining threads.
+  EXPECT_EQ(observation_done.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  release.set_value();
+  observer.join();
+  writer.join();
+  EXPECT_EQ(status, Status::kOk);
+  EXPECT_EQ(RamTierTestPeer::Wait(dirty), Status::kOk);
+}
+
+TEST(RamTier, BackingProbeKeepsFirstPutOwnershipAcrossUnlockedDiskCheck) {
+  FlushSink sink;
+  std::promise<void> entered, release, duplicate_started, duplicate_done;
+  const std::future<void> probe_entered = entered.get_future();
+  const std::shared_future<void> probe_release = release.get_future().share();
+  const std::future<void> started = duplicate_started.get_future();
+  const std::future<void> finished = duplicate_done.get_future();
+  std::atomic<uint64_t> probes{0};
+  RamTier::Options options = Opts(16 * 4096);
+  options.reclaim_interval_ms = 0;
+  options.is_persisted = [&](const BlockKey&) {
+    if (probes.fetch_add(1, std::memory_order_relaxed) == 0) {
+      entered.set_value();
+      probe_release.wait();
+    }
+    return false;
+  };
+  RamTier rt(options, sink.fn());
+  Status first = Status::kInvalid, second = Status::kInvalid;
+  std::thread leader(
+      [&] { first = rt.PutCommitted(K(212), "first", 5).status; });
+  EXPECT_EQ(probe_entered.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  std::thread duplicate([&] {
+    duplicate_started.set_value();
+    second = rt.PutCommitted(K(212), "second", 6).status;
+    duplicate_done.set_value();
+  });
+  EXPECT_EQ(started.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  EXPECT_EQ(finished.wait_for(std::chrono::seconds(2)),
+            std::future_status::timeout);
+  {
+    const std::lock_guard<std::mutex> lock(sink.m);
+    EXPECT_EQ(sink.calls, 0);
+  }
+  release.set_value();
+  leader.join();
+  duplicate.join();
+  EXPECT_EQ(first, Status::kOk);
+  EXPECT_EQ(second, Status::kOk);
+  EXPECT_EQ(probes.load(std::memory_order_relaxed), 1u);
+  const std::lock_guard<std::mutex> lock(sink.m);
+  EXPECT_EQ(sink.calls, 1);
+  EXPECT_EQ(sink.values.at(K(212).Filename()), "first");
+}
+
+TEST(RamTier, BackingProbeDeclinesCompetingPromotionWithoutWaitingForDisk) {
+  for (int mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    FlushSink sink;
+    std::promise<void> entered, release, promotion_done;
+    const std::future<void> probe_entered = entered.get_future();
+    const std::shared_future<void> probe_release = release.get_future().share();
+    const std::future<void> finished = promotion_done.get_future();
+    RamTier::Options options = Opts(16 * 4096);
+    options.reclaim_interval_ms = 0;
+    // Leave a 16 KiB arena and a legal dedicated budget for the large-copy
+    // path. Contention, not an invalid size/budget, must decline promotion.
+    options.large_reserve_bytes = 48 * 1024;
+    const std::string promoted_value(mode == 2 ? 20 * 1024 : 3, 'o');
+    options.is_persisted = [&](const BlockKey&) {
+      entered.set_value();
+      probe_release.wait();
+      return false;
+    };
+    RamTier rt(options, sink.fn());
+    Status status = Status::kInvalid;
+    std::thread writer(
+        [&] { status = rt.PutCommitted(K(213), "first", 5).status; });
+    EXPECT_EQ(probe_entered.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    bool promoted = true;
+    std::thread promoter([&] {
+      if (mode == 1) {
+        RamTier::DurableReservation reservation;
+        promoted = rt.ReserveDurable(K(213), 4096, &reservation);
+      } else {
+        promoted =
+            rt.PutDurable(K(213), promoted_value.data(), promoted_value.size());
+      }
+      promotion_done.set_value();
+    });
+    EXPECT_EQ(finished.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    release.set_value();
+    promoter.join();
+    writer.join();
+    EXPECT_FALSE(promoted);
+    EXPECT_EQ(status, Status::kOk);
+    RamTier::Hit hit;
+    ASSERT_TRUE(rt.GetPrep(K(213), 0, 0, &hit));
+    EXPECT_EQ(std::string(hit.ptr, hit.len), "first");
+    if (mode == 2) {
+      EXPECT_TRUE(
+          rt.PutDurable(K(217), promoted_value.data(), promoted_value.size()));
+    }
+  }
+}
+
+TEST(RamTier, BackingProbePreservesPersistedSuccessAndPreAdmissionWatermark) {
+  FlushSink sink;
+  sink.close();
+  RamTier::Options options = Opts(16 * 4096);
+  options.reclaim_interval_ms = 0;
+  options.ack_high_watermark_pct = 6;
+  options.is_persisted = [](const BlockKey& key) { return key == K(215); };
+  RamTier rt(options, sink.fn());
+  const OpenFlushOnExit cleanup{sink};
+  const std::string value(4096, 'd');
+  ASSERT_EQ(rt.PutWriteBack(K(214), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(sink.await_calls(1));
+  ASSERT_EQ(rt.DirtyBytes(), 4096u);  // Above the positive dirty watermark.
+  const uint64_t used = rt.UsedBytes();
+  const RamTier::PutResult persisted = rt.PutWriteBack(K(215), "known", 5);
+  EXPECT_EQ(persisted.status, Status::kOk);
+  EXPECT_FALSE(rt.Contains(K(215)));
+  const RamTier::PutResult rejected = rt.PutWriteBack(K(216), "new", 3);
+  EXPECT_EQ(rejected.status, Status::kCacheFull);
+  EXPECT_EQ(rejected.disposition, RamTier::PutDisposition::kBackpressure);
+  EXPECT_FALSE(rt.Contains(K(216)));
+  // A rejected request must not leave a placeholder that a later direct PUT
+  // mistakes for an accepted value or an unfinished completion.
+  const RamTier::PutResult direct = rt.PrepareDirectPut(K(216), "other", 5);
+  EXPECT_EQ(direct.disposition, RamTier::PutDisposition::kBypass);
+  EXPECT_EQ(rt.UsedBytes(), used);
+  EXPECT_EQ(rt.FlushBacklog(), 1u);
+  EXPECT_EQ(rt.PutBypass(), 0u);
+  EXPECT_EQ(rt.RamAcks(), 1u);
+  EXPECT_EQ(rt.AckBackpressure(), 1u);
+  const std::lock_guard<std::mutex> lock(sink.m);
+  EXPECT_EQ(sink.calls, 1);
 }
