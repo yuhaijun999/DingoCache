@@ -640,11 +640,20 @@ RamTier::Admission RamTier::Admit(
   // site under s.mu -- no path ever takes s.mu while holding completion->mu.
   bool canceled = false;
   {
-    std::lock_guard<std::mutex> lk(s.mu);
+    std::unique_lock<std::mutex> publish_lock(s.mu, std::defer_lock);
+    if (admit_test_hook_)
+      admit_test_hook_(AdmitTestPhase::kBeforeCancelCheck,
+                       publish_lock.owns_lock());
+    publish_lock.lock();
     {
       std::lock_guard<std::mutex> state_lk(completion->mu);
       canceled = completion->canceled;
     }
+    // Keep this observation adjacent to the read: moving it past a separately
+    // acquired publication lock would conceal a read/install atomicity gap.
+    if (admit_test_hook_)
+      admit_test_hook_(AdmitTestPhase::kAfterCancelCheck,
+                       publish_lock.owns_lock());
     s.writing.erase(key);
     if (!canceled) {
       Entry e;
