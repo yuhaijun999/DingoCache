@@ -113,6 +113,9 @@ class KvNodeServerWiringTestPeer {
                          std::string* out) {
     return server.group_.Range(key, 0, 0, out);
   }
+  static const std::string& DiskEngine(const KvNodeServer& server) {
+    return server.group_.EngineName();
+  }
   static Status DropDisk(KvNodeServer& server, const BlockKey& key) {
     return server.group_.Remove(key);
   }
@@ -1745,6 +1748,131 @@ TEST(RamTierWiring, ForegroundPutRetiresSurvivingDurableRamCopy) {
           server.reset();
           fs::remove_all(dir);
         }
+      }
+    }
+  }
+}
+
+TEST(RamTierWiring, SlabLegacyPutReplacesSurvivingDurableRamCopy) {
+  const ScopedEnv ram("DFKV_RAM_TIER",
+                      "0");  // Install the small RAM tier below.
+  const ScopedEnv buffered("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "1048576");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  // Modes: disk ACK, RAM ACK, writearound. Paths: shared handler, direct,
+  // batch.
+  for (int mode = 0; mode < 3; ++mode) {
+    for (int path = 0; path < 3; ++path) {
+      for (const bool pinned : {false, true}) {
+        SCOPED_TRACE("mode=" + std::to_string(mode) +
+                     " path=" + std::to_string(path) +
+                     " pinned=" + std::to_string(pinned));
+        const fs::path dir = fs::temp_directory_path() / "dfkv_slab_ram_put";
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "slab"};
+        options.eviction_policy = "legacy";
+        std::atomic<size_t> flushes{
+            0};  // Outlives the server's flush callback.
+        std::unique_ptr<KvNodeServer> server =
+            KvNodeServerWiringTestPeer::Create(std::move(options));
+        ASSERT_TRUE(server->Healthy());
+        ASSERT_EQ(KvNodeServerWiringTestPeer::DiskEngine(*server), "slab");
+        ASSERT_TRUE(fs::exists(dir / "slab_meta"));
+        ASSERT_TRUE(fs::exists(dir / "slots.tbl"));
+        KvNodeServer* const node = server.get();
+        KvNodeServerWiringTestPeer::SetRam(
+            *server,
+            [node, &flushes](const BlockKey& key, char* data, size_t len,
+                             size_t) {
+              flushes.fetch_add(1, std::memory_order_relaxed);
+              return KvNodeServerWiringTestPeer::Persist(*node, key, data,
+                                                         len) == Status::kOk;
+            },
+            mode == 1);
+        KvNodeServerWiringTestPeer::SetWriteBack(*server, mode != 2);
+        const BlockKey key{9900, 0};
+        const std::string original(4096, 'o'), replacement(4096, 'n');
+        ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(
+                      *server, key, original.data(), original.size()),
+                  Status::kOk);
+        alignas(4096) char staging[4096]{};
+        const char* data = nullptr;
+        size_t length = 0;
+        ASSERT_EQ(server->RangeDirectForKey(key, 0, original.size(), staging,
+                                            sizeof(staging), &data, &length),
+                  Status::kOk);
+        ASSERT_NE(data, nullptr);
+        ASSERT_EQ(std::string(data, length), original);
+        ASSERT_TRUE(KvNodeServerWiringTestPeer::Resident(*server, key));
+        PreparedRead old_send;
+        if (pinned) {
+          old_send = server->PrepareReadForKey(key, 0, original.size(), staging,
+                                               sizeof(staging));
+          ASSERT_EQ(old_send.status(), Status::kOk);
+          ASSERT_TRUE(old_send.source_registered());
+          ASSERT_FALSE(old_send.needs_io());  // RAM pin, not a slab disk lease.
+        }
+        // Real slab removal models independent backing disappearance; this is
+        // deliberately not a pressure-eviction/victim-selection assertion.
+        ASSERT_EQ(KvNodeServerWiringTestPeer::DropDisk(*server, key),
+                  Status::kOk);
+        std::string persisted;
+        ASSERT_EQ(
+            KvNodeServerWiringTestPeer::DiskRead(*server, key, &persisted),
+            Status::kNotFound);
+        ASSERT_TRUE(KvNodeServerWiringTestPeer::Resident(*server, key));
+        alignas(4096) char incoming[4096]{};
+        std::memcpy(incoming, replacement.data(), replacement.size());
+        FlushBarrier done;
+        Status status = Status::kInvalid;
+        std::thread writer([&] {
+          if (path == 0) {
+            std::string ignored;
+            status = server->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0, incoming,
+                replacement.size(), &ignored);
+          } else if (path == 1) {
+            status = server->CacheDirectForKey(
+                key, incoming, replacement.size(), sizeof(incoming));
+          } else {
+            const std::vector<Status> results = server->CacheDirectBatchForKeys(
+                {{key, incoming, replacement.size(), sizeof(incoming)}});
+            if (results.size() == 1) status = results[0];
+          }
+          done.Block();
+        });
+        const bool completed_with_pin = done.AwaitEntry();
+        EXPECT_TRUE(completed_with_pin) << "PUT must not wait for old RAM SEND";
+        if (!completed_with_pin) old_send = PreparedRead{};
+        done.Open();
+        writer.join();
+        EXPECT_EQ(status, Status::kOk);
+        ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+        const bool new_ram_owner = mode != 2 && path != 2 && !pinned;
+        EXPECT_EQ(flushes.load(std::memory_order_relaxed),
+                  new_ram_owner ? 1u : 0u);
+        EXPECT_EQ(KvNodeServerWiringTestPeer::Resident(*server, key),
+                  new_ram_owner);
+        EXPECT_EQ(
+            KvNodeServerWiringTestPeer::DiskRead(*server, key, &persisted),
+            Status::kOk);
+        EXPECT_EQ(persisted, replacement);
+        std::string visible;
+        EXPECT_EQ(
+            server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                         key, 0, 0, nullptr, 0, &visible),
+            Status::kOk);
+        EXPECT_EQ(visible, replacement);
+        if (pinned && completed_with_pin) {
+          EXPECT_EQ(std::string(old_send.data(), old_send.payload_len()),
+                    original);
+        }
+        old_send = PreparedRead{};
+        EXPECT_TRUE(server->Healthy());
+        server.reset();
+        fs::remove_all(dir);
       }
     }
   }
