@@ -12,14 +12,18 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "common/kv_types.h"
 #include "common/status.h"
 
 using dfkv::BlockKey;
@@ -34,6 +38,21 @@ class RamTierTestPeer {
  public:
   using Admission = RamTier::Admission;
   using Completion = std::shared_ptr<RamTier::PutCompletion>;
+  using AdmitPhase = RamTier::AdmitTestPhase;
+
+  static void SetAdmitHook(RamTier& tier,
+                           std::function<void(AdmitPhase, bool)> hook) {
+    tier.admit_test_hook_ = std::move(hook);
+  }
+  static Completion Writing(RamTier& tier, const BlockKey& key) {
+    RamTier::Shard& shard = tier.ShardFor(key);
+    const std::lock_guard<std::mutex> lock(shard.mu);
+    return shard.writing.count(key) == 0 ? Completion{} : shard.writing.at(key);
+  }
+  static bool Canceled(const Completion& completion) {
+    const std::lock_guard<std::mutex> lock(completion->mu);
+    return completion->canceled;
+  }
 
   static Admission Admit(RamTier& tier, const BlockKey& key,
                          const std::string& value, Completion* completion,
@@ -689,56 +708,96 @@ TEST(RamTier, RemoveHidesActiveFlushAndDefersPinnedRelease) {
 // flagged the canceled bit too late, the entry was installed untombstoned,
 // and the key kept answering GETs after Remove returned true (the disk copy
 // is deleted by the caller on remove, so the tier served a deleted value).
-// Here a pack of hammer threads keeps the single shard mutex saturated so
-// the writer blocks between that read and the install, opening the race
-// window; rounds where Remove observed the key must all end with the key
-// invisible.
+// Two synchronized windows cover cancellation before the check and removal
+// after the check. Checking real lock ownership also catches split publication
+// even when Remove's final tombstone/drop compensates for an incorrect install.
 TEST(RamTier, RemoveRacingInFlightPutNeverResurrects) {
   ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
   ::setenv("DFKV_RAM_TIER_SHARDS", "1", 1);
-  FlushSink sink;  // gate open: installs flush (and complete) promptly
-  RamTier rt(Opts(64ull << 20), sink.fn());
+  FlushSink sink;
+  RamTier::Options options = Opts(64ull << 20);
+  options.large_reserve_bytes = 0;
+  options.reclaim_interval_ms = 0;
+  RamTier rt(options, sink.fn());
   ASSERT_TRUE(rt.ok());
-  const std::string v(1ull << 20, 'v');  // in-arena (== one extent), slow copy
-
-  std::atomic<bool> stop_hammer{false};
-  std::vector<std::thread> hammers;
-  for (int i = 0; i < 8; ++i) {
-    hammers.emplace_back([&, i] {
-      // Never admitted; pure lock pressure on the single shard mutex so the
-      // writer's read->install transition contends with Remove's phase one.
-      while (!stop_hammer.load(std::memory_order_relaxed))
-        (void)rt.Contains(K(0xFFF00000u + i));
-    });
-  }
-
-  int observed = 0;       // rounds where Remove found the key tracked
-  int resurrections = 0;  // observed rounds where the key survived Remove
-  for (uint64_t r = 0; r < 600; ++r) {
-    std::atomic<bool> started{false};
-    std::thread writer([&] {
-      started.store(true, std::memory_order_release);
-      rt.Put(K(r), v.data(), v.size());
-    });
-    while (!started.load(std::memory_order_acquire))
-      std::this_thread::yield();
-    // Sweep across the writer's copy window (~100+ us for 1 MiB under
-    // contention) so many rounds land mid-flight.
-    std::this_thread::sleep_for(std::chrono::microseconds(10 + (r % 28) * 5));
-    const bool removed = rt.Remove(K(r));
-    writer.join();
-    if (removed) {
-      ++observed;
-      if (rt.Contains(K(r))) ++resurrections;
-      RamTier::Hit h;
-      if (rt.GetPrep(K(r), 0, 0, &h)) ++resurrections;
+  const std::string value(1ull << 20, 'v');
+  using Phase = RamTierTestPeer::AdmitPhase;
+  const Phase phases[] = {Phase::kBeforeCancelCheck, Phase::kAfterCancelCheck};
+  int observed = 0;
+  int resurrections = 0;
+  for (const Phase pause_at : phases) {
+    for (uint64_t round = 0; round < 3; ++round) {
+      SCOPED_TRACE("phase=" + std::to_string(static_cast<int>(pause_at)) +
+                   " round=" + std::to_string(round));
+      const BlockKey key = K(3 * static_cast<uint64_t>(pause_at) + round);
+      std::promise<void> paused_signal, release_signal, remove_signal;
+      const std::future<void> paused = paused_signal.get_future();
+      const std::future<void> release = release_signal.get_future();
+      const std::future<void> remove_started = remove_signal.get_future();
+      RamTierTestPeer::Completion completion;
+      int hook_calls = 0;
+      RamTierTestPeer::SetAdmitHook(rt, [&](Phase phase, bool lock_owned) {
+        ++hook_calls;
+        EXPECT_EQ(lock_owned, phase == Phase::kAfterCancelCheck);
+        if (phase == Phase::kBeforeCancelCheck && !lock_owned)
+          completion = RamTierTestPeer::Writing(rt, key);
+        if (phase == pause_at) {
+          paused_signal.set_value();
+          release.wait();
+        }
+      });
+      bool put = false, removed = false;
+      std::thread writer(
+          [&] { put = rt.Put(key, value.data(), value.size()); });
+      const bool entered =
+          paused.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+      EXPECT_TRUE(entered);
+      // Never leave a failed assertion with a paused thread or callback that
+      // refers to the next round's destroyed synchronization objects.
+      if (!entered || !completion) {
+        release_signal.set_value();
+        writer.join();
+        RamTierTestPeer::SetAdmitHook(rt, {});
+        EXPECT_NE(completion, nullptr);  // Only inspect after writer joined.
+        continue;
+      }
+      EXPECT_FALSE(RamTierTestPeer::Done(completion));
+      std::thread remover([&] {
+        remove_signal.set_value();
+        removed = rt.Remove(key);
+      });
+      bool canceled_before_check = false;
+      if (pause_at == Phase::kBeforeCancelCheck) {
+        canceled_before_check =
+            WaitFor([&] { return RamTierTestPeer::Canceled(completion); });
+        EXPECT_TRUE(canceled_before_check);
+      } else {
+        // Do not infer exclusion from a timeout: the hook already checked the
+        // actual lock held at the canceled read. Then exercise real Remove.
+        EXPECT_EQ(remove_started.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+      }
+      release_signal.set_value();
+      writer.join();
+      remover.join();
+      RamTierTestPeer::SetAdmitHook(rt, {});
+      EXPECT_EQ(hook_calls, 2);
+      EXPECT_EQ(put, pause_at == Phase::kAfterCancelCheck);
+      EXPECT_TRUE(removed);
+      EXPECT_TRUE(RamTierTestPeer::Done(completion));
+      if (canceled_before_check && removed) ++observed;
+      if (rt.Contains(key)) ++resurrections;
+      RamTier::Hit hit;
+      if (rt.GetPrep(key, 0, 0, &hit)) ++resurrections;
+      hit = RamTier::Hit{};
+      rt.Remove(key);  // Also clean up a deliberately faulty mutation run.
+      EXPECT_EQ(rt.Count(), 0u);
+      EXPECT_EQ(rt.UsedBytes(), 0u);
+      EXPECT_EQ(rt.DirtyObjects(), 0u);
+      EXPECT_EQ(rt.FlushBacklog(), 0u);
     }
-    rt.Remove(K(r));  // cleanup: writer may have missed the race window
   }
-  stop_hammer.store(true, std::memory_order_relaxed);
-  for (auto& t : hammers) t.join();
-
-  EXPECT_GE(observed, 3);  // prove the race regime was actually entered
+  EXPECT_GE(observed, 3);  // Three actual writing cancellations, not sleeps.
   EXPECT_EQ(resurrections, 0);
 }
 
