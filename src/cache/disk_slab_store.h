@@ -27,9 +27,10 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cache/disk_resident_identity.h"
+#include "cache/new_put_demand_latch.h"
 #include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
-#include "cache/new_put_demand_latch.h"
 #include "common/kv_types.h"
 #include "common/status.h"
 
@@ -71,6 +72,10 @@ class DiskSlabStore : public StoreEngine {
     // no such window in direct mode (DIO is durable at return); this closes
     // the record side to <= the cadence instead of the ~30s dirty expiry.
     uint32_t table_sync_ms = 100;
+    // Internal lifetime building block, not a policy enable switch. Startup
+    // leaves this off until identity/result propagation is integrated. Legacy
+    // stores allocate no identity table and retain existing eviction behavior.
+    bool track_resident_identity = false;
   };
 
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
@@ -193,6 +198,17 @@ class DiskSlabStore : public StoreEngine {
   DiskSlabStore& operator=(const DiskSlabStore&) = delete;
 
   Status Cache(const BlockKey& key, const void* data, size_t len) override;
+  // Concrete-store NEW PUT result: requires tracking and a non-null output.
+  // Clears *identity on entry; only the real successful NEW leader receives
+  // a credential captured under the commit lock. Keep-first/flight followers,
+  // failures and a write removed before commit return no credential, even if
+  // Status is kOk. Never bind a duplicate's attempted bytes to an old resident.
+  // A later Remove/eviction can invalidate this credential; it is not a pin.
+  // Identity exhaustion rejects NEW admissions with kCacheFull, logs once,
+  // and cannot be fixed by eviction. Typed reason/drain propagation remains
+  // required before enabling lifetime; transport-only statuses are not reused.
+  Status CacheWithIdentity(const BlockKey& key, const void* data, size_t len,
+                           DiskResidentIdentity* identity);
   // Writes an already aligned transport buffer without a value envelope.
   // Direct mode uses O_DIRECT; the bounded fallback preserves raw bytes.
   Status CacheDirect(const BlockKey& key, char* data, size_t len,
@@ -262,12 +278,17 @@ class DiskSlabStore : public StoreEngine {
   // zeroes the padding bytes in place (cap allows) and pwrites the 4 KiB-rounded
   // length via the extent's DIO fd. Caller pre-checked alignment/cap fit.
   bool WritePayloadDirect(const SlabAllocator::SlotRef& r, char* data, size_t len);
-  void CommitPayloadLocked(const std::string& key, uint32_t payload_len);
+  bool ReserveResidentGenerationLocked(uint64_t* generation);
+  DiskResidentIdentity ResidentIdentityLocked(const std::string& key) const;
+  void CommitPayloadLocked(const std::string& key, uint32_t payload_len,
+                           uint64_t generation);
   uint32_t ErasePayloadLocked(const std::string& key);
   // Shared allocate/pin -> unlocked payload write -> commit skeleton for
   // Cache/CacheDirect; `write_payload` does just the payload I/O for the slot.
   template <typename WriteFn>
-  Status CacheImpl(const BlockKey& key, size_t len, const WriteFn& write_payload);
+  Status CacheImpl(const BlockKey& key, size_t len,
+                   const WriteFn& write_payload,
+                   DiskResidentIdentity* identity = nullptr);
   struct PutFlight {
     std::mutex mu;
     std::condition_variable cv;
@@ -315,6 +336,16 @@ class DiskSlabStore : public StoreEngine {
   // key.Filename() -> its true payload length (slot_size >= this). Rebuilt on
   // open from the table; the allocator only tracks slot size.
   std::unordered_map<std::string, uint32_t> payload_len_;
+  // Enabled-only auxiliary state. Generations are reserved before slot/I/O
+  // mutation; failed reservations/writes never recycle a consumed number.
+  // Only generation is stored per resident; instance/epoch belong to the store.
+  struct ResidentIdentityState {
+    uint64_t store_instance = 0;
+    uint64_t sequence = 0;
+    bool exhausted = false;
+    std::unordered_map<std::string, uint64_t> generations;
+  };
+  std::unique_ptr<ResidentIdentityState> resident_identity_;
   std::unordered_map<uint64_t, uint64_t> tenant_used_bytes_;
   // Keys with an unlocked pread/pwrite in flight (value = op count), and keys
   // whose Remove arrived during that window (executed by the last releaser).
