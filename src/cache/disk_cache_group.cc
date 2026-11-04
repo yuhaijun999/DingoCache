@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -19,7 +21,10 @@
 #include <vector>
 
 #include "cache/disk_slab_store.h"
+#include "cache/disk_write_result.h"
+#include "cache/store_engine.h"
 #include "common/config_dump.h"
+#include "common/kv_types.h"
 #include "common/status.h"
 #include "utils/log.h"
 #include "utils/parallel_for.h"
@@ -522,8 +527,9 @@ void DiskCacheGroup::RecordQuotaRejectionLocked(uint64_t tenant_hash) {
   if (it != tenant_quota_rejections_by_hash_.end()) ++it->second;
 }
 
-
-Status DiskCacheGroup::Cache(const BlockKey& key, const void* data, size_t len) {
+template <typename WriteFn>
+Status DiskCacheGroup::CacheOne(const BlockKey& key, const void* data,
+                                size_t len, const WriteFn& write) {
   if (len == 0 || data == nullptr) return Status::kInvalid;
   StoreEngine* d = Route(key);
   if (d == nullptr) return Status::kInvalid;
@@ -538,7 +544,24 @@ Status DiskCacheGroup::Cache(const BlockKey& key, const void* data, size_t len) 
     RecordQuotaRejectionLocked(key.tenant_hash);
     return Status::kQuotaExceeded;
   }
-  return d->Cache(key, data, len);
+  return write(d);
+}
+
+Status DiskCacheGroup::Cache(const BlockKey& key, const void* data,
+                             size_t len) {
+  return CacheOne(key, data, len, [&](StoreEngine* disk) {
+    return disk->Cache(key, data, len);
+  });
+}
+
+DiskWriteResult DiskCacheGroup::CacheWithResult(const BlockKey& key,
+                                                const void* data, size_t len) {
+  DiskWriteResult result;
+  result.status = CacheOne(key, data, len, [&](StoreEngine* disk) {
+    result = disk->CacheWithResult(key, data, len);
+    return result.status;
+  });
+  return result;
 }
 
 Status DiskCacheGroup::Remove(const BlockKey& key) {
@@ -557,21 +580,20 @@ Status DiskCacheGroup::Lookup(const BlockKey& key, ValueMetadata* out) const {
 
 Status DiskCacheGroup::CacheDirect(const BlockKey& key, char* data, size_t len,
                                    size_t cap) {
-  if (len == 0 || data == nullptr) return Status::kInvalid;
-  StoreEngine* d = Route(key);
-  if (d == nullptr) return Status::kInvalid;
-  std::lock_guard<std::mutex> tenant_lock(
-      tenant_stripes_[TenantStripe(key.tenant_hash)]);
-  ValueMetadata metadata;
-  const Status lookup = d->Lookup(key, &metadata);
-  if (lookup != Status::kOk && lookup != Status::kNotFound) return lookup;
-  if (lookup == Status::kNotFound &&
-      !QuotaAllowsNewLocked(key.tenant_hash,
-                            TenantUsedBytes(key.tenant_hash), len)) {
-    RecordQuotaRejectionLocked(key.tenant_hash);
-    return Status::kQuotaExceeded;
-  }
-  return d->CacheDirect(key, data, len, cap);
+  return CacheOne(key, data, len, [&](StoreEngine* disk) {
+    return disk->CacheDirect(key, data, len, cap);
+  });
+}
+
+DiskWriteResult DiskCacheGroup::CacheDirectWithResult(const BlockKey& key,
+                                                      char* data, size_t len,
+                                                      size_t cap) {
+  DiskWriteResult result;
+  result.status = CacheOne(key, data, len, [&](StoreEngine* disk) {
+    result = disk->CacheDirectWithResult(key, data, len, cap);
+    return result.status;
+  });
+  return result;
 }
 
 Status DiskCacheGroup::Range(const BlockKey& key, uint64_t offset,
@@ -612,6 +634,22 @@ Status DiskCacheGroup::RangeDirectPrep(const BlockKey& key, uint64_t offset,
 std::vector<Status> DiskCacheGroup::CacheDirectBatch(
     const std::vector<StoreEngine::CacheBatchItem>& items,
     const DirectBatchObserver& observe) {
+  return CacheDirectBatchImpl(items, observe, nullptr);
+}
+
+std::vector<DiskWriteResult> DiskCacheGroup::CacheDirectBatchWithResults(
+    const std::vector<StoreEngine::CacheBatchItem>& items,
+    const DirectBatchObserver& observe) {
+  std::vector<DiskWriteResult> results(items.size());
+  const std::vector<Status> statuses =
+      CacheDirectBatchImpl(items, observe, &results);
+  for (size_t i = 0; i < statuses.size(); ++i) results[i].status = statuses[i];
+  return results;
+}
+
+std::vector<Status> DiskCacheGroup::CacheDirectBatchImpl(
+    const std::vector<StoreEngine::CacheBatchItem>& items,
+    const DirectBatchObserver& observe, std::vector<DiskWriteResult>* details) {
   std::vector<Status> out(items.size(), Status::kInvalid);
   if (items.empty()) return out;
 
@@ -697,10 +735,20 @@ std::vector<Status> DiskCacheGroup::CacheDirectBatch(
       std::vector<StoreEngine::CacheBatchItem> sub;
       sub.reserve(indexes.size());
       for (size_t index : indexes) sub.push_back(items[index]);
-      const std::vector<Status> statuses =
-          disks_[disk]->CacheDirectBatch(sub);
-      const size_t count = std::min(indexes.size(), statuses.size());
-      for (size_t i = 0; i < count; ++i) out[indexes[i]] = statuses[i];
+      if (details != nullptr) {
+        const std::vector<DiskWriteResult> results =
+            disks_[disk]->CacheDirectBatchWithResults(sub);
+        const size_t count = std::min(indexes.size(), results.size());
+        for (size_t i = 0; i < count; ++i) {
+          (*details)[indexes[i]] = results[i];
+          out[indexes[i]] = results[i].status;
+        }
+      } else {
+        const std::vector<Status> statuses =
+            disks_[disk]->CacheDirectBatch(sub);
+        const size_t count = std::min(indexes.size(), statuses.size());
+        for (size_t i = 0; i < count; ++i) out[indexes[i]] = statuses[i];
+      }
     } catch (...) {
       // Per-item defaults remain kIOError; other disks still complete.
     }

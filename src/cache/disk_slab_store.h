@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "cache/disk_resident_identity.h"
+#include "cache/disk_write_result.h"
 #include "cache/new_put_demand_latch.h"
 #include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
@@ -217,6 +218,12 @@ class DiskSlabStore : public StoreEngine {
   // unlocked (io_uring one-submit when built+enabled, else a sequential loop),
   // ONE lock hold commits. Per-item semantics identical to CacheDirect.
   std::vector<Status> CacheDirectBatch(const std::vector<CacheBatchItem>& items) override;
+  DiskWriteResult CacheWithResult(const BlockKey& key, const void* data,
+                                  size_t len) override;
+  DiskWriteResult CacheDirectWithResult(const BlockKey& key, char* data,
+                                        size_t len, size_t cap) override;
+  std::vector<DiskWriteResult> CacheDirectBatchWithResults(
+      const std::vector<CacheBatchItem>& items) override;
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
                std::string* out, size_t* value_len = nullptr) override;
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
@@ -288,7 +295,12 @@ class DiskSlabStore : public StoreEngine {
   template <typename WriteFn>
   Status CacheImpl(const BlockKey& key, size_t len,
                    const WriteFn& write_payload,
-                   DiskResidentIdentity* identity = nullptr);
+                   DiskWriteResult* details = nullptr);
+  Status CacheDirectImpl(const BlockKey& key, char* data, size_t len,
+                         size_t cap, DiskWriteResult* details);
+  std::vector<Status> CacheDirectBatchImpl(
+      const std::vector<CacheBatchItem>& items,
+      std::vector<DiskWriteResult>* details);
   struct PutFlight {
     std::mutex mu;
     std::condition_variable cv;
