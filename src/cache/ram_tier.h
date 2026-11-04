@@ -42,22 +42,23 @@
  * hermetically testable without libibverbs. */
 #ifndef DFKV_RAM_TIER_H_
 #define DFKV_RAM_TIER_H_
-#include <cstdlib>
-#include <chrono>
-
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <utility>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "cache/disk_resident_identity.h"
+#include "cache/disk_write_result.h"
 #include "cache/slab_allocator.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -113,6 +114,18 @@ class RamTier {
   struct FlushItem { BlockKey key; char* data; size_t len; size_t cap; };
   using FlushBatchFn = std::function<std::vector<bool>(const std::vector<FlushItem>&)>;
   void set_flush_batch(FlushBatchFn fn) { flush_batch_ = std::move(fn); }
+
+  using FlushResultFn =
+      std::function<DiskWriteResult(const BlockKey&, char*, size_t, size_t)>;
+  using FlushBatchResultFn = std::function<std::vector<DiskWriteResult>(
+      const std::vector<FlushItem>&)>;
+  // Configure before the first admission; never reconfigure concurrently.
+  // Typed callbacks take precedence over bool callbacks. Without a typed batch
+  // callback, each item uses the typed scalar callback (which must be set).
+  void set_flush_results(FlushResultFn single, FlushBatchResultFn batch = {}) {
+    flush_result_ = std::move(single);
+    flush_batch_results_ = std::move(batch);
+  }
 
   // A move-only pinned RAM location. Destruction releases the send pin; moving
   // transfers it. Callers cannot access or manually replay the release token.
@@ -185,10 +198,15 @@ class RamTier {
   struct PutResult {
     Status status;
     PutDisposition disposition = PutDisposition::kComplete;
+    DiskWriteReason reason = DiskWriteReason::kNone;
+    // The accepted owner's bytes, not a conflicting duplicate's input. This
+    // credential is not exported by Hit and does not establish read provenance.
+    DiskResidentIdentity identity{};
   };
 
   // Disk-ACK contract: wait for the admitted key's actual flush result.
-  // Admitted failures/cancellations return kIOError, never disk fallback.
+  // Bool-sink failures and cancellations return kIOError. Typed sinks preserve
+  // their terminal status/reason. Admitted failures never permit disk fallback.
   PutResult PutCommitted(const BlockKey& key, const void* data, size_t len);
 
   // Disk-direct batch preparation: join an existing PUT's terminal result,
@@ -297,6 +315,9 @@ class RamTier {
     std::condition_variable cv;
     bool done = false;
     bool success = false;
+    // Legacy completions allocate no typed result. Kept with the owner rather
+    // than reconstructing a credential by looking up the key after the flush.
+    std::unique_ptr<DiskWriteResult> disk_result;
     bool canceled = false;
     // Immutable after registration: a read copy is not an accepted PUT owner.
     bool promotion = false;
@@ -381,6 +402,10 @@ class RamTier {
                   bool admit_new = true);
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           bool success);
+  static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
+                          const DiskWriteResult& result);
+  static PutResult WaitPutResult(
+      const std::shared_ptr<PutCompletion>& completion);
   static Status WaitPut(const std::shared_ptr<PutCompletion>& completion);
   bool CommitReservation(DurableReservation* reservation) noexcept;
   void AbortReservation(DurableReservation* reservation) noexcept;
@@ -412,6 +437,8 @@ class RamTier {
   Options opt_;
   FlushFn flush_;
   FlushBatchFn flush_batch_;
+  FlushResultFn flush_result_;
+  FlushBatchResultFn flush_batch_results_;
   char* arena_ = nullptr;
   bool ready_ = false;
   std::atomic<bool> healthy_{true};
