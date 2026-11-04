@@ -9,15 +9,17 @@
 #ifndef DFKV_STORE_ENGINE_H_
 #define DFKV_STORE_ENGINE_H_
 
-#include <cstddef>
-#include <cstring>
-#include <cstdint>
-#include <memory>
-#include <utility>
 #include <unistd.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "cache/disk_write_result.h"
 #include "common/kv_types.h"
 #include "common/status.h"
 
@@ -347,6 +349,26 @@ class StoreEngine {
   virtual uint64_t Evictions() const = 0;
   virtual uint64_t EvictedBytes() const = 0;
   virtual const std::string& Dir() const = 0;
+  // Internal richer results; old backends preserve their existing semantics
+  // and supply no resident credential. Do not reconstruct identity from key.
+  virtual DiskWriteResult CacheWithResult(const BlockKey& key, const void* data,
+                                          size_t len) {
+    return {Cache(key, data, len)};
+  }
+  virtual DiskWriteResult CacheDirectWithResult(const BlockKey& key, char* data,
+                                                size_t len, size_t cap) {
+    return {CacheDirect(key, data, len, cap)};
+  }
+  virtual std::vector<DiskWriteResult> CacheDirectBatchWithResults(
+      const std::vector<CacheBatchItem>& items) {
+    // Adapt the existing virtual batch, not a scalar loop that would bypass a
+    // backend's batching, per-item failures or synchronization.
+    const std::vector<Status> statuses = CacheDirectBatch(items);
+    std::vector<DiskWriteResult> results;
+    results.reserve(statuses.size());
+    for (const Status status : statuses) results.push_back({status});
+    return results;
+  }
 };
 
 }  // namespace dfkv

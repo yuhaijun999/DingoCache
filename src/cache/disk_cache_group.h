@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "cache/disk_slab_store.h"
+#include "cache/disk_write_result.h"
 #include "cache/kv_store.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
@@ -106,6 +107,15 @@ class DiskCacheGroup {
   std::vector<Status> CacheDirectBatch(
       const std::vector<StoreEngine::CacheBatchItem>& items,
       const DirectBatchObserver& observe = {});
+  // Preserve original per-item status, failure reason and NEW provenance;
+  // these results are internal and do not enable lifetime or change the wire.
+  DiskWriteResult CacheWithResult(const BlockKey& key, const void* data,
+                                  size_t len);
+  DiskWriteResult CacheDirectWithResult(const BlockKey& key, char* data,
+                                        size_t len, size_t cap);
+  std::vector<DiskWriteResult> CacheDirectBatchWithResults(
+      const std::vector<StoreEngine::CacheBatchItem>& items,
+      const DirectBatchObserver& observe = {});
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
                std::string* out, size_t* value_len = nullptr);
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
@@ -166,6 +176,13 @@ class DiskCacheGroup {
   }
 
  private:
+  template <typename WriteFn>
+  Status CacheOne(const BlockKey& key, const void* data, size_t len,
+                  const WriteFn& write);
+  std::vector<Status> CacheDirectBatchImpl(
+      const std::vector<StoreEngine::CacheBatchItem>& items,
+      const DirectBatchObserver& observe,
+      std::vector<DiskWriteResult>* details);
   static constexpr size_t kInvalidDisk = std::numeric_limits<size_t>::max();
 
   size_t RouteIndex(const BlockKey& key) const;
