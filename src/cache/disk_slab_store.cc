@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -22,6 +23,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -29,6 +31,11 @@
 #include <utility>
 #include <vector>
 
+#include "cache/disk_resident_identity.h"
+#include "cache/slab_allocator.h"
+#include "common/kv_types.h"
+#include "common/status.h"
+#include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"  // PutU32/PutU64/GetU32/GetU64 (host-endian codec)
 
@@ -46,6 +53,20 @@ constexpr uint32_t kInitMagic = 0x49424C53u;  // "SLBI", init-in-progress
 constexpr uint32_t kStateMagic = 0x53424C53u;  // "SLBS"
 constexpr uint32_t kStateClean = 1;
 constexpr uint32_t kStateDirty = 2;
+
+// Allocate only for opt-in stores. Saturate instead of wrapping, even when
+// old stores/credentials still exist; this is not a disk routing index.
+uint64_t NextResidentStoreInstance() {
+  static std::atomic<uint64_t> sequence{0};
+  uint64_t previous = sequence.load(std::memory_order_relaxed);
+  while (previous != std::numeric_limits<uint64_t>::max()) {
+    if (sequence.compare_exchange_weak(previous, previous + 1,
+                                       std::memory_order_relaxed)) {
+      return previous + 1;
+    }
+  }
+  return 0;
+}
 
 // Bound on a re-PUT waiting out a deferred-remove window. The window lasts
 // one in-flight read/write of the slot -- I/O time, even for MiB-scale direct
@@ -503,6 +524,15 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   if (!ValidateOptions()) {
     if (ok) *ok = false;
     return;
+  }
+  if (opt_.track_resident_identity) {
+    resident_identity_ = std::make_unique<ResidentIdentityState>();
+    resident_identity_->store_instance = NextResidentStoreInstance();
+    if (resident_identity_->store_instance == 0) {
+      SetStartupError("resident store instance identity exhausted");
+      if (ok) *ok = false;
+      return;
+    }
   }
   zero_extent_records_.assign(
       static_cast<size_t>(max_slots_per_extent_) * kRecBytes, 0);
@@ -1298,9 +1328,15 @@ bool DiskSlabStore::Rebuild() {
   if (!alloc_->RestoreBulk(entries))
     return SetStartupError("inconsistent slots.tbl records during bulk rebuild");
 
-  for (const auto& entry : entries)
+  for (const SlabAllocator::RestoreEntry& entry : entries) {
+    uint64_t generation = 0;
+    if (!ReserveResidentGenerationLocked(&generation))
+      return SetStartupError("resident generation exhausted during rebuild");
+    // Rebuild precedes MarkDirtyEpoch. Save only generation here; credentials
+    // are composed with the final current epoch after construction completes.
     CommitPayloadLocked(entry.key.Filename(),
-                        static_cast<uint32_t>(entry.value_bytes));
+                        static_cast<uint32_t>(entry.value_bytes), generation);
+  }
   table_rebuilt_ += entries.size();
 
   uint8_t zero[kRecBytes] = {0};
@@ -1374,8 +1410,35 @@ bool DiskSlabStore::WritePayloadDirect(const SlabAllocator::SlotRef& r, char* da
   return PwriteAll(extent_dio_fds_[r.extent], data, alen, r.offset);
 }
 
+bool DiskSlabStore::ReserveResidentGenerationLocked(uint64_t* generation) {
+  *generation = 0;
+  if (!resident_identity_) return true;
+  if (resident_identity_->sequence == std::numeric_limits<uint64_t>::max()) {
+    if (!resident_identity_->exhausted) {
+      DFKV_LOG_ERROR(opt_.dir +
+                     ": resident generation exhausted; restart required");
+      resident_identity_->exhausted = true;
+    }
+    return false;
+  }
+  *generation = ++resident_identity_->sequence;
+  return true;
+}
+
+DiskResidentIdentity DiskSlabStore::ResidentIdentityLocked(
+    const std::string& key) const {
+  if (!resident_identity_ || !Healthy() || payload_len_.count(key) == 0)
+    return {};
+  const std::unordered_map<std::string, uint64_t>::const_iterator it =
+      resident_identity_->generations.find(key);
+  if (it == resident_identity_->generations.end()) return {};
+  return {resident_identity_->store_instance, run_epoch_, it->second};
+}
+
 void DiskSlabStore::CommitPayloadLocked(const std::string& key,
-                                        uint32_t payload_len) {
+                                        uint32_t payload_len,
+                                        uint64_t generation) {
+  if (resident_identity_) resident_identity_->generations[key] = generation;
   auto [it, inserted] = payload_len_.try_emplace(key, payload_len);
   if (inserted) {
     committed_payload_bytes_ += payload_len;
@@ -1407,6 +1470,7 @@ uint32_t DiskSlabStore::ErasePayloadLocked(const std::string& key) {
       if (tenant->second == 0) tenant_used_bytes_.erase(tenant);
     }
   }
+  if (resident_identity_) resident_identity_->generations.erase(key);
   payload_len_.erase(it);
   return payload_len;
 }
@@ -1437,10 +1501,12 @@ Status DiskSlabStore::WaitPut(const std::shared_ptr<PutFlight>& flight) {
 // as a clean miss, never as torn bytes.
 template <typename WriteFn>
 Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
-                                const WriteFn& write_payload) {
+                                const WriteFn& write_payload,
+                                DiskResidentIdentity* identity) {
   if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
+  uint64_t generation = 0;
   std::shared_ptr<PutFlight> flight;
   bool leader = false;
   {
@@ -1468,6 +1534,10 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
           continue;  // window closed: the slot is gone; fresh judgment
         return Status::kIOError;  // pin outlived the bound: fail as before
       }
+      // Reserve before allocator eviction or a valid slots.tbl write. Other
+      // leaders may commit first; uniqueness, not commit ordering, is required.
+      if (!ReserveResidentGenerationLocked(&generation))
+        return Status::kCacheFull;
       flight = std::make_shared<PutFlight>();
       put_flights_.emplace(fn, flight);
       leader = true;
@@ -1502,7 +1572,8 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       if (!removed_while_writing) alloc_->Remove(key);
     } else {
       if (!removed_while_writing) {
-        CommitPayloadLocked(fn, static_cast<uint32_t>(len));
+        CommitPayloadLocked(fn, static_cast<uint32_t>(len), generation);
+        if (identity != nullptr) *identity = ResidentIdentityLocked(fn);
         new_put_bytes_since_tick_ += ref.slot_size;
       }
       result = Status::kOk;
@@ -1518,6 +1589,21 @@ Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
   return CacheImpl(key, len, [&](const SlabAllocator::SlotRef& r) {
     return WritePayload(r, data, len);
   });
+}
+
+Status DiskSlabStore::CacheWithIdentity(const BlockKey& key, const void* data,
+                                        size_t len,
+                                        DiskResidentIdentity* identity) {
+  if (identity == nullptr) return Status::kInvalid;
+  *identity = {};
+  if (!resident_identity_ || len == 0 || data == nullptr)
+    return Status::kInvalid;
+  return CacheImpl(
+      key, len,
+      [&](const SlabAllocator::SlotRef& ref) {
+        return WritePayload(ref, data, len);
+      },
+      identity);
 }
 
 Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
@@ -1555,6 +1641,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     std::string fn;
     SlabAllocator::SlotRef ref;
     std::shared_ptr<PutFlight> flight;
+    uint64_t generation = 0;
     bool active = false;
     bool io_ok = false;
     bool direct = false;
@@ -1596,6 +1683,10 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
               }))
             continue;  // window closed: re-judge this item from scratch
           out[i] = Status::kIOError;  // pin outlived the bound: fail as before
+          break;
+        }
+        if (!ReserveResidentGenerationLocked(&st[i].generation)) {
+          out[i] = Status::kCacheFull;
           break;
         }
         st[i].flight = std::make_shared<PutFlight>();
@@ -1762,8 +1853,8 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         out[i] = Status::kIOError;
       } else {
         if (!removed) {
-          CommitPayloadLocked(st[i].fn,
-                              static_cast<uint32_t>(items[i].len));
+          CommitPayloadLocked(st[i].fn, static_cast<uint32_t>(items[i].len),
+                              st[i].generation);
           new_put_bytes_since_tick_ += st[i].ref.slot_size;
         }
         out[i] = Status::kOk;
