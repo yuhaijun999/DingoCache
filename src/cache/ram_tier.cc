@@ -469,7 +469,10 @@ void RamTier::CompletePut(const std::shared_ptr<PutCompletion>& completion,
     const std::lock_guard<std::mutex> lock(completion->mu);
     if (completion->done) return;
     completion->disk_result = std::make_unique<DiskWriteResult>(result);
-    if (result.status != Status::kOk) completion->disk_result->identity = {};
+    if (result.status != Status::kOk) {
+      completion->disk_result->identity = {};
+      completion->disk_result->outcome = DiskWriteOutcome::kUnknown;
+    }
     completion->done = true;
   }
   completion->cv.notify_all();
@@ -490,7 +493,7 @@ RamTier::PutResult RamTier::WaitPutResult(
   if (completion->disk_result) {
     const DiskWriteResult& result = *completion->disk_result;
     return {result.status, PutDisposition::kComplete, result.reason,
-            result.identity};
+            result.identity, result.outcome};
   }
   return {completion->success ? Status::kOk : Status::kIOError};
 }

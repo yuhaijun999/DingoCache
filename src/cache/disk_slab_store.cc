@@ -1478,7 +1478,7 @@ uint32_t DiskSlabStore::ErasePayloadLocked(const std::string& key) {
 }
 
 void DiskSlabStore::CompletePut(const std::shared_ptr<PutFlight>& flight,
-                                Status result) {
+                                const DiskWriteResult& result) {
   {
     std::lock_guard<std::mutex> lk(flight->mu);
     if (flight->done) return;
@@ -1488,10 +1488,17 @@ void DiskSlabStore::CompletePut(const std::shared_ptr<PutFlight>& flight,
   flight->cv.notify_all();
 }
 
-Status DiskSlabStore::WaitPut(const std::shared_ptr<PutFlight>& flight) {
+DiskWriteResult DiskSlabStore::WaitPut(
+    const std::shared_ptr<PutFlight>& flight) {
   std::unique_lock<std::mutex> lk(flight->mu);
   flight->cv.wait(lk, [&flight] { return flight->done; });
-  return flight->result;
+  DiskWriteResult result = flight->result;
+  // A store follower did not write its own bytes. Never relabel them with the
+  // owner's NEW credential, and never reconstruct the result by current key.
+  result.identity = {};
+  if (result.status == Status::kOk && result.outcome == DiskWriteOutcome::kNew)
+    result.outcome = DiskWriteOutcome::kKeptExisting;
+  return result;
 }
 
 // mu_ guards only the in-memory maps; the MB-scale payload I/O runs OUTSIDE it
@@ -1515,7 +1522,11 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
     std::unique_lock<std::mutex> lk(mu_);
     for (;;) {
       if (!Healthy()) return Status::kIOError;
-      if (payload_len_.count(fn) != 0) return Status::kOk;  // keep-first
+      if (payload_len_.count(fn) != 0) {
+        if (details != nullptr)
+          details->outcome = DiskWriteOutcome::kKeptExisting;
+        return Status::kOk;  // keep-first
+      }
       auto existing = put_flights_.find(fn);
       if (existing != put_flights_.end()) {
         flight = existing->second;  // follower of the in-flight PUT
@@ -1549,7 +1560,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       std::vector<BlockKey> evicted;
       if (alloc_->Contains(key) || !alloc_->Put(key, len, &ref, &evicted)) {
         put_flights_.erase(fn);
-        CompletePut(flight, Status::kIOError);
+        CompletePut(flight, DiskWriteResult{Status::kIOError});
         return Status::kIOError;
       }
       alloc_->Pin(key);  // write-pin for the unlocked I/O below
@@ -1559,13 +1570,17 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       break;
     }
   }
-  if (!leader) return WaitPut(flight);
+  if (!leader) {
+    const DiskWriteResult result = WaitPut(flight);
+    if (details != nullptr) *details = result;
+    return result.status;
+  }
 
   const bool io_ok = write_payload(ref) &&
                      WriteRecord(ref, key, static_cast<uint32_t>(len),
                                  /*valid=*/true);
 
-  Status result = Status::kIOError;
+  DiskWriteResult result{Status::kIOError};
   {
     std::lock_guard<std::mutex> lk(mu_);
     // A Remove that arrived during the write was deferred to the sole in-flight
@@ -1578,15 +1593,18 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
     } else {
       if (!removed_while_writing) {
         CommitPayloadLocked(fn, static_cast<uint32_t>(len), generation);
-        if (details != nullptr) details->identity = ResidentIdentityLocked(fn);
+        if (details != nullptr) result.identity = ResidentIdentityLocked(fn);
         new_put_bytes_since_tick_ += ref.slot_size;
       }
-      result = Status::kOk;
+      result.status = Status::kOk;
+      result.outcome = removed_while_writing ? DiskWriteOutcome::kRemoved
+                                             : DiskWriteOutcome::kNew;
     }
     put_flights_.erase(fn);
   }
   CompletePut(flight, result);
-  return result;
+  if (details != nullptr) *details = result;
+  return result.status;
 }
 
 Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
@@ -1710,6 +1728,8 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
           break;
         }
         if (payload_len_.count(st[i].fn) != 0) {
+          if (details != nullptr)
+            (*details)[i].outcome = DiskWriteOutcome::kKeptExisting;
           out[i] = Status::kOk;
           break;
         }
@@ -1742,7 +1762,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
         if (alloc_->Contains(it.key) ||
             !alloc_->Put(it.key, it.len, &st[i].ref, &evicted)) {
           put_flights_.erase(st[i].fn);
-          CompletePut(st[i].flight, Status::kIOError);
+          CompletePut(st[i].flight, DiskWriteResult{Status::kIOError});
           break;
         }
         alloc_->Pin(it.key);
@@ -1892,6 +1912,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
     std::lock_guard<std::mutex> lk(mu_);
     for (size_t i = 0; i < N; ++i) {
       if (!st[i].active) continue;
+      DiskWriteResult result{Status::kIOError};
       const bool removed = deferred_remove_.count(st[i].fn) > 0;
       const bool release_ok =
           ReleaseInflightLocked(items[i].key, st[i].fn);
@@ -1903,18 +1924,25 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
           CommitPayloadLocked(st[i].fn, static_cast<uint32_t>(items[i].len),
                               st[i].generation);
           if (details != nullptr)
-            (*details)[i].identity = ResidentIdentityLocked(st[i].fn);
+            result.identity = ResidentIdentityLocked(st[i].fn);
           new_put_bytes_since_tick_ += st[i].ref.slot_size;
         }
         out[i] = Status::kOk;
+        result.outcome =
+            removed ? DiskWriteOutcome::kRemoved : DiskWriteOutcome::kNew;
       }
+      result.status = out[i];
+      if (details != nullptr) (*details)[i] = result;
       put_flights_.erase(st[i].fn);
-      CompletePut(st[i].flight, out[i]);
+      CompletePut(st[i].flight, result);
     }
   }
   for (size_t i = 0; i < N; ++i) {
-    if (!st[i].active && st[i].flight)
-      out[i] = WaitPut(st[i].flight);
+    if (!st[i].active && st[i].flight) {
+      const DiskWriteResult result = WaitPut(st[i].flight);
+      out[i] = result.status;
+      if (details != nullptr) (*details)[i] = result;
+    }
   }
   return out;
 }

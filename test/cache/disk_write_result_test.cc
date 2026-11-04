@@ -43,6 +43,14 @@ class DiskSlabStoreTestPeer {
     const std::lock_guard<std::mutex> lock(store.mu_);
     return store.ResidentIdentityLocked(key.Filename());
   }
+  static bool HasPutFollower(const DiskSlabStore& store, const BlockKey& key) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    const std::unordered_map<
+        std::string, std::shared_ptr<DiskSlabStore::PutFlight>>::const_iterator
+        it = store.put_flights_.find(key.Filename());
+    // Map + gated owner hold two references; a third proves attachment.
+    return it != store.put_flights_.end() && it->second.use_count() >= 3;
+  }
   static void SetGenerationSequence(DiskSlabStore* store, uint64_t value) {
     const std::lock_guard<std::mutex> lock(store->mu_);
     store->resident_identity_->sequence = value;
@@ -163,6 +171,12 @@ TEST_F(DiskWriteResultTest,
   EXPECT_EQ(
       static_cast<unsigned char>(dfkv::DiskWriteReason::kIdentityExhausted),
       1U);
+  static_assert(
+      std::is_same_v<std::underlying_type_t<DiskWriteOutcome>, unsigned char>);
+  EXPECT_EQ(static_cast<unsigned char>(DiskWriteOutcome::kUnknown), 0U);
+  EXPECT_EQ(static_cast<unsigned char>(DiskWriteOutcome::kNew), 1U);
+  EXPECT_EQ(static_cast<unsigned char>(DiskWriteOutcome::kKeptExisting), 2U);
+  EXPECT_EQ(static_cast<unsigned char>(DiskWriteOutcome::kRemoved), 3U);
   for (const bool tracking : {false, true}) {
     SCOPED_TRACE(tracking);
     fs::remove_all(dir_);
@@ -176,12 +190,14 @@ TEST_F(DiskWriteResultTest,
     EXPECT_EQ(scalar.status, Status::kOk);
     EXPECT_EQ(scalar.reason, dfkv::DiskWriteReason::kNone);
     EXPECT_EQ(scalar.identity.valid(), tracking);
+    EXPECT_EQ(scalar.outcome, DiskWriteOutcome::kNew);
     alignas(4096) char first[4096] = "first";
     alignas(4096) char other[4096] = "other";
     const dfkv::DiskWriteResult direct =
         store.CacheDirectWithResult(K(931), first, 5, sizeof(first));
     EXPECT_EQ(direct.status, Status::kOk);
     EXPECT_EQ(direct.identity.valid(), tracking);
+    EXPECT_EQ(direct.outcome, DiskWriteOutcome::kNew);
     const std::vector<dfkv::DiskWriteResult> batch =
         store.CacheDirectBatchWithResults({{K(932), first, 5, sizeof(first)},
                                            {K(932), other, 5, sizeof(other)},
@@ -189,16 +205,20 @@ TEST_F(DiskWriteResultTest,
     ASSERT_EQ(batch.size(), 3U);
     EXPECT_EQ(batch[0].status, Status::kOk);
     EXPECT_EQ(batch[0].identity.valid(), tracking);
+    EXPECT_EQ(batch[0].outcome, DiskWriteOutcome::kNew);
     EXPECT_EQ(batch[1].status, Status::kOk);
     EXPECT_FALSE(batch[1].identity.valid());
+    EXPECT_EQ(batch[1].outcome, DiskWriteOutcome::kKeptExisting);
     EXPECT_EQ(batch[2].status, Status::kInvalid);
     EXPECT_FALSE(batch[2].identity.valid());
+    EXPECT_EQ(batch[2].outcome, DiskWriteOutcome::kUnknown);
     for (const uint64_t key : {930U, 931U, 932U}) {
       const dfkv::DiskWriteResult duplicate =
           store.CacheWithResult(K(key), other, 5);
       EXPECT_EQ(duplicate.status, Status::kOk);
       EXPECT_EQ(duplicate.reason, dfkv::DiskWriteReason::kNone);
       EXPECT_FALSE(duplicate.identity.valid());
+      EXPECT_EQ(duplicate.outcome, DiskWriteOutcome::kKeptExisting);
       std::string out;
       ASSERT_EQ(store.Range(K(key), 0, 0, &out), Status::kOk);
       EXPECT_EQ(out, "first");
@@ -309,6 +329,7 @@ TEST_F(DiskWriteResultTest, TypedWriteResultRemovedCommitHasNoCredential) {
   EXPECT_EQ(result.reason, dfkv::DiskWriteReason::kNone);
   EXPECT_FALSE(result.identity.valid());
   EXPECT_FALSE(store.IsCached(K(941)));
+  EXPECT_EQ(result.outcome, DiskWriteOutcome::kRemoved);
 }
 
 TEST_F(DiskWriteResultTest, TypedWriteResultMetadataFailureRetainsIoStatus) {
@@ -323,6 +344,7 @@ TEST_F(DiskWriteResultTest, TypedWriteResultMetadataFailureRetainsIoStatus) {
   EXPECT_EQ(result.reason, dfkv::DiskWriteReason::kNone);
   EXPECT_FALSE(result.identity.valid());
   EXPECT_FALSE(store.Healthy());
+  EXPECT_EQ(result.outcome, DiskWriteOutcome::kUnknown);
 }
 
 TEST_F(DiskWriteResultTest, GroupPreservesRealSlabResultsAcrossDisks) {
@@ -347,6 +369,7 @@ TEST_F(DiskWriteResultTest, GroupPreservesRealSlabResultsAcrossDisks) {
   for (size_t i = 0; i < results.size(); ++i) {
     EXPECT_EQ(results[i].status, Status::kOk);
     EXPECT_EQ(results[i].reason, DiskWriteReason::kNone);
+    EXPECT_EQ(results[i].outcome, DiskWriteOutcome::kNew);
     EXPECT_TRUE(results[i].identity.valid());
     instances.insert(results[i].identity.store_instance);
     DiskResidentIdentity expected;
@@ -364,6 +387,7 @@ TEST_F(DiskWriteResultTest, GroupPreservesRealSlabResultsAcrossDisks) {
       group.CacheWithResult(K(1000), "different", 9);
   EXPECT_EQ(duplicate.status, Status::kOk);
   EXPECT_FALSE(duplicate.identity.valid());
+  EXPECT_EQ(duplicate.outcome, DiskWriteOutcome::kKeptExisting);
   for (DiskSlabStore* store : stores)
     DiskSlabStoreTestPeer::SetGenerationSequence(store, UINT64_MAX);
   const DiskWriteResult exhausted = group.CacheWithResult(K(1300), value, 5);
@@ -377,6 +401,8 @@ TEST_F(DiskWriteResultTest, GroupPreservesRealSlabResultsAcrossDisks) {
   EXPECT_EQ(mixed[1].status, Status::kOk);
   EXPECT_EQ(mixed[1].reason, DiskWriteReason::kNone);
   EXPECT_FALSE(mixed[1].identity.valid());
+  EXPECT_EQ(mixed[0].outcome, DiskWriteOutcome::kUnknown);
+  EXPECT_EQ(mixed[1].outcome, DiskWriteOutcome::kKeptExisting);
 }
 
 TEST_F(DiskWriteResultTest, GroupQuotaAndInvalidItemsNeverAcquireCredentials) {
@@ -520,6 +546,12 @@ TEST_F(DiskWriteResultTest, GroupFileBackendTypedResultsRemainUnbound) {
   EXPECT_EQ(results[0].status, Status::kOk);
   EXPECT_EQ(results[0].reason, DiskWriteReason::kNone);
   EXPECT_FALSE(results[0].identity.valid());
+  EXPECT_EQ(results[0].outcome, DiskWriteOutcome::kUnknown);
+  EXPECT_EQ(group.CacheWithResult(K(1600), value, 1).outcome,
+            DiskWriteOutcome::kUnknown);
+  EXPECT_EQ(
+      group.CacheDirectWithResult(K(1601), value, 1, sizeof(value)).outcome,
+      DiskWriteOutcome::kUnknown);
   std::string out;
   ASSERT_EQ(group.Range(K(1602), 0, 0, &out), Status::kOk);
   EXPECT_EQ(out, "x");
@@ -641,11 +673,13 @@ TEST_F(DiskWriteResultTest,
     const RamTier::PutResult committed = tier.PutCommitted(K(1800), "owner", 5);
     ASSERT_EQ(committed.status, Status::kOk);
     EXPECT_TRUE(committed.identity.valid());
+    EXPECT_EQ(committed.outcome, DiskWriteOutcome::kNew);
     EXPECT_EQ(committed.identity,
               DiskSlabStoreTestPeer::Identity(*stores[0], K(1800)));
     const RamTier::PutResult duplicate =
         tier.PutCommitted(K(1800), "different", 9);
     EXPECT_EQ(duplicate.identity, committed.identity);
+    EXPECT_EQ(duplicate.outcome, DiskWriteOutcome::kNew);
     std::string disk;
     ASSERT_EQ(group.Range(K(1800), 0, 0, &disk), Status::kOk);
     EXPECT_EQ(disk, "owner");
@@ -660,10 +694,123 @@ TEST_F(DiskWriteResultTest,
     EXPECT_EQ(exhausted.reason, DiskWriteReason::kIdentityExhausted);
     EXPECT_FALSE(exhausted.identity.valid());
     EXPECT_EQ(exhausted.disposition, RamTier::PutDisposition::kComplete);
+    EXPECT_EQ(exhausted.outcome, DiskWriteOutcome::kUnknown);
     EXPECT_TRUE(tier.healthy());
     EXPECT_TRUE(group.Healthy());
     EXPECT_FALSE(tier.Contains(K(1801)));
     EXPECT_FALSE(group.IsCached(K(1801)));
+  }
+}
+
+enum class OwnerAction : unsigned char {
+  kCommit = 0,
+  kRemove = 1,
+  kPayloadFailure = 2,
+  kRecordFailure = 3,
+  kRemoveFailure = 4
+};
+
+TEST_F(DiskWriteResultTest, StoreFollowersKeepOwnerTerminalOutcomeNotIdentity) {
+  for (const bool typed_owner : {false, true}) {
+    for (const bool batch_owner : {false, true}) {
+      for (const bool batch_follower : {false, true}) {
+        for (const OwnerAction action :
+             {OwnerAction::kCommit, OwnerAction::kRemove,
+              OwnerAction::kPayloadFailure, OwnerAction::kRecordFailure,
+              OwnerAction::kRemoveFailure}) {
+          SCOPED_TRACE(typed_owner);
+          SCOPED_TRACE(batch_owner);
+          SCOPED_TRACE(batch_follower);
+          SCOPED_TRACE(static_cast<int>(action));
+          fs::remove_all(dir_);
+          HookGate gate;
+          std::atomic<unsigned> records{0};
+          DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+          options.table_sync_ms = options.reclaim_interval_ms = 0;
+          options.track_resident_identity = true;
+          DiskSlabStore store(options);
+          ASSERT_TRUE(store.Healthy());
+          DiskSlabStoreTestPeer::SetPayloadWriteHook(
+              &store, [&] { return gate.Run(); });
+          DiskSlabStoreTestPeer::SetRecordWriteHook(&store, [&] {
+            const unsigned call = ++records;
+            return action != OwnerAction::kRecordFailure &&
+                   (action != OwnerAction::kRemoveFailure || call == 1);
+          });
+          alignas(4096) char owner_bytes[4096] = "owner";
+          alignas(4096) char follower_bytes[4096] = "different";
+          DiskWriteResult owner;
+          DiskWriteResult follower;
+          std::thread leader([&] {
+            if (batch_owner) {
+              const std::vector<StoreEngine::CacheBatchItem> items{
+                  {K(1900), owner_bytes, 5, sizeof(owner_bytes)}};
+              if (typed_owner)
+                owner = store.CacheDirectBatchWithResults(items)[0];
+              else
+                owner.status = store.CacheDirectBatch(items)[0];
+            } else if (typed_owner) {
+              owner = store.CacheWithResult(K(1900), owner_bytes, 5);
+            } else {
+              owner.status = store.Cache(K(1900), owner_bytes, 5);
+            }
+          });
+          if (!gate.WaitEnteredFor()) {
+            gate.Release(false);
+            leader.join();
+            FAIL() << "owner did not reach payload gate";
+          }
+          std::thread waiter([&] {
+            if (batch_follower)
+              follower = store.CacheDirectBatchWithResults(
+                  {{K(1900), follower_bytes, 9, sizeof(follower_bytes)}})[0];
+            else
+              follower = store.CacheDirectWithResult(K(1900), follower_bytes, 9,
+                                                     sizeof(follower_bytes));
+          });
+          const std::chrono::steady_clock::time_point deadline =
+              std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          while (!DiskSlabStoreTestPeer::HasPutFollower(store, K(1900)) &&
+                 std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          const bool attached =
+              DiskSlabStoreTestPeer::HasPutFollower(store, K(1900));
+          const bool removed = action == OwnerAction::kRemove ||
+                               action == OwnerAction::kRemoveFailure;
+          if (attached && removed) {
+            EXPECT_EQ(store.Remove(K(1900)), Status::kOk);
+          }
+          // No fatal assertions until both controlled threads have joined.
+          gate.Release(action != OwnerAction::kPayloadFailure);
+          leader.join();
+          waiter.join();
+          ASSERT_TRUE(attached) << "follower was not attached to owner flight";
+          const bool success =
+              action == OwnerAction::kCommit || action == OwnerAction::kRemove;
+          EXPECT_EQ(owner.status, success ? Status::kOk : Status::kIOError);
+          EXPECT_EQ(follower.status, owner.status);
+          EXPECT_EQ(follower.reason, DiskWriteReason::kNone);
+          EXPECT_FALSE(follower.identity.valid());
+          EXPECT_EQ(follower.outcome, !success ? DiskWriteOutcome::kUnknown
+                                      : removed
+                                          ? DiskWriteOutcome::kRemoved
+                                          : DiskWriteOutcome::kKeptExisting);
+          if (typed_owner) {
+            EXPECT_EQ(owner.outcome, !success  ? DiskWriteOutcome::kUnknown
+                                     : removed ? DiskWriteOutcome::kRemoved
+                                               : DiskWriteOutcome::kNew);
+            EXPECT_EQ(owner.identity.valid(), success && !removed);
+          }
+          if (action == OwnerAction::kCommit) {
+            std::string value;
+            ASSERT_EQ(store.Range(K(1900), 0, 0, &value), Status::kOk);
+            EXPECT_EQ(value, "owner");
+          } else {
+            EXPECT_FALSE(store.IsCached(K(1900)));
+          }
+        }
+      }
+    }
   }
 }
 
