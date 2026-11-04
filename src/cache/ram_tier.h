@@ -202,6 +202,8 @@ class RamTier {
     // The accepted owner's bytes, not a conflicting duplicate's input. This
     // credential is not exported by Hit and does not establish read provenance.
     DiskResidentIdentity identity{};
+    // The accepted RAM owner's disk result, also for RAM duplicate waiters.
+    DiskWriteOutcome outcome = DiskWriteOutcome::kUnknown;
   };
 
   // Disk-ACK contract: wait for the admitted key's actual flush result.

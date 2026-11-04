@@ -305,11 +305,11 @@ class DiskSlabStore : public StoreEngine {
     std::mutex mu;
     std::condition_variable cv;
     bool done = false;
-    Status result = Status::kIOError;
+    DiskWriteResult result{Status::kIOError};
   };
   static void CompletePut(const std::shared_ptr<PutFlight>& flight,
-                          Status result);
-  static Status WaitPut(const std::shared_ptr<PutFlight>& flight);
+                          const DiskWriteResult& result);
+  static DiskWriteResult WaitPut(const std::shared_ptr<PutFlight>& flight);
   // Resolve fn's slot + committed payload length and acquire it for an unlocked
   // read (pin + inflight count, under mu_). False = miss (absent, or a write
   // still in flight). Balanced by a Release{...}Locked call.

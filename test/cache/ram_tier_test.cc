@@ -1698,7 +1698,7 @@ TEST(RamTier, TypedFlushPreservesOwnerResultAndConflictingDuplicate) {
       [&](const BlockKey& key, char* data, size_t len, size_t cap) {
         EXPECT_TRUE(gate.fn()(key, data, len, cap));
         return dfkv::DiskWriteResult{Status::kOk, dfkv::DiskWriteReason::kNone,
-                                     identity};
+                                     identity, dfkv::DiskWriteOutcome::kNew};
       });
   RamTierTestPeer::Completion owner;
   RamTierTestPeer::Completion follower;
@@ -1714,6 +1714,7 @@ TEST(RamTier, TypedFlushPreservesOwnerResultAndConflictingDuplicate) {
   EXPECT_EQ(result.status, Status::kOk);
   EXPECT_EQ(result.reason, dfkv::DiskWriteReason::kNone);
   EXPECT_EQ(result.identity, identity);
+  EXPECT_EQ(result.outcome, dfkv::DiskWriteOutcome::kNew);
   EXPECT_EQ(tier.PutCommitted(K(80000), "third", 5).identity, identity);
   EXPECT_EQ(tier.PrepareDirectPut(K(80000), "third", 5).identity, identity);
   EXPECT_EQ(tier.PutWriteBack(K(80000), "third", 5).identity, identity);
@@ -1741,7 +1742,11 @@ TEST(RamTier, TypedFlushFailureReasonsControlRetryAndHealth) {
       RamTier tier(options, nullptr);
       tier.set_flush_results([&](const BlockKey&, char*, size_t, size_t) {
         ++calls;
-        return failure;
+        dfkv::DiskWriteResult result = failure;
+        // Even a malformed failed sink result must not publish a NEW source.
+        result.identity = {17, 23, 41};
+        result.outcome = dfkv::DiskWriteOutcome::kNew;
+        return result;
       });
       RamTierTestPeer::Completion completion;
       ASSERT_EQ(RamTierTestPeer::Admit(tier, K(80001), "value", &completion,
@@ -1752,6 +1757,7 @@ TEST(RamTier, TypedFlushFailureReasonsControlRetryAndHealth) {
       EXPECT_EQ(result.status, failure.status);
       EXPECT_EQ(result.reason, failure.reason);
       EXPECT_FALSE(result.identity.valid());
+      EXPECT_EQ(result.outcome, dfkv::DiskWriteOutcome::kUnknown);
       EXPECT_EQ(result.disposition, RamTier::PutDisposition::kComplete);
       const bool exhausted =
           failure.status == Status::kCacheFull &&
@@ -1792,6 +1798,7 @@ TEST(RamTier, TypedLateSuccessCannotOverrideRemoveOrReinsert) {
   EXPECT_EQ(removed.status, Status::kIOError);
   EXPECT_EQ(removed.reason, dfkv::DiskWriteReason::kNone);
   EXPECT_FALSE(removed.identity.valid());
+  EXPECT_EQ(removed.outcome, dfkv::DiskWriteOutcome::kUnknown);
   const RamTier::PutResult fresh = tier.PutCommitted(K(80002), "new", 3);
   EXPECT_EQ(fresh.status, Status::kOk);
   EXPECT_EQ(fresh.identity.generation, 2U);
