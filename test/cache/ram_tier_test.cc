@@ -1724,6 +1724,128 @@ TEST(RamTier, TypedFlushPreservesOwnerResultAndConflictingDuplicate) {
   EXPECT_EQ(gate.values.at(K(80000).Filename()), "owner");
 }
 
+TEST(RamTier, TypedHitSnapshotsOnlyCommittedOwnerSource) {
+  FlushSink gate;
+  gate.close();
+  const dfkv::DiskResidentIdentity identity{17, 23, 41};
+  RamTier tier(Opts(64 * 4096), nullptr);
+  const OpenFlushOnExit release{gate};
+  tier.set_flush_results(
+      [&](const BlockKey& key, char* data, size_t len, size_t cap) {
+        EXPECT_TRUE(gate.fn()(key, data, len, cap));
+        return dfkv::DiskWriteResult{Status::kOk, dfkv::DiskWriteReason::kNone,
+                                     identity, dfkv::DiskWriteOutcome::kNew};
+      });
+  RamTierTestPeer::Completion owner;
+  ASSERT_EQ(RamTierTestPeer::Admit(tier, K(80100), "owner", &owner),
+            RamTierTestPeer::Admission::kAccepted);
+  ASSERT_TRUE(gate.await_calls(1));
+  RamTier::Hit before;
+  ASSERT_TRUE(tier.GetPrep(K(80100), 0, 0, &before));
+  EXPECT_FALSE(before.identity.valid());
+  gate.open();
+  ASSERT_TRUE(RamTierTestPeer::AwaitDone(owner));
+  RamTier::Hit after;
+  ASSERT_TRUE(tier.GetPrep(K(80100), 1, 3, &after));
+  EXPECT_EQ(after.identity, identity);
+  EXPECT_EQ(std::string(after.ptr, after.len), "wne");
+  EXPECT_FALSE(before.identity.valid());
+  RamTier::Hit moved(std::move(after));
+  EXPECT_EQ(moved.identity, identity);
+  // Intentionally test Hit's explicit guarantee to clear the moved-from source.
+  // NOLINTNEXTLINE(bugprone-use-after-move, hicpp-invalid-access-moved)
+  EXPECT_FALSE(after.identity.valid());
+  ASSERT_TRUE(tier.Remove(K(80100)));
+  EXPECT_EQ(moved.identity, identity);  // Historical source, not live proof.
+  EXPECT_FALSE(tier.GetPrep(K(80100), 0, 0, &moved));
+  EXPECT_FALSE(moved.identity.valid());
+  before = RamTier::Hit{};
+  EXPECT_EQ(tier.UsedBytes(), 0U);
+}
+
+TEST(RamTier, UnclassifiedAndUntrackedHitsStayUnbound) {
+  for (const dfkv::DiskWriteOutcome outcome :
+       {dfkv::DiskWriteOutcome::kUnknown, dfkv::DiskWriteOutcome::kNew}) {
+    SCOPED_TRACE(static_cast<int>(outcome));
+    RamTier tier(Opts(64 * 4096), nullptr);
+    tier.set_flush_results([&](const BlockKey&, char*, size_t, size_t) {
+      // A valid-looking id on an unclassified result is not source evidence.
+      const dfkv::DiskResidentIdentity identity =
+          outcome == dfkv::DiskWriteOutcome::kUnknown
+              ? dfkv::DiskResidentIdentity{17, 23, 41}
+              : dfkv::DiskResidentIdentity{};
+      return dfkv::DiskWriteResult{Status::kOk, dfkv::DiskWriteReason::kNone,
+                                   identity, outcome};
+    });
+    ASSERT_EQ(tier.PutCommitted(K(80101), "value", 5).status, Status::kOk);
+    RamTier::Hit hit;
+    ASSERT_TRUE(tier.GetPrep(K(80101), 0, 0, &hit));
+    EXPECT_FALSE(hit.identity.valid());
+  }
+  RamTier legacy(Opts(64 * 4096), nullptr);
+  ASSERT_EQ(legacy.PutCommitted(K(80102), "value", 5).status, Status::kOk);
+  ASSERT_TRUE(legacy.PutDurable(K(80103), "read", 4));
+  RamTier::Hit hit;
+  ASSERT_TRUE(legacy.GetPrep(K(80102), 0, 0, &hit));
+  EXPECT_FALSE(hit.identity.valid());
+  ASSERT_TRUE(legacy.GetPrep(K(80103), 0, 0, &hit));
+  EXPECT_FALSE(hit.identity.valid());
+}
+
+TEST(RamTier, TypedNonOwnerSuccessHidesAttemptButKeepsSendPin) {
+  for (const dfkv::DiskWriteOutcome outcome :
+       {dfkv::DiskWriteOutcome::kKeptExisting,
+        dfkv::DiskWriteOutcome::kRemoved}) {
+    for (const bool acknowledged : {false, true}) {
+      for (const bool dedicated : {false, true}) {
+        SCOPED_TRACE(dedicated);
+        SCOPED_TRACE(static_cast<int>(outcome));
+        SCOPED_TRACE(acknowledged);
+        FlushSink gate;
+        gate.close();
+        RamTier::Options options = Opts(128 * 4096);
+        options.large_reserve_bytes = 96 * 4096;
+        const std::string value =
+            dedicated ? std::string(33 * 4096, 'x') : "attempt";
+        RamTier tier(options, nullptr);
+        const OpenFlushOnExit release{gate};
+        tier.set_flush_results(
+            [&](const BlockKey& key, char* data, size_t len, size_t cap) {
+              EXPECT_TRUE(gate.fn()(key, data, len, cap));
+              return dfkv::DiskWriteResult{
+                  Status::kOk, dfkv::DiskWriteReason::kNone, {}, outcome};
+            });
+        RamTierTestPeer::Completion owner;
+        ASSERT_EQ(
+            RamTierTestPeer::Admit(tier, K(80104), value, &owner, acknowledged),
+            RamTierTestPeer::Admission::kAccepted);
+        ASSERT_TRUE(gate.await_calls(1));
+        RamTier::Hit pinned;
+        ASSERT_TRUE(tier.GetPrep(K(80104), 0, 0, &pinned));
+        EXPECT_EQ(pinned.in_arena, !dedicated);
+        const uint64_t charged = tier.UsedBytes();
+        gate.open();
+        ASSERT_TRUE(RamTierTestPeer::AwaitDone(owner));
+        EXPECT_EQ(RamTierTestPeer::Result(owner).status, Status::kOk);
+        EXPECT_EQ(RamTierTestPeer::Result(owner).outcome, outcome);
+        EXPECT_TRUE(tier.healthy());
+        EXPECT_EQ(tier.PostAckFlushFailures(), 0U);
+        EXPECT_NE(tier.AckToDurableLatencyMetrics("").find(
+                      "dfkv_ram_ack_to_durable_latency_seconds_count 0"),
+                  std::string::npos);
+        EXPECT_FALSE(tier.Contains(K(80104)));
+        EXPECT_EQ(tier.DirtyBytes(), 0U);
+        EXPECT_EQ(tier.DirtyObjects(), 0U);
+        EXPECT_EQ(tier.UsedBytes(), charged);
+        EXPECT_EQ(std::string(pinned.ptr, pinned.len), value);
+        EXPECT_FALSE(pinned.identity.valid());
+        pinned = RamTier::Hit{};
+        EXPECT_EQ(tier.UsedBytes(), 0U);
+      }
+    }
+  }
+}
+
 TEST(RamTier, TypedFlushFailureReasonsControlRetryAndHealth) {
   for (const bool acknowledged : {false, true}) {
     for (const dfkv::DiskWriteResult failure :

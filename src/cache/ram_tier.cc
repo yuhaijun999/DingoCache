@@ -1082,6 +1082,15 @@ bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
     out->len = static_cast<size_t>(n);
     out->value_len = static_cast<size_t>(e.len);
     out->in_arena = e.in_arena();
+    // FlushLoop publishes the immutable result under this same shard lock.
+    // A hit taken before publication stays unbound even if the flush later
+    // commits. Never recover a credential by looking up the current disk key.
+    if (e.durable && e.completion && e.completion->disk_result) {
+      const DiskWriteResult& result = *e.completion->disk_result;
+      if (result.status == Status::kOk &&
+          result.outcome == DiskWriteOutcome::kNew && result.identity.valid())
+        out->identity = result.identity;
+    }
     out->mr = out->in_arena
                   ? arena_mr_.load(std::memory_order_acquire)
                   : nullptr;
@@ -1295,8 +1304,14 @@ void RamTier::FlushLoop(Shard& s) {
           CompletePut(entry.completion, false);
           if (entry.send_pins == 0) DropLocked(s, batch[i].key);
         } else if (ok[i]) {
+          const bool discard_copy =
+              typed &&
+              (disk_results[i].outcome == DiskWriteOutcome::kKeptExisting ||
+               disk_results[i].outcome == DiskWriteOutcome::kRemoved);
+          // For a discarded copy this flag only closes dirty accounting; it
+          // does not claim these attempted bytes exist on disk.
           entry.durable = true;
-          if (entry.client_acked) {
+          if (entry.client_acked && !discard_copy) {
             const double seconds =
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - entry.dirty_since)
@@ -1311,11 +1326,19 @@ void RamTier::FlushLoop(Shard& s) {
                              entry.slot_handle);  // release the flush-pin
             entry.flush_pin = false;
           }
-          if (typed)
-            CompletePut(entry.completion, disk_results[i]);
-          else
-            CompletePut(entry.completion, true);
+          const std::shared_ptr<PutCompletion> completion = entry.completion;
+          if (discard_copy) {
+            // This successful terminal did not persist these RAM bytes. Hide
+            // them before waking waiters; existing SEND pins retain storage.
+            // DropLocked sees durable=true, so dirty accounting is not
+            // repeated.
+            DropLocked(s, batch[i].key);
+          }
           flushed_.fetch_add(1, std::memory_order_relaxed);
+          if (typed)
+            CompletePut(completion, disk_results[i]);
+          else
+            CompletePut(completion, true);
         } else if (!identity_exhausted &&
                    ++batch[i].tries < opt_.flush_retries) {
           s.flushq.push_back(std::move(batch[i]));  // retry later
