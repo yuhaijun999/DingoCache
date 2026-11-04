@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -32,6 +33,7 @@
 #include <vector>
 
 #include "cache/disk_resident_identity.h"
+#include "cache/disk_write_result.h"
 #include "cache/slab_allocator.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -1502,7 +1504,7 @@ Status DiskSlabStore::WaitPut(const std::shared_ptr<PutFlight>& flight) {
 template <typename WriteFn>
 Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
                                 const WriteFn& write_payload,
-                                DiskResidentIdentity* identity) {
+                                DiskWriteResult* details) {
   if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
@@ -1536,8 +1538,11 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       }
       // Reserve before allocator eviction or a valid slots.tbl write. Other
       // leaders may commit first; uniqueness, not commit ordering, is required.
-      if (!ReserveResidentGenerationLocked(&generation))
+      if (!ReserveResidentGenerationLocked(&generation)) {
+        if (details != nullptr)
+          details->reason = DiskWriteReason::kIdentityExhausted;
         return Status::kCacheFull;
+      }
       flight = std::make_shared<PutFlight>();
       put_flights_.emplace(fn, flight);
       leader = true;
@@ -1573,7 +1578,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
     } else {
       if (!removed_while_writing) {
         CommitPayloadLocked(fn, static_cast<uint32_t>(len), generation);
-        if (identity != nullptr) *identity = ResidentIdentityLocked(fn);
+        if (details != nullptr) details->identity = ResidentIdentityLocked(fn);
         new_put_bytes_since_tick_ += ref.slot_size;
       }
       result = Status::kOk;
@@ -1596,33 +1601,59 @@ Status DiskSlabStore::CacheWithIdentity(const BlockKey& key, const void* data,
                                         DiskResidentIdentity* identity) {
   if (identity == nullptr) return Status::kInvalid;
   *identity = {};
-  if (!resident_identity_ || len == 0 || data == nullptr)
-    return Status::kInvalid;
-  return CacheImpl(
+  if (!resident_identity_) return Status::kInvalid;
+  const DiskWriteResult result = CacheWithResult(key, data, len);
+  *identity = result.identity;
+  return result.status;
+}
+
+DiskWriteResult DiskSlabStore::CacheWithResult(const BlockKey& key,
+                                               const void* data, size_t len) {
+  DiskWriteResult result;
+  if (len == 0 || data == nullptr) return result;
+  result.status = CacheImpl(
       key, len,
       [&](const SlabAllocator::SlotRef& ref) {
         return WritePayload(ref, data, len);
       },
-      identity);
+      &result);
+  return result;
 }
 
 Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
                                   size_t cap) {
-  if (len == 0 || data == nullptr) return Status::kInvalid;
-  return CacheImpl(key, len, [&](const SlabAllocator::SlotRef& r) {
-    // O_DIRECT when enabled and the caller's buffer qualifies (RDMA recv buffers
-    // are 4 KiB-aligned with padded cap); anything else falls back to buffered.
-    const size_t alen = (len + 4095) & ~static_cast<size_t>(4095);
-    if (!extent_dio_fds_.empty() && len != 0 &&
-        (reinterpret_cast<uintptr_t>(data) & 4095) == 0 &&
-        alen <= cap && alen <= r.slot_size)
-      return WritePayloadDirect(r, data, len);
-    if (!extent_dio_fds_.empty() && len != 0)
-      dio_write_fallbacks_.fetch_add(1, std::memory_order_relaxed);
-    return WritePayload(r, data, len);
-  });
+  return CacheDirectImpl(key, data, len, cap, nullptr);
 }
 
+DiskWriteResult DiskSlabStore::CacheDirectWithResult(const BlockKey& key,
+                                                     char* data, size_t len,
+                                                     size_t cap) {
+  DiskWriteResult result;
+  result.status = CacheDirectImpl(key, data, len, cap, &result);
+  return result;
+}
+
+Status DiskSlabStore::CacheDirectImpl(const BlockKey& key, char* data,
+                                      size_t len, size_t cap,
+                                      DiskWriteResult* details) {
+  if (len == 0 || data == nullptr) return Status::kInvalid;
+  return CacheImpl(
+      key, len,
+      [&](const SlabAllocator::SlotRef& ref) {
+        // Preserve direct-write eligibility: alignment and padded capacity are
+        // required; all other callers keep the original buffered fallback.
+        const size_t aligned_len = (len + 4095) & ~static_cast<size_t>(4095);
+        if (!extent_dio_fds_.empty() &&
+            (reinterpret_cast<uintptr_t>(data) & 4095) == 0 &&
+            aligned_len <= cap && aligned_len <= ref.slot_size) {
+          return WritePayloadDirect(ref, data, len);
+        }
+        if (!extent_dio_fds_.empty())
+          dio_write_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+        return WritePayload(ref, data, len);
+      },
+      details);
+}
 
 // Batched CacheDirect. Three phases mirror CacheImpl exactly, amortized:
 //   L1 (one mu_): dedup + allocate + write-pin + inflight for every item;
@@ -1634,6 +1665,20 @@ Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
 //     rollback, payload_len_ commit.
 std::vector<Status> DiskSlabStore::CacheDirectBatch(
     const std::vector<CacheBatchItem>& items) {
+  return CacheDirectBatchImpl(items, nullptr);
+}
+
+std::vector<DiskWriteResult> DiskSlabStore::CacheDirectBatchWithResults(
+    const std::vector<CacheBatchItem>& items) {
+  std::vector<DiskWriteResult> results(items.size());
+  const std::vector<Status> statuses = CacheDirectBatchImpl(items, &results);
+  for (size_t i = 0; i < statuses.size(); ++i) results[i].status = statuses[i];
+  return results;
+}
+
+std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
+    const std::vector<CacheBatchItem>& items,
+    std::vector<DiskWriteResult>* details) {
   const size_t N = items.size();
   std::vector<Status> out(N, Status::kIOError);
   if (!Healthy() || N == 0) return out;
@@ -1686,6 +1731,8 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
           break;
         }
         if (!ReserveResidentGenerationLocked(&st[i].generation)) {
+          if (details != nullptr)
+            (*details)[i].reason = DiskWriteReason::kIdentityExhausted;
           out[i] = Status::kCacheFull;
           break;
         }
@@ -1855,6 +1902,8 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         if (!removed) {
           CommitPayloadLocked(st[i].fn, static_cast<uint32_t>(items[i].len),
                               st[i].generation);
+          if (details != nullptr)
+            (*details)[i].identity = ResidentIdentityLocked(st[i].fn);
           new_put_bytes_since_tick_ += st[i].ref.slot_size;
         }
         out[i] = Status::kOk;
