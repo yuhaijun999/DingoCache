@@ -654,6 +654,7 @@ TEST_F(DiskWriteResultTest,
     RamTier::Options options;
     options.bytes = 64 * 4096;
     options.reclaim_interval_ms = 0;
+    HookGate gate;  // Outlives the tier whose flusher invokes its hook.
     RamTier tier(options, nullptr);
     const RamTier::FlushResultFn single = [&](const BlockKey& key, char* data,
                                               size_t len, size_t cap) {
@@ -670,7 +671,21 @@ TEST_F(DiskWriteResultTest,
       };
     }
     tier.set_flush_results(single, multiple);
+    DiskSlabStoreTestPeer::SetPayloadWriteHook(stores[0],
+                                               [&] { return gate.Run(); });
+    const bool admitted = tier.Put(K(1800), "owner", 5);
+    const bool entered = admitted && gate.WaitEnteredFor();
+    RamTier::Hit before;
+    const bool hit_before = entered && tier.GetPrep(K(1800), 0, 0, &before);
+    EXPECT_FALSE(before.identity.valid());
+    // Release before any fatal assertion or waiting PUT, including on timeout.
+    gate.Release(true);
+    ASSERT_TRUE(admitted);
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(hit_before);
     const RamTier::PutResult committed = tier.PutCommitted(K(1800), "owner", 5);
+    EXPECT_FALSE(before.identity.valid());
+    before = RamTier::Hit{};
     ASSERT_EQ(committed.status, Status::kOk);
     EXPECT_TRUE(committed.identity.valid());
     EXPECT_EQ(committed.outcome, DiskWriteOutcome::kNew);
@@ -686,6 +701,7 @@ TEST_F(DiskWriteResultTest,
     RamTier::Hit hit;
     ASSERT_TRUE(tier.GetPrep(K(1800), 0, 5, &hit));
     EXPECT_EQ(std::string(hit.ptr, hit.len), disk);
+    EXPECT_EQ(hit.identity, committed.identity);
     hit = RamTier::Hit{};
     DiskSlabStoreTestPeer::SetGenerationSequence(stores[0], UINT64_MAX);
     const RamTier::PutResult exhausted =
@@ -699,6 +715,69 @@ TEST_F(DiskWriteResultTest,
     EXPECT_TRUE(group.Healthy());
     EXPECT_FALSE(tier.Contains(K(1801)));
     EXPECT_FALSE(group.IsCached(K(1801)));
+  }
+}
+
+TEST_F(DiskWriteResultTest, RamDoesNotPublishUncommittedAttemptAsDiskCopy) {
+  for (const bool batch : {false, true}) {
+    for (const bool remove_during_write : {false, true}) {
+      SCOPED_TRACE(batch);
+      SCOPED_TRACE(remove_during_write);
+      fs::remove_all(dir_);
+      std::vector<DiskSlabStore*> stores;
+      DiskCacheGroup group(GroupOptions(1, &stores));
+      ASSERT_TRUE(group.Healthy());
+      const BlockKey key = K(1850);
+      if (!remove_during_write) {
+        ASSERT_EQ(group.CacheWithResult(key, "existing", 8).outcome,
+                  DiskWriteOutcome::kNew);
+      } else {
+        // Actual slab payload I/O runs outside D. Remove wins this write,
+        // whose final release must finish invalidation before returning Ok.
+        DiskSlabStoreTestPeer::SetPayloadWriteHook(stores[0], [&] {
+          EXPECT_EQ(stores[0]->Remove(key), Status::kOk);
+          return true;
+        });
+      }
+      RamTier::Options options;
+      options.bytes = 64 * 4096;
+      options.reclaim_interval_ms = 0;
+      RamTier tier(options, nullptr);
+      const RamTier::FlushResultFn single = [&](const BlockKey& k, char* data,
+                                                size_t len, size_t cap) {
+        return group.CacheDirectWithResult(k, data, len, cap);
+      };
+      RamTier::FlushBatchResultFn multiple;
+      if (batch) {
+        multiple = [&](const std::vector<RamTier::FlushItem>& items) {
+          std::vector<StoreEngine::CacheBatchItem> writes;
+          writes.reserve(items.size());
+          for (const RamTier::FlushItem& item : items)
+            writes.push_back({item.key, item.data, item.len, item.cap});
+          return group.CacheDirectBatchWithResults(writes);
+        };
+      }
+      tier.set_flush_results(single, multiple);
+      const RamTier::PutResult result = tier.PutCommitted(key, "attempt", 7);
+      EXPECT_EQ(result.status, Status::kOk);
+      EXPECT_EQ(result.outcome, remove_during_write
+                                    ? DiskWriteOutcome::kRemoved
+                                    : DiskWriteOutcome::kKeptExisting);
+      EXPECT_FALSE(result.identity.valid());
+      RamTier::Hit hit;
+      EXPECT_FALSE(tier.GetPrep(key, 0, 0, &hit));
+      EXPECT_FALSE(hit.identity.valid());
+      EXPECT_EQ(tier.DirtyBytes(), 0U);
+      EXPECT_EQ(tier.DirtyObjects(), 0U);
+      EXPECT_EQ(tier.UsedBytes(), 0U);
+      EXPECT_TRUE(tier.healthy());
+      std::string disk;
+      EXPECT_EQ(group.Range(key, 0, 0, &disk),
+                remove_during_write ? Status::kNotFound : Status::kOk);
+      if (!remove_during_write) {
+        EXPECT_EQ(disk, "existing");
+      }
+    }
   }
 }
 

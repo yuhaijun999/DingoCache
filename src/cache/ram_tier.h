@@ -142,6 +142,8 @@ class RamTier {
     size_t value_len = 0;
     void* mr = nullptr;
     bool in_arena = false;
+    // Source snapshot for these bytes, not proof the disk resident is live.
+    DiskResidentIdentity identity{};
 
    private:
     friend class RamTier;
@@ -200,7 +202,7 @@ class RamTier {
     PutDisposition disposition = PutDisposition::kComplete;
     DiskWriteReason reason = DiskWriteReason::kNone;
     // The accepted owner's bytes, not a conflicting duplicate's input. This
-    // credential is not exported by Hit and does not establish read provenance.
+    // credential alone does not prove the disk resident is still live.
     DiskResidentIdentity identity{};
     // The accepted RAM owner's disk result, also for RAM duplicate waiters.
     DiskWriteOutcome outcome = DiskWriteOutcome::kUnknown;
@@ -319,6 +321,8 @@ class RamTier {
     bool success = false;
     // Legacy completions allocate no typed result. Kept with the owner rather
     // than reconstructing a credential by looking up the key after the flush.
+    // For an indexed entry, publish only under its shard mutex. GetPrep reads
+    // this immutable terminal result under that same mutex, without a new lock.
     std::unique_ptr<DiskWriteResult> disk_result;
     bool canceled = false;
     // Immutable after registration: a read copy is not an accepted PUT owner.
@@ -404,6 +408,7 @@ class RamTier {
                   bool admit_new = true);
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           bool success);
+  // Caller holds the resident's shard mutex through typed result publication.
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           const DiskWriteResult& result);
   static PutResult WaitPutResult(
@@ -483,6 +488,7 @@ inline RamTier::Hit& RamTier::Hit::operator=(Hit&& other) noexcept {
     value_len = other.value_len;
     mr = other.mr;
     in_arena = other.in_arena;
+    identity = std::exchange(other.identity, DiskResidentIdentity{});
     owner_ = std::exchange(other.owner_, nullptr);
     token_ = std::exchange(other.token_, 0);
     other.ptr = nullptr;
