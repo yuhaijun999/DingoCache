@@ -29,6 +29,7 @@
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/kv_store.h"
+#include "cache/ram_tier.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -607,6 +608,62 @@ TEST_F(DiskWriteResultTest,
     }
     EXPECT_EQ(failures.load(), probe->positions.size());
     EXPECT_EQ(observed_disks.load(), 2U);
+  }
+}
+
+TEST_F(DiskWriteResultTest,
+       RamCompletionPreservesRealGroupCommitAndExhaustion) {
+  for (const bool batch : {false, true}) {
+    SCOPED_TRACE(batch);
+    fs::remove_all(dir_);
+    std::vector<DiskSlabStore*> stores;
+    DiskCacheGroup group(GroupOptions(1, &stores));
+    ASSERT_TRUE(group.Healthy());
+    RamTier::Options options;
+    options.bytes = 64 * 4096;
+    options.reclaim_interval_ms = 0;
+    RamTier tier(options, nullptr);
+    const RamTier::FlushResultFn single = [&](const BlockKey& key, char* data,
+                                              size_t len, size_t cap) {
+      return group.CacheDirectWithResult(key, data, len, cap);
+    };
+    RamTier::FlushBatchResultFn multiple;
+    if (batch) {
+      multiple = [&](const std::vector<RamTier::FlushItem>& items) {
+        std::vector<StoreEngine::CacheBatchItem> writes;
+        writes.reserve(items.size());
+        for (const RamTier::FlushItem& item : items)
+          writes.push_back({item.key, item.data, item.len, item.cap});
+        return group.CacheDirectBatchWithResults(writes);
+      };
+    }
+    tier.set_flush_results(single, multiple);
+    const RamTier::PutResult committed = tier.PutCommitted(K(1800), "owner", 5);
+    ASSERT_EQ(committed.status, Status::kOk);
+    EXPECT_TRUE(committed.identity.valid());
+    EXPECT_EQ(committed.identity,
+              DiskSlabStoreTestPeer::Identity(*stores[0], K(1800)));
+    const RamTier::PutResult duplicate =
+        tier.PutCommitted(K(1800), "different", 9);
+    EXPECT_EQ(duplicate.identity, committed.identity);
+    std::string disk;
+    ASSERT_EQ(group.Range(K(1800), 0, 0, &disk), Status::kOk);
+    EXPECT_EQ(disk, "owner");
+    RamTier::Hit hit;
+    ASSERT_TRUE(tier.GetPrep(K(1800), 0, 5, &hit));
+    EXPECT_EQ(std::string(hit.ptr, hit.len), disk);
+    hit = RamTier::Hit{};
+    DiskSlabStoreTestPeer::SetGenerationSequence(stores[0], UINT64_MAX);
+    const RamTier::PutResult exhausted =
+        tier.PutCommitted(K(1801), "blocked", 7);
+    EXPECT_EQ(exhausted.status, Status::kCacheFull);
+    EXPECT_EQ(exhausted.reason, DiskWriteReason::kIdentityExhausted);
+    EXPECT_FALSE(exhausted.identity.valid());
+    EXPECT_EQ(exhausted.disposition, RamTier::PutDisposition::kComplete);
+    EXPECT_TRUE(tier.healthy());
+    EXPECT_TRUE(group.Healthy());
+    EXPECT_FALSE(tier.Contains(K(1801)));
+    EXPECT_FALSE(group.IsCached(K(1801)));
   }
 }
 

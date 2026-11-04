@@ -9,7 +9,9 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
+#include "cache/disk_write_result.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -460,14 +462,37 @@ void RamTier::CompletePut(
   completion->cv.notify_all();
 }
 
+void RamTier::CompletePut(const std::shared_ptr<PutCompletion>& completion,
+                          const DiskWriteResult& result) {
+  if (!completion) return;
+  {
+    const std::lock_guard<std::mutex> lock(completion->mu);
+    if (completion->done) return;
+    completion->disk_result = std::make_unique<DiskWriteResult>(result);
+    if (result.status != Status::kOk) completion->disk_result->identity = {};
+    completion->done = true;
+  }
+  completion->cv.notify_all();
+}
+
 Status RamTier::WaitPut(const std::shared_ptr<PutCompletion>& completion) {
-  if (!completion) return Status::kIOError;
+  return WaitPutResult(completion).status;
+}
+
+RamTier::PutResult RamTier::WaitPutResult(
+    const std::shared_ptr<PutCompletion>& completion) {
+  if (!completion) return {Status::kIOError};
   std::unique_lock<std::mutex> lk(completion->mu);
   // The shared completion owns the admitted value, not the caller's payload.
   // Returning a bypass here could persist conflicting duplicate bytes while
   // the original flush still owns its slot (or outlive Remove's disk fence).
   completion->cv.wait(lk, [&completion] { return completion->done; });
-  return completion->success ? Status::kOk : Status::kIOError;
+  if (completion->disk_result) {
+    const DiskWriteResult& result = *completion->disk_result;
+    return {result.status, PutDisposition::kComplete, result.reason,
+            result.identity};
+  }
+  return {completion->success ? Status::kOk : Status::kIOError};
 }
 
 RamTier::Admission RamTier::Admit(
@@ -706,7 +731,7 @@ RamTier::PutResult RamTier::PutCommitted(
   if (admission == Admission::kBypass)
     return {Status::kCacheFull, PutDisposition::kBypass};
   if (admission == Admission::kRejected) return {Status::kIOError};
-  return {WaitPut(completion)};
+  return WaitPutResult(completion);
 }
 
 RamTier::PutResult RamTier::PrepareDirectPut(const BlockKey& key,
@@ -717,7 +742,7 @@ RamTier::PutResult RamTier::PrepareDirectPut(const BlockKey& key,
   if (admission == Admission::kBypass)
     return {Status::kCacheFull, PutDisposition::kBypass};
   if (admission == Admission::kRejected) return {Status::kIOError};
-  return {WaitPut(completion)};
+  return WaitPutResult(completion);
 }
 
 bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
@@ -880,7 +905,7 @@ RamTier::PutResult RamTier::PutWriteBack(
   if (admission == Admission::kRejected) return {Status::kIOError};
   if (synchronous || admission == Admission::kDuplicate) {
     if (synchronous) ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
-    return {WaitPut(completion)};
+    return WaitPutResult(completion);
   }
   ram_acks_.fetch_add(1, std::memory_order_relaxed);
   return {Status::kOk};
@@ -1219,8 +1244,24 @@ void RamTier::FlushLoop(Shard& s) {
 
     // Flush: batched sink when wired (one store visit for the whole dequeue),
     // else the per-item sink. Every item is owned until this batch completes.
+    const bool typed = static_cast<bool>(flush_result_) ||
+                       static_cast<bool>(flush_batch_results_);
+    std::vector<DiskWriteResult> disk_results;
     std::vector<char> ok(B, 0);
-    if (flush_batch_ && B != 0) {
+    if (typed) {
+      if (flush_batch_results_ && B != 0) {
+        disk_results = flush_batch_results_(items);
+        // Missing rows are failures; extra rows do not belong to this dequeue.
+        disk_results.resize(B, DiskWriteResult{Status::kIOError});
+      } else {
+        disk_results.reserve(B);
+        for (const FlushItem& item : items)
+          disk_results.push_back(
+              flush_result_(item.key, item.data, item.len, item.cap));
+      }
+      for (size_t i = 0; i < B; ++i)
+        ok[i] = disk_results[i].status == Status::kOk ? 1 : 0;
+    } else if (flush_batch_ && B != 0) {
       std::vector<bool> results = flush_batch_(items);
       for (size_t i = 0; i < B && i < results.size(); ++i)
         ok[i] = results[i] ? 1 : 0;
@@ -1237,6 +1278,10 @@ void RamTier::FlushLoop(Shard& s) {
         auto it = s.index.find(batch[i].key);
         if (it == s.index.end()) continue;  // defensive
         Entry& entry = it->second;
+        // Only the exact permanent-admission reason bypasses ordinary retry.
+        const bool identity_exhausted =
+            typed && disk_results[i].status == Status::kCacheFull &&
+            disk_results[i].reason == DiskWriteReason::kIdentityExhausted;
         entry.flushing = false;
         if (entry.remove_pending) {
           if (entry.flush_pin) {
@@ -1263,13 +1308,17 @@ void RamTier::FlushLoop(Shard& s) {
                              entry.slot_handle);  // release the flush-pin
             entry.flush_pin = false;
           }
-          CompletePut(entry.completion, true);
+          if (typed)
+            CompletePut(entry.completion, disk_results[i]);
+          else
+            CompletePut(entry.completion, true);
           flushed_.fetch_add(1, std::memory_order_relaxed);
-        } else if (++batch[i].tries < opt_.flush_retries) {
+        } else if (!identity_exhausted &&
+                   ++batch[i].tries < opt_.flush_retries) {
           s.flushq.push_back(std::move(batch[i]));  // retry later
           s.cv.notify_one();
         } else {
-          const auto completion = entry.completion;
+          const std::shared_ptr<PutCompletion> completion = entry.completion;
           const bool client_acked = entry.client_acked;
           if (entry.flush_pin) {
             if (entry.in_arena())
@@ -1279,11 +1328,17 @@ void RamTier::FlushLoop(Shard& s) {
           if (client_acked)
             post_ack_flush_failures_.fetch_add(1, std::memory_order_relaxed);
           DropLocked(s, batch[i].key);
-          healthy_.store(false, std::memory_order_release);
+          // Unacknowledged identity exhaustion is admission failure, not I/O
+          // corruption. After RAM-ACK, losing the sole copy still isolates RAM.
+          if (!identity_exhausted || client_acked)
+            healthy_.store(false, std::memory_order_release);
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
           // Publish every terminal side effect before waking PutCommitted()
           // leaders and duplicate followers.
-          CompletePut(completion, false);
+          if (typed)
+            CompletePut(completion, disk_results[i]);
+          else
+            CompletePut(completion, false);
         }
       }
       s.flush_inflight -= B;
