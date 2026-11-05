@@ -14,9 +14,10 @@ namespace dfkv {
 class DiskLifetimeClock {
  public:
   // Absolute monotonic whole seconds, not wall time. Injected sources must be
-  // thread-safe when shared callers use TryNow concurrently. They must not
-  // throw. Whole-second quantization can tick before a full second has elapsed
-  // since construction; origin and samples always use the same units.
+  // thread-safe when shared callers use either sampling method concurrently.
+  // They must not throw. Whole-second quantization can tick before a full
+  // second has elapsed since construction; origin and samples use the same
+  // units.
   using NowFn = std::function<uint64_t()>;
 
   // H is fixed for this clock's lifetime. Valid range: 1..INT32_MAX, normally
@@ -24,14 +25,26 @@ class DiskLifetimeClock {
   explicit DiskLifetimeClock(uint64_t horizon_sec);
   DiskLifetimeClock(uint64_t horizon_sec, NowFn now);
 
-  // Returns a relative second offset, including valid zero, only while it is
-  // <= UINT32_MAX-H. Invalid H, an empty source, or exhaustion returns false
-  // without changing *offset. offset must be non-null.
+  // Admission sample: returns a relative second offset, including valid zero,
+  // only while it is <= UINT32_MAX-H. Invalid H, an empty source, or exhaustion
+  // returns false without changing *offset. offset must be non-null.
   // The observed age never decreases at its atomic linearization point, even
   // if a faulty injected source regresses. Exhaustion cannot clear by clock
-  // rollback: only a new instance starts a new origin. Callers must react to
-  // false BEFORE changing time metadata; this is not the full shutdown gate.
+  // rollback: only a new instance starts a new origin. False closes admission;
+  // never reuse an old output as an event timestamp. Already-admitted work
+  // uses TryDrainNow instead; neither API implements the full shutdown policy.
   bool TryNow(uint32_t* offset) const;
+
+  // For already-admitted work only; sample under the resident owner's lock
+  // when applying an update. Allows the remaining seconds through UINT32_MAX.
+  // Does not admit a request or establish grant success. Crossing UINT32_MAX-H
+  // advances the shared floor, closing subsequent TryNow admission even if
+  // the server has not polled its restart signal yet. Deadlines stay uint64.
+  // Invalid H/source or an offset > UINT32_MAX returns false, leaves *offset
+  // unchanged and must not be ignored. offset must be non-null.
+  // This primitive alone does not define the terminal policy for successful
+  // work beyond that hard bound.
+  bool TryDrainNow(uint32_t* offset) const;
 
  private:
   const uint64_t horizon_sec_;

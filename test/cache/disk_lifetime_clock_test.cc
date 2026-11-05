@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_state.h"
 
 namespace dfkv {
 namespace {
@@ -35,6 +36,9 @@ TEST(DiskLifetimeClock, OriginIsCapturedOnceAndZeroIsValid) {
   ASSERT_TRUE(disk_b.TryNow(&offset));
   EXPECT_EQ(offset, 17U);
   EXPECT_EQ(samples, 4U);
+  ASSERT_TRUE(clock.TryDrainNow(&offset));
+  EXPECT_EQ(offset, 17U);
+  EXPECT_EQ(samples, 5U);
 }
 
 TEST(DiskLifetimeClock, LargeAbsoluteOriginIsNotTruncated) {
@@ -236,6 +240,162 @@ TEST(DiskLifetimeClock, DelayedOldSampleCannotUndoAdvanceOrExhaustion) {
       EXPECT_EQ(late_offset, exhaust ? 99U : 20U);
     }
   }
+}
+
+TEST(DiskLifetimeClock, DrainUsesRepresentableHeadroomButNeverAdmits) {
+  for (const uint64_t horizon : {uint64_t{1}, uint64_t{INT32_MAX}}) {
+    SCOPED_TRACE(horizon);
+    const uint64_t origin = uint64_t{UINT32_MAX} + 1000;
+    uint64_t seconds = origin;
+    const DiskLifetimeClock clock(horizon, [&] { return seconds; });
+    uint32_t offset = 99;
+    ASSERT_TRUE(clock.TryDrainNow(&offset));
+    EXPECT_EQ(offset, 0U);
+    const uint64_t limit = uint64_t{UINT32_MAX} - horizon;
+    for (const uint64_t elapsed :
+         {limit - 1, limit, limit + 1, uint64_t{UINT32_MAX}}) {
+      seconds = origin + elapsed;
+      ASSERT_TRUE(clock.TryDrainNow(&offset));
+      EXPECT_EQ(offset, elapsed);
+      uint32_t admission = 99;
+      EXPECT_EQ(clock.TryNow(&admission), elapsed <= limit);
+      EXPECT_EQ(admission, elapsed <= limit ? elapsed : 99U);
+    }
+    ++seconds;
+    offset = 99;
+    EXPECT_FALSE(clock.TryDrainNow(&offset));
+    EXPECT_EQ(offset, 99U);
+    seconds = origin;
+    EXPECT_FALSE(clock.TryDrainNow(&offset));
+    EXPECT_FALSE(clock.TryNow(&offset));
+    EXPECT_EQ(offset, 99U);
+  }
+}
+
+TEST(DiskLifetimeClock, DrainRejectsInvalidSourceAndHorizonWithoutMutation) {
+  for (const uint64_t horizon :
+       {uint64_t{0}, uint64_t{INT32_MAX} + 1, uint64_t{UINT64_MAX}}) {
+    const DiskLifetimeClock clock(horizon, [] { return uint64_t{100}; });
+    uint32_t offset = 99;
+    EXPECT_FALSE(clock.TryDrainNow(&offset));
+    EXPECT_EQ(offset, 99U);
+  }
+  const DiskLifetimeClock empty(100, DiskLifetimeClock::NowFn{});
+  uint32_t offset = 99;
+  EXPECT_FALSE(empty.TryDrainNow(&offset));
+  EXPECT_EQ(offset, 99U);
+}
+
+TEST(DiskLifetimeClock, DrainReadUsesActualApplicationTimeAndWideDeadline) {
+  const DiskLifetimeConfig config;
+  ASSERT_TRUE(ValidateDiskLifetimeConfig(config, nullptr));
+  const uint64_t horizon = DiskLifetimeHorizon(config);
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(horizon, [&] { return seconds; });
+  seconds = uint64_t{UINT32_MAX} - horizon;
+  uint32_t commit_at = 0;
+  ASSERT_TRUE(clock.TryNow(&commit_at));
+  DiskLifetimeState state = NewDiskLifetimeState(commit_at);
+  seconds += 181;
+  uint32_t applied_at = 0;
+  ASSERT_TRUE(clock.TryDrainNow(&applied_at));
+  ASSERT_TRUE(ApplyDiskLifetimeRead(config, applied_at, &state));
+  EXPECT_EQ(state.anchor, seconds);
+  EXPECT_EQ(state.put_at, commit_at);
+  EXPECT_EQ(state.actual_reads, 1U);
+  EXPECT_FALSE(state.first_early_read());
+  EXPECT_FALSE(state.write_armed());
+  EXPECT_FALSE(clock.TryNow(&applied_at));
+  seconds = UINT32_MAX;
+  ASSERT_TRUE(clock.TryDrainNow(&applied_at));
+  ASSERT_TRUE(ApplyDiskLifetimeRead(config, applied_at, &state));
+  EXPECT_EQ(state.anchor, UINT32_MAX);
+  EXPECT_EQ(state.actual_reads, 2U);
+  const uint64_t end =
+      DiskLifetimeProtectEnd(config, state.anchor, state.scoring_reads(),
+                             state.first_early_read(), state.write_armed());
+  EXPECT_GT(end, uint64_t{UINT32_MAX});
+  EXPECT_EQ(
+      DiskLifetimeScore(config, state.anchor, state.scoring_reads(),
+                        state.first_early_read(), state.write_armed(), end),
+      static_cast<int64_t>(config.keep_score_sec));
+}
+
+TEST(DiskLifetimeClock, DrainSampleClosesDelayedAdmissionBeforeReturning) {
+  for (const bool hard_exhaustion : {false, true}) {
+    SCOPED_TRACE(hard_exhaustion);
+    std::atomic<uint64_t> seconds{0};
+    std::atomic<bool> delay_next{false};
+    std::promise<void> captured;
+    const std::future<void> sampled = captured.get_future();
+    std::promise<void> release;
+    const std::future<void> released = release.get_future();
+    const DiskLifetimeClock clock(100, [&] {
+      const uint64_t sample = seconds.load(std::memory_order_relaxed);
+      if (delay_next.exchange(false, std::memory_order_relaxed)) {
+        captured.set_value();
+        released.wait();
+      }
+      return sample;
+    });
+    seconds.store(uint64_t{UINT32_MAX} - 100, std::memory_order_relaxed);
+    delay_next.store(true, std::memory_order_relaxed);
+    bool admitted = true;
+    uint32_t admission = 99;
+    std::thread old_request([&] { admitted = clock.TryNow(&admission); });
+    const bool paused =
+        sampled.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    EXPECT_TRUE(paused);
+    if (paused) {
+      const uint64_t newer = hard_exhaustion ? uint64_t{UINT32_MAX} + 1
+                                             : uint64_t{UINT32_MAX} - 99;
+      seconds.store(newer, std::memory_order_relaxed);
+      uint32_t drain_offset = 99;
+      EXPECT_EQ(clock.TryDrainNow(&drain_offset), !hard_exhaustion);
+      EXPECT_EQ(drain_offset, hard_exhaustion ? 99U : UINT32_MAX - 99U);
+      seconds.store(0, std::memory_order_relaxed);
+    }
+    release.set_value();
+    old_request.join();
+    if (paused) {
+      EXPECT_FALSE(admitted);
+      EXPECT_EQ(admission, 99U);
+      uint32_t drain_offset = 99;
+      EXPECT_EQ(clock.TryDrainNow(&drain_offset), !hard_exhaustion);
+      EXPECT_EQ(drain_offset, hard_exhaustion ? 99U : UINT32_MAX - 99U);
+    }
+  }
+}
+
+TEST(DiskLifetimeClock, DrainHeadroomIsNotATimeoutGuarantee) {
+  DiskLifetimeConfig config;
+  config.base_sec = 1;
+  config.read_bonus_sec = 0;
+  config.max_reads = 1;
+  config.protect_sec = 1;
+  config.slowdown = 1;
+  config.boost_sec = 1;
+  config.keep_score_sec = 0;
+  config.bucket_sec = 1;
+  config.bucket_count = 2;
+  ASSERT_TRUE(ValidateDiskLifetimeConfig(config, nullptr));
+  const uint64_t horizon = DiskLifetimeHorizon(config);
+  ASSERT_EQ(horizon, 2U);
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(horizon, [&] { return seconds; });
+  seconds = uint64_t{UINT32_MAX} - horizon;
+  uint32_t offset = 99;
+  ASSERT_TRUE(clock.TryNow(&offset));
+  seconds += 3;  // A legal config can exhaust drain encoding in three seconds.
+  EXPECT_FALSE(clock.TryDrainNow(&offset));
+  EXPECT_EQ(offset, UINT32_MAX - 2U);
+  EXPECT_FALSE(clock.TryNow(&offset));
+  // A new process resets the origin, not the exhausted old clock.
+  const DiskLifetimeClock restarted(horizon, [&] { return seconds; });
+  ASSERT_TRUE(restarted.TryDrainNow(&offset));
+  EXPECT_EQ(offset, 0U);
+  ASSERT_TRUE(restarted.TryNow(&offset));
+  EXPECT_EQ(offset, 0U);
 }
 
 TEST(DiskLifetimeClock, DefaultSourceWorksWithoutEnvironmentOrWallClock) {
