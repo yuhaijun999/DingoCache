@@ -65,6 +65,11 @@ class KvNodeServer {
     return group_.Healthy() && !ram_required_failed_ &&
            (!ram_ || ram_->healthy());
   }
+  // Active lifetime admission/restart signal, independent of storage health.
+  // Null clock (normal legacy) returns false without reading a clock.
+  bool LifetimeRestartRequired() const {
+    return group_.LifetimeRestartRequired();
+  }
   // Accessors for the MDS heartbeat stats provider (STA1) -- all cheap reads.
   uint64_t Evictions() const { return group_.Evictions(); }
   uint64_t PutBusyTotal() const { return put_busy_.load(std::memory_order_relaxed); }
