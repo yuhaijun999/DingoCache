@@ -1507,3 +1507,21 @@ TEST_F(SharedLifetimeClockTest, ConcurrentPollingSharesExhaustion) {
   EXPECT_TRUE(group.LifetimeRestartRequired());
   EXPECT_TRUE(group.Healthy());
 }
+
+TEST_F(SharedLifetimeClockTest,
+       DrainSampleClosesSharedAdmissionWithoutPolling) {
+  uint64_t seconds = 100;
+  DiskCacheGroup::Options options = Options();
+  options.lifetime_clock =
+      std::make_shared<DiskLifetimeClock>(100, [&] { return seconds; });
+  const DiskCacheGroup group(options);
+  ASSERT_TRUE(group.Healthy());
+  seconds += uint64_t{UINT32_MAX} - 99;
+  uint32_t offset = 99;
+  ASSERT_TRUE(options.lifetime_clock->TryDrainNow(&offset));
+  EXPECT_EQ(offset, UINT32_MAX - 99U);
+  seconds = 100;  // The signal must reflect the prior drain sample, not this.
+  EXPECT_TRUE(group.LifetimeRestartRequired());
+  EXPECT_TRUE(group.Healthy());
+  EXPECT_EQ(group.SlabStats().metadata_io_errors, 0U);
+}
