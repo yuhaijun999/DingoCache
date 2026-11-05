@@ -2036,7 +2036,8 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(key, fn, &ref, &plen))
+  DiskResidentIdentity identity;
+  if (!AcquireForRead(key, fn, &ref, &plen, &identity))
     return Healthy() ? Status::kNotFound : Status::kIOError;
   auto bail = [&](Status status) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -2070,7 +2071,7 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
     return bail(Status::kIOError);
   }
   ReadLease lease = ReadLease::Adopt(
-      -1, this, token, &DiskSlabStore::ReleaseReadLeaseThunk);
+      -1, this, token, &DiskSlabStore::ReleaseReadLeaseThunk, identity);
   int fd = ::dup(extent_dio_fds_.empty() ? extent_fds_[ref.extent]
                                          : extent_dio_fds_[ref.extent]);
   if (fd < 0) return Status::kIOError;
@@ -2084,17 +2085,26 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
   return Status::kOk;
 }
 
-void DiskSlabStore::ReleaseReadLeaseThunk(void* owner,
-                                         uint64_t token) noexcept {
-  static_cast<DiskSlabStore*>(owner)->ReleaseReadLease(token);
+Status DiskSlabStore::ReleaseReadLeaseThunk(
+    void* owner, uint64_t token, size_t bytes,
+    DiskResidentIdentity* identity) noexcept {
+  return static_cast<DiskSlabStore*>(owner)->ReleaseReadLease(token, bytes,
+                                                              identity);
 }
 
-void DiskSlabStore::ReleaseReadLease(uint64_t token) noexcept {
+Status DiskSlabStore::ReleaseReadLease(
+    uint64_t token, size_t bytes, DiskResidentIdentity* identity) noexcept {
   std::lock_guard<std::mutex> lk(mu_);
-  auto it = prep_holds_.find(token);
-  if (it == prep_holds_.end()) return;
-  ReleaseInflightLocked(it->second.key, it->second.fn);
+  const std::unordered_map<uint64_t, PrepHold>::iterator it =
+      prep_holds_.find(token);
+  if (it == prep_holds_.end()) {
+    if (identity != nullptr) *identity = {};
+    return Status::kIOError;
+  }
+  const Status status = FinishReadLocked(it->second.key, it->second.fn,
+                                         Status::kOk, bytes, identity);
   prep_holds_.erase(it);
+  return status;
 }
 
 // Reads take the lock only to resolve the slot + commit length and acquire the

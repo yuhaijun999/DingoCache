@@ -350,8 +350,10 @@ class DiskSlabStore : public StoreEngine {
   // is still required to order the slots.tbl record before physical reuse.
   // Call with mu_ held.
   bool ReleaseInflightLocked(const BlockKey& key, const std::string& fn);
-  static void ReleaseReadLeaseThunk(void* owner, uint64_t token) noexcept;
-  void ReleaseReadLease(uint64_t token) noexcept;
+  static Status ReleaseReadLeaseThunk(void* owner, uint64_t token, size_t bytes,
+                                      DiskResidentIdentity* identity) noexcept;
+  Status ReleaseReadLease(uint64_t token, size_t bytes,
+                          DiskResidentIdentity* identity) noexcept;
   uint64_t TableOffset(uint32_t extent, uint32_t slot) const {
     return static_cast<uint64_t>(extent) * max_slots_per_extent_ * kRecBytes +
            static_cast<uint64_t>(slot) * kRecBytes;

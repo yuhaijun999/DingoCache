@@ -163,20 +163,24 @@ class KvNodeServer {
   friend class KvNodeServerWiringTestPeer;
   static void FinishDiskRead(void* owner, uint64_t flight, bool committed,
                              Status result, size_t bytes_read,
-                             double elapsed_sec, const char* data) noexcept;
+                             double elapsed_sec, const char* data,
+                             const DiskResidentIdentity& identity) noexcept;
   struct PromotedRead {
     KvNodeServer* server = nullptr;
     RamTier::DurableReservation reservation;
   };
   static void FinishPromotedDiskRead(
       void* owner, uint64_t flight, bool committed, Status result,
-      size_t bytes_read, double elapsed_sec, const char* data) noexcept;
+      size_t bytes_read, double elapsed_sec, const char* data,
+      const DiskResidentIdentity& identity) noexcept;
   static void FinishRamRead(void* owner, uint64_t token, bool committed,
                             Status result, size_t bytes_read,
-                            double elapsed_sec, const char* data) noexcept;
+                            double elapsed_sec, const char* data,
+                            const DiskResidentIdentity& identity) noexcept;
   static void FinishPullRamRead(void* owner, uint64_t token, bool committed,
                                 Status result, size_t bytes_read,
-                                double elapsed_sec, const char* data) noexcept;
+                                double elapsed_sec, const char* data,
+                                const DiskResidentIdentity& identity) noexcept;
   void AcceptLoop();
   // accepted_at stamps the accept() return so the first complete request frame
   // is due within DFKV_TCP_FIRST_REQ_MS of ACCEPT, not of handler scheduling.
