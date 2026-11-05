@@ -1947,9 +1947,29 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
   return out;
 }
 
-Status DiskSlabStore::RangeDirect(
+Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
+                                  uint64_t length, char* io_buf, size_t io_cap,
+                                  const char** out_data, size_t* out_len,
+                                  size_t* value_len) {
+  return RangeDirectImpl(key, offset, length, io_buf, io_cap, out_data, out_len,
+                         value_len, nullptr);
+}
+
+Status DiskSlabStore::RangeDirectWithIdentity(
     const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
-    size_t io_cap, const char** out_data, size_t* out_len, size_t* value_len) {
+    size_t io_cap, const char** out_data, size_t* out_len,
+    DiskResidentIdentity* identity, size_t* value_len) {
+  if (identity == nullptr) return Status::kInvalid;
+  *identity = {};
+  return RangeDirectImpl(key, offset, length, io_buf, io_cap, out_data, out_len,
+                         value_len, identity);
+}
+
+Status DiskSlabStore::RangeDirectImpl(const BlockKey& key, uint64_t offset,
+                                      uint64_t length, char* io_buf,
+                                      size_t io_cap, const char** out_data,
+                                      size_t* out_len, size_t* value_len,
+                                      DiskResidentIdentity* identity) {
   if (out_data) *out_data = nullptr;
   if (out_len) *out_len = 0;
   // Direct mode + aligned io_buf (the RDMA path's contract): O_DIRECT read of
@@ -1960,7 +1980,7 @@ Status DiskSlabStore::RangeDirect(
     const std::string fn = key.Filename();
     SlabAllocator::SlotRef ref;
     uint32_t plen = 0;
-    if (!AcquireForRead(key, fn, &ref, &plen))
+    if (!AcquireForRead(key, fn, &ref, &plen, identity))
       return Healthy() ? Status::kNotFound : Status::kIOError;
     Status st = Status::kOk;
     size_t got = 0, head = 0;
@@ -1990,7 +2010,7 @@ Status DiskSlabStore::RangeDirect(
     }
     {
       std::lock_guard<std::mutex> lk(mu_);
-      if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
+      st = FinishReadLocked(key, fn, st, got, identity);
     }
     if (st != Status::kOk) return st;
     if (value_len) *value_len = plen;
@@ -2001,7 +2021,8 @@ Status DiskSlabStore::RangeDirect(
   if (!extent_dio_fds_.empty() && Healthy())
     dio_read_fallbacks_.fetch_add(1, std::memory_order_relaxed);  // unaligned io_buf
   size_t got = 0;
-  Status st = RangeInto(key, offset, length, io_buf, io_cap, &got, value_len);
+  const Status st = RangeIntoImpl(key, offset, length, io_buf, io_cap, &got,
+                                  value_len, identity);
   if (st == Status::kOk) { if (out_data) *out_data = io_buf; if (out_len) *out_len = got; }
   return st;
 }
@@ -2081,8 +2102,8 @@ void DiskSlabStore::ReleaseReadLease(uint64_t token) noexcept {
 // slot away from eviction or explicit-remove reuse; the inflight count orders a
 // concurrent Remove's durable invalidation before the slot becomes reusable.
 bool DiskSlabStore::AcquireForRead(const BlockKey& key, const std::string& fn,
-                                   SlabAllocator::SlotRef* ref,
-                                   uint32_t* plen) {
+                                   SlabAllocator::SlotRef* ref, uint32_t* plen,
+                                   DiskResidentIdentity* identity) {
   if (!Healthy()) return false;
   {
     const std::lock_guard<std::mutex> lock(mu_);
@@ -2092,6 +2113,7 @@ bool DiskSlabStore::AcquireForRead(const BlockKey& key, const std::string& fn,
       return false;  // No committed visible payload.
     if (!alloc_->GetAndPin(key, ref)) return false;
     *plen = it->second;
+    if (identity != nullptr) *identity = ResidentIdentityLocked(fn);
     inflight_[fn]++;
   }
   if (read_acquired_hook_for_test_) read_acquired_hook_for_test_();
@@ -2122,14 +2144,44 @@ bool DiskSlabStore::ReleaseInflightLocked(const BlockKey& key,
   return release_ok;
 }
 
+Status DiskSlabStore::FinishReadLocked(const BlockKey& key,
+                                       const std::string& fn, Status status,
+                                       size_t bytes,
+                                       DiskResidentIdentity* identity) {
+  if (!ReleaseInflightLocked(key, fn)) status = Status::kIOError;
+  // This lookup only validates the captured credential. It never supplies a
+  // later resident's identity for bytes read from the old slot.
+  if (identity != nullptr && (status != Status::kOk || bytes == 0 ||
+                              !(*identity == ResidentIdentityLocked(fn))))
+    *identity = {};
+  return status;
+}
+
 Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset,
                             uint64_t length, std::string* out,
                             size_t* value_len) {
+  return RangeImpl(key, offset, length, out, value_len, nullptr);
+}
+
+Status DiskSlabStore::RangeWithIdentity(const BlockKey& key, uint64_t offset,
+                                        uint64_t length, std::string* out,
+                                        DiskResidentIdentity* identity,
+                                        size_t* value_len) {
+  if (identity == nullptr) return Status::kInvalid;
+  *identity = {};
+  if (out == nullptr) return Status::kInvalid;
+  return RangeImpl(key, offset, length, out, value_len, identity);
+}
+
+Status DiskSlabStore::RangeImpl(const BlockKey& key, uint64_t offset,
+                                uint64_t length, std::string* out,
+                                size_t* value_len,
+                                DiskResidentIdentity* identity) {
   if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(key, fn, &ref, &plen))
+  if (!AcquireForRead(key, fn, &ref, &plen, identity))
     return Healthy() ? Status::kNotFound : Status::kIOError;
   Status st = Status::kOk;
   if (offset > plen) {
@@ -2146,7 +2198,7 @@ Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset,
       st = Status::kIOError;
   }
   std::lock_guard<std::mutex> lk(mu_);
-  if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
+  st = FinishReadLocked(key, fn, st, out->size(), identity);
   if (st == Status::kOk && value_len) *value_len = plen;
   return st;
 }
@@ -2154,12 +2206,32 @@ Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset,
 Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset,
                                 uint64_t length, char* dst, size_t dst_cap,
                                 size_t* out_len, size_t* value_len) {
+  return RangeIntoImpl(key, offset, length, dst, dst_cap, out_len, value_len,
+                       nullptr);
+}
+
+Status DiskSlabStore::RangeIntoWithIdentity(const BlockKey& key,
+                                            uint64_t offset, uint64_t length,
+                                            char* dst, size_t dst_cap,
+                                            size_t* out_len,
+                                            DiskResidentIdentity* identity,
+                                            size_t* value_len) {
+  if (identity == nullptr) return Status::kInvalid;
+  *identity = {};
+  return RangeIntoImpl(key, offset, length, dst, dst_cap, out_len, value_len,
+                       identity);
+}
+
+Status DiskSlabStore::RangeIntoImpl(const BlockKey& key, uint64_t offset,
+                                    uint64_t length, char* dst, size_t dst_cap,
+                                    size_t* out_len, size_t* value_len,
+                                    DiskResidentIdentity* identity) {
   if (out_len) *out_len = 0;
   if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(key, fn, &ref, &plen))
+  if (!AcquireForRead(key, fn, &ref, &plen, identity))
     return Healthy() ? Status::kNotFound : Status::kIOError;
   Status st = Status::kOk;
   size_t got = 0;
@@ -2174,7 +2246,7 @@ Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset,
   }
   {
     std::lock_guard<std::mutex> lk(mu_);
-    if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
+    st = FinishReadLocked(key, fn, st, got, identity);
   }
   if (st == Status::kOk && out_len) *out_len = got;
   if (st == Status::kOk && value_len) *value_len = plen;
