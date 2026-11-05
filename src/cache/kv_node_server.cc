@@ -996,14 +996,15 @@ Status KvNodeServer::ProcessRequestForKey(
                 static_cast<size_t>(std::min({length, avail, max_payload}));
             out_data->resize(cap);
             size_t n = 0;
-            st = read_coalescer_.Read(
+            st = read_coalescer_.ReadWithIdentity(
                 key, offset, length,
                 out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
-                out_value_len,
-                [&](char* buf, size_t bcap, size_t* on, size_t* value_len) {
+                out_value_len, nullptr,
+                [&](char* buf, size_t bcap, size_t* on, size_t* value_len,
+                    DiskResidentIdentity* identity) {
                   std::string tmp;
-                  Status s =
-                      group_.Range(key, offset, length, &tmp, value_len);
+                  const Status s = group_.RangeWithIdentity(
+                      key, offset, length, &tmp, identity, value_len);
                   if (s == Status::kOk) {
                     size_t m = tmp.size() < bcap ? tmp.size() : bcap;
                     std::memcpy(buf, tmp.data(), m);
@@ -1128,11 +1129,12 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
   const uint64_t read_epoch = CaptureReadEpoch(key);
   Status st;
   if (coalesce_enabled_ && (read_epoch & 1) == 0) {
-    st = read_coalescer_.Read(
-        key, offset, length, dst, dst_cap, out_len, value_len,
-        [&](char* buf, size_t cap, size_t* n, size_t* stored_len) {
-          return group_.RangeInto(key, offset, length, buf, cap, n,
-                                  stored_len);
+    st = read_coalescer_.ReadWithIdentity(
+        key, offset, length, dst, dst_cap, out_len, value_len, nullptr,
+        [&](char* buf, size_t cap, size_t* n, size_t* stored_len,
+            DiskResidentIdentity* identity) {
+          return group_.RangeIntoWithIdentity(key, offset, length, buf, cap, n,
+                                              identity, stored_len);
         },
         nullptr, read_epoch);
   } else {
@@ -1307,12 +1309,13 @@ Status KvNodeServer::RangeDirectForKey(
   if (coalesce_enabled_ && (read_epoch & 1) == 0) {
     // Leader reads into the shared scratch, every rank's convoy copy lands in
     // its own registered io_buf; *out_data must point at io_buf either way.
-    st = read_coalescer_.Read(
-        key, offset, length, io_buf, io_cap, out_len, value_len,
-        [&](char* buf, size_t cap, size_t* n, size_t* stored_len) {
+    st = read_coalescer_.ReadWithIdentity(
+        key, offset, length, io_buf, io_cap, out_len, value_len, &read_identity,
+        [&](char* buf, size_t cap, size_t* n, size_t* stored_len,
+            DiskResidentIdentity* identity) {
           const char* p = nullptr;
-          Status s = group_.RangeDirect(key, offset, length, buf, cap, &p, n,
-                                        stored_len);
+          const Status s = group_.RangeDirectWithIdentity(
+              key, offset, length, buf, cap, &p, n, identity, stored_len);
           // A DIO superset read returns p = buf + head with head in (0, 4095]:
           // src points INSIDE dst, so this in-place compaction overlaps
           // (forward) and must be a memmove -- memcpy on an overlap is UB and
@@ -1498,7 +1501,7 @@ void KvNodeServer::FinishDiskRead(
     uint64_t read_epoch = 0;
     (void)server->read_coalescer_.CompleteAsync(
         flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, &key,
-        &whole, &recurrent, &read_epoch);
+        &whole, &recurrent, &read_epoch, identity);
     if (ok && whole && server->ram_ && data && bytes_read) {
       server->PromoteRead(key, read_epoch, data, bytes_read, identity);
     }
@@ -1539,7 +1542,8 @@ void KvNodeServer::FinishPromotedDiskRead(
   }
   if (flight) {
     (void)server->read_coalescer_.CompleteAsync(
-        flight, ok ? Status::kOk : Status::kIOError, data, bytes_read);
+        flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, nullptr,
+        nullptr, nullptr, nullptr, identity);
   }
   if (server->lat_sampler_.ShouldSample())
     server->get_lat_.Observe(elapsed_sec);

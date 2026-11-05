@@ -47,6 +47,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "cache/disk_resident_identity.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -157,6 +158,7 @@ class ReadCoalescer {
   // data==nullptr), waiters fall back to their own disk reads. Returns true if
   // at least one waiter had joined. Optional outputs describe the original
   // registration (including its fence epoch), not a newer read of the key.
+  // identity must describe data from that completed read, never a fresh lookup.
   // Unknown/already-completed tokens leave those outputs unchanged.
   // A successful staged whole-value completion with NO waiter leaves a
   // recurrence tombstone (key fingerprint, not payload) for RecurMs(): a
@@ -166,8 +168,8 @@ class ReadCoalescer {
   // mechanism.
   bool CompleteAsync(uint64_t token, Status st, const char* data, size_t len,
                      BlockKey* key = nullptr, bool* whole = nullptr,
-                     bool* recurrent = nullptr,
-                     uint64_t* fence_epoch = nullptr) {
+                     bool* recurrent = nullptr, uint64_t* fence_epoch = nullptr,
+                     const DiskResidentIdentity& identity = {}) {
     std::shared_ptr<Flight> f;
     bool waiters = false;
     {
@@ -207,6 +209,8 @@ class ReadCoalescer {
       std::lock_guard<std::mutex> fl(f->m);
       f->st = st;
       f->len = len;
+      f->identity =
+          st == Status::kOk && data && len ? identity : DiskResidentIdentity{};
       f->done = true;
     }
     f->cv.notify_all();
@@ -270,6 +274,39 @@ class ReadCoalescer {
               size_t dst_cap, size_t* out_len, size_t* out_value_len,
               const FillWithMetadata& fill, Outcome* oc = nullptr,
               uint64_t fence_epoch = 0) {
+    return ReadWithIdentity(
+        bk, offset, length, dst, dst_cap, out_len, out_value_len, nullptr,
+        [&](char* buffer, size_t capacity, size_t* size, size_t* value_len,
+            DiskResidentIdentity*) {
+          return fill(buffer, capacity, size, value_len);
+        },
+        oc, fence_epoch);
+  }
+
+  using FillWithIdentity = std::function<Status(char*, size_t, size_t*, size_t*,
+                                                DiskResidentIdentity*)>;
+
+  // Identity describes the returned bytes, not current residency. It shares
+  // the flight's completion fence with the payload. A fallback uses only its
+  // own fill result; failed/empty reads never export a previous credential.
+  Status ReadWithIdentity(const BlockKey& bk, uint64_t offset, uint64_t length,
+                          char* dst, size_t dst_cap, size_t* out_len,
+                          size_t* out_value_len, DiskResidentIdentity* identity,
+                          const FillWithIdentity& fill, Outcome* oc = nullptr,
+                          uint64_t fence_epoch = 0) {
+    if (identity) *identity = {};
+    auto read_own = [&](char* buffer, size_t capacity, size_t* size,
+                        size_t* value_len, DiskResidentIdentity* source) {
+      size_t n = 0;
+      DiskResidentIdentity original;
+      const Status result = fill(buffer, capacity, &n, value_len, &original);
+      if (size) *size = n;
+      if (source)
+        *source = result == Status::kOk && n > 0 && capacity > 0
+                      ? original
+                      : DiskResidentIdentity{};
+      return result;
+    };
     const Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash,
                 offset,       length,       fence_epoch};
     std::shared_ptr<Flight> f;
@@ -293,8 +330,9 @@ class ReadCoalescer {
       size_t n = 0;
       size_t value_len = 0;
       Status st =
-          f->data ? fill(f->data.get(), dst_cap, &n, &value_len)
-                  : fill(dst, dst_cap, &n, &value_len);
+          f->data
+              ? read_own(f->data.get(), dst_cap, &n, &value_len, &f->identity)
+              : read_own(dst, dst_cap, &n, &value_len, &f->identity);
       {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = map_.find(k);
@@ -315,19 +353,17 @@ class ReadCoalescer {
       }
       if (st == Status::kOk && n > 0 && f->data) {
         std::memcpy(dst, f->data.get(), n < dst_cap ? n : dst_cap);
-        if (out_len) *out_len = n < dst_cap ? n : dst_cap;
-      } else if (st == Status::kOk && out_len && !f->data) {
-        // fill wrote dst directly; `n` is its returned byte count.
-        *out_len = n;
       }
+      if (st == Status::kOk && out_len) *out_len = n < dst_cap ? n : dst_cap;
       if (st == Status::kOk && out_value_len) *out_value_len = value_len;
+      if (identity) *identity = f->identity;
       return st;
     }
     // A pipelined duplicate on the flight's own serve thread: the leader's read
     // has not been submitted yet (async prep registers before the uring batch
     // runs), so waiting here would deadlock. Read it ourselves.
     if (f->leader_tid == std::this_thread::get_id())
-      return fill(dst, dst_cap, out_len, out_value_len);
+      return read_own(dst, dst_cap, out_len, out_value_len, identity);
     // Follower: wait (bounded) for the leader, then copy from the shared
     // buffer; on timeout / failure / abort, fall back to our own read.
     f->waiters.fetch_add(1, std::memory_order_acq_rel);
@@ -338,15 +374,16 @@ class ReadCoalescer {
                           [&] { return f->done; })) {
         timeouts_.fetch_add(1, std::memory_order_relaxed);
         fl.unlock();
-        return fill(dst, dst_cap, out_len, out_value_len);
+        return read_own(dst, dst_cap, out_len, out_value_len, identity);
       }
     }
     if (f->st != Status::kOk || !f->data)
-      return fill(dst, dst_cap, out_len, out_value_len);
+      return read_own(dst, dst_cap, out_len, out_value_len, identity);
     const size_t c = f->len < dst_cap ? f->len : dst_cap;
     if (c) std::memcpy(dst, f->data.get(), c);
     if (out_len) *out_len = c;
     if (out_value_len) *out_value_len = f->value_len;
+    if (identity && c > 0) *identity = f->identity;
     coalesced_.fetch_add(1, std::memory_order_relaxed);
     return Status::kOk;
   }
@@ -357,6 +394,8 @@ class ReadCoalescer {
   size_t recur_hits() const { return recur_hits_.load(std::memory_order_relaxed); }
 
  private:
+  friend class ReadCoalescerTestPeer;
+
   struct Flight {
     std::mutex m;
     std::condition_variable cv;
@@ -364,6 +403,7 @@ class ReadCoalescer {
     Status st = Status::kInvalid;
     size_t len = 0;
     size_t value_len = 0;
+    DiskResidentIdentity identity;
     std::shared_ptr<char> data;  // 4096-aligned scratch (leader's read target)
     Key key{};
     bool whole = false;

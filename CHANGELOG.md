@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep disk-read provenance with coalesced payloads across TCP, direct and
+  asynchronous reads. Shared RAM promotions retain the original resident
+  identity; failed, empty and fallback reads cannot inherit an older source.
+
 - Finalize asynchronous disk leases before reporting read success. Deferred
   invalidation failures now reach prepared-read results and prevent RAM/READY
   publication. Validate byte provenance on release, and revoke failed grant
