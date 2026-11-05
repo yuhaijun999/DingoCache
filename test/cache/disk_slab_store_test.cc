@@ -74,6 +74,15 @@ class DiskSlabStoreTestPeer {
                ? store.resident_identity_->generations.size()
                : 0;
   }
+  // Physical ownership only, not an exportable or readable credential.
+  static uint64_t PhysicalGeneration(const DiskSlabStore& store,
+                                     const BlockKey& key) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    if (!store.resident_identity_) return 0;
+    const std::unordered_map<std::string, uint64_t>::const_iterator it =
+        store.resident_identity_->generations.find(key.Filename());
+    return it == store.resident_identity_->generations.end() ? 0 : it->second;
+  }
   static uint64_t GenerationSequence(const DiskSlabStore& store) {
     const std::lock_guard<std::mutex> lock(store.mu_);
     return store.resident_identity_->sequence;
@@ -1930,6 +1939,7 @@ TEST_F(DiskSlabTest, FailedDeferredRemoveBlocksAlreadyAdmittedReclaim) {
     DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
     options.table_sync_ms = 0;
     options.reclaim_interval_ms = 0;
+    options.track_resident_identity = true;
     const BlockKey removed{810, 0, 1};
     const BlockKey other{811, 0, 2};
     const std::string value(3000, 'r');
@@ -1964,6 +1974,7 @@ TEST_F(DiskSlabTest, FailedDeferredRemoveBlocksAlreadyAdmittedReclaim) {
                                 // fd intact
     EXPECT_FALSE(store.Healthy());
     EXPECT_EQ(store.Count(), residents);
+    EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::IdentityCount(store), residents);
     EXPECT_EQ(store.UsedBytes(), allocated);
     EXPECT_EQ(ReadFileBytes(dir_ / "slots.tbl"), table);
     EXPECT_EQ(store.Cache(removed, value.data(), value.size()),
@@ -1972,6 +1983,7 @@ TEST_F(DiskSlabTest, FailedDeferredRemoveBlocksAlreadyAdmittedReclaim) {
     reclaim.join();
     // One resident exercises whole-extent clear; two exercise slot clear.
     EXPECT_EQ(store.Count(), residents);
+    EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::IdentityCount(store), residents);
     EXPECT_EQ(store.UsedBytes(), allocated);
     EXPECT_EQ(ReadFileBytes(dir_ / "slots.tbl"), table);
     EXPECT_EQ(store.GetStats().payload_bytes, (residents - 1) * value.size());
@@ -1979,6 +1991,7 @@ TEST_F(DiskSlabTest, FailedDeferredRemoveBlocksAlreadyAdmittedReclaim) {
     lease = dfkv::ReadLease{};  // duplicate storage release must not free or
                                 // debit twice
     EXPECT_EQ(store.Count(), residents);
+    EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::IdentityCount(store), residents);
     EXPECT_EQ(store.Remove(removed), Status::kIOError);
     EXPECT_EQ(store.Evictions(), 0U);
     EXPECT_EQ(store.GetStats().watermark_record_clear_bytes, 0U);
@@ -1989,6 +2002,7 @@ TEST_F(DiskSlabTest, FailedDeferredRemoveBlocksAdmittedExtentRebind) {
   DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
   options.table_sync_ms = 0;
   options.reclaim_interval_ms = 0;
+  options.track_resident_identity = true;
   DiskSlabStore store(options);
   ASSERT_TRUE(store.Healthy());
   const BlockKey key{812, 0, 3};
@@ -2007,6 +2021,7 @@ TEST_F(DiskSlabTest, FailedDeferredRemoveBlocksAdmittedExtentRebind) {
       dfkv::DiskSlabStoreTestPeer::StealAfterAdmission(&store, &evicted));
   EXPECT_TRUE(evicted.empty());
   EXPECT_EQ(store.Count(), 1U);
+  EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::IdentityCount(store), 1U);
   EXPECT_EQ(store.UsedBytes(), 4096U);
   EXPECT_EQ(store.GetStats().bind_wipes, binds);
   EXPECT_EQ(ReadFileBytes(dir_ / "slots.tbl"), table);
@@ -2955,8 +2970,11 @@ TEST_F(DiskSlabTest, ResidentIdentityRemoveInvalidatesBeforeLastPinRelease) {
   ASSERT_EQ(store.Remove(K(910)), Status::kOk);
   EXPECT_EQ(store.Count(), 1U);  // Still physically pinned, already invisible.
   EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::Identity(store, K(910)).valid());
-  EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::IdentityCount(store), 0U);
+  EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::IdentityCount(store), 1U);
+  EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::PhysicalGeneration(store, K(910)),
+            first.generation);
   lease = dfkv::ReadLease{};
+  EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::IdentityCount(store), 0U);
   dfkv::DiskResidentIdentity next;
   ASSERT_EQ(store.CacheWithIdentity(K(910), "new", 3, &next), Status::kOk);
   EXPECT_TRUE(next.valid());
@@ -3245,4 +3263,130 @@ TEST_F(DiskSlabTest, ResidentIdentityBatchKeepsLastReservationAndItemOrder) {
   std::string out;
   ASSERT_EQ(store.Range(K(924), 0, 0, &out), Status::kOk);
   EXPECT_EQ(out, "first");
+}
+
+TEST_F(DiskSlabTest, PhysicalIdentitySurvivesUntilLastDeferredReadRelease) {
+  for (const bool fail_invalidation : {false, true}) {
+    SCOPED_TRACE(fail_invalidation);
+    fs::remove_all(dir_);
+    DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+    options.table_sync_ms = options.reclaim_interval_ms = 0;
+    options.track_resident_identity = true;
+    DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy());
+    const BlockKey key = K(930);
+    dfkv::DiskResidentIdentity original;
+    ASSERT_EQ(store.CacheWithIdentity(key, "old", 3, &original), Status::kOk);
+    dfkv::ReadLease first;
+    dfkv::ReadLease last;
+    ASSERT_EQ(store.RangeDirectPrep(key, 0, 0, 4096, &first), Status::kOk);
+    ASSERT_EQ(store.RangeDirectPrep(key, 0, 0, 4096, &last), Status::kOk);
+    ASSERT_EQ(store.Remove(key), Status::kOk);
+    EXPECT_FALSE(store.IsCached(key));
+    EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::Identity(store, key).valid());
+    EXPECT_EQ(store.TenantUsedBytes(key.tenant_hash), 0U);
+    EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::PhysicalGeneration(store, key),
+              original.generation);
+    unsigned invalidations = 0;
+    dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&store, [&] {
+      ++invalidations;
+      return !fail_invalidation;
+    });
+    first = dfkv::ReadLease{};
+    EXPECT_EQ(invalidations, 0U);
+    EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::PhysicalGeneration(store, key),
+              original.generation);
+    last = dfkv::ReadLease{};
+    EXPECT_EQ(invalidations, 1U);
+    EXPECT_EQ(store.Count(), fail_invalidation ? 1U : 0U);
+    EXPECT_EQ(store.Healthy(), !fail_invalidation);
+    EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::PhysicalGeneration(store, key),
+              fail_invalidation ? original.generation : 0U);
+    EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::Identity(store, key).valid());
+    EXPECT_EQ(store.GetStats().committed_objects, 0U);
+    last = dfkv::ReadLease{};
+    EXPECT_EQ(invalidations, 1U);
+  }
+}
+
+TEST_F(DiskSlabTest, PhysicalIdentitySurvivesConcurrentFailedRemove) {
+  DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+  options.table_sync_ms = options.reclaim_interval_ms = 0;
+  options.track_resident_identity = true;
+  DiskSlabStore store(options);
+  ASSERT_TRUE(store.Healthy());
+  const BlockKey key = K(931);
+  dfkv::DiskResidentIdentity original;
+  ASSERT_EQ(store.CacheWithIdentity(key, "old", 3, &original), Status::kOk);
+  HookGate gate;
+  dfkv::DiskSlabStoreTestPeer::SetReadAcquiredHook(&store, [&] { gate.Run(); });
+  dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&store, [] { return false; });
+  Status status = Status::kInvalid;
+  dfkv::DiskResidentIdentity source;
+  std::string bytes;
+  std::thread reader(
+      [&] { status = store.RangeWithIdentity(key, 0, 0, &bytes, &source); });
+  EXPECT_TRUE(gate.WaitEnteredFor());
+  EXPECT_EQ(store.Remove(key), Status::kOk);
+  EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::PhysicalGeneration(store, key),
+            original.generation);
+  gate.Release(true);
+  reader.join();
+  EXPECT_EQ(status, Status::kIOError);
+  EXPECT_FALSE(source.valid());
+  EXPECT_FALSE(store.Healthy());
+  EXPECT_EQ(store.Count(), 1U);
+  EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::PhysicalGeneration(store, key),
+            original.generation);
+  EXPECT_EQ(store.Remove(key), Status::kIOError);
+  EXPECT_EQ(store.Cache(key, "new", 3), Status::kIOError);
+}
+
+TEST_F(DiskSlabTest, PhysicalIdentityClearedByImmediateRemoveAndWatermark) {
+  DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+  options.table_sync_ms = options.reclaim_interval_ms = 0;
+  options.track_resident_identity = true;
+  DiskSlabStore store(options);
+  ASSERT_TRUE(store.Healthy());
+  ASSERT_EQ(store.Cache(K(932), "old", 3), Status::kOk);
+  ASSERT_EQ(store.Remove(K(932)), Status::kOk);
+  EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::IdentityCount(store), 0U);
+  ASSERT_EQ(store.Cache(K(932), "new", 3), Status::kOk);
+  ASSERT_EQ(store.Cache(K(933), "other", 5), Status::kOk);
+  dfkv::DiskSlabStoreTestPeer::EnableWatermark(&store);
+  dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
+  EXPECT_EQ(store.Count(), 0U);
+  EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::IdentityCount(store), 0U);
+  EXPECT_EQ(store.GetStats().committed_objects, 0U);
+}
+
+TEST_F(DiskSlabTest, PhysicalIdentityClearedByCrossClassReplacement) {
+  for (const bool batch : {false, true}) {
+    SCOPED_TRACE(batch);
+    fs::remove_all(dir_);
+    DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+    options.table_sync_ms = options.reclaim_interval_ms = 0;
+    options.track_resident_identity = true;
+    DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy());
+    ASSERT_EQ(store.Cache(K(934), "old", 3), Status::kOk);
+    const uint64_t original =
+        dfkv::DiskSlabStoreTestPeer::PhysicalGeneration(store, K(934));
+    ASSERT_NE(original, 0U);
+    alignas(4096) char value[8192] = {};
+    if (batch) {
+      const std::vector<Status> result = store.CacheDirectBatch(
+          {{K(935), value, sizeof(value), sizeof(value)}});
+      ASSERT_EQ(result.size(), 1U);
+      ASSERT_EQ(result[0], Status::kOk);
+    } else {
+      ASSERT_EQ(store.Cache(K(935), value, sizeof(value)), Status::kOk);
+    }
+    EXPECT_EQ(store.Count(), 1U);
+    EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::IdentityCount(store), 1U);
+    EXPECT_EQ(dfkv::DiskSlabStoreTestPeer::PhysicalGeneration(store, K(934)),
+              0U);
+    EXPECT_GT(dfkv::DiskSlabStoreTestPeer::PhysicalGeneration(store, K(935)),
+              original);
+  }
 }

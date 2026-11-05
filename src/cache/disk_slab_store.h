@@ -302,7 +302,10 @@ class DiskSlabStore : public StoreEngine {
   DiskResidentIdentity ResidentIdentityLocked(const std::string& key) const;
   void CommitPayloadLocked(const std::string& key, uint32_t payload_len,
                            uint64_t generation);
+  // Visible payload/tenant accounting only; deferred Remove hides immediately.
   uint32_t ErasePayloadLocked(const std::string& key);
+  // Confirmed physical removal, even if payload was already hidden. Holds D.
+  uint32_t ForgetResidentLocked(const std::string& key);
   // Shared allocate/pin -> unlocked payload write -> commit skeleton for
   // Cache/CacheDirect; `write_payload` does just the payload I/O for the slot.
   template <typename WriteFn>
@@ -381,7 +384,10 @@ class DiskSlabStore : public StoreEngine {
   std::unordered_map<std::string, uint32_t> payload_len_;
   // Enabled-only auxiliary state. Generations are reserved before slot/I/O
   // mutation; failed reservations/writes never recycle a consumed number.
-  // Only generation is stored per resident; instance/epoch belong to the store.
+  // Generations belong to committed physical residents, not visibility: a
+  // deferred Remove hides payload immediately, but retains generation until
+  // durable invalidation and physical removal succeed. Failed/uncommitted
+  // write reservations have no entry. Instance/epoch belong to the store.
   struct ResidentIdentityState {
     uint64_t store_instance = 0;
     uint64_t sequence = 0;
