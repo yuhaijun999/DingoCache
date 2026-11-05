@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
 #include "cache/store_engine.h"
@@ -619,6 +620,43 @@ Status DiskCacheGroup::RangeDirect(
   if (d == nullptr) return Status::kInvalid;
   return d->RangeDirect(key, offset, length, io_buf, io_cap, out_data, out_len,
                         value_len);
+}
+
+Status DiskCacheGroup::RangeWithIdentity(const BlockKey& key, uint64_t offset,
+                                         uint64_t length, std::string* out,
+                                         DiskResidentIdentity* identity,
+                                         size_t* value_len) {
+  if (identity == nullptr) return Status::kInvalid;
+  *identity = {};
+  StoreEngine* disk = Route(key);
+  if (disk == nullptr) return Status::kInvalid;
+  return disk->RangeWithIdentity(key, offset, length, out, identity, value_len);
+}
+
+Status DiskCacheGroup::RangeIntoWithIdentity(const BlockKey& key,
+                                             uint64_t offset, uint64_t length,
+                                             char* dst, size_t dst_cap,
+                                             size_t* out_len,
+                                             DiskResidentIdentity* identity,
+                                             size_t* value_len) {
+  if (identity == nullptr) return Status::kInvalid;
+  *identity = {};
+  StoreEngine* disk = Route(key);
+  if (disk == nullptr) return Status::kInvalid;
+  return disk->RangeIntoWithIdentity(key, offset, length, dst, dst_cap, out_len,
+                                     identity, value_len);
+}
+
+Status DiskCacheGroup::RangeDirectWithIdentity(
+    const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
+    size_t io_cap, const char** out_data, size_t* out_len,
+    DiskResidentIdentity* identity, size_t* value_len) {
+  if (identity == nullptr) return Status::kInvalid;
+  *identity = {};
+  StoreEngine* disk = Route(key);
+  if (disk == nullptr) return Status::kInvalid;
+  return disk->RangeDirectWithIdentity(key, offset, length, io_buf, io_cap,
+                                       out_data, out_len, identity, value_len);
 }
 
 Status DiskCacheGroup::RangeDirectPrep(const BlockKey& key, uint64_t offset,

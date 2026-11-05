@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "cache/disk_resident_identity.h"
 #include "cache/ram_tier.h"
 #include "cache/store_engine.h"
 #include "common/config_dump.h"
@@ -162,13 +163,18 @@ void KvNodeServer::AdvanceReadEpoch(const BlockKey& key) {
 }
 
 void KvNodeServer::PromoteRead(const BlockKey& key, uint64_t epoch,
-                               const char* data, size_t len) {
+                               const char* data, size_t len,
+                               const DiskResidentIdentity& identity) {
   if (!ram_ || (epoch & 1) != 0) return;
   ReadPublicationFence& fence = read_publication_[MutationKeyStripe(key)];
   const std::lock_guard<std::mutex> lock(fence.mutex);
   // Validation and publication are atomic with Remove's opening fence. A
   // publication that wins this lock is subsequently hidden by RAM Remove.
-  if (fence.epoch == epoch) ram_->PutDurable(key, data, len);
+  if (fence.epoch != epoch) return;
+  if (identity.valid())
+    ram_->PutDurable(key, data, len, identity);
+  else
+    ram_->PutDurable(key, data, len);
 }
 
 void KvNodeServer::InitRamTier() {
@@ -1295,6 +1301,7 @@ Status KvNodeServer::RangeDirectForKey(
   size_t stored_len = 0;
   if (value_len == nullptr) value_len = &stored_len;
   const uint64_t read_epoch = CaptureReadEpoch(key);
+  DiskResidentIdentity read_identity;
   Status st;
   if (coalesce_enabled_ && (read_epoch & 1) == 0) {
     // Leader reads into the shared scratch, every rank's convoy copy lands in
@@ -1315,6 +1322,10 @@ Status KvNodeServer::RangeDirectForKey(
         },
         nullptr, read_epoch);
     if (st == Status::kOk && out_data) *out_data = io_buf;
+  } else if (ram_) {
+    st = group_.RangeDirectWithIdentity(key, offset, length, io_buf, io_cap,
+                                        out_data, out_len, &read_identity,
+                                        value_len);
   } else {
     st = group_.RangeDirect(key, offset, length, io_buf, io_cap, out_data,
                             out_len, value_len);
@@ -1327,7 +1338,7 @@ Status KvNodeServer::RangeDirectForKey(
     // Best-effort: the data is already durable, so no flush is needed.
     if (ram_ && offset == 0 && *out_data && *out_len > 0 &&
         *out_len == *value_len)
-      PromoteRead(key, read_epoch, *out_data, *out_len);
+      PromoteRead(key, read_epoch, *out_data, *out_len, read_identity);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else if (st == Status::kIOError) {

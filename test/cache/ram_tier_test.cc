@@ -1846,6 +1846,34 @@ TEST(RamTier, TypedNonOwnerSuccessHidesAttemptButKeepsSendPin) {
   }
 }
 
+TEST(RamTier, ReadPromotionSourceDoesNotPretendToBeDiskWrite) {
+  const dfkv::DiskResidentIdentity identity{31, 41, 59};
+  for (const bool dedicated : {false, true}) {
+    RamTier::Options options = Opts(128 * 4096);
+    options.large_reserve_bytes = 96 * 4096;
+    RamTier tier(options, nullptr);
+    const std::string value(dedicated ? 33 * 4096 : 7, 'v');
+    ASSERT_TRUE(
+        tier.PutDurable(K(80200), value.data(), value.size(), identity));
+    RamTier::Hit hit;
+    ASSERT_TRUE(tier.GetPrep(K(80200), 0, 0, &hit));
+    EXPECT_EQ(hit.identity, identity);
+    EXPECT_EQ(hit.in_arena, !dedicated);
+    EXPECT_EQ(std::string(hit.ptr, hit.len), value);
+    const RamTier::PutResult duplicate =
+        tier.PutCommitted(K(80200), "different", 9);
+    EXPECT_EQ(duplicate.status, Status::kOk);
+    EXPECT_EQ(duplicate.identity, identity);
+    EXPECT_EQ(duplicate.outcome, dfkv::DiskWriteOutcome::kUnknown);
+    EXPECT_EQ(tier.FlushBacklog(), 0U);
+    EXPECT_EQ(tier.DirtyBytes(), 0U);
+    ASSERT_TRUE(tier.Remove(K(80200)));
+    EXPECT_EQ(hit.identity, identity);  // Pin retains its historical source.
+    hit = RamTier::Hit{};
+    EXPECT_EQ(tier.UsedBytes(), 0U);
+  }
+}
+
 TEST(RamTier, TypedFlushFailureReasonsControlRetryAndHealth) {
   for (const bool acknowledged : {false, true}) {
     for (const dfkv::DiskWriteResult failure :

@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "cache/disk_cache_group.h"
+#include "cache/disk_resident_identity.h"
 #include "cache/ram_tier.h"
 #include "cache/read_coalescer.h"
 #include "common/kv_types.h"
@@ -196,7 +197,7 @@ class KvNodeServer {
   // item.
   void AdvanceReadEpoch(const BlockKey& key);
   void PromoteRead(const BlockKey& key, uint64_t epoch, const char* data,
-                   size_t len);
+                   size_t len, const DiskResidentIdentity& identity = {});
   // Test-only seam: installed before requests; production leaves empty.
   // Runs after RAM hiding/waiting and before disk removal.
   std::function<void()> before_disk_remove_hook_for_test_;
