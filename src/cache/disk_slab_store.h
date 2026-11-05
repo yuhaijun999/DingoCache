@@ -79,7 +79,9 @@ class DiskSlabStore : public StoreEngine {
     // stores allocate no identity table and retain existing eviction behavior.
     bool track_resident_identity = false;
     // Shared process origin, installed before any disk recovery. Internal
-    // staging dependency only: does not enable scoring or gate storage I/O.
+    // staging dependency only: does not enable scoring. The group prevalidates
+    // this clock; direct internal callers must do the same. It gates new
+    // reclaim/bind decisions, not reserved I/O or required resource cleanup.
     std::shared_ptr<DiskLifetimeClock> lifetime_clock{};
   };
 
@@ -461,6 +463,8 @@ class DiskSlabStore : public StoreEngine {
   // Background free-slot reclaimer (see Options::reclaim_interval_ms): runs
   // ReclaimTick every interval, evicting ahead of demand in bounded batches
   // and rebalancing extents from cold classes to hot ones on a full store.
+  // Does not acquire mu_; allocator callbacks may call this under their lock.
+  bool CanStartReclaim() const;
   void ReclaimTick(const std::function<void()>& after_watermark_evict = {},
                    const std::function<void()>& before_lock_for_test = {});
   // Rebalance rate cap: extents moved per tick per hot class. Each move evicts
