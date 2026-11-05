@@ -285,6 +285,10 @@ void KvNodeServer::InitRamTier() {
 }
 
 Status KvNodeServer::Start(int port) {
+  if (LifetimeRestartRequired()) {
+    DFKV_LOG_ERROR("refusing startup: lifetime clock requires restart");
+    return Status::kIOError;
+  }
   if (!Healthy()) {
     DFKV_LOG_ERROR("refusing startup: local storage initialization failed");
     return Status::kIOError;
@@ -883,6 +887,10 @@ void KvNodeServer::AcceptLoop() {
 Status KvNodeServer::LookupForKey(const BlockKey& key,
                                   ValueMetadata* out) const {
   if (out == nullptr) return Status::kInvalid;
+  if (LifetimeRestartRequired()) {
+    *out = {};
+    return Status::kIOError;
+  }
   size_t ram_len = 0;
   if (ram_ && ram_->Lookup(key, &ram_len)) {
     out->value_len = ram_len;
@@ -897,7 +905,15 @@ Status KvNodeServer::ProcessRequestForKey(
     const char* payload, uint64_t payload_len, std::string* out_data,
     size_t* out_value_len) {
   if (out_value_len) *out_value_len = 0;
-  WireOp op = static_cast<WireOp>(op_raw);
+  const WireOp op = static_cast<WireOp>(op_raw);
+  // Keep diagnostics available while refusing new business work. Completion
+  // callbacks and background persistence deliberately bypass this entry gate.
+  if ((op == WireOp::kCache || op == WireOp::kRange || op == WireOp::kExist ||
+       op == WireOp::kLookup || op == WireOp::kRemove) &&
+      LifetimeRestartRequired()) {
+    if (out_data != nullptr) out_data->clear();
+    return Status::kIOError;
+  }
   Status st = Status::kInvalid;
   switch (op) {
     case WireOp::kCache: {
@@ -1014,6 +1030,8 @@ Status KvNodeServer::ProcessRequestForKey(
                 },
                 nullptr, read_epoch);
             out_data->resize(st == Status::kOk ? n : 0);
+          } else {
+            out_data->clear();  // A nested admission recheck may refuse now.
           }
         } else {
           st = group_.Range(key, offset, length, out_data, out_value_len);
@@ -1111,6 +1129,11 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
                                      uint64_t length, char* dst,
                                      size_t dst_cap, size_t* out_len,
                                      size_t* value_len) {
+  if (LifetimeRestartRequired()) {
+    if (out_len != nullptr) *out_len = 0;
+    if (value_len != nullptr) *value_len = 0;
+    return Status::kIOError;
+  }
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   if (ram_) {
@@ -1156,6 +1179,8 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
 
 std::vector<Status> KvNodeServer::CacheDirectBatchForKeys(
     const std::vector<StoreEngine::CacheBatchItem>& items) {
+  if (LifetimeRestartRequired())
+    return std::vector<Status>(items.size(), Status::kIOError);
   // Take every required foreground stripe before entering the disk group.
   // Ascending unique acquisition prevents batch/batch ABBA and self-deadlock
   // on duplicate keys or hash collisions. The flusher bypasses this wrapper.
@@ -1213,6 +1238,7 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
     invalid_ops_.fetch_add(1, std::memory_order_relaxed);
     return Status::kInvalid;
   }
+  if (LifetimeRestartRequired()) return Status::kIOError;
   if (!TryBeginPut()) return Status::kCacheFull;
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
@@ -1267,6 +1293,7 @@ bool KvNodeServer::RamPinnedHitForKey(const BlockKey& key, uint64_t offset,
                                       uint64_t length, PreparedRead* out) {
   if (out == nullptr) return false;
   *out = PreparedRead{};
+  if (LifetimeRestartRequired()) return false;
   RamTier::Hit hit;
   if (!ram_ || !ram_->GetPrep(key, offset, length, &hit,
                               /*count_access=*/false))
@@ -1281,6 +1308,12 @@ bool KvNodeServer::RamPinnedHitForKey(const BlockKey& key, uint64_t offset,
 Status KvNodeServer::RangeDirectForKey(
     const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
     size_t io_cap, const char** out_data, size_t* out_len, size_t* value_len) {
+  if (LifetimeRestartRequired()) {
+    if (out_data != nullptr) *out_data = nullptr;
+    if (out_len != nullptr) *out_len = 0;
+    if (value_len != nullptr) *value_len = 0;
+    return Status::kIOError;
+  }
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   if (ram_) {
@@ -1355,6 +1388,7 @@ PreparedRead KvNodeServer::PrepareReadForKey(
     const BlockKey& key, uint64_t offset, uint64_t length, char* staging,
     size_t staging_cap) {
   if (staging == nullptr) return PreparedRead::Result(Status::kInvalid);
+  if (LifetimeRestartRequired()) return PreparedRead::Result(Status::kIOError);
 
   // RAM preparation is part of the same owner as disk preparation. Arena hits
   // keep their send pin until SEND completion; dedicated allocations copy into
