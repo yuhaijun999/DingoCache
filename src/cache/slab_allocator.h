@@ -67,6 +67,9 @@ class SlabAllocator {
                        uint32_t resident_slots)>
         on_extent_evict;
     std::function<bool(const SlotRef&)> on_slot_evict;
+    // Internal disk identity storage, not a policy switch. Disabled for RAM
+    // and legacy; no generation array is allocated while disabled.
+    bool track_resident_identity = false;
   };
 
   // Target write parallelism per class: Put keeps up to this many extents with
@@ -160,6 +163,16 @@ class SlabAllocator {
   size_t IndexBucketForTest(const BlockKey& key) const;
 
  private:
+  friend class DiskSlabStore;
+  friend class SlabAllocatorTestPeer;
+  // Internal commit preconditions: caller serializes the resident lifecycle,
+  // tracking is enabled, key is resident, generation is reserved/nonzero and
+  // not yet installed. This is not an external fallible request interface.
+  void CommitResidentGeneration(const BlockKey& key, uint64_t generation);
+  // Physical ownership only, including pending removal. Does not touch CLOCK.
+  // Zero means disabled, absent or uncommitted; never an exportable identity.
+  uint64_t ResidentGeneration(const BlockKey& key) const;
+
   static constexpr int kUnbound = -1;
   static constexpr uint32_t kNoSlot = UINT32_MAX;
   static constexpr uint64_t kReadHeatUnit = 1024;
@@ -294,6 +307,10 @@ class SlabAllocator {
   std::vector<Class> classes_;
   std::vector<ExtentMeta> extents_;
   std::vector<SlotMeta> slots_;
+  // Enabled-only parallel dense storage. Reused SlotMeta indexes start at zero;
+  // physical FreeSlotLocked clears ownership, not payload visibility changes.
+  // Capacity follows metadata high-water usage, not current resident count.
+  std::vector<uint64_t> resident_generations_;
   uint32_t free_slot_meta_head_ = kNoSlot;
   uint32_t global_ring_head_ = kNoSlot;
   uint32_t global_hand_ = kNoSlot;
