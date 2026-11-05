@@ -86,6 +86,10 @@ class RamTierTestPeer {
 };
 class DiskSlabStoreTestPeer {
  public:
+  static void SetPayloadWriteHook(DiskSlabStore* store,
+                                  std::function<bool()> hook) {
+    store->payload_write_hook_for_test_ = std::move(hook);
+  }
   static void SetRecordWriteHook(DiskSlabStore* store,
                                  std::function<bool()> hook) {
     store->record_write_hook_for_test_ = std::move(hook);
@@ -94,6 +98,9 @@ class DiskSlabStoreTestPeer {
 class KvNodeServerWiringTestPeer {
  public:
   static RamTier& Ram(KvNodeServer& server) { return *server.ram_; }
+  static size_t MutationStripe(const BlockKey& key) {
+    return KvNodeServer::MutationKeyStripe(key);
+  }
   static DiskSlabStore& Slab(KvNodeServer& server) {
     return DiskCacheGroupTestPeer::Slab(server.group_);
   }
@@ -3175,7 +3182,7 @@ class ProductionFlushResultTest : public ::testing::Test {
     options.eviction_policy = "legacy";
     if (with_clock) {
       options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
-          100, [] { return uint64_t{100}; });
+          100, [this] { return seconds_.load(std::memory_order_relaxed); });
     }
     node_ = KvNodeServerWiringTestPeer::Create(std::move(options));
     ASSERT_TRUE(node_->Healthy());
@@ -3196,6 +3203,7 @@ class ProductionFlushResultTest : public ::testing::Test {
   const ScopedEnv reclaim_{"DFKV_SLAB_RECLAIM_MS", "0"};
   const ScopedEnv ram_reclaim_{"DFKV_RAM_RECLAIM_MS", "0"};
   fs::path dir_;
+  std::atomic<uint64_t> seconds_{100};
   std::unique_ptr<KvNodeServer> node_;
 };
 
@@ -3298,4 +3306,75 @@ TEST_F(ProductionFlushResultTest, RealRecordFailureStillIsolatesIo) {
   EXPECT_FALSE(KvNodeServerWiringTestPeer::PersistenceHealthy(*node_));
   EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*node_, {99506, 0}));
   EXPECT_FALSE(node_->Healthy());
+}
+
+TEST_F(ProductionFlushResultTest, AcceptedQueuedPutStopsWithoutPoisoningIo) {
+  // The real group keeps its 1-GiB extent, but one slot fills it. Buffered
+  // payload I/O leaves the extent sparse; no 1-GiB test allocation is written.
+  const ScopedEnv one_slot("DFKV_SLAB_GRANULARITY", "1073741824");
+  ASSERT_NO_FATAL_FAILURE(Create(true));
+  const RamTier& tier = KvNodeServerWiringTestPeer::Ram(*node_);
+  const BlockKey first_key{99507, 0};
+  BlockKey second_key{99508, 0};
+  while (KvNodeServerWiringTestPeer::MutationStripe(first_key) ==
+         KvNodeServerWiringTestPeer::MutationStripe(second_key))
+    ++second_key.digest_lo;
+  char first_data[] = "first";
+  char second_data[] = "second";
+  FlushBarrier barrier;
+  DiskSlabStoreTestPeer::SetPayloadWriteHook(
+      &KvNodeServerWiringTestPeer::Slab(*node_), [&] {
+        barrier.Block();
+        return true;
+      });
+  Status first = Status::kInvalid;
+  Status second = Status::kInvalid;
+  std::thread owner([&] {
+    first =
+        node_->CacheDirectForKey(first_key, first_data, 5, sizeof(first_data));
+  });
+  const bool entered = barrier.AwaitEntry();
+  EXPECT_TRUE(entered);
+  bool admitted = false;
+  std::thread queued;
+  if (entered) {
+    queued = std::thread([&] {
+      second = node_->CacheDirectForKey(second_key, second_data, 6,
+                                        sizeof(second_data));
+    });
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!(admitted = tier.Contains(second_key)) &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    EXPECT_TRUE(admitted);  // Actual RAM visibility proves prior admission.
+    if (admitted)
+      seconds_.store(uint64_t{UINT32_MAX} + 101, std::memory_order_relaxed);
+  }
+  // No fatal assertions while workers are blocked; always release and join.
+  barrier.Open();
+  owner.join();
+  if (queued.joinable()) queued.join();
+  DiskSlabStoreTestPeer::SetPayloadWriteHook(
+      &KvNodeServerWiringTestPeer::Slab(*node_), {});
+  EXPECT_EQ(first, Status::kOk);  // Its disk reservation preceded exhaustion.
+  if (admitted) {
+    EXPECT_EQ(second, Status::kCacheFull);
+    EXPECT_FALSE(tier.Contains(second_key));
+    EXPECT_EQ(tier.DirtyObjects(), 0U);
+    EXPECT_TRUE(KvNodeServerWiringTestPeer::PersistenceHealthy(*node_));
+    EXPECT_TRUE(node_->LifetimeRestartRequired());
+  }
+  std::string stored;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, first_key, &stored),
+            Status::kOk);
+  EXPECT_EQ(stored, "first");
+  // All accepted disk-ACK work is terminal before the old clock/store dies.
+  node_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create(true));
+  EXPECT_FALSE(node_->LifetimeRestartRequired());
+  std::string restored;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, first_key, &restored),
+            Status::kOk);
+  EXPECT_EQ(restored, "first");
 }

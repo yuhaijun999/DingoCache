@@ -12,7 +12,11 @@ enum class DiskWriteReason : unsigned char {
   kNone = 0,
   // Permanent admission failure: eviction/retry cannot replenish generations.
   // It must not be treated as disk I/O corruption or an eviction scan budget.
-  kIdentityExhausted = 1
+  kIdentityExhausted = 1,
+  // New reclaim/bind decisions stopped at the clock's hard uint32 bound.
+  // Existing bound free slots and already-started persistence may finish.
+  // This is not disk corruption; only the exact CacheFull pair is terminal.
+  kLifetimeClockExhausted = 2
 };
 
 // A terminal event, not a live-residency query or proof of equal input bytes.

@@ -70,6 +70,11 @@ class SlabAllocator {
     // Internal disk identity storage, not a policy switch. Disabled for RAM
     // and legacy; no generation array is allocated while disabled.
     bool track_resident_identity = false;
+    // Optional decision guard, called under the allocator mutex. It must not
+    // re-enter the allocator or acquire the owning store mutex. A false result
+    // forbids new binding/reclaim decisions, not already-bound free-slot use
+    // or finalization after successful persistence. Empty preserves legacy.
+    std::function<bool()> can_reclaim{};
   };
 
   // Target write parallelism per class: Put keeps up to this many extents with
@@ -178,7 +183,12 @@ class SlabAllocator {
   static constexpr uint64_t kReadHeatUnit = 1024;
   static constexpr uint64_t kReadDecayOps = 64;
 
-  enum class ExtentBindResult { kBound, kUnavailable, kPersistenceError };
+  enum class ExtentBindResult : unsigned char {
+    kBound = 0,             // Binding is ready for allocation.
+    kUnavailable = 1,       // No eligible extent is available.
+    kPersistenceError = 2,  // The durable metadata change failed.
+    kReclaimDenied = 3      // The runtime decision guard refused this work.
+  };
   struct Slot { uint32_t extent; uint32_t slot; };
 
   // Exactly one live SlotMeta is authoritative for each resident. Both the
@@ -242,19 +252,30 @@ class SlabAllocator {
   };
 
   uint32_t CanonicalSlotSize(size_t aligned_len) const;
+  // Preserve Put's public interface. The store receives a per-call reason,
+  // never a later observation of a shared failure flag. Denial is meaningful
+  // only on false; optional growth refusal may still use an existing free slot.
+  bool PutImpl(const BlockKey& key, size_t len, SlotRef* out,
+               std::vector<BlockKey>* evicted, SlotHandle* out_handle,
+               bool* reclaim_denied);
+  bool ReclaimAllowed(bool* reclaim_denied = nullptr) const;
   size_t ClassForLen(size_t aligned_len);
   size_t ClassForExactSize(uint32_t slot_size);
   ExtentBindResult BindExtentLocked(size_t cls, uint32_t extent,
-                                    bool metadata_prepared);
-  ExtentBindResult BindFreeExtent(size_t cls);
-  bool EvictOneFrom(size_t cls, std::vector<BlockKey>* evicted);
-  ExtentBindResult StealExtentFor(size_t cls,
-                                  std::vector<BlockKey>* evicted,
-                                  size_t min_donor_extents = 0);
+                                    bool metadata_prepared,
+                                    bool* reclaim_denied = nullptr);
+  ExtentBindResult BindFreeExtent(size_t cls, bool* reclaim_denied = nullptr);
+  bool EvictOneFrom(size_t cls, std::vector<BlockKey>* evicted,
+                    bool* reclaim_denied = nullptr);
+  ExtentBindResult StealExtentFor(size_t cls, std::vector<BlockKey>* evicted,
+                                  size_t min_donor_extents = 0,
+                                  bool* reclaim_denied = nullptr);
   ExtentBindResult StealColdExtentFor(size_t cls,
-                                      std::vector<BlockKey>* evicted);
+                                      std::vector<BlockKey>* evicted,
+                                      bool* reclaim_denied = nullptr);
   ExtentBindResult StealExtentLocked(uint32_t extent, size_t target_cls,
-                                      std::vector<BlockKey>* evicted);
+                                     std::vector<BlockKey>* evicted,
+                                     bool* reclaim_denied = nullptr);
 
   uint32_t AcquireSlotMetaLocked();
   void LinkBeforeHandLocked(uint32_t meta_index);
