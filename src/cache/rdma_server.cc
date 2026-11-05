@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "cache/rdma_request_order.h"
+#include "cache/store_engine.h"
 #include "cache/uring_reader.h"  // io_uring async-GET path (DFKV_WITH_URING only)
 #include "common/config_dump.h"
 #include "common/status.h"
@@ -191,6 +192,11 @@ void RdmaServer::ForgetLegacyConnection(uint64_t token) {
   legacy_connections_tokens_.erase(token);
 }
 
+bool RdmaServer::AdmitPullGrant(PreparedRead& read) {
+  if (!restart_required_handler_ || !restart_required_handler_()) return true;
+  read.Abort();
+  return false;
+}
 
 RdmaServer::RdmaServer(Handler handler, size_t max_msg,
                        const std::string& dev_name)
@@ -1207,10 +1213,12 @@ void RdmaServer::Serve(int boot_fd) {
     // Empty results retain a revocable release identity, but authorize no
     // payload READ. The one registered sentinel byte is not a wire request.
     if (output_len == 0) output = state.lease.data();
+    if (!AdmitPullGrant(prepared)) return error_reply(Status::kIOError);
     state.mr = ep.RegisterLeaseReadRegion(
         const_cast<char*>(output), std::max<size_t>(output_len, 1));
     if (!state.mr && prepared.source_registered() && prepared.Stage()) {
       output = prepared.data();
+      if (!AdmitPullGrant(prepared)) return error_reply(Status::kIOError);
       state.mr = ep.RegisterLeaseReadRegion(
           const_cast<char*>(output), std::max<size_t>(output_len, 1));
     }
@@ -1251,6 +1259,13 @@ void RdmaServer::Serve(int boot_fd) {
       return false;
     const double read_elapsed_sec = NowSteadySec() - started_sec;
     PullSlotState& state = pull_slots[slot];
+    if (!AdmitPullGrant(pinned)) {
+      state.Reset();
+      EncodeRespVersion(ep.sbuf(send_slot), wire_epoch, Status::kIOError, 0,
+                        pinned.value_len());
+      reply->first_len = response_prefix;
+      return true;  // Handled rejection, not a staging-copy fallback.
+    }
     state.mr = fail_pinned_registration_for_test_ ? nullptr :
         ep.RegisterLeaseReadRegion(const_cast<char*>(pinned.data()),
                                    pinned.payload_len());
