@@ -299,13 +299,12 @@ class DiskSlabStore : public StoreEngine {
   // length via the extent's DIO fd. Caller pre-checked alignment/cap fit.
   bool WritePayloadDirect(const SlabAllocator::SlotRef& r, char* data, size_t len);
   bool ReserveResidentGenerationLocked(uint64_t* generation);
-  DiskResidentIdentity ResidentIdentityLocked(const std::string& key) const;
-  void CommitPayloadLocked(const std::string& key, uint32_t payload_len,
-                           uint64_t generation);
+  DiskResidentIdentity ResidentIdentityLocked(const BlockKey& key,
+                                              const std::string& fn) const;
+  void CommitPayloadLocked(const BlockKey& resident_key, const std::string& key,
+                           uint32_t payload_len, uint64_t generation);
   // Visible payload/tenant accounting only; deferred Remove hides immediately.
   uint32_t ErasePayloadLocked(const std::string& key);
-  // Confirmed physical removal, even if payload was already hidden. Holds D.
-  uint32_t ForgetResidentLocked(const std::string& key);
   // Shared allocate/pin -> unlocked payload write -> commit skeleton for
   // Cache/CacheDirect; `write_payload` does just the payload I/O for the slot.
   template <typename WriteFn>
@@ -382,17 +381,13 @@ class DiskSlabStore : public StoreEngine {
   // key.Filename() -> its true payload length (slot_size >= this). Rebuilt on
   // open from the table; the allocator only tracks slot size.
   std::unordered_map<std::string, uint32_t> payload_len_;
-  // Enabled-only auxiliary state. Generations are reserved before slot/I/O
-  // mutation; failed reservations/writes never recycle a consumed number.
-  // Generations belong to committed physical residents, not visibility: a
-  // deferred Remove hides payload immediately, but retains generation until
-  // durable invalidation and physical removal succeed. Failed/uncommitted
-  // write reservations have no entry. Instance/epoch belong to the store.
+  // Enabled-only store identity. Failed writes consume reserved generations;
+  // physical per-resident generations live in the allocator's dense array and
+  // are cleared only when the slot is actually freed, not when hidden.
   struct ResidentIdentityState {
     uint64_t store_instance = 0;
     uint64_t sequence = 0;
     bool exhausted = false;
-    std::unordered_map<std::string, uint64_t> generations;
   };
   std::unique_ptr<ResidentIdentityState> resident_identity_;
   std::unordered_map<uint64_t, uint64_t> tenant_used_bytes_;

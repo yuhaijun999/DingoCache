@@ -1,13 +1,17 @@
 #include "cache/slab_allocator.h"
 
 #include <algorithm>
+#include <cassert>
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
 #include "common/config_dump.h"
+#include "common/kv_types.h"
 
 namespace dfkv {
 namespace {
@@ -279,14 +283,33 @@ size_t SlabAllocator::ClassForExactSize(uint32_t slot_size) {
   return classes_.size();
 }
 
+void SlabAllocator::CommitResidentGeneration(const BlockKey& key,
+                                             uint64_t generation) {
+  const std::lock_guard<std::mutex> lock(mu_);
+  const uint32_t* index = index_.Find(key);
+  assert(opt_.track_resident_identity && index != nullptr && generation != 0);
+  assert(slots_[*index].live && !slots_[*index].remove_pending);
+  assert(resident_generations_[*index] == 0);
+  resident_generations_[*index] = generation;
+}
+
+uint64_t SlabAllocator::ResidentGeneration(const BlockKey& key) const {
+  if (!opt_.track_resident_identity) return 0;
+  const std::lock_guard<std::mutex> lock(mu_);
+  const uint32_t* index = index_.Find(key);
+  return index != nullptr ? resident_generations_[*index] : 0;
+}
+
 uint32_t SlabAllocator::AcquireSlotMetaLocked() {
   if (free_slot_meta_head_ != kNoSlot) {
     const uint32_t index = free_slot_meta_head_;
     free_slot_meta_head_ = slots_[index].free_next;
     slots_[index] = SlotMeta{};
+    if (opt_.track_resident_identity) resident_generations_[index] = 0;
     return index;
   }
   slots_.emplace_back();
+  if (opt_.track_resident_identity) resident_generations_.push_back(0);
   return static_cast<uint32_t>(slots_.size() - 1);
 }
 
@@ -482,6 +505,8 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
   if (std::adjacent_find(keys.begin(), keys.end()) != keys.end()) return false;
 
   slots_.reserve(slots_.size() + entries.size());
+  if (opt_.track_resident_identity)
+    resident_generations_.reserve(slots_.size() + entries.size());
   index_.Reserve(index_.size() + entries.size());
 
 
@@ -560,6 +585,7 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
 
   if (meta.refs > 0 && extent.pinned > 0) --extent.pinned;
   index_.Erase(meta.key);
+  if (opt_.track_resident_identity) resident_generations_[index] = 0;
   PushFreeLocked(cls, extent_index, physical_slot);
   ++extent.free_slots;
   extent.useful_bytes -= useful_bytes;

@@ -41,7 +41,7 @@ class DiskSlabStoreTestPeer {
   static DiskResidentIdentity Identity(const DiskSlabStore& store,
                                        const BlockKey& key) {
     const std::lock_guard<std::mutex> lock(store.mu_);
-    return store.ResidentIdentityLocked(key.Filename());
+    return store.ResidentIdentityLocked(key, key.Filename());
   }
   static bool HasPutFollower(const DiskSlabStore& store, const BlockKey& key) {
     const std::lock_guard<std::mutex> lock(store.mu_);
