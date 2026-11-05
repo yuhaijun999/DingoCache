@@ -27,6 +27,16 @@ DiskLifetimeClock::DiskLifetimeClock(uint64_t horizon_sec, NowFn now)
 }
 
 bool DiskLifetimeClock::TryNow(uint32_t* offset) const {
+  uint32_t elapsed = 0;
+  if (!TryDrainNow(&elapsed) ||
+      elapsed > std::numeric_limits<uint32_t>::max() - horizon_sec_) {
+    return false;
+  }
+  *offset = elapsed;
+  return true;
+}
+
+bool DiskLifetimeClock::TryDrainNow(uint32_t* offset) const {
   if (horizon_sec_ == 0 ||
       horizon_sec_ >
           static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) ||
@@ -44,8 +54,7 @@ bool DiskLifetimeClock::TryNow(uint32_t* offset) const {
                                              std::memory_order_relaxed)) {
   }
   const uint64_t monotonic_elapsed = std::max(observed, elapsed);
-  const uint64_t limit = std::numeric_limits<uint32_t>::max() - horizon_sec_;
-  if (monotonic_elapsed > limit) return false;
+  if (monotonic_elapsed > std::numeric_limits<uint32_t>::max()) return false;
   *offset = static_cast<uint32_t>(monotonic_elapsed);
   return true;
 }
