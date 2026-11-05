@@ -78,6 +78,12 @@ class RdmaServer {
   void set_prepare_read_handler(PrepareReadHandler h) {
     prepare_read_handler_ = std::move(h);
   }
+  // Set before Start(); the thread-safe callback and its owner must outlive
+  // Stop(). Empty preserves legacy behavior. Only new PULL grants are gated,
+  // never RELEASE or cleanup of an already established grant.
+  void SetRestartRequiredHandler(std::function<bool()> handler) {
+    restart_required_handler_ = std::move(handler);
+  }
   // Pinned arena hit lookup (B5-3 zero-copy pull GET): returns true with a
   // send-pinned arena address the dynamic-pull READY can name directly, or
   // false when the read must use the staging-copy pull path. Optional; when
@@ -166,6 +172,9 @@ class RdmaServer {
   bool UseUringPath() const;
 
  private:
+  // Call before each MR registration, including a staged retry, not after a
+  // grant has succeeded. Refusal aborts preparation without publishing success.
+  bool AdmitPullGrant(PreparedRead& read);
   void AcceptLoop();
   void Serve(int boot_fd);
   void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
@@ -204,6 +213,7 @@ class RdmaServer {
   CacheDirectHandler cache_direct_handler_;
   CacheDirectBatchHandler cache_direct_batch_handler_;
   PrepareReadHandler prepare_read_handler_;
+  std::function<bool()> restart_required_handler_;
   PinnedRamHandler pinned_ram_handler_;
   std::vector<std::pair<void*, size_t>> user_regions_;  // RAM arena pool MRs (RegisterMemory)
   size_t max_msg_;

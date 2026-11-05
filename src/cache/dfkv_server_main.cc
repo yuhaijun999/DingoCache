@@ -430,6 +430,8 @@ int main(int argc, char** argv) {
                char* staging, size_t cap) {
           return srv.PrepareReadForKey(key, off, len, staging, cap);
         });
+    rsrv->SetRestartRequiredHandler(
+        [&srv] { return srv.LifetimeRestartRequired(); });
     // B5-3: dynamic-pull GETs of arena-resident values serve the pinned arena
     // address instead of staging a payload-sized copy per pull.
     if (srv.ram_enabled()) {
