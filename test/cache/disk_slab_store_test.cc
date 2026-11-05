@@ -42,6 +42,7 @@
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
+#include "slab_allocator_test_peer.h"
 
 using dfkv::BlockKey;
 using dfkv::DiskSlabStore;
@@ -57,7 +58,7 @@ class DiskSlabStoreTestPeer {
   static DiskResidentIdentity Identity(const DiskSlabStore& store,
                                        const BlockKey& key) {
     const std::lock_guard<std::mutex> lock(store.mu_);
-    return store.ResidentIdentityLocked(key.Filename());
+    return store.ResidentIdentityLocked(key, key.Filename());
   }
   static bool HasPutFollower(const DiskSlabStore& store, const BlockKey& key) {
     const std::lock_guard<std::mutex> lock(store.mu_);
@@ -70,18 +71,13 @@ class DiskSlabStoreTestPeer {
   }
   static size_t IdentityCount(const DiskSlabStore& store) {
     const std::lock_guard<std::mutex> lock(store.mu_);
-    return store.resident_identity_
-               ? store.resident_identity_->generations.size()
-               : 0;
+    return SlabAllocatorTestPeer::GenerationCount(*store.alloc_);
   }
   // Physical ownership only, not an exportable or readable credential.
   static uint64_t PhysicalGeneration(const DiskSlabStore& store,
                                      const BlockKey& key) {
     const std::lock_guard<std::mutex> lock(store.mu_);
-    if (!store.resident_identity_) return 0;
-    const std::unordered_map<std::string, uint64_t>::const_iterator it =
-        store.resident_identity_->generations.find(key.Filename());
-    return it == store.resident_identity_->generations.end() ? 0 : it->second;
+    return SlabAllocatorTestPeer::Generation(*store.alloc_, key);
   }
   static uint64_t GenerationSequence(const DiskSlabStore& store) {
     const std::lock_guard<std::mutex> lock(store.mu_);

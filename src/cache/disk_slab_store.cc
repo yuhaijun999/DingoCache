@@ -540,6 +540,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
       static_cast<size_t>(max_slots_per_extent_) * kRecBytes, 0);
 
   SlabAllocator::Options ao;
+  ao.track_resident_identity = opt_.track_resident_identity;
   ao.extent_bytes = opt_.extent_bytes;
   ao.num_extents = num_extents_;
   ao.align = static_cast<uint32_t>(opt_.slot_granularity);  // slot_size is a granularity multiple
@@ -1336,7 +1337,7 @@ bool DiskSlabStore::Rebuild() {
       return SetStartupError("resident generation exhausted during rebuild");
     // Rebuild precedes MarkDirtyEpoch. Save only generation here; credentials
     // are composed with the final current epoch after construction completes.
-    CommitPayloadLocked(entry.key.Filename(),
+    CommitPayloadLocked(entry.key, entry.key.Filename(),
                         static_cast<uint32_t>(entry.value_bytes), generation);
   }
   table_rebuilt_ += entries.size();
@@ -1428,19 +1429,20 @@ bool DiskSlabStore::ReserveResidentGenerationLocked(uint64_t* generation) {
 }
 
 DiskResidentIdentity DiskSlabStore::ResidentIdentityLocked(
-    const std::string& key) const {
-  if (!resident_identity_ || !Healthy() || payload_len_.count(key) == 0)
+    const BlockKey& key, const std::string& fn) const {
+  if (!resident_identity_ || !Healthy() || payload_len_.count(fn) == 0)
     return {};
-  const std::unordered_map<std::string, uint64_t>::const_iterator it =
-      resident_identity_->generations.find(key);
-  if (it == resident_identity_->generations.end()) return {};
-  return {resident_identity_->store_instance, run_epoch_, it->second};
+  const uint64_t generation = alloc_->ResidentGeneration(key);
+  if (generation == 0) return {};
+  return {resident_identity_->store_instance, run_epoch_, generation};
 }
 
-void DiskSlabStore::CommitPayloadLocked(const std::string& key,
+void DiskSlabStore::CommitPayloadLocked(const BlockKey& resident_key,
+                                        const std::string& key,
                                         uint32_t payload_len,
                                         uint64_t generation) {
-  if (resident_identity_) resident_identity_->generations[key] = generation;
+  if (resident_identity_)
+    alloc_->CommitResidentGeneration(resident_key, generation);
   auto [it, inserted] = payload_len_.try_emplace(key, payload_len);
   if (inserted) {
     committed_payload_bytes_ += payload_len;
@@ -1474,12 +1476,6 @@ uint32_t DiskSlabStore::ErasePayloadLocked(const std::string& key) {
   }
   payload_len_.erase(it);
   return payload_len;
-}
-
-uint32_t DiskSlabStore::ForgetResidentLocked(const std::string& key) {
-  // Do not gate this on payload presence: deferred Remove already hid it.
-  if (resident_identity_) resident_identity_->generations.erase(key);
-  return ErasePayloadLocked(key);
 }
 
 void DiskSlabStore::CompletePut(const std::shared_ptr<PutFlight>& flight,
@@ -1571,7 +1567,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       alloc_->Pin(key);  // write-pin for the unlocked I/O below
       inflight_[fn]++;
       for (const BlockKey& ev : evicted)
-        evicted_bytes_ += ForgetResidentLocked(ev.Filename());
+        evicted_bytes_ += ErasePayloadLocked(ev.Filename());
       break;
     }
   }
@@ -1597,8 +1593,9 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       if (!removed_while_writing) alloc_->Remove(key);
     } else {
       if (!removed_while_writing) {
-        CommitPayloadLocked(fn, static_cast<uint32_t>(len), generation);
-        if (details != nullptr) result.identity = ResidentIdentityLocked(fn);
+        CommitPayloadLocked(key, fn, static_cast<uint32_t>(len), generation);
+        if (details != nullptr)
+          result.identity = ResidentIdentityLocked(key, fn);
         new_put_bytes_since_tick_ += ref.slot_size;
       }
       result.status = Status::kOk;
@@ -1773,7 +1770,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
         alloc_->Pin(it.key);
         inflight_[st[i].fn]++;
         for (const BlockKey& ev : evicted)
-          evicted_bytes_ += ForgetResidentLocked(ev.Filename());
+          evicted_bytes_ += ErasePayloadLocked(ev.Filename());
         st[i].active = true;
         // Same alignment and padded-capacity eligibility as CacheDirect.
         const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
@@ -1926,10 +1923,11 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
         out[i] = Status::kIOError;
       } else {
         if (!removed) {
-          CommitPayloadLocked(st[i].fn, static_cast<uint32_t>(items[i].len),
+          CommitPayloadLocked(items[i].key, st[i].fn,
+                              static_cast<uint32_t>(items[i].len),
                               st[i].generation);
           if (details != nullptr)
-            result.identity = ResidentIdentityLocked(st[i].fn);
+            result.identity = ResidentIdentityLocked(items[i].key, st[i].fn);
           new_put_bytes_since_tick_ += st[i].ref.slot_size;
         }
         out[i] = Status::kOk;
@@ -2128,7 +2126,7 @@ bool DiskSlabStore::AcquireForRead(const BlockKey& key, const std::string& fn,
       return false;  // No committed visible payload.
     if (!alloc_->GetAndPin(key, ref)) return false;
     *plen = it->second;
-    if (identity != nullptr) *identity = ResidentIdentityLocked(fn);
+    if (identity != nullptr) *identity = ResidentIdentityLocked(key, fn);
     inflight_[fn]++;
   }
   if (read_acquired_hook_for_test_) read_acquired_hook_for_test_();
@@ -2154,12 +2152,9 @@ bool DiskSlabStore::ReleaseInflightLocked(const BlockKey& key,
     else
       alloc_->Remove(key);
   }
-  // Failure leaves the physical resident (and its generation) isolated in
-  // place. Visibility stays hidden, but physical ownership must not disappear.
-  if (release_ok)
-    ForgetResidentLocked(fn);
-  else
-    ErasePayloadLocked(fn);
+  // Allocator removal clears its generation only after successful invalidation.
+  // On failure the physical resident remains isolated; visibility stays hidden.
+  ErasePayloadLocked(fn);
   remove_cv_.notify_all();
   return release_ok;
 }
@@ -2172,7 +2167,7 @@ Status DiskSlabStore::FinishReadLocked(const BlockKey& key,
   // This lookup only validates the captured credential. It never supplies a
   // later resident's identity for bytes read from the old slot.
   if (identity != nullptr && (status != Status::kOk || bytes == 0 ||
-                              !(*identity == ResidentIdentityLocked(fn))))
+                              !(*identity == ResidentIdentityLocked(key, fn))))
     *identity = {};
   return status;
 }
@@ -2310,7 +2305,7 @@ Status DiskSlabStore::Remove(const BlockKey& key) {
   if (!WriteRecord(ref, key, 0, /*valid=*/false))
     return Status::kIOError;
   alloc_->Remove(key);
-  ForgetResidentLocked(fn);
+  ErasePayloadLocked(fn);
   return Status::kOk;
 }
 
@@ -2385,8 +2380,7 @@ void DiskSlabStore::ReclaimTick(
                                                std::memory_order_relaxed);
       if (!evicted.empty()) {
         if (after_watermark_evict) after_watermark_evict();
-        for (const BlockKey& key : evicted)
-          ForgetResidentLocked(key.Filename());
+        for (const BlockKey& key : evicted) ErasePayloadLocked(key.Filename());
       }
       watermark_latch_.EndTick(alloc_->UsedBytes(), evict_low_bytes_);
       watermark_active_.store(watermark_latch_.active, std::memory_order_relaxed);
@@ -2444,7 +2438,7 @@ void DiskSlabStore::ReclaimTick(
           std::lock_guard<std::mutex> lk(mu_);
           ok = alloc_->StealFrom(donor, i, &evicted);
           for (const BlockKey& key : evicted)
-            evicted_bytes_ += ForgetResidentLocked(key.Filename());
+            evicted_bytes_ += ErasePayloadLocked(key.Filename());
         }
         if (!ok) { extents[donor] = 0; continue; }  // donor all pinned: try next
         extents[donor]--;
@@ -2466,7 +2460,7 @@ void DiskSlabStore::ReclaimTick(
         std::lock_guard<std::mutex> lk(mu_);
         got = alloc_->ReclaimClass(i, target, batch, &evicted);
         for (const BlockKey& key : evicted)
-          evicted_bytes_ += ForgetResidentLocked(key.Filename());
+          evicted_bytes_ += ErasePayloadLocked(key.Filename());
       }
       if (got > 0) reclaimed_.fetch_add(got, std::memory_order_relaxed);
       budget -= std::min(budget, got);
