@@ -48,6 +48,13 @@ using namespace dfkv;  // NOLINT
 using namespace std::chrono_literals;
 
 namespace dfkv {
+class DiskSlabStoreTestPeer {
+ public:
+  static void SetRecordWriteHook(DiskSlabStore* store,
+                                 std::function<bool()> hook) {
+    store->record_write_hook_for_test_ = std::move(hook);
+  }
+};
 class KvNodeServerWiringTestPeer {
  public:
   static std::unique_ptr<KvNodeServer> Create(DiskCacheGroup::Options options) {
@@ -65,6 +72,10 @@ class KvNodeServerWiringTestPeer {
         server.read_publication_[server.MutationKeyStripe(key)];
     const std::lock_guard<std::mutex> lock(fence.mutex);
     fence.epoch = epoch;
+  }
+  static bool ReadFlight(KvNodeServer& server, const BlockKey& key,
+                         uint64_t offset, uint64_t length, uint64_t epoch) {
+    return server.read_coalescer_.InFlight(key, offset, length, epoch);
   }
   static uint64_t ReadEpoch(KvNodeServer& server, const BlockKey& key) {
     return server.CaptureReadEpoch(key);
@@ -1396,6 +1407,11 @@ TEST(RamTierWiring, RegisteredPromotionCompletesWhileRemoveWaits) {
   ASSERT_EQ(::pread(read.fd(), read.staging(), read.aligned_len(),
                     static_cast<off_t>(read.aligned_off())),
             static_cast<ssize_t>(read.aligned_len()));
+  // Storage can finish before the grant/publication decision. Remove must
+  // still be completed by Commit, not by destroying the retained SEND owner.
+  ASSERT_EQ(read.FinishStorage(Status::kOk, read.payload_len()), Status::kOk);
+  EXPECT_EQ(read.fd(), -1);
+  EXPECT_GT(server->RamUsedBytes(), 0U);
   FlushBarrier disk_remove;
   KvNodeServerWiringTestPeer::SetBeforeDiskRemoveHook(
       *server, [&] { disk_remove.Block(); });
@@ -2564,6 +2580,148 @@ TEST(RamTierWiring, TrackedSyncPromotionKeepsSourceAndRejectsLatePublication) {
       EXPECT_TRUE(next.valid());
       EXPECT_FALSE(next == committed.identity);
     }
+    server.reset();
+    fs::remove_all(dir);
+  }
+}
+
+TEST(RamTierWiring, AsyncLastReleaseControlsStatusAndReservationSource) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  enum class Case : unsigned char {
+    kSuccess = 0,
+    kRemove = 1,
+    kInvalidationFailure = 2,
+    kIoFailure = 3,
+    kAbort = 4,
+    kEmpty = 5
+  };
+  for (const Case action :
+       {Case::kSuccess, Case::kRemove, Case::kInvalidationFailure,
+        Case::kIoFailure, Case::kAbort, Case::kEmpty}) {
+    SCOPED_TRACE(static_cast<unsigned>(action));
+    const fs::path dir =
+        fs::temp_directory_path() / "dfkv_async_source_terminal";
+    fs::remove_all(dir);
+    DiskSlabStore* store = nullptr;
+    DiskCacheGroup::Options options{{dir.string()}, 1U << 20, "slab"};
+    options.eviction_policy = "legacy";
+    options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+      DiskSlabStore::Options slab;
+      slab.dir = path;
+      slab.capacity_bytes = capacity;
+      slab.extent_bytes = 1U << 20;
+      slab.slot_granularity = 4096;
+      slab.reclaim_interval_ms = slab.table_sync_ms = 0;
+      slab.track_resident_identity = true;
+      std::unique_ptr<DiskSlabStore> result =
+          std::make_unique<DiskSlabStore>(slab);
+      store = result.get();
+      return result;
+    };
+    std::unique_ptr<KvNodeServer> server =
+        KvNodeServerWiringTestPeer::Create(std::move(options));
+    ASSERT_TRUE(server->Healthy());
+    KvNodeServerWiringTestPeer::SetRam(
+        *server, [](const BlockKey&, char*, size_t, size_t) { return false; });
+    KvNodeServerWiringTestPeer::SetCoalescing(*server, true);
+    const BlockKey key{9830, 0};
+    const DiskWriteResult committed =
+        KvNodeServerWiringTestPeer::PersistSource(*server, key, "owner", 5);
+    ASSERT_TRUE(committed.identity.valid());
+    alignas(4096) char staging[4096] = {};
+    const bool partial =
+        action == Case::kRemove || action == Case::kInvalidationFailure;
+    const bool empty = action == Case::kEmpty;
+    const uint64_t offset = empty ? 5 : partial ? 1 : 0;
+    const uint64_t epoch = KvNodeServerWiringTestPeer::ReadEpoch(*server, key);
+    PreparedRead read =
+        server->PrepareReadForKey(key, offset, 0, staging, sizeof(staging));
+    ASSERT_EQ(read.status(), Status::kOk);
+    EXPECT_EQ(read.needs_io(), !empty);
+    EXPECT_EQ(read.source_registered(), !partial && !empty);
+    EXPECT_FALSE(read.source_identity().valid());
+    if (!empty) {
+      const ssize_t got = ::pread(read.fd(), read.staging(), read.aligned_len(),
+                                  static_cast<off_t>(read.aligned_off()));
+      ASSERT_GE(got, 0);
+      ASSERT_GE(static_cast<size_t>(got), read.head() + read.payload_len());
+      EXPECT_TRUE(KvNodeServerWiringTestPeer::ReadFlight(*server, key, offset,
+                                                         0, epoch));
+    }
+    if (action == Case::kRemove || action == Case::kInvalidationFailure) {
+      if (action == Case::kInvalidationFailure) {
+        DiskSlabStoreTestPeer::SetRecordWriteHook(store, [] { return false; });
+      }
+      std::string ignored;
+      ASSERT_EQ(
+          server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                       key, 0, 0, nullptr, 0, &ignored),
+          Status::kOk);
+    }
+    const Status io_status =
+        action == Case::kIoFailure ? Status::kIOError : Status::kOk;
+    const Status expected =
+        action == Case::kInvalidationFailure || action == Case::kIoFailure
+            ? Status::kIOError
+            : Status::kOk;
+    EXPECT_EQ(
+        read.FinishStorage(io_status,
+                           action == Case::kIoFailure ? 0 : read.payload_len()),
+        expected);
+    EXPECT_EQ(read.status(), expected);
+    EXPECT_EQ(read.fd(), -1);
+    EXPECT_EQ(server->RamUsedBytes() != 0, !partial && !empty);
+    EXPECT_TRUE(read.owns_cleanup());  // Final I/O status is not grant success.
+    EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+    if (action == Case::kSuccess) {
+      EXPECT_EQ(read.source_identity(), committed.identity);
+      PreparedRead moved(std::move(read));
+      read =
+          std::move(moved);  // Reinitialization preserves final storage state.
+      EXPECT_EQ(read.source_identity(), committed.identity);
+      EXPECT_TRUE(read.Stage());  // Fallback works after I/O, before grant.
+      EXPECT_EQ(std::string(read.data(), read.payload_len()), "owner");
+    }
+    EXPECT_EQ(
+        KvNodeServerWiringTestPeer::ReadFlight(*server, key, offset, 0, epoch),
+        !empty);
+    if (action == Case::kAbort) {
+      EXPECT_TRUE(read.Abort());
+      EXPECT_EQ(read.status(), Status::kIOError);
+      EXPECT_EQ(server->RamUsedBytes(), 0U);
+      EXPECT_FALSE(read.source_identity().valid());
+      EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+      EXPECT_FALSE(KvNodeServerWiringTestPeer::ReadFlight(*server, key, offset,
+                                                          0, epoch));
+      read = PreparedRead{};
+      server.reset();
+      fs::remove_all(dir);
+      continue;
+    }
+    // A later Ok cannot turn a failed terminal back into a successful read.
+    EXPECT_TRUE(read.Commit(Status::kOk, read.payload_len(), 0.0));
+    EXPECT_EQ(read.status(), expected);
+    EXPECT_FALSE(
+        KvNodeServerWiringTestPeer::ReadFlight(*server, key, offset, 0, epoch));
+    EXPECT_EQ(read.source_identity(), action == Case::kSuccess
+                                          ? committed.identity
+                                          : DiskResidentIdentity{});
+    if (action == Case::kSuccess) {
+      EXPECT_EQ(KvNodeServerWiringTestPeer::RamSource(*server, key),
+                committed.identity);
+      PreparedRead hit =
+          server->PrepareReadForKey(key, 0, 0, staging, sizeof(staging));
+      EXPECT_FALSE(hit.needs_io());
+      EXPECT_TRUE(hit.Commit(Status::kOk, hit.payload_len(), 0.0));
+      EXPECT_EQ(hit.source_identity(), committed.identity);
+    } else if (action == Case::kInvalidationFailure ||
+               action == Case::kIoFailure) {
+      EXPECT_EQ(server->RamUsedBytes(), 0U);
+      EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+    }
+    EXPECT_FALSE(read.Commit(Status::kOk, read.payload_len(), 0.0));
+    EXPECT_FALSE(read.Abort());
+    read = PreparedRead{};
     server.reset();
     fs::remove_all(dir);
   }

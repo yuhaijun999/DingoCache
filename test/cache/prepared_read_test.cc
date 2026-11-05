@@ -1,19 +1,21 @@
-#include "cache/kv_node_server.h"
-#include "transport/wire.h"
-
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <memory>
 #include <string>
 #include <thread>
-#include <unistd.h>
+
+#include "cache/kv_node_server.h"
+#include "cache/store_engine.h"
+#include "common/status.h"
+#include "transport/wire.h"
 
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
@@ -84,6 +86,8 @@ TEST(PreparedRead, CompletionAndFailureAreSingleTerminalActions) {
                                staging.size());
   ASSERT_EQ(failed.status(), Status::kOk);
   EXPECT_TRUE(failed.Commit(Status::kIOError, 0, 0.001));
+  EXPECT_EQ(failed.status(), Status::kIOError);
+  EXPECT_FALSE(failed.source_identity().valid());
   EXPECT_FALSE(failed.Abort());
 
   }

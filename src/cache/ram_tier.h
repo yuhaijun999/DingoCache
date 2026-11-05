@@ -171,6 +171,7 @@ class RamTier {
     char* data() const noexcept;
     size_t capacity() const noexcept;
     bool Commit() noexcept;
+    bool Commit(const DiskResidentIdentity& identity) noexcept;
 
    private:
     friend class RamTier;
@@ -420,7 +421,8 @@ class RamTier {
   static PutResult WaitPutResult(
       const std::shared_ptr<PutCompletion>& completion);
   static Status WaitPut(const std::shared_ptr<PutCompletion>& completion);
-  bool CommitReservation(DurableReservation* reservation) noexcept;
+  bool CommitReservation(DurableReservation* reservation,
+                         const DiskResidentIdentity& identity) noexcept;
   void AbortReservation(DurableReservation* reservation) noexcept;
   void ReclaimLargeFor(uint64_t bytes);
 

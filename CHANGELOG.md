@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Finalize asynchronous disk leases before reporting read success. Deferred
+  invalidation failures now reach prepared-read results and prevent RAM/READY
+  publication. Validate byte provenance on release, and revoke failed grant
+  registrations before freeing their source buffers.
+
 - Defer RDMA io_uring-path mutations behind local disk reads and preserve the
   resulting request-order barrier while allowing grant releases to progress.
   Failed registered reads now finish their hidden RAM writer before the queued

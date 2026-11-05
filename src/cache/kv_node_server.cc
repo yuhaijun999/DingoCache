@@ -1270,8 +1270,9 @@ bool KvNodeServer::RamPinnedHitForKey(const BlockKey& key, uint64_t offset,
                               /*count_access=*/false))
     return false;
   if (!hit.in_arena || hit.len == 0) return false;
-  *out = PreparedRead::Ready(hit.ptr, hit.len, hit.value_len, true, nullptr,
-                            0, this, hit.TransferToken(), &FinishPullRamRead);
+  *out = PreparedRead::Ready(hit.ptr, hit.len, hit.value_len, true, nullptr, 0,
+                             this, hit.TransferToken(), &FinishPullRamRead,
+                             hit.identity);
   return true;
 }
 
@@ -1363,8 +1364,8 @@ PreparedRead KvNodeServer::PrepareReadForKey(
       return PreparedRead::Result(Status::kInvalid);
     const uint64_t token = hit.TransferToken();
     PreparedRead read = PreparedRead::Ready(
-        hit.in_arena ? hit.ptr : staging, hit.len, hit.value_len,
-        hit.in_arena, staging, staging_cap, this, token, &FinishRamRead);
+        hit.in_arena ? hit.ptr : staging, hit.len, hit.value_len, hit.in_arena,
+        staging, staging_cap, this, token, &FinishRamRead, hit.identity);
     if (hit.len > staging_cap || (hit.len != 0 && hit.ptr == nullptr)) {
       read.Abort();
       return PreparedRead::Result(Status::kInvalid);
@@ -1473,7 +1474,8 @@ PreparedRead KvNodeServer::PrepareReadForKey(
 
 void KvNodeServer::FinishDiskRead(
     void* owner, uint64_t flight, bool committed, Status result,
-    size_t bytes_read, double elapsed_sec, const char* data) noexcept {
+    size_t bytes_read, double elapsed_sec, const char* data,
+    const DiskResidentIdentity& identity) noexcept {
   KvNodeServer* server = static_cast<KvNodeServer*>(owner);
   if (server == nullptr) return;
   if (!committed) {
@@ -1498,7 +1500,7 @@ void KvNodeServer::FinishDiskRead(
         flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, &key,
         &whole, &recurrent, &read_epoch);
     if (ok && whole && server->ram_ && data && bytes_read) {
-      server->PromoteRead(key, read_epoch, data, bytes_read);
+      server->PromoteRead(key, read_epoch, data, bytes_read, identity);
     }
   }
   if (server->lat_sampler_.ShouldSample())
@@ -1507,7 +1509,8 @@ void KvNodeServer::FinishDiskRead(
 
 void KvNodeServer::FinishPromotedDiskRead(
     void* owner, uint64_t flight, bool committed, Status result,
-    size_t bytes_read, double elapsed_sec, const char* data) noexcept {
+    size_t bytes_read, double elapsed_sec, const char* data,
+    const DiskResidentIdentity& identity) noexcept {
   PromotedRead* promoted = static_cast<PromotedRead*>(owner);
   KvNodeServer* server = promoted == nullptr ? nullptr : promoted->server;
   if (server == nullptr) return;
@@ -1524,7 +1527,7 @@ void KvNodeServer::FinishPromotedDiskRead(
     // prevents publication but must wake Remove without waiting for SEND.
     // Commit keeps the physical pin until the PreparedRead post-read hold is
     // released.
-    (void)promoted->reservation.Commit();
+    (void)promoted->reservation.Commit(identity);
     server->cache_hit_.fetch_add(1, std::memory_order_relaxed);
     server->bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
   } else {
@@ -1544,19 +1547,22 @@ void KvNodeServer::FinishPromotedDiskRead(
 
 void KvNodeServer::FinishRamRead(
     void* owner, uint64_t token, bool committed, Status result,
-    size_t bytes_read, double elapsed_sec, const char* data) noexcept {
+    size_t bytes_read, double elapsed_sec, const char* data,
+    const DiskResidentIdentity& identity) noexcept {
   (void)committed;
   (void)result;
   (void)bytes_read;
   (void)elapsed_sec;
   (void)data;
+  (void)identity;
   KvNodeServer* server = static_cast<KvNodeServer*>(owner);
   if (server != nullptr && server->ram_) server->ram_->ReleaseToken(token);
 }
 
 void KvNodeServer::FinishPullRamRead(
     void* owner, uint64_t token, bool committed, Status result,
-    size_t bytes_read, double elapsed_sec, const char* data) noexcept {
+    size_t bytes_read, double elapsed_sec, const char* data,
+    const DiskResidentIdentity& identity) noexcept {
   auto* server = static_cast<KvNodeServer*>(owner);
   if (server != nullptr && committed && result == Status::kOk) {
     server->ram_->hits_.fetch_add(1, std::memory_order_relaxed);
@@ -1565,7 +1571,8 @@ void KvNodeServer::FinishPullRamRead(
     if (server->lat_sampler_.ShouldSample())
       server->get_lat_.Observe(elapsed_sec);
   }
-  FinishRamRead(owner, token, committed, result, bytes_read, elapsed_sec, data);
+  FinishRamRead(owner, token, committed, result, bytes_read, elapsed_sec, data,
+                identity);
 }
 
 // Keep-alive: serve requests on this connection until the peer closes it.
