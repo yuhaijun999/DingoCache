@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/disk_resident_identity.h"
 #include "cache/disk_write_result.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -368,6 +369,37 @@ class StoreEngine {
     results.reserve(statuses.size());
     for (const Status status : statuses) results.push_back({status});
     return results;
+  }
+  // Internal synchronous reads. Credentials describe these returned bytes,
+  // never a later lookup by key. Zero bytes/failures return no credential.
+  // Old backends retain Status semantics and provide no source identity.
+  virtual Status RangeWithIdentity(const BlockKey& key, uint64_t offset,
+                                   uint64_t length, std::string* out,
+                                   DiskResidentIdentity* identity,
+                                   size_t* value_len = nullptr) {
+    if (identity == nullptr) return Status::kInvalid;
+    *identity = {};
+    return Range(key, offset, length, out, value_len);
+  }
+  virtual Status RangeIntoWithIdentity(const BlockKey& key, uint64_t offset,
+                                       uint64_t length, char* dst,
+                                       size_t dst_cap, size_t* out_len,
+                                       DiskResidentIdentity* identity,
+                                       size_t* value_len = nullptr) {
+    if (identity == nullptr) return Status::kInvalid;
+    *identity = {};
+    return RangeInto(key, offset, length, dst, dst_cap, out_len, value_len);
+  }
+  virtual Status RangeDirectWithIdentity(const BlockKey& key, uint64_t offset,
+                                         uint64_t length, char* io_buf,
+                                         size_t io_cap, const char** out_data,
+                                         size_t* out_len,
+                                         DiskResidentIdentity* identity,
+                                         size_t* value_len = nullptr) {
+    if (identity == nullptr) return Status::kInvalid;
+    *identity = {};
+    return RangeDirect(key, offset, length, io_buf, io_cap, out_data, out_len,
+                       value_len);
   }
 };
 

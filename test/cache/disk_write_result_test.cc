@@ -55,6 +55,9 @@ class DiskSlabStoreTestPeer {
     const std::lock_guard<std::mutex> lock(store->mu_);
     store->resident_identity_->sequence = value;
   }
+  static void SetReadHook(DiskSlabStore* store, std::function<void()> hook) {
+    store->read_acquired_hook_for_test_ = std::move(hook);
+  }
   static void SetPayloadWriteHook(DiskSlabStore* store,
                                   std::function<bool()> hook) {
     store->payload_write_hook_for_test_ = std::move(hook);
@@ -115,6 +118,28 @@ struct HookGate {
   }
 };
 
+enum class ReadEntry : unsigned char { kString = 0, kInto = 1, kDirect = 2 };
+
+Status ReadSource(DiskCacheGroup& group, ReadEntry entry, const BlockKey& key,
+                  uint64_t offset, uint64_t length, std::string* out,
+                  DiskResidentIdentity* identity, size_t cap = 4096,
+                  size_t* value_len = nullptr) {
+  if (entry == ReadEntry::kString)
+    return group.RangeWithIdentity(key, offset, length, out, identity,
+                                   value_len);
+  alignas(4096) char buffer[4096] = {};
+  const char* data = buffer;
+  size_t got = 0;
+  const Status status =
+      entry == ReadEntry::kInto
+          ? group.RangeIntoWithIdentity(key, offset, length, buffer, cap, &got,
+                                        identity, value_len)
+          : group.RangeDirectWithIdentity(key, offset, length, buffer, cap,
+                                          &data, &got, identity, value_len);
+  if (status == Status::kOk) out->assign(data, got);
+  return status;
+}
+
 class DiskWriteResultTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -136,21 +161,25 @@ class DiskWriteResultTest : public ::testing::Test {
     return options;
   }
   DiskCacheGroup::Options GroupOptions(size_t count,
-                                       std::vector<DiskSlabStore*>* stores) {
+                                       std::vector<DiskSlabStore*>* stores,
+                                       bool tracking = true,
+                                       bool direct = false) {
     DiskCacheGroup::Options options;
     for (size_t i = 0; i < count; ++i)
       options.cache_dirs.push_back((dir_ / std::to_string(i)).string());
     options.capacity_bytes = count * (1U << 20);
     options.engine = "slab";
     options.eviction_policy = "legacy";
-    options.engine_factory = [stores](const std::string& path, uint64_t cap) {
+    options.engine_factory = [stores, tracking, direct](const std::string& path,
+                                                        uint64_t cap) {
       DiskSlabStore::Options slab;
       slab.dir = path;
       slab.capacity_bytes = cap;
       slab.extent_bytes = 1U << 20;
       slab.slot_granularity = 4096;
       slab.table_sync_ms = slab.reclaim_interval_ms = 0;
-      slab.track_resident_identity = true;
+      slab.track_resident_identity = tracking;
+      slab.direct_writes = direct;
       std::unique_ptr<DiskSlabStore> store =
           std::make_unique<DiskSlabStore>(slab);
       stores->push_back(store.get());
@@ -778,6 +807,195 @@ TEST_F(DiskWriteResultTest, RamDoesNotPublishUncommittedAttemptAsDiskCopy) {
         EXPECT_EQ(disk, "existing");
       }
     }
+  }
+}
+
+TEST_F(DiskWriteResultTest, SyncReadSourceBindsRealRamPromotion) {
+  for (const ReadEntry entry :
+       {ReadEntry::kString, ReadEntry::kInto, ReadEntry::kDirect}) {
+    SCOPED_TRACE(static_cast<int>(entry));
+    fs::remove_all(dir_);
+    std::vector<DiskSlabStore*> stores;
+    DiskCacheGroup group(GroupOptions(1, &stores));
+    const DiskWriteResult committed =
+        group.CacheWithResult(K(2000), "owner", 5);
+    ASSERT_EQ(committed.status, Status::kOk);
+    ASSERT_TRUE(committed.identity.valid());
+    DiskResidentIdentity identity{99, 99, 99};
+    std::string data;
+    size_t stored = 0;
+    ASSERT_EQ(ReadSource(group, entry, K(2000), 0, 0, &data, &identity, 4096,
+                         &stored),
+              Status::kOk);
+    EXPECT_EQ(data, "owner");
+    EXPECT_EQ(stored, 5U);
+    EXPECT_EQ(identity, committed.identity);
+    RamTier::Options options;
+    options.bytes = 64 * 4096;
+    options.reclaim_interval_ms = 0;
+    RamTier tier(options, nullptr);
+    ASSERT_TRUE(tier.PutDurable(K(2000), data.data(), data.size(), identity));
+    RamTier::Hit hit;
+    ASSERT_TRUE(tier.GetPrep(K(2000), 0, 0, &hit));
+    EXPECT_EQ(std::string(hit.ptr, hit.len), "owner");
+    EXPECT_EQ(hit.identity, committed.identity);
+    // An already visible RAM owner cannot be relabeled by a later promotion.
+    ASSERT_TRUE(tier.PutDurable(K(2000), "different", 9, {99, 99, 99}));
+    ASSERT_TRUE(tier.GetPrep(K(2000), 0, 0, &hit));
+    EXPECT_EQ(hit.identity, committed.identity);
+    EXPECT_EQ(std::string(hit.ptr, hit.len), "owner");
+  }
+}
+
+TEST_F(DiskWriteResultTest, SyncReadSourceDoesNotGuessForEmptyOrFailedReads) {
+  for (const bool tracking : {false, true}) {
+    for (const ReadEntry entry :
+         {ReadEntry::kString, ReadEntry::kInto, ReadEntry::kDirect}) {
+      SCOPED_TRACE(tracking);
+      SCOPED_TRACE(static_cast<int>(entry));
+      fs::remove_all(dir_);
+      std::vector<DiskSlabStore*> stores;
+      DiskCacheGroup group(GroupOptions(1, &stores, tracking));
+      const DiskWriteResult committed =
+          group.CacheWithResult(K(2001), "owner", 5);
+      ASSERT_EQ(committed.status, Status::kOk);
+      for (const uint64_t offset : {0U, 5U, 6U}) {
+        DiskResidentIdentity identity{99, 99, 99};
+        std::string data;
+        const Status status =
+            ReadSource(group, entry, K(2001), offset, 2, &data, &identity);
+        EXPECT_EQ(status, offset > 5 ? Status::kInvalid : Status::kOk);
+        EXPECT_EQ(identity, tracking && offset == 0 ? committed.identity
+                                                    : DiskResidentIdentity{});
+        if (offset == 0) {
+          EXPECT_EQ(data, "ow");
+        }
+      }
+      DiskResidentIdentity identity{99, 99, 99};
+      std::string data;
+      EXPECT_EQ(ReadSource(group, entry, K(2002), 0, 0, &data, &identity),
+                Status::kNotFound);
+      EXPECT_FALSE(identity.valid());
+    }
+  }
+}
+
+TEST_F(DiskWriteResultTest, SyncReadSourceFinalReleaseControlsCredentials) {
+  for (const bool fail_invalidation : {false, true}) {
+    for (const ReadEntry entry :
+         {ReadEntry::kString, ReadEntry::kInto, ReadEntry::kDirect}) {
+      SCOPED_TRACE(fail_invalidation);
+      SCOPED_TRACE(static_cast<int>(entry));
+      fs::remove_all(dir_);
+      HookGate gate;  // Outlives group and its read hook, even on timeout.
+      std::vector<DiskSlabStore*> stores;
+      DiskCacheGroup group(GroupOptions(1, &stores));
+      const BlockKey key = K(2010);
+      const DiskWriteResult committed = group.CacheWithResult(key, "owner", 5);
+      ASSERT_TRUE(committed.identity.valid());
+      DiskSlabStoreTestPeer::SetReadHook(stores[0], [&] { gate.Run(); });
+      DiskSlabStoreTestPeer::SetRecordWriteHook(
+          stores[0], [&] { return !fail_invalidation; });
+      DiskResidentIdentity identity{99, 99, 99};
+      std::string data;
+      Status status = Status::kInvalid;
+      std::thread reader([&] {
+        status = ReadSource(group, entry, key, 0, 0, &data, &identity);
+      });
+      const bool entered = gate.WaitEnteredFor();
+      if (entered) {
+        EXPECT_EQ(group.Remove(key), Status::kOk);
+      }
+      gate.Release(true);
+      reader.join();
+      ASSERT_TRUE(entered);
+      EXPECT_EQ(status, fail_invalidation ? Status::kIOError : Status::kOk);
+      EXPECT_FALSE(identity.valid());
+      EXPECT_FALSE(group.IsCached(key));
+      if (!fail_invalidation) {
+        EXPECT_EQ(data, "owner");
+        const DiskWriteResult next = group.CacheWithResult(key, "new", 3);
+        EXPECT_TRUE(next.identity.valid());
+        EXPECT_FALSE(next.identity == committed.identity);
+        EXPECT_FALSE(identity.valid());  // Do not relabel old bytes as next.
+      }
+    }
+  }
+}
+
+TEST_F(DiskWriteResultTest, SyncReadPayloadFailureClearsCapturedSource) {
+  for (const ReadEntry entry :
+       {ReadEntry::kString, ReadEntry::kInto, ReadEntry::kDirect}) {
+    fs::remove_all(dir_);
+    std::vector<DiskSlabStore*> stores;
+    DiskCacheGroup group(GroupOptions(1, &stores));
+    ASSERT_TRUE(group.CacheWithResult(K(2011), "owner", 5).identity.valid());
+    // Force a real short pread after acquisition, not an injected result.
+    DiskSlabStoreTestPeer::SetReadHook(stores[0], [&] {
+      fs::resize_file(dir_ / "0" / "extents" / "E00000", 0);
+    });
+    DiskResidentIdentity identity{99, 99, 99};
+    std::string data;
+    EXPECT_EQ(ReadSource(group, entry, K(2011), 0, 0, &data, &identity),
+              Status::kIOError);
+    EXPECT_FALSE(identity.valid());
+  }
+}
+
+TEST_F(DiskWriteResultTest, SyncReadDirectSourceSurvivesDioAndFallbacks) {
+  std::vector<DiskSlabStore*> stores;
+  DiskCacheGroup group(GroupOptions(1, &stores, true, true));
+  ASSERT_TRUE(group.Healthy());
+  if (!stores[0]->DirectWritesActive())
+    GTEST_SKIP() << "filesystem rejected O_DIRECT; DIO branch not exercised";
+  const std::string value(3000, 'v');
+  const DiskWriteResult committed =
+      group.CacheWithResult(K(2012), value.data(), value.size());
+  ASSERT_TRUE(committed.identity.valid());
+  alignas(4096) char buffer[8192] = {};
+  for (const bool unaligned : {false, true}) {
+    for (const size_t capacity : {0U, 1U, 4096U}) {
+      SCOPED_TRACE(unaligned);
+      SCOPED_TRACE(capacity);
+      char* const destination = buffer + (unaligned ? 1 : 0);
+      const char* data = nullptr;
+      size_t got = 99;
+      DiskResidentIdentity identity{99, 99, 99};
+      ASSERT_EQ(group.RangeDirectWithIdentity(K(2012), 1, 20, destination,
+                                              capacity, &data, &got, &identity),
+                Status::kOk);
+      EXPECT_EQ(got, capacity == 0 ? 0U : capacity == 1 ? 1U : 20U);
+      EXPECT_EQ(identity,
+                got != 0 ? committed.identity : DiskResidentIdentity{});
+      if (got != 0) {
+        EXPECT_EQ(std::string(data, got), std::string(got, 'v'));
+      }
+      if (!unaligned && capacity == 4096) {
+        EXPECT_EQ(data, destination + 1);  // Proves aligned DIO head path.
+      }
+    }
+  }
+}
+
+TEST_F(DiskWriteResultTest, SyncReadFileBackendRemainsUnbound) {
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {dir_.string()};
+  options.capacity_bytes = 1U << 20;
+  options.engine = "file";
+  options.eviction_policy = "legacy";
+  DiskCacheGroup group(options);
+  ASSERT_TRUE(group.Healthy());
+  ASSERT_EQ(group.Cache(K(2013), "owner", 5), Status::kOk);
+  for (const ReadEntry entry :
+       {ReadEntry::kString, ReadEntry::kInto, ReadEntry::kDirect}) {
+    DiskResidentIdentity identity{99, 99, 99};
+    std::string data;
+    EXPECT_EQ(ReadSource(group, entry, K(2013), 0, 0, &data, &identity),
+              Status::kOk);
+    EXPECT_EQ(data, "owner");
+    EXPECT_FALSE(identity.valid());
+    EXPECT_EQ(ReadSource(group, entry, K(2013), 0, 0, &data, nullptr),
+              Status::kInvalid);
   }
 }
 

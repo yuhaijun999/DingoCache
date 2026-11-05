@@ -201,10 +201,10 @@ class RamTier {
     Status status;
     PutDisposition disposition = PutDisposition::kComplete;
     DiskWriteReason reason = DiskWriteReason::kNone;
-    // The accepted owner's bytes, not a conflicting duplicate's input. This
-    // credential alone does not prove the disk resident is still live.
+    // Source of the accepted RAM bytes (write owner or read promotion), not
+    // conflicting duplicate input. This is not proof the disk is still live.
     DiskResidentIdentity identity{};
-    // The accepted RAM owner's disk result, also for RAM duplicate waiters.
+    // Disk write outcome for the accepted owner; read promotions use Unknown.
     DiskWriteOutcome outcome = DiskWriteOutcome::kUnknown;
   };
 
@@ -233,6 +233,10 @@ class RamTier {
   // declines (false) and the promotion is silently skipped; promoted slots can
   // never crowd out the write path's flush resources.
   bool PutDurable(const BlockKey& key, const void* data, size_t len);
+  // Caller proves a whole-value read and serializes publication with Remove/
+  // rewrite (the server uses its read epoch fence). Identity is not a pin.
+  bool PutDurable(const BlockKey& key, const void* data, size_t len,
+                  const DiskResidentIdentity& identity);
 
   // Before a serialized foreground PUT, hide durable cache copies and cancel
   // promotion writers; keep dirty/failed PUT owners and all physical SEND pins.
@@ -323,7 +327,7 @@ class RamTier {
     // than reconstructing a credential by looking up the key after the flush.
     // For an indexed entry, publish only under its shard mutex. GetPrep reads
     // this immutable terminal result under that same mutex, without a new lock.
-    std::unique_ptr<DiskWriteResult> disk_result;
+    std::unique_ptr<PutResult> result;
     bool canceled = false;
     // Immutable after registration: a read copy is not an accepted PUT owner.
     bool promotion = false;
@@ -411,6 +415,8 @@ class RamTier {
   // Caller holds the resident's shard mutex through typed result publication.
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           const DiskWriteResult& result);
+  static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
+                          const PutResult& result);
   static PutResult WaitPutResult(
       const std::shared_ptr<PutCompletion>& completion);
   static Status WaitPut(const std::shared_ptr<PutCompletion>& completion);

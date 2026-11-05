@@ -29,6 +29,9 @@
 #include <gtest/gtest.h>
 
 #include "cache/disk_cache_group.h"
+#include "cache/disk_resident_identity.h"
+#include "cache/disk_slab_store.h"
+#include "cache/disk_write_result.h"
 #include "cache/kv_node_server.h"
 #include "cache/kv_store.h"
 #include "cache/ram_tier.h"
@@ -104,6 +107,17 @@ class KvNodeServerWiringTestPeer {
   }
   static bool Resident(KvNodeServer& server, const BlockKey& key) {
     return server.ram_->Contains(key);
+  }
+  static DiskWriteResult PersistSource(KvNodeServer& server,
+                                       const BlockKey& key, const char* data,
+                                       size_t len) {
+    return server.group_.CacheWithResult(key, data, len);
+  }
+  static DiskResidentIdentity RamSource(KvNodeServer& server,
+                                        const BlockKey& key) {
+    RamTier::Hit hit;
+    return server.ram_->GetPrep(key, 0, 0, &hit) ? hit.identity
+                                                 : DiskResidentIdentity{};
   }
   static Status Persist(KvNodeServer& server, const BlockKey& key,
                         const char* data, size_t len) {
@@ -208,6 +222,24 @@ struct FlushBarrier {
 struct OpenFlushOnExit {
   FlushBarrier& barrier;
   ~OpenFlushOnExit() { barrier.Open(); }
+};
+
+class TrackedReadBarrierStore : public DiskSlabStore {
+ public:
+  explicit TrackedReadBarrierStore(const Options& options)
+      : DiskSlabStore(options) {}
+  Status RangeDirectWithIdentity(const BlockKey& key, uint64_t offset,
+                                 uint64_t length, char* buffer, size_t capacity,
+                                 const char** data, size_t* size,
+                                 DiskResidentIdentity* identity,
+                                 size_t* value_len) override {
+    const Status result = DiskSlabStore::RangeDirectWithIdentity(
+        key, offset, length, buffer, capacity, data, size, identity, value_len);
+    if (after_read_ != nullptr) after_read_->Block();
+    return result;
+  }
+  // Set before launching the reader; never changed while it is running.
+  FlushBarrier* after_read_ = nullptr;
 };
 
 class BlockingBypassStore : public KVStore {
@@ -2448,4 +2480,91 @@ TEST(RamTierWiring, BatchPutWithRamPreservesTenantQuotaAndDuplicateOrder) {
   EXPECT_TRUE(server->Healthy());
   server.reset();
   fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, TrackedSyncPromotionKeepsSourceAndRejectsLatePublication) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  for (const bool replace : {false, true}) {
+    SCOPED_TRACE(replace);
+    const fs::path dir = fs::temp_directory_path() / "dfkv_tracked_sync_source";
+    fs::remove_all(dir);
+    FlushBarrier gate;  // Outlives the server and any controlled callback.
+    TrackedReadBarrierStore* store = nullptr;
+    DiskCacheGroup::Options options{{dir.string()}, 1U << 20, "slab"};
+    options.eviction_policy = "legacy";
+    options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+      DiskSlabStore::Options slab;
+      slab.dir = path;
+      slab.capacity_bytes = capacity;
+      slab.extent_bytes = 1U << 20;
+      slab.slot_granularity = 4096;
+      slab.reclaim_interval_ms = slab.table_sync_ms = 0;
+      slab.track_resident_identity = true;
+      std::unique_ptr<TrackedReadBarrierStore> result =
+          std::make_unique<TrackedReadBarrierStore>(slab);
+      store = result.get();
+      return result;
+    };
+    std::unique_ptr<KvNodeServer> server =
+        KvNodeServerWiringTestPeer::Create(std::move(options));
+    ASSERT_TRUE(server->Healthy());
+    KvNodeServerWiringTestPeer::SetRam(
+        *server, [](const BlockKey&, char*, size_t, size_t) { return false; });
+    KvNodeServerWiringTestPeer::SetWriteBack(*server, false);
+    KvNodeServerWiringTestPeer::SetCoalescing(*server, false);
+    const BlockKey key{9820, 0};
+    const DiskWriteResult committed =
+        KvNodeServerWiringTestPeer::PersistSource(*server, key, "old", 3);
+    ASSERT_TRUE(committed.identity.valid());
+    alignas(4096) char buffer[4096] = {};
+    const char* data = nullptr;
+    size_t length = 0;
+    ASSERT_EQ(server->RangeDirectForKey(key, 0, 0, buffer, sizeof(buffer),
+                                        &data, &length),
+              Status::kOk);
+    EXPECT_EQ(KvNodeServerWiringTestPeer::RamSource(*server, key),
+              committed.identity);
+    ASSERT_TRUE(KvNodeServerWiringTestPeer::DropRam(*server, key));
+    store->after_read_ = &gate;
+    Status status = Status::kInvalid;
+    std::string bytes;
+    std::thread reader([&] {
+      status = server->RangeDirectForKey(key, 0, 0, buffer, sizeof(buffer),
+                                         &data, &length);
+      if (status == Status::kOk) bytes.assign(data, length);
+    });
+    const bool entered = gate.AwaitEntry();
+    std::string ignored;
+    if (entered) {
+      EXPECT_EQ(
+          server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                       key, 0, 0, nullptr, 0, &ignored),
+          Status::kOk);
+      if (replace) {
+        EXPECT_EQ(
+            server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                         key, 0, 0, "new", 3, &ignored),
+            Status::kOk);
+      }
+    }
+    gate.Open();
+    reader.join();
+    ASSERT_TRUE(entered);
+    EXPECT_EQ(status, Status::kOk);
+    EXPECT_EQ(bytes, "old");
+    EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+    EXPECT_FALSE(KvNodeServerWiringTestPeer::RamSource(*server, key).valid());
+    if (replace) {
+      ASSERT_EQ(server->RangeDirectForKey(key, 0, 0, buffer, sizeof(buffer),
+                                          &data, &length),
+                Status::kOk);
+      EXPECT_EQ(std::string(data, length), "new");
+      const DiskResidentIdentity next =
+          KvNodeServerWiringTestPeer::RamSource(*server, key);
+      EXPECT_TRUE(next.valid());
+      EXPECT_FALSE(next == committed.identity);
+    }
+    server.reset();
+    fs::remove_all(dir);
+  }
 }

@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
 #include "cache/kv_store.h"
@@ -124,6 +125,20 @@ class DiskCacheGroup {
   Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
                      char* io_buf, size_t io_cap, const char** out_data,
                      size_t* out_len, size_t* value_len = nullptr);
+  // Synchronous read source; no credential is reconstructed from key.
+  Status RangeWithIdentity(const BlockKey& key, uint64_t offset,
+                           uint64_t length, std::string* out,
+                           DiskResidentIdentity* identity,
+                           size_t* value_len = nullptr);
+  Status RangeIntoWithIdentity(const BlockKey& key, uint64_t offset,
+                               uint64_t length, char* dst, size_t dst_cap,
+                               size_t* out_len, DiskResidentIdentity* identity,
+                               size_t* value_len = nullptr);
+  Status RangeDirectWithIdentity(const BlockKey& key, uint64_t offset,
+                                 uint64_t length, char* io_buf, size_t io_cap,
+                                 const char** out_data, size_t* out_len,
+                                 DiskResidentIdentity* identity,
+                                 size_t* value_len = nullptr);
   // Cheap prep half of RangeDirect (no disk read); the returned lease carries
   // descriptor and storage-pin ownership through asynchronous queues.
   Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,

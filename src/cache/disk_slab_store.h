@@ -234,6 +234,19 @@ class DiskSlabStore : public StoreEngine {
   Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
                      char* io_buf, size_t io_cap, const char** out_data,
                      size_t* out_len, size_t* value_len = nullptr) override;
+  Status RangeWithIdentity(const BlockKey& key, uint64_t offset,
+                           uint64_t length, std::string* out,
+                           DiskResidentIdentity* identity,
+                           size_t* value_len = nullptr) override;
+  Status RangeIntoWithIdentity(const BlockKey& key, uint64_t offset,
+                               uint64_t length, char* dst, size_t dst_cap,
+                               size_t* out_len, DiskResidentIdentity* identity,
+                               size_t* value_len = nullptr) override;
+  Status RangeDirectWithIdentity(const BlockKey& key, uint64_t offset,
+                                 uint64_t length, char* io_buf, size_t io_cap,
+                                 const char** out_data, size_t* out_len,
+                                 DiskResidentIdentity* identity,
+                                 size_t* value_len = nullptr) override;
   // Async prep pins the resolved slot and returns a move-only lease over both
   // the dup'd extent descriptor and that pin. Abandoning or completing the read
   // destroys the lease and balances the hold without a manual release protocol.
@@ -301,6 +314,21 @@ class DiskSlabStore : public StoreEngine {
   std::vector<Status> CacheDirectBatchImpl(
       const std::vector<CacheBatchItem>& items,
       std::vector<DiskWriteResult>* details);
+  Status RangeImpl(const BlockKey& key, uint64_t offset, uint64_t length,
+                   std::string* out, size_t* value_len,
+                   DiskResidentIdentity* identity);
+  Status RangeIntoImpl(const BlockKey& key, uint64_t offset, uint64_t length,
+                       char* dst, size_t dst_cap, size_t* out_len,
+                       size_t* value_len, DiskResidentIdentity* identity);
+  Status RangeDirectImpl(const BlockKey& key, uint64_t offset, uint64_t length,
+                         char* io_buf, size_t io_cap, const char** out_data,
+                         size_t* out_len, size_t* value_len,
+                         DiskResidentIdentity* identity);
+  // Caller holds D. Last release may change the final status; only keep the
+  // originally captured source if it is still visible, never relabel by key.
+  Status FinishReadLocked(const BlockKey& key, const std::string& fn,
+                          Status status, size_t bytes,
+                          DiskResidentIdentity* identity);
   struct PutFlight {
     std::mutex mu;
     std::condition_variable cv;
@@ -314,7 +342,8 @@ class DiskSlabStore : public StoreEngine {
   // read (pin + inflight count, under mu_). False = miss (absent, or a write
   // still in flight). Balanced by a Release{...}Locked call.
   bool AcquireForRead(const BlockKey& key, const std::string& fn,
-                      SlabAllocator::SlotRef* ref, uint32_t* plen);
+                      SlabAllocator::SlotRef* ref, uint32_t* plen,
+                      DiskResidentIdentity* identity = nullptr);
   // Drop one in-flight hold on fn (unpin + count). The LAST releaser performs
   // the durable invalidation for a Remove that arrived while I/O was active.
   // SlabAllocator itself also defers pinned removal, but this caller-level state

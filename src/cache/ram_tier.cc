@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/disk_resident_identity.h"
 #include "cache/disk_write_result.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
@@ -464,14 +465,21 @@ void RamTier::CompletePut(
 
 void RamTier::CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           const DiskWriteResult& result) {
+  CompletePut(completion,
+              PutResult{result.status, PutDisposition::kComplete, result.reason,
+                        result.identity, result.outcome});
+}
+
+void RamTier::CompletePut(const std::shared_ptr<PutCompletion>& completion,
+                          const PutResult& result) {
   if (!completion) return;
   {
     const std::lock_guard<std::mutex> lock(completion->mu);
     if (completion->done) return;
-    completion->disk_result = std::make_unique<DiskWriteResult>(result);
+    completion->result = std::make_unique<PutResult>(result);
     if (result.status != Status::kOk) {
-      completion->disk_result->identity = {};
-      completion->disk_result->outcome = DiskWriteOutcome::kUnknown;
+      completion->result->identity = {};
+      completion->result->outcome = DiskWriteOutcome::kUnknown;
     }
     completion->done = true;
   }
@@ -490,11 +498,7 @@ RamTier::PutResult RamTier::WaitPutResult(
   // Returning a bypass here could persist conflicting duplicate bytes while
   // the original flush still owns its slot (or outlive Remove's disk fence).
   completion->cv.wait(lk, [&completion] { return completion->done; });
-  if (completion->disk_result) {
-    const DiskWriteResult& result = *completion->disk_result;
-    return {result.status, PutDisposition::kComplete, result.reason,
-            result.identity, result.outcome};
-  }
+  if (completion->result) return *completion->result;
   return {completion->success ? Status::kOk : Status::kIOError};
 }
 
@@ -915,6 +919,11 @@ RamTier::PutResult RamTier::PutWriteBack(
 }
 
 bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
+  return PutDurable(key, data, len, {});
+}
+
+bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len,
+                         const DiskResidentIdentity& identity) {
   if (!arena_ || len == 0 || data == nullptr) return false;
   uint64_t requested_cap = 0;
   if (!AlignCapacity(len, opt_.slot_granularity, &requested_cap) ||
@@ -1015,7 +1024,12 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
       e.large = std::move(dedicated);
       e.durable = true;
       e.completion = completion;
-      CompletePut(completion, true);
+      if (identity.valid())
+        CompletePut(completion,
+                    PutResult{Status::kOk, PutDisposition::kComplete,
+                              DiskWriteReason::kNone, identity});
+      else
+        CompletePut(completion, true);
       s.index.emplace(key, std::move(e));
       if (!large) s.alloc->Unpin(key, slot_handle);
     } else if (!large) {
@@ -1082,13 +1096,13 @@ bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
     out->len = static_cast<size_t>(n);
     out->value_len = static_cast<size_t>(e.len);
     out->in_arena = e.in_arena();
-    // FlushLoop publishes the immutable result under this same shard lock.
+    // Flush and promotion publish the immutable result under this shard lock.
     // A hit taken before publication stays unbound even if the flush later
     // commits. Never recover a credential by looking up the current disk key.
-    if (e.durable && e.completion && e.completion->disk_result) {
-      const DiskWriteResult& result = *e.completion->disk_result;
-      if (result.status == Status::kOk &&
-          result.outcome == DiskWriteOutcome::kNew && result.identity.valid())
+    if (e.durable && e.completion && e.completion->result) {
+      const PutResult& result = *e.completion->result;
+      if (result.status == Status::kOk && result.identity.valid() &&
+          (e.completion->promotion || result.outcome == DiskWriteOutcome::kNew))
         out->identity = result.identity;
     }
     out->mr = out->in_arena
