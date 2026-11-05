@@ -39,6 +39,7 @@
 #include "client/key_map.h"
 #include "common/kv_types.h"
 #include "common/status.h"
+#include "read_coalescer_test_peer.h"
 #include "transport/tcp_transport.h"
 #include "transport/wire.h"
 
@@ -65,6 +66,24 @@ class KvNodeServerWiringTestPeer {
   }
   static void SetCoalescing(KvNodeServer& server, bool enabled) {
     server.coalesce_enabled_ = enabled;
+  }
+  static Status ReadSharedSource(KvNodeServer& server, const BlockKey& key,
+                                 uint64_t offset, uint64_t epoch,
+                                 DiskResidentIdentity* identity,
+                                 std::string* payload) {
+    char bytes[16] = {};
+    size_t length = 0;
+    const Status result = server.read_coalescer_.ReadWithIdentity(
+        key, offset, 0, bytes, sizeof(bytes), &length, nullptr, identity,
+        [](char*, size_t, size_t*, size_t*, DiskResidentIdentity*) {
+          return Status::kIOError;
+        },
+        nullptr, epoch);
+    if (result == Status::kOk) payload->assign(bytes, length);
+    return result;
+  }
+  static bool AwaitCopyWaiter(KvNodeServer& server) {
+    return ReadCoalescerTestPeer::WaitForCopyWaiter(server.read_coalescer_);
   }
   static void SetReadEpoch(KvNodeServer& server, const BlockKey& key,
                            uint64_t epoch) {
@@ -246,6 +265,24 @@ class TrackedReadBarrierStore : public DiskSlabStore {
                                  size_t* value_len) override {
     const Status result = DiskSlabStore::RangeDirectWithIdentity(
         key, offset, length, buffer, capacity, data, size, identity, value_len);
+    if (after_read_ != nullptr) after_read_->Block();
+    return result;
+  }
+  Status RangeWithIdentity(const BlockKey& key, uint64_t offset,
+                           uint64_t length, std::string* bytes,
+                           DiskResidentIdentity* identity,
+                           size_t* value_len) override {
+    const Status result = DiskSlabStore::RangeWithIdentity(
+        key, offset, length, bytes, identity, value_len);
+    if (after_read_ != nullptr) after_read_->Block();
+    return result;
+  }
+  Status RangeIntoWithIdentity(const BlockKey& key, uint64_t offset,
+                               uint64_t length, char* buffer, size_t capacity,
+                               size_t* size, DiskResidentIdentity* identity,
+                               size_t* value_len) override {
+    const Status result = DiskSlabStore::RangeIntoWithIdentity(
+        key, offset, length, buffer, capacity, size, identity, value_len);
     if (after_read_ != nullptr) after_read_->Block();
     return result;
   }
@@ -2500,11 +2537,15 @@ TEST(RamTierWiring, BatchPutWithRamPreservesTenantQuotaAndDuplicateOrder) {
 
 TEST(RamTierWiring, TrackedSyncPromotionKeepsSourceAndRejectsLatePublication) {
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
-  for (const bool replace : {false, true}) {
+  for (const unsigned char scenario : {0, 1, 2, 3, 4, 5}) {
+    const bool replace = (scenario & 1) != 0;
+    const bool coalesce = scenario >= 2;
+    SCOPED_TRACE(coalesce);
     SCOPED_TRACE(replace);
     const fs::path dir = fs::temp_directory_path() / "dfkv_tracked_sync_source";
     fs::remove_all(dir);
     FlushBarrier gate;  // Outlives the server and any controlled callback.
+    FlushBarrier late_gate;
     TrackedReadBarrierStore* store = nullptr;
     DiskCacheGroup::Options options{{dir.string()}, 1U << 20, "slab"};
     options.eviction_policy = "legacy";
@@ -2527,7 +2568,7 @@ TEST(RamTierWiring, TrackedSyncPromotionKeepsSourceAndRejectsLatePublication) {
     KvNodeServerWiringTestPeer::SetRam(
         *server, [](const BlockKey&, char*, size_t, size_t) { return false; });
     KvNodeServerWiringTestPeer::SetWriteBack(*server, false);
-    KvNodeServerWiringTestPeer::SetCoalescing(*server, false);
+    KvNodeServerWiringTestPeer::SetCoalescing(*server, coalesce);
     const BlockKey key{9820, 0};
     const DiskWriteResult committed =
         KvNodeServerWiringTestPeer::PersistSource(*server, key, "old", 3);
@@ -2541,7 +2582,45 @@ TEST(RamTierWiring, TrackedSyncPromotionKeepsSourceAndRejectsLatePublication) {
     EXPECT_EQ(KvNodeServerWiringTestPeer::RamSource(*server, key),
               committed.identity);
     ASSERT_TRUE(KvNodeServerWiringTestPeer::DropRam(*server, key));
-    store->after_read_ = &gate;
+    if (coalesce) {
+      // TCP/Into leaders and a direct follower share one real slab snapshot.
+      store->after_read_ = &gate;
+      std::string leader_bytes;
+      std::thread leader([&] {
+        if (scenario < 4) {
+          EXPECT_EQ(server->ProcessRequestForKey(
+                        static_cast<uint8_t>(WireOp::kRange), key, 0, 3,
+                        nullptr, 0, &leader_bytes),
+                    Status::kOk);
+        } else {
+          char target[4] = {};
+          size_t n = 0;
+          EXPECT_EQ(
+              server->RangeIntoForKey(key, 0, 3, target, sizeof(target), &n),
+              Status::kOk);
+          leader_bytes.assign(target, n);
+        }
+      });
+      const bool leader_entered = gate.AwaitEntry();
+      std::thread follower([&] {
+        EXPECT_EQ(server->RangeDirectForKey(key, 0, 3, buffer, sizeof(buffer),
+                                            &data, &length),
+                  Status::kOk);
+      });
+      const bool joined = KvNodeServerWiringTestPeer::AwaitCopyWaiter(*server);
+      gate.Open();
+      leader.join();
+      follower.join();
+      EXPECT_TRUE(leader_entered);
+      EXPECT_TRUE(joined);
+      EXPECT_EQ(leader_bytes, "old");
+      EXPECT_EQ(std::string(data, length), "old");
+      EXPECT_EQ(KvNodeServerWiringTestPeer::RamSource(*server, key),
+                committed.identity);
+      ASSERT_TRUE(KvNodeServerWiringTestPeer::DropRam(*server, key));
+      store->after_read_ = nullptr;
+    }
+    store->after_read_ = &late_gate;
     Status status = Status::kInvalid;
     std::string bytes;
     std::thread reader([&] {
@@ -2549,7 +2628,7 @@ TEST(RamTierWiring, TrackedSyncPromotionKeepsSourceAndRejectsLatePublication) {
                                          &data, &length);
       if (status == Status::kOk) bytes.assign(data, length);
     });
-    const bool entered = gate.AwaitEntry();
+    const bool entered = late_gate.AwaitEntry();
     std::string ignored;
     if (entered) {
       EXPECT_EQ(
@@ -2563,7 +2642,7 @@ TEST(RamTierWiring, TrackedSyncPromotionKeepsSourceAndRejectsLatePublication) {
             Status::kOk);
       }
     }
-    gate.Open();
+    late_gate.Open();
     reader.join();
     ASSERT_TRUE(entered);
     EXPECT_EQ(status, Status::kOk);
@@ -2698,8 +2777,31 @@ TEST(RamTierWiring, AsyncLastReleaseControlsStatusAndReservationSource) {
       fs::remove_all(dir);
       continue;
     }
+    DiskResidentIdentity shared_identity;
+    std::string shared_bytes;
+    Status shared_status = Status::kInvalid;
+    std::thread follower;
+    bool joined = false;
+    if (!empty) {
+      follower = std::thread([&] {
+        shared_status = KvNodeServerWiringTestPeer::ReadSharedSource(
+            *server, key, offset, epoch, &shared_identity, &shared_bytes);
+      });
+      joined = KvNodeServerWiringTestPeer::AwaitCopyWaiter(*server);
+    }
     // A later Ok cannot turn a failed terminal back into a successful read.
     EXPECT_TRUE(read.Commit(Status::kOk, read.payload_len(), 0.0));
+    if (!empty) {
+      follower.join();
+      EXPECT_TRUE(joined);
+      EXPECT_EQ(shared_status, expected);
+      EXPECT_EQ(shared_bytes, expected != Status::kOk ? ""
+                              : partial               ? "wner"
+                                                      : "owner");
+      EXPECT_EQ(shared_identity, action == Case::kSuccess
+                                     ? committed.identity
+                                     : DiskResidentIdentity{});
+    }
     EXPECT_EQ(read.status(), expected);
     EXPECT_FALSE(
         KvNodeServerWiringTestPeer::ReadFlight(*server, key, offset, 0, epoch));
