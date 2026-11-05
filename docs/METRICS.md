@@ -81,7 +81,7 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_build_info{version,transport,engine,write_mode[,node,group]}` | gauge | 版本 + 构建传输（rdma/tcp）+ resolved 存储引擎；slab 的 `write_mode` 为 `direct`/`buffered`，显式 file 为 `n/a`；设置 `--id`/`--group` 时追加 `node`/`group` label；恒为 1 |
 | `dfkv_uptime_seconds` | gauge | 启动至今秒数 |
 | `dfkv_storage_healthy` | gauge | 当前 disk group 与显式请求 RAM tier 的 terminal health；0 时 `/healthz`、`/readyz` 均为 503 |
-| `dfkv_server_startup_complete` / `dfkv_server_mds_registration_ready` / `dfkv_server_healthy` / `dfkv_server_ready` | gauge | startup、本次首次 MDS 注册门、本地动态 health、三者合取；`dfkvctl stat --all` 用这组稳定 gauge 判定节点健康 |
+| `dfkv_server_startup_complete` / `dfkv_server_mds_registration_ready` / `dfkv_server_healthy` / `dfkv_server_ready` | gauge | startup、本次首次 MDS 注册门、本地动态 health；ready 还要求未触发 lifetime 时钟重启信号（正常旧模式无此信号），不将该信号当磁盘 I/O 故障；`dfkvctl stat --all` 用这组稳定 gauge 判定节点健康 |
 | `dfkv_cache_put_total` / `dfkv_cache_hit_total` / `dfkv_cache_miss_total` | counter | PUT / GET 命中 / GET 未命中 |
 | `dfkv_exist_hit_total` / `dfkv_exist_miss_total` | counter | Exist 命中 / 未命中 |
 | `dfkv_remove_ok_total` / `dfkv_remove_miss_total` | counter | Remove 删掉了块 / 目标本就不存在（partial save 清理等路径的诊断分型） |

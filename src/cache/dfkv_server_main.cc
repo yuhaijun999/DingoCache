@@ -525,8 +525,9 @@ int main(int argc, char** argv) {
     gauge("dfkv_server_healthy",
           "Whether local storage and required RAM tiers are healthy", healthy);
     gauge("dfkv_server_ready",
-          "Whether startup, MDS registration, and local health are ready",
-          startup && registered && healthy);
+          "Whether startup, registration, health, and lifetime clock permit "
+          "serving",
+          startup && registered && healthy && !srv.LifetimeRestartRequired());
     return s;
   });
   if (metrics_port >= 0) {
@@ -535,7 +536,8 @@ int main(int argc, char** argv) {
     mhttp->set_health_check([&srv] { return srv.Healthy(); });
     mhttp->set_ready_check([ready_flag, mds_ready, &srv] {
       return ready_flag->load(std::memory_order_acquire) &&
-             mds_ready->load(std::memory_order_acquire) && srv.Healthy();
+             mds_ready->load(std::memory_order_acquire) && srv.Healthy() &&
+             !srv.LifetimeRestartRequired();
     });
     if (mhttp->Start(metrics_port, metrics_bind) == Status::kOk)
       DFKV_LOG_INFO("dfkv_server /metrics on port " + std::to_string(mhttp->port()));
@@ -651,16 +653,20 @@ int main(int argc, char** argv) {
                     ? "dfkv_server ready (all startup stages complete)"
                     : "dfkv_server initialized; readiness awaits initial MDS registration");
 
-  while (!g_stop &&
-         !(registrar && registrar->first_registration_timed_out())) {
+  while (!g_stop && !(registrar && registrar->first_registration_timed_out()) &&
+         !srv.LifetimeRestartRequired()) {
     struct timespec ts{0, 50 * 1000 * 1000};
     nanosleep(&ts, nullptr);
   }
+  ready_flag->store(false, std::memory_order_release);
+  const bool lifetime_restart = srv.LifetimeRestartRequired();
   const bool registration_timed_out =
       registrar && registrar->first_registration_timed_out();
   if (registration_timed_out) {
     DFKV_LOG_ERROR(
         "dfkv_server shutting down after first MDS registration deadline");
+  } else if (lifetime_restart) {
+    DFKV_LOG_ERROR("lifetime clock requires restart; draining before shutdown");
   } else {
     DFKV_LOG_INFO("dfkv_server shutting down");
   }
@@ -671,5 +677,5 @@ int main(int argc, char** argv) {
   if (rsrv) rsrv->Stop();
 #endif
   srv.Stop();
-  return registration_timed_out ? 1 : 0;
+  return (registration_timed_out || lifetime_restart) ? 1 : 0;
 }

@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 
 #include "cache/disk_cache_group.h"
+#include "cache/disk_lifetime_clock.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
@@ -162,6 +163,12 @@ class KvNodeServerWiringTestPeer {
   }
   static Status DropDisk(KvNodeServer& server, const BlockKey& key) {
     return server.group_.Remove(key);
+  }
+  static bool PersistenceHealthy(const KvNodeServer& server) {
+    return server.group_.Healthy() && (!server.ram_ || server.ram_->healthy());
+  }
+  static uint64_t DiskReadLeases(const KvNodeServer& server) {
+    return server.group_.SlabStats().prep_holds;
   }
   static bool Drain(KvNodeServer& server) {
     return server.ram_->WaitForDrain(2s);
@@ -2827,4 +2834,277 @@ TEST(RamTierWiring, AsyncLastReleaseControlsStatusAndReservationSource) {
     server.reset();
     fs::remove_all(dir);
   }
+}
+
+class LifetimeAdmissionTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ =
+        fs::temp_directory_path() /
+        ("dfkv_lifetime_admission_" +
+         std::to_string(
+             ::testing::UnitTest::GetInstance()->current_test_info()->line()));
+    fs::remove_all(dir_);
+    options_.cache_dirs = {dir_.string()};
+    options_.capacity_bytes = 1ull << 30;
+    options_.engine = "slab";
+    options_.eviction_policy = "legacy";
+    options_.lifetime_clock = std::make_shared<DiskLifetimeClock>(100, [this] {
+      const uint64_t sample = seconds_.load(std::memory_order_relaxed);
+      if (expire_after_sample_.exchange(false, std::memory_order_relaxed))
+        seconds_.store(UINT32_MAX, std::memory_order_relaxed);
+      return sample;
+    });
+    server_ = KvNodeServerWiringTestPeer::Create(options_);
+    ASSERT_TRUE(server_->Healthy());
+  }
+  void TearDown() override {
+    server_.reset();
+    fs::remove_all(dir_);
+  }
+  void Expire() { seconds_.store(UINT32_MAX, std::memory_order_relaxed); }
+  void InstallRam() {
+    KvNodeServer* const node = server_.get();
+    KvNodeServerWiringTestPeer::SetRam(
+        *node, [node](const BlockKey& key, char* data, size_t len, size_t) {
+          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+                 Status::kOk;
+        });
+  }
+  const ScopedEnv ram_off_{"DFKV_RAM_TIER", "0"};
+  const ScopedEnv buffered_{"DFKV_SLAB_WRITE", "buffered"};
+  const ScopedEnv granularity_{"DFKV_SLAB_GRANULARITY", "1048576"};
+  const ScopedEnv sync_{"DFKV_SLAB_TABLE_SYNC_MS", "0"};
+  const ScopedEnv reclaim_{"DFKV_SLAB_RECLAIM_MS", "0"};
+  std::atomic<uint64_t> seconds_{0};
+  std::atomic<bool> expire_after_sample_{false};
+  DiskCacheGroup::Options options_;
+  std::unique_ptr<KvNodeServer> server_;
+  fs::path dir_;
+};
+
+TEST_F(LifetimeAdmissionTest, RejectsEveryNewBusinessEntryBeforeRamHit) {
+  const BlockKey key{99001, 0};
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server_, key, "old", 3),
+            Status::kOk);
+  InstallRam();
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::InstallDurable(*server_, key, "old"));
+  Expire();
+  EXPECT_TRUE(server_->LifetimeRestartRequired());
+  EXPECT_TRUE(server_->Healthy());  // Health is persistence, not readiness.
+  for (const WireOp op : {WireOp::kRange, WireOp::kLookup, WireOp::kExist,
+                          WireOp::kRemove, WireOp::kCache}) {
+    std::string out = "stale";
+    size_t total = 99;
+    EXPECT_EQ(server_->ProcessRequestForKey(static_cast<uint8_t>(op), key, 0, 0,
+                                            "new", 3, &out, &total),
+              Status::kIOError);
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(total, 0U);
+  }
+  ValueMetadata metadata;
+  metadata.value_len = 99;
+  EXPECT_EQ(server_->LookupForKey(key, &metadata), Status::kIOError);
+  EXPECT_EQ(metadata.value_len, 0U);
+  alignas(4096) char bytes[4096] = {};
+  size_t length = 99;
+  size_t total = 99;
+  EXPECT_EQ(server_->RangeIntoForKey(key, 0, 0, bytes, sizeof(bytes), &length,
+                                     &total),
+            Status::kIOError);
+  EXPECT_EQ(length, 0U);
+  EXPECT_EQ(total, 0U);
+  const char* data = bytes;
+  length = total = 99;
+  EXPECT_EQ(server_->RangeDirectForKey(key, 0, 0, bytes, sizeof(bytes), &data,
+                                       &length, &total),
+            Status::kIOError);
+  EXPECT_EQ(data, nullptr);
+  EXPECT_EQ(length, 0U);
+  EXPECT_EQ(total, 0U);
+  EXPECT_EQ(server_->CacheDirectForKey(key, bytes, 3, sizeof(bytes)),
+            Status::kIOError);
+  const std::vector<Status> results = server_->CacheDirectBatchForKeys(
+      {{key, bytes, 3, sizeof(bytes)}, {{99002, 0}, bytes, 3, sizeof(bytes)}});
+  ASSERT_EQ(results.size(), 2U);
+  EXPECT_EQ(results[0], Status::kIOError);
+  EXPECT_EQ(results[1], Status::kIOError);
+  PreparedRead pinned;
+  EXPECT_FALSE(server_->RamPinnedHitForKey(key, 0, 0, &pinned));
+  EXPECT_FALSE(pinned.owns_cleanup());
+  const PreparedRead prepared =
+      server_->PrepareReadForKey(key, 0, 0, bytes, sizeof(bytes));
+  EXPECT_EQ(prepared.status(), Status::kIOError);
+  EXPECT_FALSE(prepared.owns_cleanup());
+  std::string disk;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server_, key, &disk),
+            Status::kOk);
+  EXPECT_EQ(disk, "old");
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::Resident(*server_, key));
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::PersistenceHealthy(*server_));
+  for (const WireOp op : {WireOp::kStats, WireOp::kMembers}) {
+    std::string out;
+    EXPECT_EQ(server_->ProcessRequestForKey(static_cast<uint8_t>(op), key, 0, 0,
+                                            nullptr, 0, &out),
+              Status::kOk);
+  }
+  seconds_.store(0, std::memory_order_relaxed);
+  EXPECT_TRUE(server_->LifetimeRestartRequired());
+}
+
+TEST_F(LifetimeAdmissionTest, StartupRechecksClockBeforeOpeningListener) {
+  Expire();
+  EXPECT_EQ(server_->Start(0), Status::kIOError);
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::PersistenceHealthy(*server_));
+}
+
+TEST_F(LifetimeAdmissionTest, AdmittedPreparedReadStillReleasesDiskLease) {
+  const BlockKey key{99003, 0};
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server_, key, "value", 5),
+            Status::kOk);
+  alignas(4096) char bytes[4096] = {};
+  PreparedRead read =
+      server_->PrepareReadForKey(key, 0, 0, bytes, sizeof(bytes));
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_TRUE(read.needs_io());
+  ASSERT_EQ(::pread(read.fd(), read.staging(), read.aligned_len(),
+                    static_cast<off_t>(read.aligned_off())),
+            static_cast<ssize_t>(read.aligned_len()));
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskReadLeases(*server_), 1U);
+  Expire();
+  const PreparedRead refused =
+      server_->PrepareReadForKey(key, 0, 0, bytes, sizeof(bytes));
+  EXPECT_EQ(refused.status(), Status::kIOError);
+  EXPECT_TRUE(read.Commit(Status::kOk, read.payload_len(), 0));
+  EXPECT_EQ(read.status(), Status::kOk);
+  EXPECT_FALSE(read.owns_cleanup());
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskReadLeases(*server_), 0U);
+}
+
+TEST_F(LifetimeAdmissionTest, AdmittedPinnedRamReadStillCompletes) {
+  InstallRam();
+  const BlockKey key{99004, 0};
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::InstallDurable(*server_, key, "ram"));
+  PreparedRead old;
+  ASSERT_TRUE(server_->RamPinnedHitForKey(key, 0, 0, &old));
+  Expire();
+  PreparedRead refused;
+  EXPECT_FALSE(server_->RamPinnedHitForKey(key, 0, 0, &refused));
+  EXPECT_TRUE(old.Commit(Status::kOk, 3, 0));
+  EXPECT_FALSE(old.owns_cleanup());
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::PersistenceHealthy(*server_));
+}
+
+TEST_F(LifetimeAdmissionTest, StopDrainsAdmittedWriteBackAndCleanlyReopens) {
+  ASSERT_EQ(server_->Start(0), Status::kOk);
+  FlushBarrier barrier;
+  KvNodeServer* const node = server_.get();
+  KvNodeServerWiringTestPeer::SetRam(
+      *node, [&, node](const BlockKey& key, char* data, size_t len, size_t) {
+        barrier.Block();
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+               Status::kOk;
+      });
+  const std::string address = "127.0.0.1:" + std::to_string(node->port());
+  const BlockKey key{99005, 0};
+  Status result = Status::kInvalid;
+  std::thread client([&] {
+    TcpTransport tcp;
+    tcp.set_timeouts(1000, 5000);
+    result = tcp.Cache(address, key, "accepted", 8);
+  });
+  EXPECT_TRUE(barrier.AwaitEntry());
+  Expire();
+  // New RAM admission must be refused while the old disk-ACK owner is waiting.
+  alignas(4096) char fresh[4096] = {};
+  EXPECT_EQ(node->CacheDirectForKey({99006, 0}, fresh, 3, sizeof(fresh)),
+            Status::kIOError);
+  std::atomic<bool> stopped{false};
+  std::thread stopper([&] {
+    node->Stop();
+    stopped.store(true, std::memory_order_release);
+  });
+  client.join();  // Stop's socket shutdown cancels the waiting client reply.
+  EXPECT_EQ(result, Status::kIOError);
+  EXPECT_FALSE(stopped.load(std::memory_order_acquire));
+  barrier.Open();
+  stopper.join();
+  EXPECT_TRUE(stopped.load(std::memory_order_acquire));
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::PersistenceHealthy(*node));
+  server_.reset();  // Joins RAM flusher before disk writes its clean epoch.
+  options_.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      100, [this] { return seconds_.load(std::memory_order_relaxed); });
+  server_ = KvNodeServerWiringTestPeer::Create(options_);
+  ASSERT_TRUE(server_->Healthy());
+  std::string value;
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server_, key, &value),
+            Status::kOk);
+  EXPECT_EQ(value, "accepted");
+}
+
+TEST_F(LifetimeAdmissionTest, TcpRamHitWorksAtBoundaryAndRejectsAfterIt) {
+  InstallRam();
+  const BlockKey key{99007, 0};
+  ASSERT_TRUE(
+      KvNodeServerWiringTestPeer::InstallDurable(*server_, key, "cached"));
+  ASSERT_EQ(server_->Start(0), Status::kOk);
+  const std::string address = "127.0.0.1:" + std::to_string(server_->port());
+  TcpTransport tcp;
+  tcp.set_timeouts(1000, 5000);
+  seconds_.store(uint64_t{UINT32_MAX} - 100, std::memory_order_relaxed);
+  std::string value;
+  ASSERT_EQ(tcp.Range(address, key, 0, 6, &value), Status::kOk);
+  EXPECT_EQ(value, "cached");
+  seconds_.store(uint64_t{UINT32_MAX} - 99, std::memory_order_relaxed);
+  EXPECT_EQ(tcp.Range(address, key, 0, 6, &value), Status::kIOError);
+  EXPECT_TRUE(server_->Healthy());
+  EXPECT_TRUE(server_->LifetimeRestartRequired());
+}
+
+TEST_F(LifetimeAdmissionTest, RamAckDirtyValueCanDrainAfterNewAdmissionCloses) {
+  ASSERT_EQ(server_->Start(0), Status::kOk);
+  FlushBarrier barrier;
+  KvNodeServer* const node = server_.get();
+  KvNodeServerWiringTestPeer::SetRam(
+      *node,
+      [&, node](const BlockKey& key, char* data, size_t len, size_t) {
+        barrier.Block();
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+               Status::kOk;
+      },
+      true);
+  const BlockKey key{99008, 0};
+  std::string ignored;
+  EXPECT_EQ(node->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                       key, 0, 0, "ram-ack", 7, &ignored),
+            Status::kOk);
+  EXPECT_TRUE(barrier.AwaitEntry());
+  Expire();
+  EXPECT_TRUE(node->LifetimeRestartRequired());
+  barrier.Open();
+  node->Stop();
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::PersistenceHealthy(*node));
+  std::string disk;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node, key, &disk),
+            Status::kOk);
+  EXPECT_EQ(disk, "ram-ack");
+  server_.reset();  // Join the flusher before its captured barrier dies.
+}
+
+TEST_F(LifetimeAdmissionTest, NestedLookupRejectionClearsOldResponse) {
+  const BlockKey key{99009, 0};
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server_, key, "old", 3),
+            Status::kOk);
+  KvNodeServerWiringTestPeer::SetCoalescing(*server_, true);
+  expire_after_sample_.store(true, std::memory_order_relaxed);
+  std::string value = "stale response";
+  size_t total = 99;
+  EXPECT_EQ(
+      server_->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange), key,
+                                    0, 3, nullptr, 0, &value, &total),
+      Status::kIOError);
+  EXPECT_TRUE(value.empty());
+  EXPECT_EQ(total, 0U);
+  EXPECT_TRUE(server_->LifetimeRestartRequired());
+  EXPECT_TRUE(server_->Healthy());
 }
