@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -253,28 +254,48 @@ void KvNodeServer::InitRamTier() {
       o, [this](const BlockKey& k, char* d, size_t l, size_t cap) {
         return group_.CacheDirect(k, d, l, cap) == Status::kOk;
       });
-  // Batched sink: a flush worker's whole dequeue rides one lock-amortized
-  // (and, with a uring build, one-submit) store visit per disk.
-  tier->set_flush_batch([this](const std::vector<RamTier::FlushItem>& items) {
-    std::vector<StoreEngine::CacheBatchItem> b;
-    b.reserve(items.size());
-    for (const auto& it : items)
-      b.push_back(StoreEngine::CacheBatchItem{it.key, it.data, it.len, it.cap});
-    std::vector<Status> sts = group_.CacheDirectBatch(
-        b, [this](size_t disk, size_t objects, uint64_t bytes,
-                  size_t failures, double seconds) {
-          if (disk >= ram_flush_disks_.size()) return;
-          auto& m = *ram_flush_disks_[disk];
-          m.batches.fetch_add(1, std::memory_order_relaxed);
-          m.objects.fetch_add(objects, std::memory_order_relaxed);
-          m.bytes.fetch_add(bytes, std::memory_order_relaxed);
-          m.failures.fetch_add(failures, std::memory_order_relaxed);
-          m.latency.Observe(seconds);
+  // Keep the same per-disk observer for either result channel.
+  const auto observe = [this](size_t disk, size_t objects, uint64_t bytes,
+                              size_t failures, double seconds) {
+    if (disk >= ram_flush_disks_.size()) return;
+    RamFlushDiskMetrics& metrics = *ram_flush_disks_[disk];
+    metrics.batches.fetch_add(1, std::memory_order_relaxed);
+    metrics.objects.fetch_add(objects, std::memory_order_relaxed);
+    metrics.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    metrics.failures.fetch_add(failures, std::memory_order_relaxed);
+    metrics.latency.Observe(seconds);
+  };
+  if (group_.HasLifetimeClock()) {
+    // Retain per-item status/reason for the staged clock owner's shutdown
+    // protocol. This dependency is not a public lifetime-policy switch.
+    tier->set_flush_results(
+        [this](const BlockKey& key, char* data, size_t len, size_t cap) {
+          return group_.CacheDirectWithResult(key, data, len, cap);
+        },
+        [this, observe](const std::vector<RamTier::FlushItem>& items) {
+          std::vector<StoreEngine::CacheBatchItem> batch;
+          batch.reserve(items.size());
+          for (const RamTier::FlushItem& item : items)
+            batch.push_back({item.key, item.data, item.len, item.cap});
+          return group_.CacheDirectBatchWithResults(batch, observe);
         });
-    std::vector<bool> ok(items.size(), false);
-    for (size_t i = 0; i < sts.size(); ++i) ok[i] = (sts[i] == Status::kOk);
-    return ok;
-  });
+  } else {
+    // Preserve normal legacy/file bool failure mapping and completion storage.
+    // One dequeue still uses one lock-amortized store visit per disk.
+    tier->set_flush_batch(
+        [this, observe](const std::vector<RamTier::FlushItem>& items) {
+          std::vector<StoreEngine::CacheBatchItem> batch;
+          batch.reserve(items.size());
+          for (const RamTier::FlushItem& item : items)
+            batch.push_back({item.key, item.data, item.len, item.cap});
+          const std::vector<Status> statuses =
+              group_.CacheDirectBatch(batch, observe);
+          std::vector<bool> ok(items.size(), false);
+          for (size_t i = 0; i < statuses.size(); ++i)
+            ok[i] = statuses[i] == Status::kOk;
+          return ok;
+        });
+  }
   if (tier->ok()) {
     ram_ = std::move(tier);
   } else {
