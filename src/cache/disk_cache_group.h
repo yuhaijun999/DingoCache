@@ -101,6 +101,9 @@ class DiskCacheGroup {
 
   explicit DiskCacheGroup(Options opt);
   bool Healthy() const;
+  // Internal dependency presence, not a policy-enable or clock-health query.
+  // Does not sample time. Normal legacy/file startup has no lifetime clock.
+  bool HasLifetimeClock() const { return lifetime_clock_ != nullptr; }
   // Actively sample the optional shared clock. Once exhausted, rollback cannot
   // clear the restart requirement. Does not mark storage unhealthy, stop new
   // requests, or drain accepted work; the future server gate must do those in
