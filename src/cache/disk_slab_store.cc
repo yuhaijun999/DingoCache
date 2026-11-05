@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/disk_lifetime_clock.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_write_result.h"
 #include "cache/slab_allocator.h"
@@ -541,6 +542,8 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
 
   SlabAllocator::Options ao;
   ao.track_resident_identity = opt_.track_resident_identity;
+  if (opt_.lifetime_clock)
+    ao.can_reclaim = [this] { return CanStartReclaim(); };
   ao.extent_bytes = opt_.extent_bytes;
   ao.num_extents = num_extents_;
   ao.align = static_cast<uint32_t>(opt_.slot_granularity);  // slot_size is a granularity multiple
@@ -1559,15 +1562,27 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       put_flights_.emplace(fn, flight);
       leader = true;
       std::vector<BlockKey> evicted;
-      if (alloc_->Contains(key) || !alloc_->Put(key, len, &ref, &evicted)) {
+      bool reclaim_denied = false;
+      const bool allocated =
+          !alloc_->Contains(key) &&
+          alloc_->PutImpl(key, len, &ref, &evicted, nullptr, &reclaim_denied);
+      // The returned list owns completed invalidations, even if a later
+      // allocation step fails. Never restore those residents' visibility.
+      for (const BlockKey& ev : evicted)
+        evicted_bytes_ += ErasePayloadLocked(ev.Filename());
+      if (!allocated) {
+        DiskWriteResult result{Status::kIOError};
+        if (reclaim_denied && Healthy()) {
+          result.status = Status::kCacheFull;
+          result.reason = DiskWriteReason::kLifetimeClockExhausted;
+        }
         put_flights_.erase(fn);
-        CompletePut(flight, DiskWriteResult{Status::kIOError});
-        return Status::kIOError;
+        CompletePut(flight, result);
+        if (details != nullptr) *details = result;
+        return result.status;
       }
       alloc_->Pin(key);  // write-pin for the unlocked I/O below
       inflight_[fn]++;
-      for (const BlockKey& ev : evicted)
-        evicted_bytes_ += ErasePayloadLocked(ev.Filename());
       break;
     }
   }
@@ -1761,16 +1776,27 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
         st[i].flight = std::make_shared<PutFlight>();
         put_flights_.emplace(st[i].fn, st[i].flight);
         std::vector<BlockKey> evicted;
-        if (alloc_->Contains(it.key) ||
-            !alloc_->Put(it.key, it.len, &st[i].ref, &evicted)) {
+        bool reclaim_denied = false;
+        const bool allocated =
+            !alloc_->Contains(it.key) &&
+            alloc_->PutImpl(it.key, it.len, &st[i].ref, &evicted, nullptr,
+                            &reclaim_denied);
+        for (const BlockKey& ev : evicted)
+          evicted_bytes_ += ErasePayloadLocked(ev.Filename());
+        if (!allocated) {
+          DiskWriteResult result{Status::kIOError};
+          if (reclaim_denied && Healthy()) {
+            result.status = Status::kCacheFull;
+            result.reason = DiskWriteReason::kLifetimeClockExhausted;
+          }
+          out[i] = result.status;
+          if (details != nullptr) (*details)[i] = result;
           put_flights_.erase(st[i].fn);
-          CompletePut(st[i].flight, DiskWriteResult{Status::kIOError});
+          CompletePut(st[i].flight, result);
           break;
         }
         alloc_->Pin(it.key);
         inflight_[st[i].fn]++;
-        for (const BlockKey& ev : evicted)
-          evicted_bytes_ += ErasePayloadLocked(ev.Filename());
         st[i].active = true;
         // Same alignment and padded-capacity eligibility as CacheDirect.
         const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
@@ -2343,10 +2369,18 @@ uint64_t DiskSlabStore::EvictedBytes() const {
 // RECLAIM: then top free slots up to the demand-driven watermark (~2 intervals
 // of the insert rate, capped at 1/4 of bound capacity) in bounded batches per
 // lock hold, so Put never waits behind an inline CLOCK sweep.
+bool DiskSlabStore::CanStartReclaim() const {
+  if (!Healthy()) return false;
+  if (!opt_.lifetime_clock) return true;
+  const DiskLifetimeClock& clock = *opt_.lifetime_clock;
+  uint32_t offset = 0;
+  return clock.TryDrainNow(&offset);
+}
+
 void DiskSlabStore::ReclaimTick(
     const std::function<void()>& after_watermark_evict,
     const std::function<void()>& before_lock_for_test) {
-  if (!Healthy()) return;
+  if (!CanStartReclaim()) return;
   // Private test seam: pause work already admitted, before acquiring mu_.
   if (before_lock_for_test) before_lock_for_test();
   // Successful NEW commits renew pressure eligibility. Inactive history
@@ -2355,6 +2389,7 @@ void DiskSlabStore::ReclaimTick(
   if (evict_high_bytes_ != 0) {
     const auto started = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(mu_);
+    if (!CanStartReclaim()) return;
     const uint64_t used = alloc_->UsedBytes();
     // Retain the exact input of the unchanged high predicate before eviction.
     if (used > evict_high_bytes_) {
@@ -2401,6 +2436,7 @@ void DiskSlabStore::ReclaimTick(
       watermark_latch_.EndTick(alloc_->UsedBytes(), evict_low_bytes_);
     }
   }
+  if (!CanStartReclaim()) return;
   const auto classes = alloc_->Classes();
   if (reclaim_last_puts_.size() < classes.size())
     reclaim_last_puts_.resize(classes.size(), 0);
@@ -2422,6 +2458,7 @@ void DiskSlabStore::ReclaimTick(
           (want - free_now + c.slots_per_extent - 1) / c.slots_per_extent;
       need_ext = std::min<size_t>(need_ext, kGrowExtentsPerTick);
       while (need_ext > 0) {
+        if (!CanStartReclaim()) return;
         size_t donor = classes.size();
         for (size_t d = 0; d < classes.size(); ++d) {  // coldest, then biggest
           if (d == i || extents[d] <= SlabAllocator::kStripeWays) continue;
@@ -2436,6 +2473,7 @@ void DiskSlabStore::ReclaimTick(
         bool ok;
         {
           std::lock_guard<std::mutex> lk(mu_);
+          if (!CanStartReclaim()) return;
           ok = alloc_->StealFrom(donor, i, &evicted);
           for (const BlockKey& key : evicted)
             evicted_bytes_ += ErasePayloadLocked(key.Filename());
@@ -2458,6 +2496,7 @@ void DiskSlabStore::ReclaimTick(
       size_t got;
       {
         std::lock_guard<std::mutex> lk(mu_);
+        if (!CanStartReclaim()) return;
         got = alloc_->ReclaimClass(i, target, batch, &evicted);
         for (const BlockKey& key : evicted)
           evicted_bytes_ += ErasePayloadLocked(key.Filename());

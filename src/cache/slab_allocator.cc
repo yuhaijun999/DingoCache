@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "common/config_dump.h"
 #include "common/kv_types.h"
@@ -426,13 +427,25 @@ void SlabAllocator::TouchLocked(uint32_t index) {
   extent.heat_seq = activity_seq_;
 }
 
+bool SlabAllocator::ReclaimAllowed(bool* reclaim_denied) const {
+  if (reclaim_denied != nullptr && *reclaim_denied) return false;
+  if (!opt_.can_reclaim || opt_.can_reclaim()) return true;
+  if (reclaim_denied != nullptr) *reclaim_denied = true;
+  return false;
+}
+
 SlabAllocator::ExtentBindResult SlabAllocator::BindExtentLocked(
-    size_t cls_index, uint32_t extent_index, bool metadata_prepared) {
+    size_t cls_index, uint32_t extent_index, bool metadata_prepared,
+    bool* reclaim_denied) {
   if (cls_index >= classes_.size() || extent_index >= extents_.size() ||
       extents_[extent_index].cls != kUnbound)
     return ExtentBindResult::kUnavailable;
   Class& cls = classes_[cls_index];
   if (cls.slots_per_extent == 0) return ExtentBindResult::kUnavailable;
+  // A successful wipe authorizes its cleanup/final binding even if the guard
+  // closes during persistence. Restore also installs prevalidated metadata.
+  if (!metadata_prepared && !ReclaimAllowed(reclaim_denied))
+    return ExtentBindResult::kReclaimDenied;
   if (!metadata_prepared && opt_.on_extent_bind &&
       !opt_.on_extent_bind(extent_index))
     return ExtentBindResult::kPersistenceError;
@@ -449,15 +462,16 @@ SlabAllocator::ExtentBindResult SlabAllocator::BindExtentLocked(
   return ExtentBindResult::kBound;
 }
 
-SlabAllocator::ExtentBindResult SlabAllocator::BindFreeExtent(size_t cls) {
+SlabAllocator::ExtentBindResult SlabAllocator::BindFreeExtent(
+    size_t cls, bool* reclaim_denied) {
   if (unbound_ == 0) return ExtentBindResult::kUnavailable;
+  if (!ReclaimAllowed(reclaim_denied)) return ExtentBindResult::kReclaimDenied;
   for (uint32_t extent = 0; extent < extents_.size(); ++extent) {
     if (extents_[extent].cls == kUnbound)
-      return BindExtentLocked(cls, extent, false);
+      return BindExtentLocked(cls, extent, false, reclaim_denied);
   }
   return ExtentBindResult::kUnavailable;
 }
-
 
 bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
   std::lock_guard<std::mutex> lock(mu_);
@@ -606,12 +620,14 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
 }
 
 bool SlabAllocator::EvictOneFrom(size_t cls_index,
-                                 std::vector<BlockKey>* evicted) {
+                                 std::vector<BlockKey>* evicted,
+                                 bool* reclaim_denied) {
   Class& cls = classes_[cls_index];
   if (cls.resident_count == 0) return false;
   const size_t limit = 2 * cls.resident_count + 2;
   uint32_t fallback = kNoSlot;
   for (size_t steps = 0; steps < limit && cls.resident_count != 0; ++steps) {
+    if (!ReclaimAllowed(reclaim_denied)) return false;
     if (cls.hand == kNoSlot) cls.hand = cls.ring_head;
     const uint32_t current = cls.hand;
     SlotMeta& meta = slots_[current];
@@ -622,6 +638,7 @@ bool SlabAllocator::EvictOneFrom(size_t cls_index,
       meta.referenced = false;
       continue;
     }
+    if (!ReclaimAllowed(reclaim_denied)) return false;
     if (opt_.on_slot_evict && !opt_.on_slot_evict(meta.ref)) return false;
     BlockKey victim = meta.key;
     FreeSlotLocked(current);
@@ -631,6 +648,7 @@ bool SlabAllocator::EvictOneFrom(size_t cls_index,
   }
   if (fallback != kNoSlot && slots_[fallback].live) {
     SlotMeta& meta = slots_[fallback];
+    if (!ReclaimAllowed(reclaim_denied)) return false;
     if (opt_.on_slot_evict && !opt_.on_slot_evict(meta.ref)) return false;
     BlockKey victim = meta.key;
     FreeSlotLocked(fallback);
@@ -642,8 +660,9 @@ bool SlabAllocator::EvictOneFrom(size_t cls_index,
 }
 
 SlabAllocator::ExtentBindResult SlabAllocator::StealExtentFor(
-    size_t target_cls, std::vector<BlockKey>* evicted,
-    size_t min_donor_extents) {
+    size_t target_cls, std::vector<BlockKey>* evicted, size_t min_donor_extents,
+    bool* reclaim_denied) {
+  if (!ReclaimAllowed(reclaim_denied)) return ExtentBindResult::kReclaimDenied;
   int best = -1;
   uint64_t best_heat = std::numeric_limits<uint64_t>::max();
   uint64_t best_useful = std::numeric_limits<uint64_t>::max();
@@ -668,12 +687,14 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentFor(
     }
   }
   if (best < 0) return ExtentBindResult::kUnavailable;
-  return StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted);
+  return StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted,
+                           reclaim_denied);
 }
 
 SlabAllocator::ExtentBindResult SlabAllocator::StealColdExtentFor(
-    size_t target_cls, std::vector<BlockKey>* evicted) {
+    size_t target_cls, std::vector<BlockKey>* evicted, bool* reclaim_denied) {
   if (!cold_steal_enabled_) return ExtentBindResult::kUnavailable;
+  if (!ReclaimAllowed(reclaim_denied)) return ExtentBindResult::kReclaimDenied;
   const uint64_t window = cold_window_ ? cold_window_ : index_.size();
   if (window == 0 || put_seq_ <= window) return ExtentBindResult::kUnavailable;
   const uint64_t cold_before = put_seq_ - window;
@@ -699,15 +720,15 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealColdExtentFor(
     }
   }
   if (best < 0) return ExtentBindResult::kUnavailable;
-  const ExtentBindResult result =
-      StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted);
+  const ExtentBindResult result = StealExtentLocked(
+      static_cast<uint32_t>(best), target_cls, evicted, reclaim_denied);
   if (result == ExtentBindResult::kBound) ++cold_steals_;
   return result;
 }
 
 SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
-    uint32_t extent_index, size_t target_cls,
-    std::vector<BlockKey>* evicted) {
+    uint32_t extent_index, size_t target_cls, std::vector<BlockKey>* evicted,
+    bool* reclaim_denied) {
   ExtentMeta& extent = extents_[extent_index];
   const int old_cls = extent.cls;
   if (old_cls == kUnbound || target_cls >= classes_.size() ||
@@ -715,6 +736,7 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
     return ExtentBindResult::kUnavailable;
 
   // The durable extent wipe happens before any resident is forgotten.
+  if (!ReclaimAllowed(reclaim_denied)) return ExtentBindResult::kReclaimDenied;
   if (opt_.on_extent_bind && !opt_.on_extent_bind(extent_index))
     return ExtentBindResult::kPersistenceError;
   while (extent.resident_head != kNoSlot) {
@@ -742,6 +764,7 @@ bool SlabAllocator::StealFrom(size_t donor_cls, size_t target_cls,
   if (donor_cls == target_cls || donor_cls >= classes_.size() ||
       target_cls >= classes_.size() || classes_[target_cls].slots_per_extent == 0)
     return false;
+  if (!ReclaimAllowed()) return false;
   int best = -1;
   uint64_t best_heat = std::numeric_limits<uint64_t>::max();
   uint64_t best_useful = std::numeric_limits<uint64_t>::max();
@@ -768,7 +791,16 @@ bool SlabAllocator::StealFrom(size_t donor_cls, size_t target_cls,
 bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
                         std::vector<BlockKey>* evicted,
                         SlotHandle* out_handle) {
+  return PutImpl(key, len, out, evicted, out_handle, nullptr);
+}
+
+bool SlabAllocator::PutImpl(const BlockKey& key, size_t len, SlotRef* out,
+                            std::vector<BlockKey>* evicted,
+                            SlotHandle* out_handle, bool* reclaim_denied) {
   std::lock_guard<std::mutex> lock(mu_);
+  bool local_denied = false;
+  if (reclaim_denied == nullptr) reclaim_denied = &local_denied;
+  *reclaim_denied = false;
   if (out_handle) *out_handle = SlotHandle{};
   ++activity_seq_;
   if (uint32_t* existing = index_.Find(key)) {
@@ -789,23 +821,33 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
   for (;;) {
     Class& cls = classes_[cls_index];
     while (cls.ext_rr.size() < kStripeWays) {
-      const ExtentBindResult bind = BindFreeExtent(cls_index);
+      const ExtentBindResult bind = BindFreeExtent(cls_index, reclaim_denied);
       if (bind == ExtentBindResult::kBound) continue;
       if (bind == ExtentBindResult::kPersistenceError) return false;
       break;
     }
-    if (PopFreeLocked(cls, &placement)) break;
+    if (PopFreeLocked(cls, &placement)) {
+      *reclaim_denied =
+          false;  // The actual allocation no longer needs reclaim.
+      break;
+    }
+    if (*reclaim_denied) return false;
     if (cls.bound_extents < kStripeWays) {
       const ExtentBindResult grow =
-          StealExtentFor(cls_index, evicted, kStripeWays);
+          StealExtentFor(cls_index, evicted, kStripeWays, reclaim_denied);
       if (grow == ExtentBindResult::kBound) continue;
-      if (grow == ExtentBindResult::kPersistenceError) return false;
+      if (grow == ExtentBindResult::kPersistenceError || *reclaim_denied)
+        return false;
     }
-    const ExtentBindResult cold = StealColdExtentFor(cls_index, evicted);
+    const ExtentBindResult cold =
+        StealColdExtentFor(cls_index, evicted, reclaim_denied);
     if (cold == ExtentBindResult::kBound) continue;
-    if (cold == ExtentBindResult::kPersistenceError) return false;
-    if (EvictOneFrom(cls_index, evicted)) continue;
-    const ExtentBindResult steal = StealExtentFor(cls_index, evicted);
+    if (cold == ExtentBindResult::kPersistenceError || *reclaim_denied)
+      return false;
+    if (EvictOneFrom(cls_index, evicted, reclaim_denied)) continue;
+    if (*reclaim_denied) return false;
+    const ExtentBindResult steal =
+        StealExtentFor(cls_index, evicted, 0, reclaim_denied);
     if (steal == ExtentBindResult::kBound) continue;
     if (steal == ExtentBindResult::kPersistenceError) return false;
     return false;
@@ -987,6 +1029,7 @@ size_t SlabAllocator::EvictColdToTarget(uint64_t target_bytes,
        steps < limit && freed < max_victims && used_bytes_ > target_bytes &&
        global_hand_ != kNoSlot;
        ++steps) {
+    if (!ReclaimAllowed()) break;
     ++watermark_scan_steps_;
     const uint32_t index = global_hand_;
     SlotMeta& meta = slots_[index];
@@ -1000,6 +1043,7 @@ size_t SlabAllocator::EvictColdToTarget(uint64_t target_bytes,
     // Leave reference credit to class-local CLOCK; it must not postpone an
     // older resident past more recent reads or writes here.
 
+    if (!ReclaimAllowed()) break;
     const ExtentMeta& extent = extents_[meta.ref.extent];
     if (extent.resident_count == 1 && opt_.on_extent_evict) {
       if (!opt_.on_extent_evict(meta.ref.extent, extent.total_slots, 1))
