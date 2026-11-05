@@ -10,7 +10,9 @@
 #include "client/node_dedup.h"
 #include "client/key_map.h"
 #include "cache/disk_cache_group.h"
+#include "cache/disk_lifetime_clock.h"
 #include "cache/kv_node_server.h"
+#include "cache/ram_tier.h"
 #include "cache/rdma_server.h"
 #include "cache/store_engine.h"
 #include "common/config_dump.h"
@@ -29,6 +31,7 @@
 #include <gtest/gtest.h>
 #include <sys/mman.h>  // shm_unlink (node-dedup test)
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -64,6 +67,9 @@ using namespace dfkv;  // NOLINT
 namespace dfkv {
 class KvNodeServerTestPeer {
  public:
+  static uint64_t DiskReadLeases(const KvNodeServer& server) {
+    return server.group_.SlabStats().prep_holds;
+  }
   static RamTier& Ram(KvNodeServer& server) { return *server.ram_; }
   static uint64_t GetLatencyCount(const KvNodeServer& server) {
     return server.get_lat_.Count();
@@ -88,6 +94,9 @@ class KvNodeServerTestPeer {
 };
 class RdmaServerTestPeer {
  public:
+  static bool AdmitPullGrant(RdmaServer& server, PreparedRead& read) {
+    return server.AdmitPullGrant(read);
+  }
   using DiscoverFn = std::function<rdma::RdmaDiscoveryResult(
       const std::vector<std::string>&, rdma::RdmaDiscoveryPolicy)>;
   using InitializeAnchorFn = std::function<std::unique_ptr<rdma::RcEndpoint>(
@@ -350,6 +359,117 @@ class ScopedEnv {
   std::string old_;
   bool had_old_ = false;
 };
+
+// These admission/ownership tests need no QP, MR registration or RDMA device.
+class RdmaPullAdmissionTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ =
+        fs::temp_directory_path() /
+        ("dfkv_pull_admission_" +
+         std::to_string(
+             ::testing::UnitTest::GetInstance()->current_test_info()->line()));
+    fs::remove_all(dir_);
+    node_ = std::make_unique<KvNodeServer>(dir_.string(), 1ull << 30);
+    ASSERT_TRUE(node_->Healthy());
+    ASSERT_EQ(node_->CacheDirectForKey(key_, value_, 5, 5), Status::kOk);
+  }
+  void TearDown() override {
+    node_.reset();
+    fs::remove_all(dir_);
+  }
+  PreparedRead Prepare() {
+    return node_->PrepareReadForKey(key_, 0, 5, staging_, sizeof(staging_));
+  }
+  const ScopedEnv slab_{"DFKV_STORE_ENGINE", "slab"};
+  const ScopedEnv ram_off_{"DFKV_RAM_TIER", "0"};
+  const ScopedEnv buffered_{"DFKV_SLAB_WRITE", "buffered"};
+  const ScopedEnv granularity_{"DFKV_SLAB_GRANULARITY", "1048576"};
+  const ScopedEnv sync_{"DFKV_SLAB_TABLE_SYNC_MS", "0"};
+  const ScopedEnv reclaim_{"DFKV_SLAB_RECLAIM_MS", "0"};
+  fs::path dir_;
+  std::unique_ptr<KvNodeServer> node_;
+  RdmaServer transport_{RdmaServer::Handler{}, kMaxMsg};
+  const BlockKey key_{99101, 0};
+  char value_[6] = "value";
+  alignas(4096) char staging_[4096] = {};
+};
+
+TEST_F(RdmaPullAdmissionTest, EmptyPredicateKeepsPreparationActive) {
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_TRUE(read.needs_io());
+  EXPECT_TRUE(RdmaServerTestPeer::AdmitPullGrant(transport_, read));
+  EXPECT_TRUE(read.owns_cleanup());
+  EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 1U);
+  EXPECT_TRUE(read.Abort());
+  EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 0U);
+}
+
+TEST_F(RdmaPullAdmissionTest, BoundaryAllowsButExhaustionAbortsBeforeRetry) {
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(100, [&] { return seconds; });
+  transport_.SetRestartRequiredHandler([&] {
+    uint32_t offset = 0;
+    return !clock.TryNow(&offset);
+  });
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  seconds = uint64_t{UINT32_MAX} - 100;
+  EXPECT_TRUE(RdmaServerTestPeer::AdmitPullGrant(transport_, read));
+  EXPECT_TRUE(read.owns_cleanup());
+  ++seconds;
+  // Models a second admission attempt after an unsuccessful registration.
+  EXPECT_FALSE(RdmaServerTestPeer::AdmitPullGrant(transport_, read));
+  EXPECT_EQ(read.status(), Status::kIOError);
+  EXPECT_FALSE(read.owns_cleanup());
+  EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 0U);
+  EXPECT_FALSE(read.Commit(Status::kOk, 5, 0));
+  seconds = 0;
+  EXPECT_FALSE(RdmaServerTestPeer::AdmitPullGrant(transport_, read));
+}
+
+TEST_F(RdmaPullAdmissionTest, CompletedStorageCanAbortBeforeGrantSuccess) {
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_EQ(::pread(read.fd(), read.staging(), read.aligned_len(),
+                    static_cast<off_t>(read.aligned_off())),
+            static_cast<ssize_t>(read.aligned_len()));
+  ASSERT_EQ(read.FinishStorage(Status::kOk, 5), Status::kOk);
+  EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 0U);
+  transport_.SetRestartRequiredHandler([] { return true; });
+  EXPECT_FALSE(RdmaServerTestPeer::AdmitPullGrant(transport_, read));
+  EXPECT_FALSE(read.owns_cleanup());
+  EXPECT_EQ(read.status(), Status::kIOError);
+  EXPECT_FALSE(read.Commit(Status::kOk, 5, 0));
+  EXPECT_TRUE(node_->Healthy());
+}
+
+TEST_F(RdmaPullAdmissionTest,
+       PinnedRamRefusalReleasesWithoutSuccessAccounting) {
+  const ScopedEnv ram_on("DFKV_RAM_TIER", "1");
+  const ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
+  const ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
+  const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+  node_.reset();
+  node_ = std::make_unique<KvNodeServer>(dir_.string(), 1ull << 30);
+  ASSERT_TRUE(node_->ram_enabled());
+  RamTier& ram = KvNodeServerTestPeer::Ram(*node_);
+  ASSERT_TRUE(ram.PutDurable(key_, value_, 5));
+  const uint64_t hits = ram.Hits();
+  PreparedRead read;
+  ASSERT_TRUE(node_->RamPinnedHitForKey(key_, 0, 5, &read));
+  EXPECT_TRUE(ram.Remove(key_));
+  EXPECT_GT(ram.UsedBytes(), 0U);  // Removal must retain the pinned slot.
+  transport_.SetRestartRequiredHandler([] { return true; });
+  EXPECT_FALSE(RdmaServerTestPeer::AdmitPullGrant(transport_, read));
+  EXPECT_FALSE(read.owns_cleanup());
+  EXPECT_FALSE(read.Commit(Status::kOk, 5, 0));
+  EXPECT_EQ(ram.Hits(), hits);
+  EXPECT_EQ(ram.UsedBytes(), 0U);  // Abort released the last physical pin.
+  EXPECT_TRUE(node_->Healthy());
+}
 
 std::string SelfHdr() { return "test/model"; }
 void ConfigureTestRecvSegment() {
