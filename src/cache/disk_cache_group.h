@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/disk_lifetime_clock.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
@@ -92,10 +93,20 @@ class DiskCacheGroup {
     // Explicit choice overrides DFKV_SLAB_EVICTION_POLICY, including an empty
     // value (invalid). Unset reads the environment, then requests the default.
     std::optional<std::string> eviction_policy{};
+    // Internal staging injection, shared by all real slabs before recovery.
+    // Empty in normal legacy/file startup. Not a policy enable switch or a
+    // complete admission/drain gate; file and custom engines reject injection.
+    std::shared_ptr<DiskLifetimeClock> lifetime_clock{};
   };
 
   explicit DiskCacheGroup(Options opt);
   bool Healthy() const;
+  // Actively sample the optional shared clock. Once exhausted, rollback cannot
+  // clear the restart requirement. Does not mark storage unhealthy, stop new
+  // requests, or drain accepted work; the future server gate must do those in
+  // order while allowing storage persistence to finish. Null clock returns
+  // false.
+  bool LifetimeRestartRequired() const;
   const std::string& StartupError() const { return startup_error_; }
 
   Status Cache(const BlockKey& key, const void* data, size_t len);
@@ -191,6 +202,7 @@ class DiskCacheGroup {
   }
 
  private:
+  friend class DiskCacheGroupTestPeer;
   template <typename WriteFn>
   Status CacheOne(const BlockKey& key, const void* data, size_t len,
                   const WriteFn& write);
@@ -214,6 +226,8 @@ class DiskCacheGroup {
   std::string startup_error_;
   std::string engine_;      // resolved backend name (see EngineName)
   std::string write_mode_;  // resolved slab I/O mode (see WriteMode)
+  // Outlives disks; each slab also retains the same shared dependency.
+  std::shared_ptr<DiskLifetimeClock> lifetime_clock_;
   std::vector<std::unique_ptr<StoreEngine>> disks_;
   std::vector<const DiskSlabStore*> slabs_;  // typed view of disks_ (slab engine only)
   std::unordered_map<std::string, size_t> by_id_;  // disk id -> stable index

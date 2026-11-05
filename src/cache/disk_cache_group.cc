@@ -332,6 +332,18 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   }
   const bool use_slab = config.engine == DiskEvictionEngine::kSlab;
   engine_ = use_slab ? "slab" : "file";
+  if (opt.lifetime_clock) {
+    if (!use_slab || opt.engine_factory) {
+      fail("lifetime clock requires real slab engines");
+      return;
+    }
+    uint32_t offset = 0;
+    if (!opt.lifetime_clock->TryNow(&offset)) {
+      fail("lifetime clock is invalid or exhausted; a new clock is required");
+      return;
+    }
+    lifetime_clock_ = std::move(opt.lifetime_clock);
+  }
 
   int disk_weight = 1;
   if (!ResolveDiskHashWeight(&disk_weight)) {
@@ -420,6 +432,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       if (slab_gran) so.slot_granularity = slab_gran;
       so.table_sync_ms = sync_ms;
       so.reclaim_interval_ms = reclaim_ms;
+      so.lifetime_clock = lifetime_clock_;
       std::string error;
       if (!DiskSlabStore::ValidateGeometry(so, &error)) {
         fail(so.dir + ": " + error +
@@ -487,6 +500,11 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
                   ", points min=" + std::to_string(min_points) +
                   " max=" + std::to_string(max_points));
   }
+}
+
+bool DiskCacheGroup::LifetimeRestartRequired() const {
+  uint32_t offset = 0;
+  return lifetime_clock_ && !lifetime_clock_->TryNow(&offset);
 }
 
 bool DiskCacheGroup::Healthy() const {

@@ -37,6 +37,7 @@
 
 namespace dfkv {
 
+class DiskLifetimeClock;
 class DiskSlabStoreTestPeer;
 
 class DiskSlabStore : public StoreEngine {
@@ -77,6 +78,9 @@ class DiskSlabStore : public StoreEngine {
     // leaves this off until identity/result propagation is integrated. Legacy
     // stores allocate no identity table and retain existing eviction behavior.
     bool track_resident_identity = false;
+    // Shared process origin, installed before any disk recovery. Internal
+    // staging dependency only: does not enable scoring or gate storage I/O.
+    std::shared_ptr<DiskLifetimeClock> lifetime_clock{};
   };
 
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).

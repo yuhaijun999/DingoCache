@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -16,6 +17,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <ios>
 #include <iterator>
 #include <limits>
@@ -27,10 +30,13 @@
 #include <string_view>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
+#include "cache/disk_lifetime_clock.h"
 #include "cache/disk_slab_store.h"
 #include "cache/kv_node_server.h"
+#include "cache/store_engine.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -1263,4 +1269,241 @@ TEST_F(DiskGroupTest, ConfiguredQuotaFileFailsClosed) {
     EXPECT_FALSE(group.Healthy());
     EXPECT_NE(group.StartupError().find("malformed"), std::string::npos);
   }
+}
+
+namespace dfkv {
+class DiskCacheGroupTestPeer {
+ public:
+  static const DiskLifetimeClock* Clock(const DiskCacheGroup& group) {
+    return group.lifetime_clock_.get();
+  }
+  static const DiskSlabStore& Slab(const DiskCacheGroup& group, size_t index) {
+    return *group.slabs_.at(index);
+  }
+  static DiskSlabStore* SlabForKey(DiskCacheGroup* group, const BlockKey& key) {
+    return static_cast<DiskSlabStore*>(group->Route(key));
+  }
+};
+
+class DiskSlabStoreTestPeer {
+ public:
+  static const DiskLifetimeClock* Clock(const DiskSlabStore& store) {
+    return store.opt_.lifetime_clock.get();
+  }
+  static void SetPayloadWriteHook(DiskSlabStore* store,
+                                  std::function<bool()> hook) {
+    store->payload_write_hook_for_test_ = std::move(hook);
+  }
+};
+}  // namespace dfkv
+
+class SharedLifetimeClockTest : public DiskGroupTest {
+ protected:
+  DiskCacheGroup::Options Options() const {
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {(base_ / "a").string(), (base_ / "b").string()};
+    options.capacity_bytes = 2ull << 30;
+    options.engine = "slab";
+    options.eviction_policy = "legacy";
+    return options;
+  }
+  const ScopedEnv write_mode_{"DFKV_SLAB_WRITE", "buffered"};
+  const ScopedEnv sync_{"DFKV_SLAB_TABLE_SYNC_MS", "0"};
+  const ScopedEnv reclaim_{"DFKV_SLAB_RECLAIM_MS", "0"};
+  const ScopedEnv granularity_{"DFKV_SLAB_GRANULARITY", "1048576"};
+};
+
+TEST_F(SharedLifetimeClockTest, DefaultLeavesBothDisksWithoutLifetimeClock) {
+  const DiskCacheGroup group(Options());
+  ASSERT_TRUE(group.Healthy()) << group.StartupError();
+  EXPECT_EQ(DiskCacheGroupTestPeer::Clock(group), nullptr);
+  EXPECT_FALSE(group.LifetimeRestartRequired());
+  for (size_t i = 0; i < 2; ++i)
+    EXPECT_EQ(
+        DiskSlabStoreTestPeer::Clock(DiskCacheGroupTestPeer::Slab(group, i)),
+        nullptr);
+}
+
+TEST_F(SharedLifetimeClockTest, RealDisksShareOriginAndStickyRestartSignal) {
+  uint64_t seconds = 100;
+  const std::shared_ptr<DiskLifetimeClock> clock =
+      std::make_shared<DiskLifetimeClock>(100, [&] { return seconds; });
+  DiskCacheGroup::Options options = Options();
+  options.lifetime_clock = clock;
+  seconds = 117;  // Group/disk construction must not start a new origin.
+  const DiskCacheGroup group(options);
+  ASSERT_TRUE(group.Healthy()) << group.StartupError();
+  EXPECT_EQ(DiskCacheGroupTestPeer::Clock(group), clock.get());
+  for (size_t i = 0; i < 2; ++i) {
+    const DiskLifetimeClock* disk_clock =
+        DiskSlabStoreTestPeer::Clock(DiskCacheGroupTestPeer::Slab(group, i));
+    ASSERT_EQ(disk_clock, clock.get());
+    uint32_t offset = 99;
+    ASSERT_TRUE(disk_clock->TryNow(&offset));
+    EXPECT_EQ(offset, 17U);
+  }
+  const uint64_t limit = uint64_t{UINT32_MAX} - 100;
+  for (const uint64_t elapsed : {limit - 1, limit}) {
+    seconds = 100 + elapsed;
+    EXPECT_FALSE(group.LifetimeRestartRequired());
+  }
+  seconds = 100 + limit + 1;
+  EXPECT_TRUE(group.LifetimeRestartRequired());
+  seconds = 100;
+  EXPECT_TRUE(group.LifetimeRestartRequired());
+  EXPECT_TRUE(group.Healthy());  // Restart need is not a metadata I/O failure.
+}
+
+TEST_F(SharedLifetimeClockTest, InvalidOrExhaustedClockRejectsBeforeOpen) {
+  uint64_t seconds = 100;
+  const std::shared_ptr<DiskLifetimeClock> invalid =
+      std::make_shared<DiskLifetimeClock>(0, [&] { return seconds; });
+  const std::shared_ptr<DiskLifetimeClock> exhausted =
+      std::make_shared<DiskLifetimeClock>(100, [&] { return seconds; });
+  seconds += UINT32_MAX;
+  for (const std::shared_ptr<DiskLifetimeClock>& clock : {invalid, exhausted}) {
+    DiskCacheGroup::Options options = Options();
+    options.lifetime_clock = clock;
+    const DiskCacheGroup group(options);
+    EXPECT_FALSE(group.Healthy());
+    EXPECT_NE(group.StartupError().find("clock"), std::string::npos);
+    EXPECT_FALSE(fs::exists(base_));
+  }
+}
+
+TEST_F(SharedLifetimeClockTest, FileAndCustomFactoryRejectClockBeforeOpen) {
+  const std::shared_ptr<DiskLifetimeClock> clock =
+      std::make_shared<DiskLifetimeClock>(100);
+  for (const bool custom : {false, true}) {
+    DiskCacheGroup::Options options = Options();
+    options.lifetime_clock = clock;
+    options.engine = custom ? "slab" : "file";
+    unsigned calls = 0;
+    if (custom) {
+      options.engine_factory = [&](const std::string&, uint64_t) {
+        ++calls;
+        return std::unique_ptr<StoreEngine>();
+      };
+    }
+    const DiskCacheGroup group(options);
+    EXPECT_FALSE(group.Healthy());
+    EXPECT_NE(group.StartupError().find("clock"), std::string::npos);
+    EXPECT_EQ(calls, 0U);
+    EXPECT_FALSE(fs::exists(base_));
+  }
+}
+
+TEST_F(SharedLifetimeClockTest,
+       RestartSignalDoesNotPreventWriteOrCleanRecovery) {
+  std::atomic<uint64_t> seconds{100};
+  const std::shared_ptr<DiskLifetimeClock> clock =
+      std::make_shared<DiskLifetimeClock>(100, [&] { return seconds.load(); });
+  DiskCacheGroup::Options options = Options();
+  options.lifetime_clock = clock;
+  const BlockKey key{7001, 0, 0};
+  {
+    DiskCacheGroup group(options);
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    std::promise<void> entered;
+    const std::future<void> blocked = entered.get_future();
+    std::promise<void> release;
+    const std::future<void> released = release.get_future();
+    DiskSlabStoreTestPeer::SetPayloadWriteHook(
+        DiskCacheGroupTestPeer::SlabForKey(&group, key), [&] {
+          entered.set_value();
+          released.wait();
+          return true;
+        });
+    Status result = Status::kInvalid;
+    std::thread writer([&] { result = group.Cache(key, "value", 5); });
+    const bool paused =
+        blocked.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    EXPECT_TRUE(paused);
+    seconds.store(uint64_t{UINT32_MAX} + 100);
+    EXPECT_TRUE(group.LifetimeRestartRequired());
+    EXPECT_TRUE(group.Healthy());
+    release.set_value();
+    writer.join();
+    EXPECT_EQ(result, Status::kOk);
+    EXPECT_EQ(group.SlabStats().metadata_io_errors, 0U);
+    // No successful timestamp event is installed in this prerequisite slice.
+  }
+  options.lifetime_clock =
+      std::make_shared<DiskLifetimeClock>(100, [&] { return seconds.load(); });
+  DiskCacheGroup reopened(options);
+  ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+  EXPECT_FALSE(reopened.LifetimeRestartRequired());
+  EXPECT_EQ(reopened.SlabStats().unclean_resets, 0U);
+  EXPECT_EQ(reopened.SlabStats().table_rebuilt, 1U);
+  std::string value;
+  ASSERT_EQ(reopened.Range(key, 0, 0, &value), Status::kOk);
+  EXPECT_EQ(value, "value");
+  uint32_t offset = 99;
+  ASSERT_TRUE(options.lifetime_clock->TryNow(&offset));
+  EXPECT_EQ(offset, 0U);
+  EXPECT_FALSE(clock->TryNow(&offset));  // Old clock never revives.
+}
+
+TEST_F(SharedLifetimeClockTest, RejectedClockLeavesExistingMetadataUnchanged) {
+  DiskCacheGroup::Options options = Options();
+  {
+    DiskCacheGroup group(options);
+    ASSERT_TRUE(group.Healthy());
+    ASSERT_EQ(group.Cache({7002, 0, 0}, "saved", 5), Status::kOk);
+  }
+  const auto snapshot = [&] {
+    std::vector<std::string> bytes;
+    for (const std::string& dir : options.cache_dirs) {
+      for (const char* name :
+           {"slab_meta", "slab_state", "slab_initializing", "slots.tbl"}) {
+        const fs::path path = fs::path(dir) / name;
+        if (!fs::exists(path)) {
+          bytes.emplace_back("absent");
+          continue;
+        }
+        std::ifstream input(path, std::ios::binary);
+        EXPECT_TRUE(input.is_open());
+        bytes.push_back("present:" +
+                        std::string(std::istreambuf_iterator<char>(input),
+                                    std::istreambuf_iterator<char>()));
+      }
+    }
+    return bytes;
+  };
+  const std::vector<std::string> before = snapshot();
+  uint64_t seconds = 0;
+  options.lifetime_clock =
+      std::make_shared<DiskLifetimeClock>(100, [&] { return seconds; });
+  seconds = UINT32_MAX;
+  {
+    const DiskCacheGroup rejected(options);
+    EXPECT_FALSE(rejected.Healthy());
+    EXPECT_EQ(rejected.DiskCount(), 0U);
+  }
+  EXPECT_EQ(snapshot(), before);
+}
+
+TEST_F(SharedLifetimeClockTest, ConcurrentPollingSharesExhaustion) {
+  std::atomic<uint64_t> seconds{0};
+  DiskCacheGroup::Options options = Options();
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      100, [&] { return seconds.load(std::memory_order_relaxed); });
+  const DiskCacheGroup group(options);
+  ASSERT_TRUE(group.Healthy());
+  seconds.store(UINT32_MAX, std::memory_order_relaxed);
+  std::atomic<unsigned> missed{0};
+  std::vector<std::thread> pollers;
+  for (unsigned i = 0; i < 4; ++i) {
+    pollers.emplace_back([&] {
+      for (unsigned sample = 0; sample < 100; ++sample) {
+        if (!group.LifetimeRestartRequired())
+          missed.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (std::thread& poller : pollers) poller.join();
+  EXPECT_EQ(missed.load(std::memory_order_relaxed), 0U);
+  seconds.store(0, std::memory_order_relaxed);
+  EXPECT_TRUE(group.LifetimeRestartRequired());
+  EXPECT_TRUE(group.Healthy());
 }
