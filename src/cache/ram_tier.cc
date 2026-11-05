@@ -69,8 +69,11 @@ size_t RamTier::DurableReservation::capacity() const noexcept {
   return state_ ? static_cast<size_t>(state_->cap) : 0;
 }
 
-bool RamTier::DurableReservation::Commit() noexcept {
-  return state_ && state_->owner->CommitReservation(this);
+bool RamTier::DurableReservation::Commit() noexcept { return Commit({}); }
+
+bool RamTier::DurableReservation::Commit(
+    const DiskResidentIdentity& identity) noexcept {
+  return state_ && state_->owner->CommitReservation(this, identity);
 }
 
 void RamTier::DurableReservation::Reset() noexcept {
@@ -813,8 +816,8 @@ bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
   return true;
 }
 
-bool RamTier::CommitReservation(
-    DurableReservation* reservation) noexcept {
+bool RamTier::CommitReservation(DurableReservation* reservation,
+                                const DiskResidentIdentity& identity) noexcept {
   if (reservation == nullptr || !reservation->state_ ||
       reservation->state_->finished)
     return false;
@@ -841,7 +844,12 @@ bool RamTier::CommitReservation(
       entry.durable = true;
       entry.send_pins = 1;
       entry.completion = state.completion;
-      CompletePut(state.completion, true);
+      if (identity.valid())
+        CompletePut(state.completion,
+                    PutResult{Status::kOk, PutDisposition::kComplete,
+                              DiskWriteReason::kNone, identity});
+      else
+        CompletePut(state.completion, true);
       s.index.emplace(state.key, std::move(entry));
       state.installed = true;
     } else {

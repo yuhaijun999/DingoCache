@@ -62,31 +62,37 @@ class ReadLease {
 
  private:
   friend class DiskSlabStore;
+  friend class PreparedRead;
   friend class KVStore;
-  using ReleaseFn = void (*)(void* owner, uint64_t token) noexcept;
+  using ReleaseFn = Status (*)(void* owner, uint64_t token, size_t bytes,
+                               DiskResidentIdentity* identity) noexcept;
   static ReadLease Adopt(int fd, void* owner = nullptr, uint64_t token = 0,
-                         ReleaseFn release = nullptr) noexcept {
+                         ReleaseFn release = nullptr,
+                         const DiskResidentIdentity& identity = {}) noexcept {
     ReadLease lease;
     lease.fd_ = fd;
     lease.owner_ = owner;
     lease.token_ = token;
     lease.release_ = release;
+    lease.identity_ = identity;
     return lease;
   }
   void AdoptDescriptor(int fd) noexcept { fd_ = fd; }
-  void Release() noexcept {
+  Status Release() noexcept {
     const int fd = std::exchange(fd_, -1);
     ReleaseFn release = std::exchange(release_, nullptr);
     void* owner = std::exchange(owner_, nullptr);
     const uint64_t token = std::exchange(token_, 0);
     if (fd >= 0) ::close(fd);
-    if (release != nullptr) release(owner, token);
+    return release != nullptr ? release(owner, token, payload_len, &identity_)
+                              : Status::kOk;
   }
   void MoveFrom(ReadLease&& other) noexcept {
     fd_ = std::exchange(other.fd_, -1);
     owner_ = std::exchange(other.owner_, nullptr);
     token_ = std::exchange(other.token_, 0);
     release_ = std::exchange(other.release_, nullptr);
+    identity_ = std::exchange(other.identity_, DiskResidentIdentity{});
     aligned_off = other.aligned_off;
     aligned_len = other.aligned_len;
     head = other.head;
@@ -103,6 +109,7 @@ class ReadLease {
   void* owner_ = nullptr;
   uint64_t token_ = 0;
   ReleaseFn release_ = nullptr;
+  DiskResidentIdentity identity_{};
 };
 
 // One prepared transport read and its complete terminal lifecycle. The owner is
@@ -125,6 +132,26 @@ class PreparedRead {
   }
 
   Status status() const noexcept { return status_; }
+  // Finalize completed I/O before registering a grant. This releases storage
+  // without publishing RAM/coalescer success; Commit still owns that decision.
+  // A failure is latched: a later Ok cannot override it.
+  Status FinishStorage(Status result, size_t bytes_read) noexcept {
+    if (!active_) return status_;
+    if (result != Status::kOk) status_ = result;
+    if (!storage_finished_) {
+      storage_finished_ = true;
+      if (lease_.Release() != Status::kOk) status_ = Status::kIOError;
+    }
+    if (status_ != Status::kOk || bytes_read == 0) lease_.identity_ = {};
+    return status_;
+  }
+  // Validated byte provenance, not proof of successful grant publication or
+  // continued disk residency. No credential is exported before I/O finishes.
+  DiskResidentIdentity source_identity() const noexcept {
+    return storage_finished_ && status_ == Status::kOk ? lease_.identity_
+                                                       : DiskResidentIdentity{};
+  }
+
   bool owns_cleanup() const noexcept { return active_; }
   bool needs_io() const noexcept { return needs_io_; }
   int fd() const noexcept { return lease_.fd(); }
@@ -154,8 +181,10 @@ class PreparedRead {
     return true;
   }
 
-  // Commit a completed storage read or a completed RAM-backed send. `bytes_read`
-  // is the exact payload byte count exposed to completion accounting.
+  // Commit a completed storage read or a completed RAM-backed send.
+  // `bytes_read` is the exact payload byte count exposed to completion
+  // accounting. The bool reports terminal ownership, not success; inspect
+  // status() afterwards.
   bool Commit(Status result, size_t bytes_read, double elapsed_sec) noexcept {
     if (!active_) {
       // A storage read may retain a post-read source pin until the subsequent
@@ -163,15 +192,16 @@ class PreparedRead {
       post_read_hold_.reset();
       return false;
     }
+    result = FinishStorage(result, bytes_read);
     active_ = false;
     FinishFn finish = std::exchange(finish_, nullptr);
     void* owner = std::exchange(owner_, nullptr);
     const uint64_t token = std::exchange(token_, 0);
     if (finish != nullptr) {
-      finish(owner, token, true, result, bytes_read, elapsed_sec,
-             result == Status::kOk ? data_ : nullptr);
+      finish(owner, token, true, result, result == Status::kOk ? bytes_read : 0,
+             elapsed_sec, result == Status::kOk ? data_ : nullptr,
+             lease_.identity_);
     }
-    lease_ = ReadLease{};
     return true;
   }
 
@@ -182,14 +212,16 @@ class PreparedRead {
       post_read_hold_.reset();
       return false;
     }
+    (void)lease_.Release();
+    lease_.identity_ = {};
+    status_ = Status::kIOError;
     active_ = false;
     FinishFn finish = std::exchange(finish_, nullptr);
     void* owner = std::exchange(owner_, nullptr);
     const uint64_t token = std::exchange(token_, 0);
     if (finish != nullptr) {
-      finish(owner, token, false, Status::kIOError, 0, 0.0, nullptr);
+      finish(owner, token, false, Status::kIOError, 0, 0.0, nullptr, {});
     }
-    lease_ = ReadLease{};
     post_read_hold_.reset();
     return true;
   }
@@ -198,7 +230,8 @@ class PreparedRead {
   friend class KvNodeServer;
   using FinishFn = void (*)(void* owner, uint64_t token, bool committed,
                             Status result, size_t bytes_read,
-                            double elapsed_sec, const char* data) noexcept;
+                            double elapsed_sec, const char* data,
+                            const DiskResidentIdentity& identity) noexcept;
 
   static PreparedRead Result(Status status) noexcept {
     PreparedRead read;
@@ -232,12 +265,14 @@ class PreparedRead {
     read.post_read_hold_ = std::move(post_read_hold);
     return read;
   }
-  static PreparedRead Ready(const char* data, size_t payload_len,
-                            size_t value_len, bool source_registered,
-                            char* staging, size_t staging_cap, void* owner,
-                            uint64_t token, FinishFn finish) noexcept {
+  static PreparedRead Ready(
+      const char* data, size_t payload_len, size_t value_len,
+      bool source_registered, char* staging, size_t staging_cap, void* owner,
+      uint64_t token, FinishFn finish,
+      const DiskResidentIdentity& identity = {}) noexcept {
     PreparedRead read;
     read.status_ = Status::kOk;
+    read.lease_.identity_ = identity;
     read.payload_len_ = payload_len;
     read.value_len_ = value_len;
     read.staging_ = staging;
@@ -254,6 +289,7 @@ class PreparedRead {
     status_ = other.status_;
     active_ = std::exchange(other.active_, false);
     needs_io_ = other.needs_io_;
+    storage_finished_ = std::exchange(other.storage_finished_, false);
     source_registered_ = other.source_registered_;
     aligned_off_ = other.aligned_off_;
     aligned_len_ = other.aligned_len_;
@@ -275,6 +311,7 @@ class PreparedRead {
   Status status_ = Status::kInvalid;
   bool active_ = false;
   bool needs_io_ = false;
+  bool storage_finished_ = false;
   bool source_registered_ = false;
   uint64_t aligned_off_ = 0;
   size_t aligned_len_ = 0;

@@ -23,6 +23,7 @@
 #include "cache/rdma_request_order.h"
 #include "cache/uring_reader.h"  // io_uring async-GET path (DFKV_WITH_URING only)
 #include "common/config_dump.h"
+#include "common/status.h"
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_topology.h"
 #include "transport/rdma_verbs.h"  // RcEndpoint, QpInfo
@@ -1181,6 +1182,9 @@ void RdmaServer::Serve(int boot_fd) {
                           Reply* reply) -> bool {
     PullSlotState& state = pull_slots[slot];
     auto error_reply = [&](Status status) {
+      // Revoke access before Abort can release registered RAM/staging storage.
+      ep.ReleaseLeaseReadRegion(state.mr);
+      state.mr = nullptr;
       prepared.Abort();
       state.Reset();
       EncodeRespVersion(ep.sbuf(send_slot), wire_epoch, status, 0, value_len);
@@ -1192,6 +1196,14 @@ void RdmaServer::Serve(int boot_fd) {
         output_len > value_len - request.fields.offset ||
         (output_len != 0 && output == nullptr))
       return error_reply(Status::kInvalid);
+    // Resolve the last disk release before registering any memory. Completion
+    // publication still waits for a valid grant, so registration failure aborts
+    // without promoting RAM or reporting a successful prepared read.
+    if (prepared.needs_io() &&
+        prepared.FinishStorage(Status::kOk, output_len) != Status::kOk) {
+      prepared.Commit(Status::kIOError, 0, elapsed_sec);
+      return error_reply(prepared.status());
+    }
     // Empty results retain a revocable release identity, but authorize no
     // payload READ. The one registered sentinel byte is not a wire request.
     if (output_len == 0) output = state.lease.data();
@@ -1205,8 +1217,11 @@ void RdmaServer::Serve(int boot_fd) {
     if (!state.mr) return error_reply(Status::kIOError);
     // Publish disk/coalescer completion before READY; followers must not wait
     // for the client's RELEASE. Its post-read hold stays owned by the grant.
-    if (prepared.needs_io())
+    if (prepared.needs_io()) {
       prepared.Commit(Status::kOk, output_len, elapsed_sec);
+      if (prepared.status() != Status::kOk)
+        return error_reply(prepared.status());
+    }
     state.arena_read = std::move(prepared);
     state.read_elapsed_sec = elapsed_sec;
     state.busy = true;
