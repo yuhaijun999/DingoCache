@@ -50,6 +50,40 @@ using namespace dfkv;  // NOLINT
 using namespace std::chrono_literals;
 
 namespace dfkv {
+class DiskCacheGroupTestPeer {
+ public:
+  static DiskSlabStore& Slab(DiskCacheGroup& group) {
+    return *static_cast<DiskSlabStore*>(group.disks_.front().get());
+  }
+};
+class RamTierTestPeer {
+ public:
+  static bool HasTypedSingle(const RamTier& tier) {
+    return static_cast<bool>(tier.flush_result_);
+  }
+  static bool HasTypedBatch(const RamTier& tier) {
+    return static_cast<bool>(tier.flush_batch_results_);
+  }
+  static DiskWriteResult FlushSingle(RamTier& tier, const BlockKey& key,
+                                     char* data, size_t len, size_t cap) {
+    return tier.flush_result_(key, data, len, cap);
+  }
+  static std::vector<DiskWriteResult> FlushBatch(
+      RamTier& tier, const std::vector<RamTier::FlushItem>& items) {
+    return tier.flush_batch_results_(items);
+  }
+  static bool StoredResult(RamTier& tier, const BlockKey& key,
+                           RamTier::PutResult* result) {
+    RamTier::Shard& shard = tier.ShardFor(key);
+    const std::lock_guard<std::mutex> lock(shard.mu);
+    if (shard.index.count(key) == 0) return false;
+    const std::shared_ptr<RamTier::PutCompletion>& completion =
+        shard.index.at(key).completion;
+    if (!completion || !completion->result) return false;
+    *result = *completion->result;
+    return true;
+  }
+};
 class DiskSlabStoreTestPeer {
  public:
   static void SetRecordWriteHook(DiskSlabStore* store,
@@ -59,6 +93,14 @@ class DiskSlabStoreTestPeer {
 };
 class KvNodeServerWiringTestPeer {
  public:
+  static RamTier& Ram(KvNodeServer& server) { return *server.ram_; }
+  static DiskSlabStore& Slab(KvNodeServer& server) {
+    return DiskCacheGroupTestPeer::Slab(server.group_);
+  }
+  static uint64_t FlushObjects(const KvNodeServer& server) {
+    return server.ram_flush_disks_.front()->objects.load(
+        std::memory_order_relaxed);
+  }
   static std::unique_ptr<KvNodeServer> Create(DiskCacheGroup::Options options) {
     return std::unique_ptr<KvNodeServer>(new KvNodeServer(std::move(options)));
   }
@@ -3107,4 +3149,153 @@ TEST_F(LifetimeAdmissionTest, NestedLookupRejectionClearsOldResponse) {
   EXPECT_EQ(total, 0U);
   EXPECT_TRUE(server_->LifetimeRestartRequired());
   EXPECT_TRUE(server_->Healthy());
+}
+
+// Construct the real node/RAM tier: never replace its production flush sinks.
+class ProductionFlushResultTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ =
+        fs::temp_directory_path() /
+        ("dfkv_production_flush_" +
+         std::to_string(
+             ::testing::UnitTest::GetInstance()->current_test_info()->line()));
+    fs::remove_all(dir_);
+  }
+  void TearDown() override {
+    node_.reset();
+    fs::remove_all(dir_);
+  }
+  void Create(bool with_clock, const char* engine = "slab") {
+    node_.reset();
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {(dir_ / engine).string()};
+    options.capacity_bytes = 1ull << 30;
+    options.engine = engine;
+    options.eviction_policy = "legacy";
+    if (with_clock) {
+      options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+          100, [] { return uint64_t{100}; });
+    }
+    node_ = KvNodeServerWiringTestPeer::Create(std::move(options));
+    ASSERT_TRUE(node_->Healthy());
+    ASSERT_TRUE(node_->ram_enabled());
+    ASSERT_EQ(KvNodeServerWiringTestPeer::DiskEngine(*node_), engine);
+  }
+  const ScopedEnv ram_on_{"DFKV_RAM_TIER", "1"};
+  const ScopedEnv ram_bytes_{"DFKV_RAM_TIER_BYTES", "8388608"};
+  const ScopedEnv extent_{"DFKV_RAM_TIER_EXTENT_BYTES", "1048576"};
+  const ScopedEnv reserve_{"DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0"};
+  const ScopedEnv shards_{"DFKV_RAM_TIER_SHARDS", "1"};
+  const ScopedEnv workers_{"DFKV_RAM_FLUSH_THREADS", "1"};
+  const ScopedEnv writeback_{"DFKV_RAM_WRITE_MODE", "writeback"};
+  const ScopedEnv disk_ack_{"DFKV_PUT_ACK_MODE", "disk"};
+  const ScopedEnv buffered_{"DFKV_SLAB_WRITE", "buffered"};
+  const ScopedEnv granularity_{"DFKV_SLAB_GRANULARITY", "1048576"};
+  const ScopedEnv sync_{"DFKV_SLAB_TABLE_SYNC_MS", "0"};
+  const ScopedEnv reclaim_{"DFKV_SLAB_RECLAIM_MS", "0"};
+  const ScopedEnv ram_reclaim_{"DFKV_RAM_RECLAIM_MS", "0"};
+  fs::path dir_;
+  std::unique_ptr<KvNodeServer> node_;
+};
+
+TEST_F(ProductionFlushResultTest, NormalLegacyAndFileRetainBoolCompletion) {
+  for (const char* engine : {"slab", "file"}) {
+    SCOPED_TRACE(engine);
+    ASSERT_NO_FATAL_FAILURE(Create(false, engine));
+    RamTier& tier = KvNodeServerWiringTestPeer::Ram(*node_);
+    EXPECT_FALSE(RamTierTestPeer::HasTypedSingle(tier));
+    EXPECT_FALSE(RamTierTestPeer::HasTypedBatch(tier));
+    const BlockKey key{99501, 0};
+    char data[] = "legacy";
+    ASSERT_EQ(node_->CacheDirectForKey(key, data, 6, sizeof(data)),
+              Status::kOk);
+    ASSERT_TRUE(tier.Contains(key));
+    RamTier::PutResult completion{Status::kInvalid};
+    EXPECT_FALSE(RamTierTestPeer::StoredResult(tier, key, &completion));
+    std::string stored;
+    ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, key, &stored),
+              Status::kOk);
+    EXPECT_EQ(stored, "legacy");
+    EXPECT_EQ(KvNodeServerWiringTestPeer::FlushObjects(*node_), 1U);
+  }
+}
+
+TEST_F(ProductionFlushResultTest, ClockPathPreservesActualWriteCompletion) {
+  ASSERT_NO_FATAL_FAILURE(Create(true));
+  RamTier& tier = KvNodeServerWiringTestPeer::Ram(*node_);
+  const BlockKey key{99502, 0};
+  char data[] = "clock";
+  ASSERT_EQ(node_->CacheDirectForKey(key, data, 5, sizeof(data)), Status::kOk);
+  RamTier::PutResult result{Status::kInvalid};
+  ASSERT_TRUE(RamTierTestPeer::StoredResult(tier, key, &result));
+  EXPECT_EQ(result.status, Status::kOk);
+  EXPECT_EQ(result.reason, DiskWriteReason::kNone);
+  EXPECT_EQ(result.outcome, DiskWriteOutcome::kNew);
+  EXPECT_FALSE(result.identity.valid());  // Real slabs do not track it yet.
+  EXPECT_EQ(KvNodeServerWiringTestPeer::FlushObjects(*node_), 1U);
+  std::string stored;
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, key, &stored),
+            Status::kOk);
+  EXPECT_EQ(stored, "clock");
+}
+
+TEST_F(ProductionFlushResultTest, ClockScalarSinkPersistsAndClassifies) {
+  ASSERT_NO_FATAL_FAILURE(Create(true));
+  RamTier& tier = KvNodeServerWiringTestPeer::Ram(*node_);
+  ASSERT_TRUE(RamTierTestPeer::HasTypedSingle(tier));
+  char data[] = "scalar";
+  const BlockKey key{99503, 0};
+  const DiskWriteResult result =
+      RamTierTestPeer::FlushSingle(tier, key, data, 6, sizeof(data));
+  ASSERT_EQ(result.status, Status::kOk);
+  EXPECT_EQ(result.outcome, DiskWriteOutcome::kNew);
+  EXPECT_FALSE(result.identity.valid());
+  const DiskWriteResult duplicate =
+      RamTierTestPeer::FlushSingle(tier, key, data, 6, sizeof(data));
+  EXPECT_EQ(duplicate.status, Status::kOk);
+  EXPECT_EQ(duplicate.outcome, DiskWriteOutcome::kKeptExisting);
+  std::string stored;
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, key, &stored),
+            Status::kOk);
+  EXPECT_EQ(stored, "scalar");
+}
+
+TEST_F(ProductionFlushResultTest, ClockBatchSinkKeepsOrderStatusAndObserver) {
+  ASSERT_NO_FATAL_FAILURE(Create(true));
+  RamTier& tier = KvNodeServerWiringTestPeer::Ram(*node_);
+  ASSERT_TRUE(RamTierTestPeer::HasTypedBatch(tier));
+  char data[] = "batch";
+  char other[] = "other";
+  const BlockKey key{99504, 0};
+  const std::vector<RamTier::FlushItem> items{{{99505, 0}, nullptr, 0, 0},
+                                              {key, data, 5, sizeof(data)},
+                                              {key, other, 5, sizeof(other)}};
+  const std::vector<DiskWriteResult> results =
+      RamTierTestPeer::FlushBatch(tier, items);
+  ASSERT_EQ(results.size(), 3U);
+  EXPECT_EQ(results[0].status, Status::kInvalid);
+  EXPECT_EQ(results[0].outcome, DiskWriteOutcome::kUnknown);
+  EXPECT_EQ(results[1].status, Status::kOk);
+  EXPECT_EQ(results[1].outcome, DiskWriteOutcome::kNew);
+  EXPECT_EQ(results[2].status, Status::kOk);
+  EXPECT_EQ(results[2].outcome, DiskWriteOutcome::kKeptExisting);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::FlushObjects(*node_), 2U);
+  std::string stored;
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, key, &stored),
+            Status::kOk);
+  EXPECT_EQ(stored, "batch");
+}
+
+TEST_F(ProductionFlushResultTest, RealRecordFailureStillIsolatesIo) {
+  ASSERT_NO_FATAL_FAILURE(Create(true));
+  DiskSlabStoreTestPeer::SetRecordWriteHook(
+      &KvNodeServerWiringTestPeer::Slab(*node_), [] { return false; });
+  char data[] = "failed";
+  const Status result =
+      node_->CacheDirectForKey({99506, 0}, data, 6, sizeof(data));
+  EXPECT_EQ(result, Status::kIOError);
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::PersistenceHealthy(*node_));
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*node_, {99506, 0}));
+  EXPECT_FALSE(node_->Healthy());
 }
