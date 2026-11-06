@@ -36,6 +36,7 @@
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_state.h"
+#include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
 #include "cache/kv_node_server.h"
@@ -1655,4 +1656,58 @@ TEST_F(SharedLifetimeClockTest,
     EXPECT_EQ(group.DiskCount(), 0U);
   }
   EXPECT_EQ(snapshot(), before);
+}
+
+TEST_F(SharedLifetimeClockTest, LogicalReadCountersAggregateAcrossBothDisks) {
+  DiskCacheGroup::Options options = Options();
+  options.lifetime_config = DiskLifetimeConfig{};
+  std::atomic<uint64_t> seconds{100};
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(*options.lifetime_config),
+      [&] { return seconds.load(std::memory_order_relaxed); });
+  DiskCacheGroup group(options);
+  ASSERT_TRUE(group.Healthy());
+  ASSERT_TRUE(group.TracksLifetimeState());
+  const DiskSlabStore* const disk0 = &DiskCacheGroupTestPeer::Slab(group, 0);
+  BlockKey first{7102, 0};
+  BlockKey second{7103, 0};
+  for (unsigned i = 0;
+       i < 1000 && DiskCacheGroupTestPeer::SlabForKey(&group, first) != disk0;
+       ++i)
+    ++first.digest_lo;
+  for (unsigned i = 0;
+       i < 1000 && DiskCacheGroupTestPeer::SlabForKey(&group, second) == disk0;
+       ++i)
+    ++second.digest_lo;
+  ASSERT_EQ(DiskCacheGroupTestPeer::SlabForKey(&group, first), disk0);
+  ASSERT_NE(DiskCacheGroupTestPeer::SlabForKey(&group, second), disk0);
+  const DiskWriteResult a = group.CacheWithResult(first, "value", 5);
+  const DiskWriteResult b = group.CacheWithResult(second, "value", 5);
+  ASSERT_TRUE(a.identity.valid());
+  ASSERT_TRUE(b.identity.valid());
+  // Inputs represent already-successful bound/unbound reads; real Node
+  // dispatch and per-follower accounting are verified by the wiring tests.
+  group.NotifyLifetimeReadSuccess(first, a.identity, 5);
+  group.NotifyLifetimeReadSuccess(second, b.identity, 5);
+  group.NotifyLifetimeReadSuccess(first, {}, 5);
+  DiskResidentIdentity stale = b.identity;
+  ++stale.generation;
+  group.NotifyLifetimeReadSuccess(second, stale, 5);
+  seconds.store(uint64_t{UINT32_MAX} + 101, std::memory_order_relaxed);
+  group.NotifyLifetimeReadSuccess(first, a.identity, 5);
+  group.NotifyLifetimeReadSuccess(second, b.identity, 5);
+  const DiskSlabStore::LifetimeReadCounters counters =
+      group.SlabStats().lifetime_reads;
+  EXPECT_EQ(counters.successful, 6U);
+  EXPECT_EQ(counters.applied, 2U);
+  EXPECT_EQ(counters.no_binding, 1U);
+  EXPECT_EQ(counters.race_lost, 1U);
+  EXPECT_EQ(counters.clock_hard_exhausted, 2U);
+  EXPECT_EQ(counters.io_unhealthy, 0U);
+  EXPECT_EQ(counters.state_unavailable, 0U);
+  for (size_t i = 0; i < 2; ++i)
+    EXPECT_EQ(DiskCacheGroupTestPeer::Slab(group, i)
+                  .GetStats()
+                  .lifetime_reads.successful,
+              3U);
 }

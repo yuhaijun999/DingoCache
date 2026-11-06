@@ -537,6 +537,14 @@ bool DiskCacheGroup::Healthy() const {
   return true;
 }
 
+void DiskCacheGroup::NotifyLifetimeReadSuccess(
+    const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes) {
+  if (bytes == 0 || !TracksLifetimeState()) return;
+  const size_t disk = RouteIndex(key);
+  if (disk < slabs_.size())
+    slabs_[disk]->NotifyLifetimeReadSuccess(key, identity, bytes);
+}
+
 void DiskCacheGroup::PreventCleanShutdown() {
   for (DiskSlabStore* slab : slabs_) slab->PreventCleanShutdown();
 }
@@ -903,6 +911,14 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.metadata_io_errors += st.metadata_io_errors;
     sum.lifetime_init_clock_hard_exhausted +=
         st.lifetime_init_clock_hard_exhausted;
+    sum.lifetime_reads.successful += st.lifetime_reads.successful;
+    sum.lifetime_reads.applied += st.lifetime_reads.applied;
+    sum.lifetime_reads.no_binding += st.lifetime_reads.no_binding;
+    sum.lifetime_reads.race_lost += st.lifetime_reads.race_lost;
+    sum.lifetime_reads.clock_hard_exhausted +=
+        st.lifetime_reads.clock_hard_exhausted;
+    sum.lifetime_reads.io_unhealthy += st.lifetime_reads.io_unhealthy;
+    sum.lifetime_reads.state_unavailable += st.lifetime_reads.state_unavailable;
     sum.unclean_resets += st.unclean_resets;
     sum.eviction_record_clears += st.eviction_record_clears;
     sum.record_writes += st.record_writes;

@@ -17,9 +17,11 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -31,6 +33,7 @@
 #include "cache/disk_cache_group.h"
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_state.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
@@ -42,6 +45,7 @@
 #include "common/kv_types.h"
 #include "common/status.h"
 #include "read_coalescer_test_peer.h"
+#include "slab_allocator_test_peer.h"
 #include "transport/tcp_transport.h"
 #include "transport/wire.h"
 
@@ -96,6 +100,15 @@ class RamTierTestPeer {
 };
 class DiskSlabStoreTestPeer {
  public:
+  static std::optional<DiskLifetimeState> LifetimeState(
+      const DiskSlabStore& store, const BlockKey& key) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    return SlabAllocatorTestPeer::LifetimeSnapshotFor(*store.alloc_, key)
+        .second;
+  }
+  static void SetReadHook(DiskSlabStore& store, std::function<void()> hook) {
+    store.read_acquired_hook_for_test_ = std::move(hook);
+  }
   static void SetPayloadWriteHook(DiskSlabStore* store,
                                   std::function<bool()> hook) {
     store->payload_write_hook_for_test_ = std::move(hook);
@@ -107,6 +120,17 @@ class DiskSlabStoreTestPeer {
 };
 class KvNodeServerWiringTestPeer {
  public:
+  static DiskSlabStore::LifetimeReadCounters LifetimeCounters(
+      const KvNodeServer& server) {
+    return server.group_.SlabStats().lifetime_reads;
+  }
+  static bool WaitForReadFollowers(KvNodeServer& server, int count = 1) {
+    return ReadCoalescerTestPeer::WaitForCopyWaiter(server.read_coalescer_,
+                                                    count);
+  }
+  static size_t ReadTimeouts(const KvNodeServer& server) {
+    return server.read_coalescer_.timeouts();
+  }
   static RamTier& Ram(KvNodeServer& server) { return *server.ram_; }
   static size_t MutationStripe(const BlockKey& key) {
     return KvNodeServer::MutationKeyStripe(key);
@@ -3535,4 +3559,461 @@ TEST_F(ProductionFlushResultTest, SuccessfulHardCrossingExposesInitSkipMetric) {
   ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, key, &value),
             Status::kOk);
   EXPECT_EQ(value, "committed");
+}
+
+class LifetimeSuccessReadTest : public ProductionFlushResultTest {
+ protected:
+  void CreateScored() {
+    node_.reset();
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {(dir_ / "slab").string()};
+    options.capacity_bytes = 1ull << 30;
+    options.engine = "slab";
+    options.eviction_policy = "legacy";
+    options.lifetime_config = DiskLifetimeConfig{};
+    options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+        DiskLifetimeHorizon(*options.lifetime_config),
+        [this] { return seconds_.load(std::memory_order_relaxed); });
+    node_ = KvNodeServerWiringTestPeer::Create(options);
+    ASSERT_TRUE(node_->Healthy());
+    KvNodeServerWiringTestPeer::SetCoalescing(*node_, false);
+  }
+  DiskWriteResult Seed(const BlockKey& key,
+                       const std::string& value = "value") {
+    return KvNodeServerWiringTestPeer::PersistSource(*node_, key, value.data(),
+                                                     value.size());
+  }
+  DiskLifetimeState State(const BlockKey& key) const {
+    const std::optional<DiskLifetimeState> state =
+        DiskSlabStoreTestPeer::LifetimeState(
+            KvNodeServerWiringTestPeer::Slab(*node_), key);
+    if (!state.has_value()) {
+      ADD_FAILURE() << "the scored resident is missing";
+      return {};
+    }
+    return *state;
+  }
+  DiskSlabStore::LifetimeReadCounters Counters() const {
+    return KvNodeServerWiringTestPeer::LifetimeCounters(*node_);
+  }
+  Status Read(const BlockKey& key, std::string* out, uint64_t offset = 0,
+              uint64_t length = 0) {
+    return node_->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                       key, offset, length, nullptr, 0, out);
+  }
+  void ExpectConservation(uint64_t successful) const {
+    const DiskSlabStore::LifetimeReadCounters counters = Counters();
+    EXPECT_EQ(counters.successful, successful);
+    EXPECT_EQ(counters.successful,
+              counters.applied + counters.no_binding + counters.race_lost +
+                  counters.clock_hard_exhausted + counters.io_unhealthy +
+                  counters.state_unavailable);
+  }
+};
+
+TEST_F(LifetimeSuccessReadTest, RequestAndIntoCountEachLogicalSuccess) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  const BlockKey key{99900, 0};
+  ASSERT_EQ(Seed(key).status, Status::kOk);
+  seconds_.store(121, std::memory_order_relaxed);
+  std::string value;
+  ASSERT_EQ(Read(key, &value), Status::kOk);
+  EXPECT_EQ(value, "value");
+  EXPECT_EQ(State(key).actual_reads, 1U);
+  EXPECT_EQ(State(key).anchor, 21U);
+  char buffer[32] = {};
+  size_t size = 0;
+  ASSERT_EQ(node_->RangeIntoForKey(key, 0, 0, buffer, sizeof(buffer), &size),
+            Status::kOk);
+  EXPECT_EQ(std::string(buffer, size), "value");
+  EXPECT_EQ(State(key).actual_reads, 2U);
+  EXPECT_EQ(Counters().applied, 2U);
+  EXPECT_EQ(
+      MetricVal(node_->MetricsText(), "dfkv_slab_lifetime_read_success_total"),
+      2);
+  EXPECT_EQ(
+      MetricVal(node_->MetricsText(), "dfkv_slab_lifetime_read_applied_total"),
+      2);
+  ExpectConservation(2);
+}
+
+TEST_F(LifetimeSuccessReadTest, TcpSocketReadHeatsDiskAndRamSources) {
+  for (const bool ram_hit : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(CreateScored());
+    const BlockKey key{99910 + static_cast<uint64_t>(ram_hit), 0};
+    const DiskWriteResult written = Seed(key);
+    ASSERT_EQ(written.status, Status::kOk);
+    ASSERT_TRUE(written.identity.valid());
+    if (ram_hit) {
+      ASSERT_TRUE(KvNodeServerWiringTestPeer::Ram(*node_).PutDurable(
+          key, "value", 5, written.identity));
+    }
+    ASSERT_EQ(node_->Start(0), Status::kOk);
+    TcpTransport tcp;
+    tcp.set_timeouts(1000, 5000);
+    std::string value;
+    ASSERT_EQ(tcp.Range("127.0.0.1:" + std::to_string(node_->port()), key, 0, 5,
+                        &value),
+              Status::kOk);
+    EXPECT_EQ(value, "value");
+    EXPECT_EQ(State(key).actual_reads, 1U);
+    EXPECT_EQ(Counters().applied, 1U);
+    ExpectConservation(1);
+  }
+}
+
+TEST_F(LifetimeSuccessReadTest, RamIntoUsesItsBoundSourceAfterReleasingHit) {
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  const BlockKey key{99912, 0};
+  const DiskWriteResult written = Seed(key);
+  ASSERT_TRUE(written.identity.valid());
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::Ram(*node_).PutDurable(
+      key, "value", 5, written.identity));
+  char buffer[32] = {};
+  ASSERT_EQ(node_->RangeIntoForKey(key, 0, 0, buffer, sizeof(buffer), nullptr),
+            Status::kOk);
+  EXPECT_EQ(std::string(buffer, 5), "value");
+  EXPECT_EQ(State(key).actual_reads, 1U);
+  EXPECT_EQ(Counters().applied, 1U);
+  ExpectConservation(1);
+}
+
+TEST_F(LifetimeSuccessReadTest, UnboundRamNeverDiscoversALaterDiskBinding) {
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  const BlockKey key{99913, 0};
+  ASSERT_TRUE(
+      KvNodeServerWiringTestPeer::Ram(*node_).PutDurable(key, "ram", 3));
+  ASSERT_EQ(Seed(key, "disk").status, Status::kOk);
+  std::string value;
+  ASSERT_EQ(Read(key, &value), Status::kOk);
+  EXPECT_EQ(value, "ram");
+  char buffer[32] = {};
+  size_t size = 0;
+  ASSERT_EQ(node_->RangeIntoForKey(key, 0, 0, buffer, sizeof(buffer), &size),
+            Status::kOk);
+  EXPECT_EQ(std::string(buffer, size), "ram");
+  EXPECT_EQ(State(key).actual_reads, 0U);
+  EXPECT_EQ(Counters().no_binding, 2U);
+  EXPECT_EQ(MetricVal(node_->MetricsText(),
+                      "dfkv_slab_lifetime_read_no_binding_total"),
+            2);
+  ExpectConservation(2);
+}
+
+TEST_F(LifetimeSuccessReadTest, OldRamSourceNeverHeatsSameKeyReplacement) {
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  const BlockKey key{99914, 0};
+  const DiskWriteResult old = Seed(key, "old");
+  ASSERT_TRUE(old.identity.valid());
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::Ram(*node_).PutDurable(key, "old", 3,
+                                                                 old.identity));
+  // Deliberately retain the old RAM copy across physical disk replacement.
+  // This tests notification provenance, not bypassed Node PUT visibility.
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DropDisk(*node_, key), Status::kOk);
+  const DiskWriteResult replacement = Seed(key, "new");
+  ASSERT_TRUE(replacement.identity.valid());
+  ASSERT_FALSE(old.identity == replacement.identity);
+  std::string value;
+  ASSERT_EQ(Read(key, &value), Status::kOk);
+  EXPECT_EQ(value, "old");
+  EXPECT_EQ(State(key).actual_reads, 0U);
+  EXPECT_EQ(Counters().race_lost, 1U);
+  EXPECT_EQ(MetricVal(node_->MetricsText(),
+                      "dfkv_slab_lifetime_read_race_lost_total"),
+            1);
+  ExpectConservation(1);
+}
+
+TEST_F(LifetimeSuccessReadTest, CopyFollowersCountRequestsRatherThanOneIo) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  for (const bool into : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(CreateScored());
+    KvNodeServerWiringTestPeer::SetCoalescing(*node_, true);
+    const BlockKey key{99915 + static_cast<uint64_t>(into), 0};
+    ASSERT_EQ(Seed(key).status, Status::kOk);
+    const std::shared_ptr<FlushBarrier> barrier =
+        std::make_shared<FlushBarrier>();
+    const OpenFlushOnExit release{*barrier};
+    std::atomic<unsigned> reads{0};
+    DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+    DiskSlabStoreTestPeer::SetReadHook(store, [barrier, &reads] {
+      reads.fetch_add(1, std::memory_order_relaxed);
+      barrier->Block();
+    });
+    constexpr size_t kRequests = 4;
+    std::vector<Status> results(kRequests, Status::kInvalid);
+    std::vector<std::string> values(kRequests);
+    const auto request = [&](size_t index) {
+      if (into) {
+        char buffer[32] = {};
+        size_t size = 0;
+        results[index] =
+            node_->RangeIntoForKey(key, 0, 5, buffer, sizeof(buffer), &size);
+        values[index].assign(buffer, size);
+      } else {
+        results[index] = Read(key, &values[index], 0, 5);
+      }
+    };
+    std::thread leader([&] { request(0); });
+    EXPECT_TRUE(barrier->AwaitEntry());
+    std::vector<std::thread> followers;
+    for (size_t i = 1; i < kRequests; ++i)
+      followers.emplace_back([&, i] { request(i); });
+    EXPECT_TRUE(KvNodeServerWiringTestPeer::WaitForReadFollowers(*node_, 3));
+    barrier->Open();
+    leader.join();
+    for (std::thread& follower : followers) follower.join();
+    DiskSlabStoreTestPeer::SetReadHook(store, {});
+    for (size_t i = 0; i < kRequests; ++i) {
+      EXPECT_EQ(results[i], Status::kOk);
+      EXPECT_EQ(values[i], "value");
+    }
+    EXPECT_EQ(reads.load(std::memory_order_relaxed), 1U);
+    EXPECT_EQ(State(key).scoring_reads(), kRequests);
+    EXPECT_EQ(State(key).actual_reads, 3U);
+    EXPECT_EQ(Counters().applied, kRequests);
+    ExpectConservation(kRequests);
+  }
+}
+
+TEST_F(LifetimeSuccessReadTest, TimeoutFallbackHasOnlyItsOwnSuccessEvent) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  KvNodeServerWiringTestPeer::SetCoalescing(*node_, true);
+  const BlockKey key{99917, 0};
+  ASSERT_EQ(Seed(key).status, Status::kOk);
+  const std::shared_ptr<FlushBarrier> barrier =
+      std::make_shared<FlushBarrier>();
+  const OpenFlushOnExit release{*barrier};
+  std::atomic<unsigned> reads{0};
+  DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+  DiskSlabStoreTestPeer::SetReadHook(store, [barrier, &reads] {
+    if (reads.fetch_add(1, std::memory_order_relaxed) == 0) barrier->Block();
+  });
+  Status leader_status = Status::kInvalid;
+  Status follower_status = Status::kInvalid;
+  std::string leader_value;
+  std::string follower_value;
+  std::thread leader([&] { leader_status = Read(key, &leader_value, 0, 5); });
+  EXPECT_TRUE(barrier->AwaitEntry());
+  std::promise<void> finished;
+  const std::future<void> done = finished.get_future();
+  std::thread follower([&] {
+    follower_status = Read(key, &follower_value, 0, 5);
+    finished.set_value();
+  });
+  const bool fallback_finished =
+      done.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  EXPECT_TRUE(fallback_finished);
+  if (fallback_finished) {
+    EXPECT_EQ(Counters().applied, 1U);  // Leader's physical I/O is still held.
+    EXPECT_GT(KvNodeServerWiringTestPeer::ReadTimeouts(*node_), 0U);
+  }
+  seconds_.store(129, std::memory_order_relaxed);
+  barrier->Open();
+  leader.join();
+  follower.join();
+  DiskSlabStoreTestPeer::SetReadHook(store, {});
+  EXPECT_EQ(leader_status, Status::kOk);
+  EXPECT_EQ(follower_status, Status::kOk);
+  EXPECT_EQ(leader_value, "value");
+  EXPECT_EQ(follower_value, "value");
+  EXPECT_EQ(reads.load(std::memory_order_relaxed), 2U);
+  EXPECT_EQ(State(key).scoring_reads(), 2U);
+  EXPECT_EQ(State(key).anchor, 29U);
+  EXPECT_EQ(Counters().applied, 2U);
+  ExpectConservation(2);
+}
+
+TEST_F(LifetimeSuccessReadTest,
+       LastReleaseRemoveUsesFinalStatusAndOriginalSource) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  for (const bool fail_invalidation : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(CreateScored());
+    const BlockKey key{99918 + static_cast<uint64_t>(fail_invalidation), 0};
+    ASSERT_EQ(Seed(key).status, Status::kOk);
+    DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+    DiskSlabStoreTestPeer::SetReadHook(store, [&] {
+      EXPECT_EQ(store.Remove(key), Status::kOk);
+      if (fail_invalidation)
+        DiskSlabStoreTestPeer::SetRecordWriteHook(&store, [] { return false; });
+    });
+    std::string value;
+    const Status result = Read(key, &value);
+    DiskSlabStoreTestPeer::SetReadHook(store, {});
+    if (fail_invalidation) {
+      EXPECT_EQ(result, Status::kIOError);
+      EXPECT_EQ(State(key).actual_reads, 0U);
+      ExpectConservation(0);
+    } else {
+      EXPECT_EQ(result, Status::kOk);
+      EXPECT_EQ(value, "value");
+      EXPECT_EQ(Counters().race_lost, 1U);
+      EXPECT_EQ(Counters().no_binding, 0U);
+      ExpectConservation(1);
+    }
+  }
+}
+
+TEST_F(LifetimeSuccessReadTest,
+       AdmittedReadUsesDrainClockWithoutReversingSuccess) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  for (const bool hard : {false, true}) {
+    ASSERT_NO_FATAL_FAILURE(CreateScored());
+    const BlockKey key{99920 + static_cast<uint64_t>(hard), 0};
+    ASSERT_EQ(Seed(key).status, Status::kOk);
+    DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+    DiskSlabStoreTestPeer::SetReadHook(store, [&, hard] {
+      seconds_.store(uint64_t{UINT32_MAX} + (hard ? 101 : 100),
+                     std::memory_order_relaxed);
+    });
+    std::string value;
+    const Status result = Read(key, &value);
+    DiskSlabStoreTestPeer::SetReadHook(store, {});
+    EXPECT_EQ(result, Status::kOk);
+    EXPECT_EQ(value, "value");
+    EXPECT_TRUE(node_->Healthy());
+    if (hard) {
+      EXPECT_EQ(Counters().clock_hard_exhausted, 1U);
+      EXPECT_EQ(MetricVal(node_->MetricsText(),
+                          "dfkv_slab_lifetime_read_clock_hard_exhausted_total"),
+                1);
+      EXPECT_EQ(State(key).actual_reads, 0U);
+    } else {
+      EXPECT_EQ(Counters().applied, 1U);
+      EXPECT_EQ(State(key).anchor, UINT32_MAX);
+    }
+    ExpectConservation(1);
+    EXPECT_TRUE(node_->LifetimeRestartRequired());
+    seconds_.store(100, std::memory_order_relaxed);
+    EXPECT_EQ(Read(key, &value), Status::kIOError);
+    ExpectConservation(1);
+  }
+}
+
+TEST_F(LifetimeSuccessReadTest, EmptyFailedAndMetadataOnlyReadsDoNotHeat) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  const BlockKey key{99922, 0};
+  ASSERT_EQ(Seed(key).status, Status::kOk);
+  std::string value;
+  EXPECT_EQ(Read(key, &value, 5, 0), Status::kOk);
+  EXPECT_TRUE(value.empty());
+  EXPECT_EQ(Read(key, &value, 6, 0), Status::kInvalid);
+  EXPECT_EQ(Read({99923, 0}, &value), Status::kNotFound);
+  ValueMetadata metadata;
+  EXPECT_EQ(node_->LookupForKey(key, &metadata), Status::kOk);
+  EXPECT_EQ(node_->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kExist),
+                                        key, 0, 0, nullptr, 0, &value),
+            Status::kOk);
+  char buffer[32] = {};
+  size_t size = 99;
+  EXPECT_EQ(node_->RangeIntoForKey(key, 0, 5, buffer, 0, &size), Status::kOk);
+  EXPECT_EQ(size, 0U);
+  EXPECT_EQ(State(key).actual_reads, 0U);
+  ExpectConservation(0);
+}
+
+TEST_F(LifetimeSuccessReadTest,
+       PullPreparationAndResourceReleaseNeverNotifyHere) {
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  const BlockKey key{99924, 0};
+  const DiskWriteResult written = Seed(key);
+  ASSERT_TRUE(written.identity.valid());
+  alignas(4096) char buffer[4096] = {};
+  const char* data = nullptr;
+  size_t size = 0;
+  ASSERT_EQ(
+      node_->RangeDirectForKey(key, 0, 5, buffer, sizeof(buffer), &data, &size),
+      Status::kOk);
+  EXPECT_EQ(std::string(data, size), "value");
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::Ram(*node_).PutDurable(
+      key, "value", 5, written.identity));
+  PreparedRead prepared =
+      node_->PrepareReadForKey(key, 0, 5, buffer, sizeof(buffer));
+  ASSERT_EQ(prepared.status(), Status::kOk);
+  EXPECT_TRUE(prepared.Commit(Status::kOk, 5, 0));
+  PreparedRead pinned;
+  ASSERT_TRUE(node_->RamPinnedHitForKey(key, 0, 5, &pinned));
+  EXPECT_TRUE(pinned.Commit(Status::kOk, 5, 0));
+  EXPECT_EQ(State(key).actual_reads, 0U);
+  ExpectConservation(0);
+}
+
+TEST_F(LifetimeSuccessReadTest, ClockOnlyLegacyHasNoAddedCompletionSampling) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir_ / "slab").string()};
+  options.capacity_bytes = 1ull << 30;
+  options.engine = "slab";
+  options.eviction_policy = "legacy";
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      100, [this] { return seconds_.load(std::memory_order_relaxed); });
+  node_ = KvNodeServerWiringTestPeer::Create(options);  // Clock-only.
+  ASSERT_TRUE(node_->Healthy());
+  KvNodeServerWiringTestPeer::SetCoalescing(*node_, false);
+  const BlockKey key{99925, 0};
+  ASSERT_EQ(Seed(key).status, Status::kOk);
+  DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+  DiskSlabStoreTestPeer::SetReadHook(store, [this] {
+    seconds_.store(uint64_t{UINT32_MAX} + 101, std::memory_order_relaxed);
+  });
+  std::string value;
+  EXPECT_EQ(Read(key, &value), Status::kOk);
+  DiskSlabStoreTestPeer::SetReadHook(store, {});
+  seconds_.store(100, std::memory_order_relaxed);
+  EXPECT_FALSE(node_->LifetimeRestartRequired());
+  ExpectConservation(0);
+}
+
+TEST_F(LifetimeSuccessReadTest, SourcePreservationDoesNotBypassPromotionFence) {
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  const BlockKey key{99926, 0};
+  ASSERT_EQ(Seed(key).status, Status::kOk);
+  DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+  DiskSlabStoreTestPeer::SetReadHook(store, [&] {
+    std::string ignored;
+    EXPECT_EQ(node_->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                          key, 0, 0, nullptr, 0, &ignored),
+              Status::kOk);
+  });
+  alignas(4096) char buffer[4096] = {};
+  const char* data = nullptr;
+  size_t size = 0;
+  const Status result =
+      node_->RangeDirectForKey(key, 0, 5, buffer, sizeof(buffer), &data, &size);
+  DiskSlabStoreTestPeer::SetReadHook(store, {});
+  ASSERT_EQ(result, Status::kOk);
+  EXPECT_EQ(std::string(data, size), "value");
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Ram(*node_).Contains(key));
+  EXPECT_FALSE(store.IsCached(key));
+  ExpectConservation(0);  // PULL preparation is still deferred to D.
+}
+
+TEST_F(LifetimeSuccessReadTest, CleanRecoveryFirstReadKeepsUnknownHistory) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  const BlockKey key{99927, 0};
+  ASSERT_EQ(Seed(key).status, Status::kOk);
+  node_.reset();
+  seconds_.store(135, std::memory_order_relaxed);
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  EXPECT_EQ(State(key).scoring_reads(), 1U);  // Staged seed, not R45's n=2.
+  EXPECT_EQ(State(key).actual_reads, 0U);
+  EXPECT_TRUE(State(key).history_unknown);
+  seconds_.store(140, std::memory_order_relaxed);
+  std::string value;
+  ASSERT_EQ(Read(key, &value), Status::kOk);
+  EXPECT_EQ(value, "value");
+  const DiskLifetimeState state = State(key);
+  EXPECT_EQ(state.scoring_reads(), 2U);
+  EXPECT_EQ(state.actual_reads, 1U);
+  EXPECT_EQ(state.anchor, 5U);
+  EXPECT_TRUE(state.history_unknown);
+  EXPECT_FALSE(state.write_armed());
+  EXPECT_FALSE(state.first_early_read());
+  EXPECT_EQ(ClassifyDiskLifetimeRead(DiskLifetimeConfig{}, state, 5),
+            DiskLifetimeReadClass::kReadOnceOutsideNewWriteWindow);
+  ExpectConservation(1);
 }

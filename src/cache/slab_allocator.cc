@@ -6,11 +6,14 @@
 #include <cstdlib>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "cache/disk_lifetime_clock.h"
+#include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_state.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
@@ -302,6 +305,30 @@ void SlabAllocator::CommitResidentGeneration(
   resident_generations_[*index] = generation;
   if (opt_.track_lifetime_state && lifetime_state != nullptr)
     resident_lifetime_states_[*index] = *lifetime_state;
+}
+
+SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
+    const BlockKey& key, uint64_t generation, const DiskLifetimeConfig& config,
+    const DiskLifetimeClock& clock) {
+  const std::lock_guard<std::mutex> lock(mu_);
+  const uint32_t* index = index_.Find(key);
+  if (!opt_.track_resident_identity || index == nullptr || generation == 0 ||
+      !slots_[*index].live || slots_[*index].remove_pending ||
+      resident_generations_[*index] != generation)
+    return LifetimeReadResult::kResidentChanged;
+  uint32_t applied_at = 0;
+  // Hard exhaustion takes priority over a deliberately uninitialized state
+  // left by an already-admitted NEW commit beyond the representable clock.
+  if (!clock.TryDrainNow(&applied_at))
+    return LifetimeReadResult::kClockHardExhausted;
+  if (!opt_.track_lifetime_state) return LifetimeReadResult::kStateUnavailable;
+  std::optional<DiskLifetimeState>& resident_state =
+      resident_lifetime_states_[*index];
+  if (!resident_state.has_value()) return LifetimeReadResult::kStateUnavailable;
+  DiskLifetimeState& state = *resident_state;
+  if (!ApplyDiskLifetimeRead(config, applied_at, &state))
+    return LifetimeReadResult::kStateUnavailable;
+  return LifetimeReadResult::kApplied;
 }
 
 uint64_t SlabAllocator::ResidentGeneration(const BlockKey& key) const {

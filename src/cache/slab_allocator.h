@@ -28,6 +28,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/disk_lifetime_clock.h"
+#include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_state.h"
 #include "common/kv_types.h"
 
@@ -184,6 +187,18 @@ class SlabAllocator {
   void CommitResidentGeneration(
       const BlockKey& key, uint64_t generation,
       const DiskLifetimeState* lifetime_state = nullptr);
+  enum class LifetimeReadResult : unsigned char {
+    kApplied = 0,             // Updated the matched resident.
+    kResidentChanged = 1,     // No matching live generation remains.
+    kClockHardExhausted = 2,  // The shared clock cannot represent this event.
+    kStateUnavailable = 3,    // Missing state or inconsistent event time.
+  };
+  // Caller holds the store lifecycle lock (D before A). Validate ownership,
+  // sample the shared clock and update heat in one A critical section; a stale
+  // credential must never sample time or mutate a later same-key resident.
+  LifetimeReadResult ApplyLifetimeRead(const BlockKey& key, uint64_t generation,
+                                       const DiskLifetimeConfig& config,
+                                       const DiskLifetimeClock& clock);
   // Physical ownership only, including pending removal. Does not touch CLOCK.
   // Zero means disabled, absent or uncommitted; never an exportable identity.
   uint64_t ResidentGeneration(const BlockKey& key) const;

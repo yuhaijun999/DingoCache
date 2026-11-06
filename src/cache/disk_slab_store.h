@@ -17,6 +17,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -91,8 +93,21 @@ class DiskSlabStore : public StoreEngine {
     std::optional<DiskLifetimeConfig> lifetime_config{};
   };
 
+  // Enabled, nonempty logical successes partition into exactly one outcome.
+  // Real I/O health wins over binding/race/clock diagnostics; GET is unchanged.
+  struct LifetimeReadCounters {
+    uint64_t successful = 0;
+    uint64_t applied = 0;
+    uint64_t no_binding = 0;
+    uint64_t race_lost = 0;
+    uint64_t clock_hard_exhausted = 0;
+    uint64_t io_unhealthy = 0;
+    uint64_t state_unavailable = 0;
+  };
+
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
   struct Stats {
+    LifetimeReadCounters lifetime_reads{};
     uint64_t dio_write_fallbacks = 0;
     uint64_t dio_read_fallbacks = 0;
     uint64_t table_syncs = 0;
@@ -249,6 +264,9 @@ class DiskSlabStore : public StoreEngine {
   Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
                      char* io_buf, size_t io_cap, const char** out_data,
                      size_t* out_len, size_t* value_len = nullptr) override;
+  // With internal lifetime metadata enabled, successful nonzero reads retain
+  // original byte provenance even after removal. It is not a residency proof;
+  // NotifyLifetimeReadSuccess validates it again. Failed/empty reads clear it.
   Status RangeWithIdentity(const BlockKey& key, uint64_t offset,
                            uint64_t length, std::string* out,
                            DiskResidentIdentity* identity,
@@ -281,6 +299,13 @@ class DiskSlabStore : public StoreEngine {
   uint64_t TableRebuilt() const { return table_rebuilt_; }  // records restored at open
   // Resolved I/O mode: direct_writes requested AND the filesystem took O_DIRECT.
   bool DirectWritesActive() const { return !extent_dio_fds_.empty(); }
+  // Logical request success only, not a storage read/fill notification. The
+  // captured identity proves byte provenance, not current residency: recheck
+  // the same generation before heating, never reconstruct it from the key.
+  bool TracksLifetimeState() const { return opt_.lifetime_config.has_value(); }
+  void NotifyLifetimeReadSuccess(const BlockKey& key,
+                                 const DiskResidentIdentity& identity,
+                                 size_t bytes);
   Stats GetStats() const;
   std::vector<SlabAllocator::ClassStat> ClassStats() const;
   bool Healthy() const override {
@@ -428,6 +453,7 @@ class DiskSlabStore : public StoreEngine {
   // unlocked window, inflight_/deferred_remove_ protect it from Remove;
   // payload_len_ install after the write is the reader-visible commit).
   mutable std::mutex mu_;
+  LifetimeReadCounters lifetime_reads_{};  // under mu_
   uint64_t committed_payload_bytes_ = 0;  // under mu_
   uint64_t lifetime_init_clock_hard_exhausted_ = 0;  // under mu_
   bool ok_ = false;

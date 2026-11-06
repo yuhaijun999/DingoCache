@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Apply staged lifetime heat once per successful nonempty synchronous request,
+  including RAM hits and coalesced followers, using original resident provenance.
+  Keep PULL preparation deferred until grant success and preserve legacy behavior.
+
 - Initialize staged lifetime resident metadata with physical identity ownership,
   and expose hard-clock initialization skips without failing committed writes.
   Public lifetime policy selection remains gated; legacy victim rules stay intact.

@@ -2224,10 +2224,14 @@ Status DiskSlabStore::FinishReadLocked(const BlockKey& key,
                                        size_t bytes,
                                        DiskResidentIdentity* identity) {
   if (!ReleaseInflightLocked(key, fn)) status = Status::kIOError;
-  // This lookup only validates the captured credential. It never supplies a
-  // later resident's identity for bytes read from the old slot.
-  if (identity != nullptr && (status != Status::kOk || bytes == 0 ||
-                              !(*identity == ResidentIdentityLocked(key, fn))))
+  // Enabled lifetime reads preserve original byte provenance even if the last
+  // pin just removed that resident. The logical-success owner revalidates the
+  // captured generation before heating; it must never substitute a newer one.
+  // Legacy keeps its existing post-release credential clearing behavior.
+  if (identity != nullptr &&
+      (status != Status::kOk || bytes == 0 ||
+       (!opt_.lifetime_config.has_value() &&
+        !(*identity == ResidentIdentityLocked(key, fn)))))
     *identity = {};
   return status;
 }
@@ -2550,6 +2554,48 @@ std::vector<SlabAllocator::ClassStat> DiskSlabStore::ClassStats() const {
                 : std::vector<SlabAllocator::ClassStat>{};
 }
 
+void DiskSlabStore::NotifyLifetimeReadSuccess(
+    const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes) {
+  // Keep disabled and empty successes off the lifetime lock/clock path.
+  if (!opt_.lifetime_config.has_value() || bytes == 0) return;
+  const std::lock_guard<std::mutex> lock(mu_);
+  ++lifetime_reads_.successful;
+  if (!Healthy()) {
+    ++lifetime_reads_.io_unhealthy;
+    return;
+  }
+  if (!identity.valid()) {
+    ++lifetime_reads_.no_binding;
+    return;
+  }
+  if (!resident_identity_ ||
+      identity.store_instance != resident_identity_->store_instance ||
+      identity.run_epoch != run_epoch_ ||
+      payload_len_.count(key.Filename()) == 0) {
+    ++lifetime_reads_.race_lost;
+    return;
+  }
+  // D orders visibility/removal; A checks the same physical generation and
+  // samples actual application time atomically with the state update. Do not
+  // use storage completion time or legacy Get/Touch as the heat event.
+  const SlabAllocator::LifetimeReadResult result = alloc_->ApplyLifetimeRead(
+      key, identity.generation, *opt_.lifetime_config, *opt_.lifetime_clock);
+  switch (result) {
+    case SlabAllocator::LifetimeReadResult::kApplied:
+      ++lifetime_reads_.applied;
+      break;
+    case SlabAllocator::LifetimeReadResult::kResidentChanged:
+      ++lifetime_reads_.race_lost;
+      break;
+    case SlabAllocator::LifetimeReadResult::kClockHardExhausted:
+      ++lifetime_reads_.clock_hard_exhausted;
+      break;
+    case SlabAllocator::LifetimeReadResult::kStateUnavailable:
+      ++lifetime_reads_.state_unavailable;
+      break;
+  }
+}
+
 DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   Stats st;
   st.dio_write_fallbacks =
@@ -2609,6 +2655,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
     st.pool_extents = alloc_->PoolExtents();
   }
   std::lock_guard<std::mutex> lk(mu_);
+  st.lifetime_reads = lifetime_reads_;
   st.payload_bytes = committed_payload_bytes_;
   st.lifetime_init_clock_hard_exhausted = lifetime_init_clock_hard_exhausted_;
   st.committed_objects = payload_len_.size();

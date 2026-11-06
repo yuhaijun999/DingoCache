@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -109,6 +110,16 @@ class DiskCacheGroup {
   // Internal dependency presence, not a policy-enable or clock-health query.
   // Does not sample time. Normal legacy/file startup has no lifetime clock.
   bool HasLifetimeClock() const { return lifetime_clock_ != nullptr; }
+  // Internal metadata opt-in, not public strategy readiness or clock health.
+  // Immutable after construction; no sampling or locking on legacy requests.
+  bool TracksLifetimeState() const {
+    return !slabs_.empty() && slabs_.front()->TracksLifetimeState();
+  }
+  // One already-successful nonzero business read. Preparation/physical I/O
+  // alone must not call this; the original source is not a residency promise.
+  void NotifyLifetimeReadSuccess(const BlockKey& key,
+                                 const DiskResidentIdentity& identity,
+                                 size_t bytes);
   // Actively sample the optional shared clock. Once exhausted, rollback cannot
   // clear the restart requirement. Does not mark storage unhealthy, stop new
   // requests, or drain accepted work; the future server gate must do those in

@@ -135,9 +135,11 @@ class KvNodeServer {
   std::vector<Status> CacheDirectBatchForKeys(
       const std::vector<StoreEngine::CacheBatchItem>& items);
 
+  // Preparation only: the current RDMA caller uses this before PULL MR/grant
+  // establishment. It does not notify lifetime read success.
   // RDMA direct GET: read an O_DIRECT-aligned superset into `io_buf`; *out_data
-  // points inside that same buffer at the exact requested range so the RDMA layer
-  // can scatter-send it without copying into sbuf.
+  // points inside that same buffer at the exact requested range so the RDMA
+  // layer can scatter-send it without copying into sbuf.
   Status RangeDirectForKey(const BlockKey& key, uint64_t offset,
                            uint64_t length, char* io_buf, size_t io_cap,
                            const char** out_data, size_t* out_len,

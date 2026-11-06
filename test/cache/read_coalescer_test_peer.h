@@ -13,7 +13,7 @@
 namespace dfkv {
 class ReadCoalescerTestPeer {
  public:
-  static bool WaitForCopyWaiter(ReadCoalescer& coalescer) {
+  static bool WaitForCopyWaiter(ReadCoalescer& coalescer, int minimum = 1) {
     const std::chrono::steady_clock::time_point deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -22,7 +22,8 @@ class ReadCoalescerTestPeer {
         for (const std::pair<const ReadCoalescer::Key,
                              std::shared_ptr<ReadCoalescer::Flight>>& entry :
              coalescer.map_) {
-          if (entry.second->copy_waiters.load(std::memory_order_acquire) > 0)
+          if (entry.second->copy_waiters.load(std::memory_order_acquire) >=
+              minimum)
             return true;
         }
       }

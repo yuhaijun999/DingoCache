@@ -227,6 +227,10 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_bind_wipes_total` | counter | extent 绑定新 class 前完成的旧 slot-grid 清理 |
 | `dfkv_slab_metadata_io_errors_total` / `dfkv_slab_unclean_resets_total` | counter | slots.tbl/epoch 持久化失败 / 冷升时丢弃 dirty epoch |
 | `dfkv_slab_lifetime_init_clock_hard_exhausted_total` | counter | 内部评分路径的 NEW 或恢复住户因超过32位时钟硬界限而跳过评分初始化的次数；数据提交和身份仍有效，不是 PUT 失败或 I/O 错误。未初始化状态不可用于评分。未注入评分配置的 legacy 及仅注入 clock 的路径恒为0，file 不输出此 slab 指标；此计数不代表外部 lifetime 已开放 |
+| `dfkv_slab_lifetime_read_success_total` / `dfkv_slab_lifetime_read_applied_total` | counter | 内部评分路径收到的非零逻辑成功读通知数 / 已对原住户应用的通知数；不是物理 I/O 数，不含失败、零字节、Lookup/Exist。B+C阶段仅同步请求/Into及其RAM、copy follower接线，PULL须等D授权成立，准备/RELEASE不补计 |
+| `dfkv_slab_lifetime_read_no_binding_total` / `dfkv_slab_lifetime_read_race_lost_total` | counter | 成功字节没有盘来源凭据 / 原来源实例、epoch、可见性或generation已不匹配；绝不按当前同名key补绑定或补热 |
+| `dfkv_slab_lifetime_read_clock_hard_exhausted_total` | counter | 原住户仍匹配，但实际应用时超过32位时钟硬界限；保留逻辑读成功，不伪报已计热或I/O失败。软门禁后的可表示排空阶段仍正常计热 |
+| `dfkv_slab_lifetime_read_io_unhealthy_total` / `dfkv_slab_lifetime_read_state_unavailable_total` | counter | 已成功的读在通知时遇盘I/O隔离 / 匹配住户的评分state缺失或时间不变量错误（正常应为0）；均不改原读状态。失败GET本身不发送通知 |
 | `dfkv_slab_eviction_record_clears_total` / `dfkv_slab_record_writes_total` | counter | allocator 复用前持久清除记录 / 已提交 slots.tbl record 写数 |
 | `dfkv_slab_capacity_bytes` / `dfkv_slab_allocated_bytes` / `dfkv_slab_payload_bytes` / `dfkv_slab_internal_fragmentation_bytes` | gauge | 物理 payload 容量 / 已占 slot / 逻辑 payload / 内部碎片 |
 | `dfkv_slab_allocator_objects` / `dfkv_slab_committed_objects` | gauge | allocator resident（含未提交写）/ reader-visible 已提交对象 |
@@ -235,6 +239,9 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_class_allocated_bytes{slot_size}` / `dfkv_slab_class_useful_bytes{slot_size}` / `dfkv_slab_class_fragmentation_bytes{slot_size}` | gauge | 每 class 的占用、有效 payload、内部碎片 |
 | `dfkv_slab_class_read_heat{slot_size}` / `dfkv_slab_class_put_total{slot_size}` | gauge / counter | 每 class 的衰减读热度 / 累计 PUT |
 | `dfkv_slab_failed_disks` / `dfkv_slab_healthy` | gauge | fail-closed disk 数 / 全部 slab disk 是否健康 |
+
+上述通知原因互斥：success = applied + no_binding + race_lost + clock_hard_exhausted + io_unhealthy + state_unavailable。优先级为I/O隔离、无绑定、旧实例/epoch/可见性/代际、硬时钟、状态可用性，再应用。硬界限造成的未初始化state按clock原因记，不混成state_unavailable。无评分配置的legacy及仅clock注入不采新应用时间、不加新热锁、计数为0；file不输出slab指标。所有新指标不带key/request标签。
+
 
 PUT 准入门（**仅 `--put-inflight-limit > 0` 时输出**）：
 | `dfkv_put_busy_total` | counter | 被准入门以 kCacheFull 快速拒绝的 PUT（受控 miss，替代深队列尾延迟） |

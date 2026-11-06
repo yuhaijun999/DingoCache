@@ -667,6 +667,27 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_init_clock_hard_exhausted_total", "counter",
            "NEW and recovered residents left unscored at hard clock exhaustion",
            ss.lifetime_init_clock_hard_exhausted);
+    metric("dfkv_slab_lifetime_read_success_total", "counter",
+           "Nonzero successful business reads notified to lifetime metadata",
+           ss.lifetime_reads.successful);
+    metric("dfkv_slab_lifetime_read_applied_total", "counter",
+           "Successful read notifications applied to the original resident",
+           ss.lifetime_reads.applied);
+    metric("dfkv_slab_lifetime_read_no_binding_total", "counter",
+           "Successful reads without a disk source binding",
+           ss.lifetime_reads.no_binding);
+    metric("dfkv_slab_lifetime_read_race_lost_total", "counter",
+           "Successful reads whose original resident is no longer visible",
+           ss.lifetime_reads.race_lost);
+    metric("dfkv_slab_lifetime_read_clock_hard_exhausted_total", "counter",
+           "Successful reads left unheated at hard clock exhaustion",
+           ss.lifetime_reads.clock_hard_exhausted);
+    metric("dfkv_slab_lifetime_read_io_unhealthy_total", "counter",
+           "Successful read notifications skipped by disk I/O isolation",
+           ss.lifetime_reads.io_unhealthy);
+    metric("dfkv_slab_lifetime_read_state_unavailable_total", "counter",
+           "Matching residents with unavailable or invalid lifetime state",
+           ss.lifetime_reads.state_unavailable);
     metric("dfkv_slab_unclean_resets_total", "counter",
            "Dirty prior epochs discarded during cold recovery",
            ss.unclean_resets);
@@ -998,12 +1019,15 @@ Status KvNodeServer::ProcessRequestForKey(
     case WireOp::kRange: {
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
+      const bool track_lifetime = group_.TracksLifetimeState();
+      DiskResidentIdentity read_identity;
       bool ram_served = false;
       if (ram_) {  // RAM hot tier: serve straight from the arena (copy out), no disk
         RamTier::Hit h;
         if (ram_->GetPrep(key, offset, length, &h)) {
           out_data->assign(h.ptr, h.len);
           if (out_value_len) *out_value_len = h.value_len;
+          if (track_lifetime) read_identity = h.identity;
           st = Status::kOk;
           cache_hit_.fetch_add(1, std::memory_order_relaxed);
           bytes_read_.fetch_add(out_data->size(), std::memory_order_relaxed);
@@ -1046,7 +1070,7 @@ Status KvNodeServer::ProcessRequestForKey(
             st = read_coalescer_.ReadWithIdentity(
                 key, offset, length,
                 out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
-                out_value_len, nullptr,
+                out_value_len, track_lifetime ? &read_identity : nullptr,
                 [&](char* buf, size_t bcap, size_t* on, size_t* value_len,
                     DiskResidentIdentity* identity) {
                   std::string tmp;
@@ -1065,7 +1089,10 @@ Status KvNodeServer::ProcessRequestForKey(
             out_data->clear();  // A nested admission recheck may refuse now.
           }
         } else {
-          st = group_.Range(key, offset, length, out_data, out_value_len);
+          st = track_lifetime
+                   ? group_.RangeWithIdentity(key, offset, length, out_data,
+                                              &read_identity, out_value_len)
+                   : group_.Range(key, offset, length, out_data, out_value_len);
         }
         if (st == Status::kOk) {
           cache_hit_.fetch_add(1, std::memory_order_relaxed);
@@ -1076,6 +1103,10 @@ Status KvNodeServer::ProcessRequestForKey(
           get_io_err_.fetch_add(1, std::memory_order_relaxed);
         }
       }
+      // Every request, including each copy follower, reaches this point once.
+      // The RAM Hit scope has ended; no RAM lock/pin is needed by notification.
+      if (track_lifetime && st == Status::kOk)
+        group_.NotifyLifetimeReadSuccess(key, read_identity, out_data->size());
       if (samp) get_lat_.Observe(NowSec() - t0);
       break;
     }
@@ -1165,6 +1196,10 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
     if (value_len != nullptr) *value_len = 0;
     return Status::kIOError;
   }
+  const bool track_lifetime = group_.TracksLifetimeState();
+  DiskResidentIdentity read_identity;
+  size_t local_size = 0;
+  if (out_len == nullptr) out_len = &local_size;
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   if (ram_) {
@@ -1174,8 +1209,12 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
       std::memcpy(dst, h.ptr, n);
       if (out_len) *out_len = n;
       if (value_len) *value_len = h.value_len;
+      if (track_lifetime) read_identity = h.identity;
+      h = RamTier::Hit{};  // Finish RAM ownership before taking the disk lock.
       cache_hit_.fetch_add(1, std::memory_order_relaxed);
       bytes_read_.fetch_add(n, std::memory_order_relaxed);
+      if (track_lifetime)
+        group_.NotifyLifetimeReadSuccess(key, read_identity, n);
       if (samp) get_lat_.Observe(NowSec() - t0);
       return Status::kOk;
     }
@@ -1184,7 +1223,8 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
   Status st;
   if (coalesce_enabled_ && (read_epoch & 1) == 0) {
     st = read_coalescer_.ReadWithIdentity(
-        key, offset, length, dst, dst_cap, out_len, value_len, nullptr,
+        key, offset, length, dst, dst_cap, out_len, value_len,
+        track_lifetime ? &read_identity : nullptr,
         [&](char* buf, size_t cap, size_t* n, size_t* stored_len,
             DiskResidentIdentity* identity) {
           return group_.RangeIntoWithIdentity(key, offset, length, buf, cap, n,
@@ -1192,12 +1232,17 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
         },
         nullptr, read_epoch);
   } else {
-    st = group_.RangeInto(key, offset, length, dst, dst_cap, out_len,
-                          value_len);
+    st = track_lifetime
+             ? group_.RangeIntoWithIdentity(key, offset, length, dst, dst_cap,
+                                            out_len, &read_identity, value_len)
+             : group_.RangeInto(key, offset, length, dst, dst_cap, out_len,
+                                value_len);
   }
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
+    if (track_lifetime)
+      group_.NotifyLifetimeReadSuccess(key, read_identity, *out_len);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else if (st == Status::kIOError) {

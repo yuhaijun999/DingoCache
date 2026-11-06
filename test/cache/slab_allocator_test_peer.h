@@ -8,6 +8,8 @@
 #include <optional>
 #include <utility>
 
+#include "cache/disk_lifetime_clock.h"
+#include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_state.h"
 #include "cache/slab_allocator.h"
 #include "common/kv_types.h"
@@ -16,6 +18,14 @@ namespace dfkv {
 
 class SlabAllocatorTestPeer {
  public:
+  using LifetimeReadResult = SlabAllocator::LifetimeReadResult;
+  static LifetimeReadResult ApplyLifetimeRead(SlabAllocator& allocator,
+                                              const BlockKey& key,
+                                              uint64_t generation,
+                                              const DiskLifetimeConfig& config,
+                                              const DiskLifetimeClock& clock) {
+    return allocator.ApplyLifetimeRead(key, generation, config, clock);
+  }
   using LifetimeSnapshot =
       std::pair<uint64_t, std::optional<DiskLifetimeState>>;
 
