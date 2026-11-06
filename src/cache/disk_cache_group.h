@@ -110,6 +110,9 @@ class DiskCacheGroup {
   // order while allowing storage persistence to finish. Null clock returns
   // false.
   bool LifetimeRestartRequired() const;
+  // Owner-only final-close veto, before disk destruction. Applies to every
+  // built-in slab, without changing storage health or injected/file engines.
+  void PreventCleanShutdown();
   const std::string& StartupError() const { return startup_error_; }
 
   Status Cache(const BlockKey& key, const void* data, size_t len);
@@ -232,7 +235,8 @@ class DiskCacheGroup {
   // Outlives disks; each slab also retains the same shared dependency.
   std::shared_ptr<DiskLifetimeClock> lifetime_clock_;
   std::vector<std::unique_ptr<StoreEngine>> disks_;
-  std::vector<const DiskSlabStore*> slabs_;  // typed view of disks_ (slab engine only)
+  std::vector<DiskSlabStore*>
+      slabs_;  // typed view of disks_ (slab engine only)
   std::unordered_map<std::string, size_t> by_id_;  // disk id -> stable index
   ConHash ring_;
   mutable std::array<std::mutex, kTenantStripes> tenant_stripes_;

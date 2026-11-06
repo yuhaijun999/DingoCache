@@ -108,6 +108,13 @@ KvNodeServer::~KvNodeServer() {
   // callback calls group_.Cache -- group_ is a member, still alive here); group_
   // is destroyed last, after this body.
   Stop();
+  if (ram_) {
+    // A temporary Stop timeout is not the final drain result. Join first;
+    // even a never-started node can own accepted RAM writes. Keep clock-stop
+    // leftovers distinct from disk I/O failure and never claim a clean epoch.
+    const bool drained = ram_->Shutdown();
+    if (group_.HasLifetimeClock() && !drained) group_.PreventCleanShutdown();
+  }
   ram_.reset();
 }
 

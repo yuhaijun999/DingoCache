@@ -699,7 +699,8 @@ DiskSlabStore::~DiskSlabStore() {
   if (clean) clean = SyncPayloads();
   if (clean)
     clean = SyncTable(record_writes_.load(std::memory_order_relaxed));
-  if (clean) MarkCleanEpoch();
+  if (clean && clean_shutdown_allowed_.load(std::memory_order_relaxed))
+    MarkCleanEpoch();
   for (int fd : extent_fds_)
     if (fd >= 0) ::close(fd);
   for (int fd : extent_dio_fds_)

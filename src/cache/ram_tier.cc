@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -262,18 +263,27 @@ RamTier::RamTier(Options opt, FlushFn flush)
 }
 
 RamTier::~RamTier() {
+  Shutdown();
+  if (arena_) std::free(arena_);
+}
+
+bool RamTier::Shutdown() {
   if (reclaim_thread_.joinable()) {
-    { std::lock_guard<std::mutex> lk(reclaim_mu_); reclaim_stop_ = true; }
+    {
+      const std::lock_guard<std::mutex> lock(reclaim_mu_);
+      reclaim_stop_ = true;
+    }
     reclaim_cv_.notify_all();
     reclaim_thread_.join();
   }
-  for (auto& sh : shards_) {
-    std::lock_guard<std::mutex> lk(sh->mu);
-    sh->stop = true;
+  for (const std::unique_ptr<Shard>& shard : shards_) {
+    const std::lock_guard<std::mutex> lock(shard->mu);
+    shard->stop = true;
   }
-  for (auto& sh : shards_) sh->cv.notify_all();
-  for (auto& f : flushers_) if (f.joinable()) f.join();
-  if (arena_) std::free(arena_);
+  for (const std::unique_ptr<Shard>& shard : shards_) shard->cv.notify_all();
+  for (std::thread& flusher : flushers_)
+    if (flusher.joinable()) flusher.join();
+  return healthy() && DirtyObjects() == 0;
 }
 
 bool RamTier::WaitForDrain(std::chrono::milliseconds timeout) {

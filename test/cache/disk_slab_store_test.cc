@@ -3386,3 +3386,28 @@ TEST_F(DiskSlabTest, PhysicalIdentityClearedByCrossClassReplacement) {
               original);
   }
 }
+
+TEST_F(DiskSlabTest, CleanShutdownVetoIsStickyWithoutIoIsolation) {
+  DiskSlabStore::Options options = Opts(8192, 8192, 4096);
+  options.direct_writes = false;
+  options.reclaim_interval_ms = 0;
+  options.table_sync_ms = 0;
+  const BlockKey key{99700, 0};
+  {
+    DiskSlabStore store(options);
+    ASSERT_EQ(store.Cache(key, "disk", 4), Status::kOk);
+    store.PreventCleanShutdown();
+    store.PreventCleanShutdown();
+    EXPECT_TRUE(store.Healthy());
+    EXPECT_EQ(store.GetStats().metadata_io_errors, 0U);
+  }
+  const std::string state = ReadFileBytes(dir_ / "slab_state");
+  ASSERT_EQ(state.size(), 64U);
+  uint32_t marker = 0;
+  std::memcpy(&marker, state.data() + 16, sizeof(marker));
+  EXPECT_EQ(marker, 2U);  // Existing on-disk dirty state, not a format change.
+  const DiskSlabStore reopened(options);
+  ASSERT_TRUE(reopened.Healthy());
+  EXPECT_EQ(reopened.GetStats().unclean_resets, 1U);
+  EXPECT_FALSE(reopened.IsCached(key));
+}

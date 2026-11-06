@@ -278,6 +278,11 @@ class DiskSlabStore : public StoreEngine {
     return ok_ && !metadata_failed_.load(std::memory_order_acquire);
   }
   const std::string& StartupError() const override { return startup_error_; }
+  // Sticky owner veto, set before destruction begins. Still syncs payload and
+  // table on close, but leaves the epoch dirty; does not change I/O health.
+  void PreventCleanShutdown() {
+    clean_shutdown_allowed_.store(false, std::memory_order_relaxed);
+  }
 
  private:
   friend class DiskSlabStoreTestPeer;
@@ -416,6 +421,7 @@ class DiskSlabStore : public StoreEngine {
   uint64_t committed_payload_bytes_ = 0;  // under mu_
   bool ok_ = false;
   std::atomic<bool> metadata_failed_{false};
+  std::atomic<bool> clean_shutdown_allowed_{true};
   std::string startup_error_;
   uint64_t table_rebuilt_ = 0;
   uint64_t evicted_bytes_ = 0;

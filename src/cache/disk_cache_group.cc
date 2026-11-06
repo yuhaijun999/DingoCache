@@ -514,6 +514,10 @@ bool DiskCacheGroup::Healthy() const {
   return true;
 }
 
+void DiskCacheGroup::PreventCleanShutdown() {
+  for (DiskSlabStore* slab : slabs_) slab->PreventCleanShutdown();
+}
+
 size_t DiskCacheGroup::RouteIndex(const BlockKey& key) const {
   if (disks_.size() == 1) return 0;
   std::string id;

@@ -58,6 +58,15 @@ class DiskCacheGroupTestPeer {
 };
 class RamTierTestPeer {
  public:
+  static void GateTypedBatch(RamTier& tier, std::function<void()> gate) {
+    const RamTier::FlushBatchResultFn batch = tier.flush_batch_results_;
+    tier.flush_batch_results_ =
+        [batch,
+         gate = std::move(gate)](const std::vector<RamTier::FlushItem>& items) {
+          gate();
+          return batch(items);
+        };
+  }
   static bool HasTypedSingle(const RamTier& tier) {
     return static_cast<bool>(tier.flush_result_);
   }
@@ -212,6 +221,9 @@ class KvNodeServerWiringTestPeer {
   }
   static Status DropDisk(KvNodeServer& server, const BlockKey& key) {
     return server.group_.Remove(key);
+  }
+  static uint64_t UncleanResets(const KvNodeServer& server) {
+    return server.group_.SlabStats().unclean_resets;
   }
   static bool PersistenceHealthy(const KvNodeServer& server) {
     return server.group_.Healthy() && (!server.ram_ || server.ram_->healthy());
@@ -3173,11 +3185,14 @@ class ProductionFlushResultTest : public ::testing::Test {
     node_.reset();
     fs::remove_all(dir_);
   }
-  void Create(bool with_clock, const char* engine = "slab") {
+  void Create(bool with_clock, const char* engine = "slab", size_t disks = 1) {
     node_.reset();
     DiskCacheGroup::Options options;
     options.cache_dirs = {(dir_ / engine).string()};
-    options.capacity_bytes = 1ull << 30;
+    for (size_t i = 1; i < disks; ++i)
+      options.cache_dirs.push_back(
+          (dir_ / (engine + std::to_string(i))).string());
+    options.capacity_bytes = (1ull << 30) * disks;
     options.engine = engine;
     options.eviction_policy = "legacy";
     if (with_clock) {
@@ -3377,4 +3392,112 @@ TEST_F(ProductionFlushResultTest, AcceptedQueuedPutStopsWithoutPoisoningIo) {
   EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, first_key, &restored),
             Status::kOk);
   EXPECT_EQ(restored, "first");
+}
+
+TEST_F(ProductionFlushResultTest, UndrainedRamAckLeavesEveryDiskDirty) {
+  const ScopedEnv ram_ack("DFKV_PUT_ACK_MODE", "ram");
+  const ScopedEnv timeout("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S", "0");
+  const ScopedEnv one_slot("DFKV_SLAB_GRANULARITY", "1073741824");
+  for (const bool started : {false, true}) {
+    SCOPED_TRACE(started);
+    ASSERT_NO_FATAL_FAILURE(Create(true, "slab", 2));
+    if (started) {
+      ASSERT_EQ(node_->Start(0), Status::kOk);
+    }
+    const BlockKey disk_key{99600, 0};
+    ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*node_, disk_key, "disk", 4),
+              Status::kOk);
+    const std::shared_ptr<FlushBarrier> barrier =
+        std::make_shared<FlushBarrier>();
+    const OpenFlushOnExit release{*barrier};
+    RamTierTestPeer::GateTypedBatch(KvNodeServerWiringTestPeer::Ram(*node_),
+                                    [barrier] { barrier->Block(); });
+    char data[] = "acked";
+    ASSERT_EQ(node_->CacheDirectForKey({99601, 0}, data, 5, sizeof(data)),
+              Status::kOk);
+    ASSERT_TRUE(barrier->AwaitEntry());
+    EXPECT_EQ(KvNodeServerWiringTestPeer::Ram(*node_).DirtyObjects(), 1U);
+    seconds_.fetch_add(uint64_t{UINT32_MAX} + 1, std::memory_order_relaxed);
+    if (started) {
+      node_->Stop();
+      node_->Stop();
+    }
+    barrier->Open();
+    node_.reset();  // Final join must see the retained, unqueued dirty value.
+    ASSERT_NO_FATAL_FAILURE(Create(true, "slab", 2));
+    EXPECT_EQ(KvNodeServerWiringTestPeer::UncleanResets(*node_), 2U);
+    EXPECT_TRUE(KvNodeServerWiringTestPeer::PersistenceHealthy(*node_));
+    std::string value;
+    EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, disk_key, &value),
+              Status::kNotFound);
+    // Dirty recovery deliberately cold-resets old disk cache, not RAM-ACK
+    // recovery. This is the existing conservative restart contract.
+    node_.reset();
+  }
+}
+
+TEST_F(ProductionFlushResultTest,
+       TimedOutStopCanStillFinishCleanlyAtDestruction) {
+  const ScopedEnv ram_ack("DFKV_PUT_ACK_MODE", "ram");
+  const ScopedEnv timeout("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S", "0");
+  ASSERT_NO_FATAL_FAILURE(Create(true));
+  ASSERT_EQ(node_->Start(0), Status::kOk);
+  const std::shared_ptr<FlushBarrier> barrier =
+      std::make_shared<FlushBarrier>();
+  const OpenFlushOnExit release{*barrier};
+  RamTier& tier = KvNodeServerWiringTestPeer::Ram(*node_);
+  RamTierTestPeer::GateTypedBatch(tier, [barrier] { barrier->Block(); });
+  char data[] = "acked";
+  const BlockKey key{99602, 0};
+  ASSERT_EQ(node_->CacheDirectForKey(key, data, 5, sizeof(data)), Status::kOk);
+  ASSERT_TRUE(barrier->AwaitEntry());
+  node_->Stop();
+  EXPECT_EQ(tier.ShutdownDrainTimeouts(), 1U);
+  EXPECT_EQ(tier.DirtyObjects(), 1U);
+  barrier->Open();
+  node_.reset();  // The join, not Stop's temporary timeout, decides clean.
+  ASSERT_NO_FATAL_FAILURE(Create(true));
+  EXPECT_EQ(KvNodeServerWiringTestPeer::UncleanResets(*node_), 0U);
+  std::string value;
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, key, &value),
+            Status::kOk);
+  EXPECT_EQ(value, "acked");
+}
+
+TEST_F(ProductionFlushResultTest, RemovedRamAckDoesNotPreventCleanShutdown) {
+  const ScopedEnv ram_ack("DFKV_PUT_ACK_MODE", "ram");
+  const ScopedEnv one_slot("DFKV_SLAB_GRANULARITY", "1073741824");
+  ASSERT_NO_FATAL_FAILURE(Create(true));
+  const BlockKey disk_key{99603, 0};
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*node_, disk_key, "disk", 4),
+            Status::kOk);
+  const std::shared_ptr<FlushBarrier> barrier =
+      std::make_shared<FlushBarrier>();
+  const OpenFlushOnExit release{*barrier};
+  RamTier& tier = KvNodeServerWiringTestPeer::Ram(*node_);
+  RamTierTestPeer::GateTypedBatch(tier, [barrier] { barrier->Block(); });
+  char data[] = "acked";
+  const BlockKey pending{99604, 0};
+  ASSERT_EQ(node_->CacheDirectForKey(pending, data, 5, sizeof(data)),
+            Status::kOk);
+  ASSERT_TRUE(barrier->AwaitEntry());
+  seconds_.store(uint64_t{UINT32_MAX} + 101, std::memory_order_relaxed);
+  barrier->Open();
+  ASSERT_TRUE(WaitFor([&] {
+    RamTier::PutResult result{Status::kInvalid};
+    return RamTierTestPeer::StoredResult(tier, pending, &result) &&
+           result.status == Status::kCacheFull &&
+           result.reason == DiskWriteReason::kLifetimeClockExhausted;
+  }));
+  EXPECT_EQ(tier.DirtyObjects(), 1U);
+  EXPECT_TRUE(tier.healthy());
+  ASSERT_TRUE(
+      tier.Remove(pending));  // Required cleanup after terminal refusal.
+  node_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create(true));
+  EXPECT_EQ(KvNodeServerWiringTestPeer::UncleanResets(*node_), 0U);
+  std::string value;
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, disk_key, &value),
+            Status::kOk);
+  EXPECT_EQ(value, "disk");
 }

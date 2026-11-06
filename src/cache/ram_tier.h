@@ -391,6 +391,11 @@ class RamTier {
 
   friend class KvNodeServer;
   friend class RamTierTestPeer;
+  // Owner-only final shutdown after all external users have quiesced. Stops
+  // and joins workers but retains the arena until destruction. Serial repeat
+  // calls are safe; do not call from a flush callback or restart afterward.
+  // Unlike WaitForDrain, this reports final health and dirty state after join.
+  bool Shutdown();
   enum class AdmitTestPhase : unsigned char {
     kBeforeCancelCheck = 0,
     kAfterCancelCheck = 1,

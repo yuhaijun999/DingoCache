@@ -38,6 +38,7 @@ namespace dfkv {
 // into a sleep-sized race window.
 class RamTierTestPeer {
  public:
+  static bool Shutdown(RamTier& tier) { return tier.Shutdown(); }
   using Admission = RamTier::Admission;
   using Completion = std::shared_ptr<RamTier::PutCompletion>;
   using AdmitPhase = RamTier::AdmitTestPhase;
@@ -2141,6 +2142,9 @@ TEST(RamTier, ClockExhaustionRetainsAckedPayloadAndFlushPinUntilRemove) {
   EXPECT_TRUE(RamTierTestPeer::FlushPinned(tier, K(80301)));
   EXPECT_FALSE(tier.WaitForDrain(std::chrono::milliseconds(0)));
   EXPECT_EQ(tier.ShutdownDrainTimeouts(), 1U);
+  EXPECT_FALSE(RamTierTestPeer::Shutdown(tier));
+  EXPECT_FALSE(RamTierTestPeer::Shutdown(tier));
+  EXPECT_TRUE(tier.healthy());
   RamTier::Hit hit;
   ASSERT_TRUE(tier.GetPrep(K(80301), 0, 5, &hit));
   EXPECT_EQ(std::string(hit.ptr, hit.len), "owner");
@@ -2250,4 +2254,29 @@ TEST(RamTier, TypedRetryPublishesFinalSuccessAndIgnoresExtraBatchRows) {
   EXPECT_TRUE(WaitFor([&] { return tier.Flushed() == 1U; }));
   EXPECT_EQ(tier.FlushDropped(), 0U);
   EXPECT_TRUE(tier.healthy());
+}
+
+TEST(RamTier, FinalShutdownJoinsAcceptedWritesAndIsIdempotent) {
+  RamTier::Options options = Opts(64 * 4096);
+  options.reclaim_interval_ms = 0;
+  RamTier tier(options,
+               [](const BlockKey&, char*, size_t, size_t) { return true; });
+  ASSERT_TRUE(tier.Put(K(80400), "accepted", 8));
+  EXPECT_TRUE(RamTierTestPeer::Shutdown(tier));
+  EXPECT_EQ(tier.DirtyObjects(), 0U);
+  EXPECT_EQ(tier.Flushed(), 1U);
+  EXPECT_TRUE(RamTierTestPeer::Shutdown(tier));
+}
+
+TEST(RamTier, FinalShutdownRejectsUnhealthyEvenWithoutDirtyObjects) {
+  RamTier::Options options = Opts(64 * 4096);
+  options.reclaim_interval_ms = 0;
+  options.flush_retries = 1;
+  RamTier tier(options,
+               [](const BlockKey&, char*, size_t, size_t) { return false; });
+  ASSERT_EQ(tier.PutCommitted(K(80401), "failed", 6).status, Status::kIOError);
+  EXPECT_EQ(tier.DirtyObjects(), 0U);
+  EXPECT_FALSE(tier.healthy());
+  EXPECT_FALSE(RamTierTestPeer::Shutdown(tier));
+  EXPECT_FALSE(RamTierTestPeer::Shutdown(tier));
 }
