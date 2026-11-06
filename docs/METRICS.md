@@ -235,6 +235,10 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_background_scan_slices_total` | counter | Background class allocator lock slices. |
 | `dfkv_slab_lifetime_background_budget_exhausted_total` | counter | Class ticks deferred at a scan or successful-victim cap. |
 | `dfkv_slab_lifetime_background_no_candidate_total` | counter | Background class scans with no eligible candidate. |
+| `dfkv_slab_lifetime_watermark_budget_exhausted_total` | counter | Internal lifetime watermark ticks stopped at the shared resident-visit cap; does not imply no eligible victim. |
+| `dfkv_slab_lifetime_watermark_no_candidate_total` | counter | Internal lifetime watermark scans that completed their stable traversal without an eligible candidate; separate from budget and metadata failure. |
+| `dfkv_slab_lifetime_watermark_pin_skips_total` | counter | Pinned resident checks in internal lifetime watermark scans; repeated checks count again. |
+| `dfkv_slab_lifetime_watermark_protected_victims_total` | counter | Successfully invalidated checked winners with score strictly above KEEP (soft-protection fallback). |
 | `dfkv_slab_lifetime_init_clock_hard_exhausted_total` | counter | 内部评分路径的 NEW 或恢复住户因超过32位时钟硬界限而跳过评分初始化的次数；数据提交和身份仍有效，不是 PUT 失败或 I/O 错误。未初始化状态不可用于评分。未注入评分配置的 legacy 及仅注入 clock 的路径恒为0，file 不输出此 slab 指标；此计数不代表外部 lifetime 已开放 |
 | `dfkv_slab_lifetime_read_success_total` / `dfkv_slab_lifetime_read_applied_total` | counter | 内部评分路径收到的非零逻辑成功读通知数 / 已对原住户应用的通知数；不是物理 I/O 数，不含失败、零字节、Lookup/Exist。同步请求/Into及其RAM、copy follower和PULL已成立授权均按逻辑请求计数；PULL在有效READ注册与授权所有权建立后、READY编码前通知，准备/RELEASE不补计；不是READY发送成功或客户端消费证明 |
 | `dfkv_slab_lifetime_read_no_binding_total` / `dfkv_slab_lifetime_read_race_lost_total` | counter | 成功字节没有盘来源凭据 / 原来源实例、epoch、可见性或generation已不匹配；绝不按当前同名key补绑定或补热 |

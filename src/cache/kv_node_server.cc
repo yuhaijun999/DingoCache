@@ -691,6 +691,17 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_background_budget_exhausted_total", "counter",
            "Class ticks deferred at a scan or successful-victim cap",
            ss.lifetime_background_budget_exhausted);
+    metric("dfkv_slab_lifetime_watermark_budget_exhausted_total", "counter",
+           "Lifetime watermark budget exhausted.",
+           ss.lifetime_watermark_budget_exhausted);
+    metric("dfkv_slab_lifetime_watermark_no_candidate_total", "counter",
+           "Lifetime watermark no candidate.",
+           ss.lifetime_watermark_no_candidate);
+    metric("dfkv_slab_lifetime_watermark_pin_skips_total", "counter",
+           "Lifetime watermark pin skips.", ss.lifetime_watermark_pin_skips);
+    metric("dfkv_slab_lifetime_watermark_protected_victims_total", "counter",
+           "Lifetime watermark protected victims.",
+           ss.lifetime_watermark_protected_victims);
     metric("dfkv_slab_lifetime_background_no_candidate_total", "counter",
            "Background class scans with no eligible candidate",
            ss.lifetime_background_no_candidate);

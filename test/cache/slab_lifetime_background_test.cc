@@ -358,16 +358,19 @@ TEST_F(LifetimeBackgroundStoreTest, FullPinnedTraversalIsNotBudgetOrIoFailure) {
   EXPECT_EQ(store_->GetStats().lifetime_background_budget_exhausted, 0U);
 }
 
-TEST_F(LifetimeBackgroundStoreTest, DispatchDoesNotRunLegacyWatermarkFirst) {
+TEST_F(LifetimeBackgroundStoreTest,
+       DispatchRunsLifetimeWatermarkWithoutLegacyDonor) {
   ASSERT_NO_FATAL_FAILURE(Create(4));
   ASSERT_NO_FATAL_FAILURE(SeedStore(4));
   DiskSlabStoreTestPeer::ForceLegacyWatermark(*store_);
   DiskSlabStoreTestPeer::Dispatch(*store_);
   const DiskSlabStore::Stats stats = store_->GetStats();
-  EXPECT_EQ(stats.reclaimed_slots, 1U);
-  EXPECT_EQ(stats.watermark_evictions, 0U);
+  EXPECT_EQ(stats.reclaimed_slots, 0U);
+  EXPECT_EQ(stats.watermark_evictions, 4U);
+  EXPECT_EQ(stats.watermark_slot_record_clears, 4U);
+  EXPECT_EQ(stats.watermark_extent_clears, 0U);
   EXPECT_EQ(stats.rebalanced_extents, 0U);
-  EXPECT_EQ(store_->Count(), 3U);
+  EXPECT_EQ(store_->Count(), 0U);
 }
 
 TEST_F(LifetimeBackgroundStoreTest, RealInvalidationFailureRetainsResident) {

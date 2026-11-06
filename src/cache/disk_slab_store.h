@@ -92,7 +92,7 @@ class DiskSlabStore : public StoreEngine {
     // Absent by default; does not select a new eviction policy.
     std::optional<DiskLifetimeConfig> lifetime_config{};
     // Internal class selector gate, never set by group/CLI. Requires scoring;
-    // its background path does not run the still-staged watermarks or donors.
+    // its background path runs score watermarks/classes, but no staged donors.
     bool lifetime_class_eviction = false;
   };
 
@@ -120,6 +120,11 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_background_scan_slices = 0;
     uint64_t lifetime_background_budget_exhausted = 0;
     uint64_t lifetime_background_no_candidate = 0;
+    uint64_t lifetime_watermark_budget_exhausted = 0;
+    uint64_t lifetime_watermark_no_candidate = 0;
+    uint64_t lifetime_watermark_pin_skips = 0;
+    uint64_t lifetime_watermark_protected_victims = 0;
+
     uint64_t dio_write_fallbacks = 0;
     uint64_t dio_read_fallbacks = 0;
     uint64_t table_syncs = 0;
@@ -479,6 +484,11 @@ class DiskSlabStore : public StoreEngine {
   uint64_t lifetime_background_scan_slices_ = 0;
   uint64_t lifetime_background_budget_exhausted_ = 0;
   uint64_t lifetime_background_no_candidate_ = 0;
+  uint64_t lifetime_watermark_budget_exhausted_ = 0;
+  uint64_t lifetime_watermark_no_candidate_ = 0;
+  uint64_t lifetime_watermark_pin_skips_ = 0;
+  uint64_t lifetime_watermark_protected_victims_ = 0;
+
   // Invoked only between class slices, after releasing BOTH lifecycle locks.
   std::function<void()> lifetime_scan_yield_hook_for_test_{};
   LifetimeReadCounters lifetime_reads_{};  // under mu_

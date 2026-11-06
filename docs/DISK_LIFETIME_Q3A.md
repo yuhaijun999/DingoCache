@@ -21,7 +21,7 @@
 
 - `DiskSlabStore::Options::lifetime_class_eviction` 默认 false，Group/CLI
   不转发该内部测试开关。开启要求有效 scoring/clock；可设置后台周期。
-  新 class 后台路径不会混入尚未接通的 legacy 水位/donor。
+  新后台路径先运行Q3b评分水位，再运行class回收，不混入legacy donor。
 - 一片 allocator 锁内最多访问1024个 resident，使用同一 now。
   各档轮转检查本片首个合法候选，按 score、anchor、住户 generation
   比较；KEEP 是软线，pin 不能淘汰。只保证实际检查候选中的最低分。
@@ -56,14 +56,14 @@
   即使没有新 PUT，安静 tick 仍会续扫。达到目标后清掉任务，不空转扫描。
 - 全 pin/当前无候选与访问或成功件数到限分开计数；保留待做任务到后续
   tick，不在同一 tick 无限重试。后台暂缓不变成某个客户端的 CacheFull。
-- ReclaimTick 在内部开关下直接进入新 class 路径，不先运行旧全局水位
-  或 donor GROW；普通 shadow/legacy 路径保持原行为。
+- ReclaimTick 在内部开关下先运行Q3b评分水位，再运行新class路径；
+  不运行旧全局水位或donor GROW，普通shadow/legacy保持原行为。
 - 四个 background 计数与前台计数分开，`reclaimed_slots` 仍统计真实
   后台成功删除量。扫描计数不是 p99 的硬界，失效 I/O 仍遵守既有契约。
 
 ## 内存与验收边界
 
-本轮 GCC13/x86_64：allocator568B不变，Store1672→1728B（固定+56，含4个
+Q3a提交时 GCC13/x86_64：allocator568B不变，Store1672→1728B（固定+56，含4个
 后台计数和pending vector）；StoreOptions200B不变，Stats496→528B。
 SlotMeta104、links20、queue12字节不变；既有 enabled版本8B/class保留。
 新增 pending target 每class一个size_t（本ABI为8B），只在新后台路径分配。
@@ -81,5 +81,6 @@ SlotMeta104、links20、queue12字节不变；既有 enabled版本8B/class保留
 - 固定维度扫描/预算指标见 `docs/METRICS.md`。
 
 Q3a 的内部类内实现本轮收口；不冒称完整策略、性能或公开激活已验收。
-下一步 Q3b 全盘水位公平选择；完整Q3c端到端激活/ACK门禁及D4桶/donor待后续。
+Q3b全盘水位公平选择见 `docs/DISK_LIFETIME_Q3B.md`；
+完整Q3c端到端激活/ACK门禁及D4桶/donor待后续。
 L12真实MR/READY/RXE/kernel io_uring数据面继续按用户约定后置，不算通过。

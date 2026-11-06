@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add internally gated lifetime watermark eviction with fair per-band cursors,
+  per-victim score merging and one shared tick visit budget. Keep existing
+  pressure-latch semantics, clear only successful slot records, and export
+  budget/no-candidate/pin/soft-protection counters. Public policy stays gated.
+
 - Add internally gated lifetime background class reclaim with 1024-visit lock
   slices and shared per-class tick budgets. Resume pending headroom on quiet
   ticks while keeping legacy watermarks/donors out of this staged path.

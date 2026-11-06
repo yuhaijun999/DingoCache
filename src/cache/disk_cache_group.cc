@@ -921,6 +921,13 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_background_budget_exhausted +=
         st.lifetime_background_budget_exhausted;
     sum.lifetime_background_no_candidate += st.lifetime_background_no_candidate;
+    sum.lifetime_watermark_budget_exhausted +=
+        st.lifetime_watermark_budget_exhausted;
+    sum.lifetime_watermark_no_candidate += st.lifetime_watermark_no_candidate;
+    sum.lifetime_watermark_pin_skips += st.lifetime_watermark_pin_skips;
+    sum.lifetime_watermark_protected_victims +=
+        st.lifetime_watermark_protected_victims;
+
     sum.lifetime_reads.successful += st.lifetime_reads.successful;
     sum.lifetime_reads.applied += st.lifetime_reads.applied;
     sum.lifetime_reads.no_binding += st.lifetime_reads.no_binding;

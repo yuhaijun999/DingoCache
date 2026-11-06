@@ -1,6 +1,7 @@
 #include "cache/slab_allocator.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -1319,6 +1320,134 @@ SlabAllocator::LifetimeReclaimResult SlabAllocator::ReclaimLifetimeClass(
   }
   result.more = cls.free_count < target_free && unbound_ == 0;
   return result;
+}
+
+size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
+                                            size_t max_victims,
+                                            const DiskLifetimeConfig& config,
+                                            const DiskLifetimeClock& clock,
+                                            std::vector<BlockKey>* evicted,
+                                            LifetimeWatermarkStats* stats) {
+  const std::lock_guard<std::mutex> lock(mu_);
+  if (stats != nullptr) *stats = LifetimeWatermarkStats{};
+  if (!opt_.track_lifetime_state || max_victims == 0) return 0;
+  const size_t limit = max_victims > SIZE_MAX / 4 ? SIZE_MAX : 4 * max_victims;
+  const uint32_t bands = opt_.lifetime_max_reads + 1;
+  std::array<uint32_t, 64> candidates;
+  std::array<uint32_t, 64> starts;
+  std::array<bool, 64> done{};
+  candidates.fill(kNoSlot);
+  for (uint32_t band = 0; band < bands; ++band) {
+    starts[band] = lifetime_queues_[band].cursor;
+    done[band] = starts[band] == kNoSlot;
+  }
+  size_t visits = 0;
+  size_t freed = 0;
+  while (freed < max_victims && used_bytes_ > target_bytes && visits < limit) {
+    if (!ReclaimAllowed()) break;
+    uint32_t now = 0;
+    if (!clock.TryDrainNow(&now)) break;
+    uint32_t best = kNoSlot;
+    uint32_t best_band = 0;
+    int64_t best_score = 0;
+    bool pending = false;
+    uint32_t cached_pending = 0;
+    for (uint32_t band = 0; band < bands; ++band)
+      cached_pending += candidates[band] != kNoSlot;
+    // Each nonempty band receives at most one resident check per round.
+    // A pinned prefix cannot monopolize the tick before another band runs.
+    for (uint32_t turn = 0; turn < bands && visits < limit; ++turn) {
+      const uint32_t band = lifetime_next_band_;
+      lifetime_next_band_ = (band + 1) % bands;
+      if (done[band]) continue;
+      LifetimeQueue& queue = lifetime_queues_[band];
+      uint32_t current = candidates[band];
+      if (current != kNoSlot) --cached_pending;
+      if (current == kNoSlot) {
+        current = queue.cursor;
+        const uint32_t next = lifetime_links_[current].indexes[0].next;
+        queue.cursor = next == kNoSlot ? queue.head : next;
+        done[band] = queue.cursor == starts[band];
+      }
+      ++visits;
+      ++watermark_scan_steps_;
+      const SlotMeta& meta = slots_[current];
+      if (meta.refs != 0 && stats != nullptr) ++stats->pin_skips;
+      if (meta.live && !meta.remove_pending && meta.refs == 0 &&
+          resident_generations_[current] != 0 &&
+          resident_lifetime_states_[current].has_value() &&
+          lifetime_links_[current].band == band) {
+        candidates[band] = current;
+        done[band] = false;
+        const DiskLifetimeState& state = *resident_lifetime_states_[current];
+        const int64_t score = DiskLifetimeScore(
+            config, state.anchor, state.scoring_reads(),
+            state.first_early_read(), state.write_armed(), now);
+        // The lock excludes heat, pin, identity and membership mutations.
+        // Rechecking a cached candidate still pays one visit this round.
+        if (best == kNoSlot || score < best_score ||
+            (score == best_score &&
+             (state.anchor < resident_lifetime_states_[best]->anchor ||
+              (state.anchor == resident_lifetime_states_[best]->anchor &&
+               resident_generations_[current] <
+                   resident_generations_[best])))) {
+          best = current;
+          best_band = band;
+          best_score = score;
+        }
+      } else {
+        candidates[band] = kNoSlot;
+      }
+      pending = pending || !done[band];
+      // Leave one visit available when a checked winner already exists. This
+      // also lets tiny caps make progress when they cannot cover every band.
+      // Every candidate retained from the previous selection must compete
+      // again first; a partial round must not discard a known colder one.
+      if (best != kNoSlot && cached_pending == 0 && visits + 1 == limit) break;
+    }
+    // Do not start persistence after exhausting the shared access budget.
+    if (visits == limit) {
+      if (stats != nullptr) ++stats->budget_exhausted;
+      break;
+    }
+    if (best == kNoSlot) {
+      if (!pending) {
+        if (stats != nullptr) ++stats->no_candidate;
+        break;
+      }
+      continue;
+    }
+    if (!ReclaimAllowed() || !clock.TryDrainNow(&now)) break;
+    // Unlike legacy's last-resident optimization, this path only clears one
+    // slot record. No whole-extent donor operation belongs to watermarks.
+    if (opt_.on_slot_evict) {
+      if (!opt_.on_slot_evict(slots_[best].ref)) break;
+    } else if (opt_.on_extent_evict) {
+      break;  // A whole-extent callback cannot safely invalidate one slot.
+    }
+    const BlockKey victim = slots_[best].key;
+    FreeSlotLocked(best);
+    if (evicted != nullptr) evicted->push_back(victim);
+    ++evictions_;
+    ++watermark_evictions_;
+    ++freed;
+    if (stats != nullptr &&
+        best_score > static_cast<int64_t>(config.keep_score_sec))
+      ++stats->protected_victims;
+    // Replenish only the winning band; every other cached candidate will be
+    // checked against the next round's common clock before competing again.
+    candidates[best_band] = kNoSlot;
+    starts[best_band] = lifetime_queues_[best_band].cursor;
+    done[best_band] = starts[best_band] == kNoSlot;
+  }
+  // An eligible resident observed on the last paid visit could not be
+  // invalidated. Revisit it first next tick instead of wrapping through the
+  // same pinned prefix forever. Nonwinning candidates must not be skipped.
+  for (uint32_t band = 0; band < bands; ++band) {
+    if (candidates[band] != kNoSlot)
+      lifetime_queues_[band].cursor = candidates[band];
+  }
+  return freed;
 }
 
 size_t SlabAllocator::EvictColdToTarget(uint64_t target_bytes,

@@ -20,6 +20,14 @@ namespace dfkv {
 
 class SlabAllocatorTestPeer {
  public:
+  static size_t EvictLifetimeToTarget(SlabAllocator& allocator, uint64_t target,
+                                      size_t max_victims,
+                                      const DiskLifetimeConfig& config,
+                                      const DiskLifetimeClock& clock,
+                                      std::vector<BlockKey>* evicted) {
+    return allocator.EvictLifetimeToTarget(target, max_victims, config, clock,
+                                           evicted);
+  }
   using LifetimeScan = SlabAllocator::LifetimeScan;
   using LifetimeScanResult = SlabAllocator::LifetimeScanResult;
   using LifetimeReclaimResult = SlabAllocator::LifetimeReclaimResult;

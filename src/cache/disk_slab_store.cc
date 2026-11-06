@@ -620,8 +620,17 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
     long x = std::strtol(v, nullptr, 10);
     return (x >= 0 && x <= 100) ? static_cast<unsigned>(x) : dflt;
   };
-  const unsigned high_pct = env_pct("DFKV_SLAB_EVICT_HIGH_PCT", 92);
-  unsigned low_pct = env_pct("DFKV_SLAB_EVICT_LOW_PCT", 88);
+  // Internal lifetime execution uses the already validated snapshot, not a
+  // second environment parse that could disagree with its scoring config.
+  unsigned high_pct = 0;
+  unsigned low_pct = 0;
+  if (opt_.lifetime_class_eviction && opt_.lifetime_config.has_value()) {
+    high_pct = static_cast<unsigned>(opt_.lifetime_config->high_pct);
+    low_pct = static_cast<unsigned>(opt_.lifetime_config->low_pct);
+  } else {
+    high_pct = env_pct("DFKV_SLAB_EVICT_HIGH_PCT", 92);
+    low_pct = env_pct("DFKV_SLAB_EVICT_LOW_PCT", 88);
+  }
   if (low_pct >= high_pct && high_pct > 0) low_pct = high_pct - 1;
   evict_high_bytes_ = high_pct ? opt_.capacity_bytes / 100 * high_pct : 0;
   evict_low_bytes_ = opt_.capacity_bytes / 100 * low_pct;
@@ -2529,10 +2538,6 @@ void DiskSlabStore::ReclaimTick(
   if (!CanStartReclaim()) return;
   // Private test seam: pause work already admitted, before acquiring mu_.
   if (before_lock_for_test) before_lock_for_test();
-  if (opt_.lifetime_class_eviction) {
-    ReclaimLifetimeTick();
-    return;  // Do not mix in unimplemented lifetime watermark/donor policies.
-  }
   // Successful NEW commits renew pressure eligibility. Inactive history
   // expires after 128 quiet observations; required active drain is preserved.
   // Sampling and composite mutation share mu_.
@@ -2556,8 +2561,19 @@ void DiskSlabStore::ReclaimTick(
       evicted.clear();
       const uint64_t used_before = alloc_->UsedBytes();
       watermark_selector_call_ = true;
-      alloc_->EvictColdToTarget(evict_low_bytes_,
-                               evict_max_victims_per_tick_, &evicted);
+      if (opt_.lifetime_class_eviction) {
+        SlabAllocator::LifetimeWatermarkStats stats;
+        alloc_->EvictLifetimeToTarget(
+            evict_low_bytes_, evict_max_victims_per_tick_,
+            *opt_.lifetime_config, *opt_.lifetime_clock, &evicted, &stats);
+        lifetime_watermark_budget_exhausted_ += stats.budget_exhausted;
+        lifetime_watermark_no_candidate_ += stats.no_candidate;
+        lifetime_watermark_pin_skips_ += stats.pin_skips;
+        lifetime_watermark_protected_victims_ += stats.protected_victims;
+      } else {
+        alloc_->EvictColdToTarget(evict_low_bytes_, evict_max_victims_per_tick_,
+                                  &evicted);
+      }
       watermark_selector_call_ = false;
       const uint64_t used_after = alloc_->UsedBytes();
       if (used_after < used_before)
@@ -2587,6 +2603,10 @@ void DiskSlabStore::ReclaimTick(
     }
   }
   if (!CanStartReclaim()) return;
+  if (opt_.lifetime_class_eviction) {
+    ReclaimLifetimeTick();
+    return;  // Lifetime donor growth remains a separate, disabled stage.
+  }
   const auto classes = alloc_->Classes();
   if (reclaim_last_puts_.size() < classes.size())
     reclaim_last_puts_.resize(classes.size(), 0);
@@ -2777,6 +2797,12 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.lifetime_background_budget_exhausted =
       lifetime_background_budget_exhausted_;
   st.lifetime_background_no_candidate = lifetime_background_no_candidate_;
+  st.lifetime_watermark_budget_exhausted = lifetime_watermark_budget_exhausted_;
+  st.lifetime_watermark_no_candidate = lifetime_watermark_no_candidate_;
+  st.lifetime_watermark_pin_skips = lifetime_watermark_pin_skips_;
+  st.lifetime_watermark_protected_victims =
+      lifetime_watermark_protected_victims_;
+
   st.lifetime_reads = lifetime_reads_;
   st.payload_bytes = committed_payload_bytes_;
   st.lifetime_init_clock_hard_exhausted = lifetime_init_clock_hard_exhausted_;

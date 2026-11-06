@@ -244,6 +244,19 @@ class SlabAllocator {
                                              size_t max_victims,
                                              LifetimeScan& scan,
                                              std::vector<BlockKey>* evicted);
+  struct LifetimeWatermarkStats {
+    uint64_t budget_exhausted = 0;
+    uint64_t no_candidate = 0;
+    uint64_t pin_skips = 0;
+    uint64_t protected_victims = 0;
+  };
+  // Internal disk watermark selector. Candidates never survive this A lock;
+  // all scans and cached-candidate checks share one 4*max_victims budget.
+  size_t EvictLifetimeToTarget(uint64_t target_bytes, size_t max_victims,
+                               const DiskLifetimeConfig& config,
+                               const DiskLifetimeClock& clock,
+                               std::vector<BlockKey>* evicted,
+                               LifetimeWatermarkStats* stats = nullptr);
   void BumpLifetimeVersionLocked(uint32_t meta_index);
   // Physical ownership only, including pending removal. Does not touch CLOCK.
   // Zero means disabled, absent or uncommitted; never an exportable identity.
@@ -426,12 +439,14 @@ class SlabAllocator {
   // deliberately uninitialized resident from a valid state whose anchor is 0.
   // Only physical removal clears a committed state, not payload visibility.
   std::vector<std::optional<DiskLifetimeState>> resident_lifetime_states_;
-  // Optional score indexes, used only by the internal foreground selector.
+  // Optional score indexes, used only by the internal disk selectors.
   // Legacy rings remain authoritative without that Store gate. Disabled paths
   // allocate no links or queue heads; the RAM per-slot layout stays unchanged.
   std::vector<LifetimeLinks> lifetime_links_;
   // Row 0 is global; row cls+1 is class-local, each with MAX_READS+1 bands.
   std::vector<LifetimeQueue> lifetime_queues_;
+  uint32_t lifetime_next_band_ =
+      0;  // Global watermark turn, including quiet ticks.
   // Enabled-only class mutation versions, including pin eligibility changes.
   std::vector<uint64_t> lifetime_versions_;
   uint32_t free_slot_meta_head_ = kNoSlot;
