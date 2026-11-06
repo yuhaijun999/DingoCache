@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -33,6 +34,8 @@
 #include <vector>
 
 #include "cache/disk_lifetime_clock.h"
+#include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_state.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_write_result.h"
 #include "cache/slab_allocator.h"
@@ -542,6 +545,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
 
   SlabAllocator::Options ao;
   ao.track_resident_identity = opt_.track_resident_identity;
+  ao.track_lifetime_state = opt_.lifetime_config.has_value();
   if (opt_.lifetime_clock)
     ao.can_reclaim = [this] { return CanStartReclaim(); };
   ao.extent_bytes = opt_.extent_bytes;
@@ -845,6 +849,18 @@ bool DiskSlabStore::ValidateExistingDataFiles(const Options& options,
 
 bool DiskSlabStore::ValidateOptions() {
   std::string error;
+  if (opt_.lifetime_config) {
+    if (!ValidateDiskLifetimeConfig(*opt_.lifetime_config, &error))
+      return SetStartupError(error);
+    const uint64_t horizon = DiskLifetimeHorizon(*opt_.lifetime_config);
+    if (!opt_.lifetime_clock || opt_.lifetime_clock->horizon_sec() != horizon)
+      return SetStartupError("lifetime scoring requires a clock matching H=" +
+                             std::to_string(horizon));
+    uint32_t offset = 0;
+    if (!opt_.lifetime_clock->TryNow(&offset))
+      return SetStartupError("lifetime clock is invalid or exhausted");
+    opt_.track_resident_identity = true;
+  }
   if (!ValidateGeometry(opt_, &error)) return SetStartupError(error);
   num_extents_ = static_cast<uint32_t>(opt_.capacity_bytes / opt_.extent_bytes);
   max_slots_per_extent_ =
@@ -1342,7 +1358,8 @@ bool DiskSlabStore::Rebuild() {
     // Rebuild precedes MarkDirtyEpoch. Save only generation here; credentials
     // are composed with the final current epoch after construction completes.
     CommitPayloadLocked(entry.key, entry.key.Filename(),
-                        static_cast<uint32_t>(entry.value_bytes), generation);
+                        static_cast<uint32_t>(entry.value_bytes), generation,
+                        /*recovered=*/true);
   }
   table_rebuilt_ += entries.size();
 
@@ -1444,9 +1461,25 @@ DiskResidentIdentity DiskSlabStore::ResidentIdentityLocked(
 void DiskSlabStore::CommitPayloadLocked(const BlockKey& resident_key,
                                         const std::string& key,
                                         uint32_t payload_len,
-                                        uint64_t generation) {
-  if (resident_identity_)
-    alloc_->CommitResidentGeneration(resident_key, generation);
+                                        uint64_t generation, bool recovered) {
+  if (resident_identity_) {
+    std::optional<DiskLifetimeState> state;
+    if (opt_.lifetime_config) {
+      // Runtime commits hold mu_; recovery is exclusively owned before the
+      // store is published. Neither path may initialize heat past the bound.
+      uint32_t offset = 0;
+      if (opt_.lifetime_clock->TryDrainNow(&offset)) {
+        state = recovered ? RecoveredDiskLifetimeState(1)
+                          : NewDiskLifetimeState(offset);
+      } else {
+        // Data already committed successfully. Keep its identity but no heat;
+        // null state must never be used as a valid score (anchor 0 is valid).
+        ++lifetime_init_clock_hard_exhausted_;
+      }
+    }
+    alloc_->CommitResidentGeneration(resident_key, generation,
+                                     state ? &*state : nullptr);
+  }
   auto [it, inserted] = payload_len_.try_emplace(key, payload_len);
   if (inserted) {
     committed_payload_bytes_ += payload_len;
@@ -2577,6 +2610,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   }
   std::lock_guard<std::mutex> lk(mu_);
   st.payload_bytes = committed_payload_bytes_;
+  st.lifetime_init_clock_hard_exhausted = lifetime_init_clock_hard_exhausted_;
   st.committed_objects = payload_len_.size();
   st.deferred_removes = deferred_remove_total_;
   st.inflight = inflight_.size();

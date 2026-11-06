@@ -34,12 +34,16 @@
 #include <vector>
 
 #include "cache/disk_lifetime_clock.h"
+#include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_state.h"
 #include "cache/disk_slab_store.h"
+#include "cache/disk_write_result.h"
 #include "cache/kv_node_server.h"
 #include "cache/store_engine.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
 #include "common/status.h"
+#include "slab_allocator_test_peer.h"
 
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
@@ -1287,6 +1291,19 @@ class DiskCacheGroupTestPeer {
 
 class DiskSlabStoreTestPeer {
  public:
+  static std::optional<DiskLifetimeState> State(const DiskSlabStore& store,
+                                                const BlockKey& key) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    return SlabAllocatorTestPeer::LifetimeSnapshotFor(*store.alloc_, key)
+        .second;
+  }
+  static uint64_t ConfigBase(const DiskSlabStore& store) {
+    if (!store.opt_.lifetime_config) {
+      ADD_FAILURE() << "scoring configuration is missing";
+      return 0;
+    }
+    return store.opt_.lifetime_config->base_sec;
+  }
   static const DiskLifetimeClock* Clock(const DiskSlabStore& store) {
     return store.opt_.lifetime_clock.get();
   }
@@ -1524,4 +1541,118 @@ TEST_F(SharedLifetimeClockTest,
   EXPECT_TRUE(group.LifetimeRestartRequired());
   EXPECT_TRUE(group.Healthy());
   EXPECT_EQ(group.SlabStats().metadata_io_errors, 0U);
+}
+
+TEST_F(SharedLifetimeClockTest,
+       ScoringSnapshotEnablesRealIdentityAndHeatTogether) {
+  DiskCacheGroup::Options options = Options();
+  options.lifetime_config = DiskLifetimeConfig{};
+  uint64_t seconds = 100;
+  const uint64_t horizon = DiskLifetimeHorizon(*options.lifetime_config);
+  options.lifetime_clock =
+      std::make_shared<DiskLifetimeClock>(horizon, [&] { return seconds; });
+  DiskCacheGroup group(options);
+  ASSERT_TRUE(group.Healthy()) << group.StartupError();
+  for (size_t i = 0; i < 2; ++i) {
+    EXPECT_EQ(
+        DiskSlabStoreTestPeer::Clock(DiskCacheGroupTestPeer::Slab(group, i)),
+        options.lifetime_clock.get());
+  }
+  options.lifetime_config->base_sec = 1;  // Must not mutate the owned snapshot.
+  EXPECT_EQ(
+      DiskSlabStoreTestPeer::ConfigBase(DiskCacheGroupTestPeer::Slab(group, 0)),
+      604800U);
+  seconds = 131;
+  const BlockKey key{7100, 0};
+  const DiskWriteResult result = group.CacheWithResult(key, "value", 5);
+  ASSERT_EQ(result.status, Status::kOk);
+  EXPECT_TRUE(result.identity.valid());
+  const std::optional<DiskLifetimeState> state = DiskSlabStoreTestPeer::State(
+      *DiskCacheGroupTestPeer::SlabForKey(&group, key), key);
+  if (!state.has_value()) {
+    ADD_FAILURE() << "real group write did not initialize scoring state";
+    return;
+  }
+  EXPECT_EQ(state->anchor, 31U);
+}
+
+TEST_F(SharedLifetimeClockTest, ScoringCanConstructOneConfigMatchedClock) {
+  DiskCacheGroup::Options options = Options();
+  options.lifetime_config = DiskLifetimeConfig{};
+  const DiskCacheGroup group(options);
+  ASSERT_TRUE(group.Healthy()) << group.StartupError();
+  const DiskLifetimeClock* const clock = DiskCacheGroupTestPeer::Clock(group);
+  ASSERT_NE(clock, nullptr);
+  EXPECT_EQ(clock->horizon_sec(),
+            DiskLifetimeHorizon(*options.lifetime_config));
+  for (size_t i = 0; i < 2; ++i)
+    EXPECT_EQ(
+        DiskSlabStoreTestPeer::Clock(DiskCacheGroupTestPeer::Slab(group, i)),
+        clock);
+}
+
+TEST_F(SharedLifetimeClockTest, InvalidScoringInputsRejectEveryDiskBeforeOpen) {
+  for (unsigned which = 0; which < 4; ++which) {
+    SCOPED_TRACE(which);
+    DiskCacheGroup::Options options = Options();
+    options.lifetime_config = DiskLifetimeConfig{};
+    unsigned factory_calls = 0;
+    if (which == 0) options.lifetime_config->max_reads = 64;
+    if (which == 1)
+      options.lifetime_clock = std::make_shared<DiskLifetimeClock>(1);
+    if (which == 2) options.engine = "file";
+    if (which == 3) {
+      options.engine_factory = [&](const std::string&, uint64_t) {
+        ++factory_calls;
+        return std::unique_ptr<StoreEngine>{};
+      };
+    }
+    const DiskCacheGroup group(options);
+    EXPECT_FALSE(group.Healthy());
+    EXPECT_EQ(group.DiskCount(), 0U);
+    EXPECT_FALSE(group.StartupError().empty());
+    EXPECT_EQ(factory_calls, 0U);
+    EXPECT_FALSE(fs::exists(base_));
+  }
+}
+
+TEST_F(SharedLifetimeClockTest, ScoringSnapshotDoesNotOpenPublicPolicyGate) {
+  DiskCacheGroup::Options options = Options();
+  options.lifetime_config = DiskLifetimeConfig{};
+  options.eviction_policy = "lifetime";
+  const DiskCacheGroup group(options);
+  EXPECT_FALSE(group.Healthy());
+  EXPECT_NE(group.StartupError().find("stage 4.5"), std::string::npos);
+  EXPECT_FALSE(fs::exists(base_));
+}
+
+TEST_F(SharedLifetimeClockTest,
+       InvalidSnapshotLeavesExistingDiskEpochsUntouched) {
+  DiskCacheGroup::Options options = Options();
+  {
+    DiskCacheGroup group(options);
+    ASSERT_TRUE(group.Healthy());
+    ASSERT_EQ(group.Cache({7101, 0}, "saved", 5), Status::kOk);
+  }
+  const auto snapshot = [&] {
+    std::vector<std::string> bytes;
+    for (const std::string& dir : options.cache_dirs) {
+      for (const char* name : {"slab_meta", "slab_state", "slots.tbl"}) {
+        std::ifstream input(fs::path(dir) / name, std::ios::binary);
+        EXPECT_TRUE(input.is_open());
+        bytes.emplace_back(std::istreambuf_iterator<char>(input),
+                           std::istreambuf_iterator<char>());
+      }
+    }
+    return bytes;
+  };
+  const std::vector<std::string> before = snapshot();
+  options.lifetime_config = DiskLifetimeConfig{};
+  options.lifetime_config->max_reads = 0;
+  {
+    const DiskCacheGroup group(options);
+    EXPECT_FALSE(group.Healthy());
+    EXPECT_EQ(group.DiskCount(), 0U);
+  }
+  EXPECT_EQ(snapshot(), before);
 }

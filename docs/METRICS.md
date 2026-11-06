@@ -226,6 +226,7 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_batched_writes_total` / `dfkv_slab_uring_write_batches_total` | counter | 进入 batched store visit 的 payload 写数 / io_uring 单次 submit 轮数 |
 | `dfkv_slab_bind_wipes_total` | counter | extent 绑定新 class 前完成的旧 slot-grid 清理 |
 | `dfkv_slab_metadata_io_errors_total` / `dfkv_slab_unclean_resets_total` | counter | slots.tbl/epoch 持久化失败 / 冷升时丢弃 dirty epoch |
+| `dfkv_slab_lifetime_init_clock_hard_exhausted_total` | counter | 内部评分路径的 NEW 或恢复住户因超过32位时钟硬界限而跳过评分初始化的次数；数据提交和身份仍有效，不是 PUT 失败或 I/O 错误。未初始化状态不可用于评分。未注入评分配置的 legacy 及仅注入 clock 的路径恒为0，file 不输出此 slab 指标；此计数不代表外部 lifetime 已开放 |
 | `dfkv_slab_eviction_record_clears_total` / `dfkv_slab_record_writes_total` | counter | allocator 复用前持久清除记录 / 已提交 slots.tbl record 写数 |
 | `dfkv_slab_capacity_bytes` / `dfkv_slab_allocated_bytes` / `dfkv_slab_payload_bytes` / `dfkv_slab_internal_fragmentation_bytes` | gauge | 物理 payload 容量 / 已占 slot / 逻辑 payload / 内部碎片 |
 | `dfkv_slab_allocator_objects` / `dfkv_slab_committed_objects` | gauge | allocator resident（含未提交写）/ reader-visible 已提交对象 |

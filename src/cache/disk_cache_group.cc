@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "cache/disk_lifetime_clock.h"
+#include "cache/disk_lifetime_math.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
@@ -332,6 +334,26 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   }
   const bool use_slab = config.engine == DiskEvictionEngine::kSlab;
   engine_ = use_slab ? "slab" : "file";
+  if (opt.lifetime_config) {
+    if (!use_slab || opt.engine_factory) {
+      fail("lifetime scoring metadata requires real slab engines");
+      return;
+    }
+    std::string error;
+    if (!ValidateDiskLifetimeConfig(*opt.lifetime_config, &error)) {
+      fail(error);
+      return;
+    }
+    const uint64_t horizon = DiskLifetimeHorizon(*opt.lifetime_config);
+    if (!opt.lifetime_clock)
+      opt.lifetime_clock = std::make_shared<DiskLifetimeClock>(horizon);
+    if (opt.lifetime_clock->horizon_sec() != horizon) {
+      fail("lifetime clock horizon=" +
+           std::to_string(opt.lifetime_clock->horizon_sec()) +
+           " must equal validated H=" + std::to_string(horizon));
+      return;
+    }
+  }
   if (opt.lifetime_clock) {
     if (!use_slab || opt.engine_factory) {
       fail("lifetime clock requires real slab engines");
@@ -433,6 +455,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       so.table_sync_ms = sync_ms;
       so.reclaim_interval_ms = reclaim_ms;
       so.lifetime_clock = lifetime_clock_;
+      so.lifetime_config = opt.lifetime_config;
       std::string error;
       if (!DiskSlabStore::ValidateGeometry(so, &error)) {
         fail(so.dir + ": " + error +
@@ -878,6 +901,8 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.batched_writes += st.batched_writes;
     sum.uring_write_batches += st.uring_write_batches;
     sum.metadata_io_errors += st.metadata_io_errors;
+    sum.lifetime_init_clock_hard_exhausted +=
+        st.lifetime_init_clock_hard_exhausted;
     sum.unclean_resets += st.unclean_resets;
     sum.eviction_record_clears += st.eviction_record_clears;
     sum.record_writes += st.record_writes;

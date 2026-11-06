@@ -21,12 +21,14 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "cache/disk_lifetime_math.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_write_result.h"
 #include "cache/new_put_demand_latch.h"
@@ -83,6 +85,10 @@ class DiskSlabStore : public StoreEngine {
     // this clock; direct internal callers must do the same. It gates new
     // reclaim/bind decisions, not reserved I/O or required resource cleanup.
     std::shared_ptr<DiskLifetimeClock> lifetime_clock{};
+    // Internal scoring snapshot; validated before any file is opened. Requires
+    // a usable clock with matching H and also enables resident identities.
+    // Absent by default; does not select a new eviction policy.
+    std::optional<DiskLifetimeConfig> lifetime_config{};
   };
 
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
@@ -116,6 +122,9 @@ class DiskSlabStore : public StoreEngine {
     uint64_t batched_writes = 0;
     uint64_t uring_write_batches = 0;
     uint64_t metadata_io_errors = 0;
+    // Successful NEW/recovered residents left deliberately unscored when their
+    // initialization crossed the hard clock bound. Not failed disk writes.
+    uint64_t lifetime_init_clock_hard_exhausted = 0;
     uint64_t unclean_resets = 0;
     uint64_t eviction_record_clears = 0;
     uint64_t record_writes = 0;
@@ -313,7 +322,8 @@ class DiskSlabStore : public StoreEngine {
   DiskResidentIdentity ResidentIdentityLocked(const BlockKey& key,
                                               const std::string& fn) const;
   void CommitPayloadLocked(const BlockKey& resident_key, const std::string& key,
-                           uint32_t payload_len, uint64_t generation);
+                           uint32_t payload_len, uint64_t generation,
+                           bool recovered = false);
   // Visible payload/tenant accounting only; deferred Remove hides immediately.
   uint32_t ErasePayloadLocked(const std::string& key);
   // Shared allocate/pin -> unlocked payload write -> commit skeleton for
@@ -419,6 +429,7 @@ class DiskSlabStore : public StoreEngine {
   // payload_len_ install after the write is the reader-visible commit).
   mutable std::mutex mu_;
   uint64_t committed_payload_bytes_ = 0;  // under mu_
+  uint64_t lifetime_init_clock_hard_exhausted_ = 0;  // under mu_
   bool ok_ = false;
   std::atomic<bool> metadata_failed_{false};
   std::atomic<bool> clean_shutdown_allowed_{true};

@@ -24,6 +24,8 @@ class DiskLifetimeClock {
   // obtained from DiskLifetimeHorizon after validating the numeric config.
   explicit DiskLifetimeClock(uint64_t horizon_sec);
   DiskLifetimeClock(uint64_t horizon_sec, NowFn now);
+  // Immutable configuration bound; callers validate the numeric config first.
+  uint64_t horizon_sec() const { return horizon_sec_; }
 
   // Admission sample: returns a relative second offset, including valid zero,
   // only while it is <= UINT32_MAX-H. Invalid H, an empty source, or exhaustion

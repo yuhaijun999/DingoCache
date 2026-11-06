@@ -30,6 +30,7 @@
 
 #include "cache/disk_cache_group.h"
 #include "cache/disk_lifetime_clock.h"
+#include "cache/disk_lifetime_math.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
@@ -3500,4 +3501,38 @@ TEST_F(ProductionFlushResultTest, RemovedRamAckDoesNotPreventCleanShutdown) {
   ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, disk_key, &value),
             Status::kOk);
   EXPECT_EQ(value, "disk");
+}
+
+TEST_F(ProductionFlushResultTest, SuccessfulHardCrossingExposesInitSkipMetric) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir_ / "slab").string()};
+  options.capacity_bytes = 1ull << 30;
+  options.engine = "slab";
+  options.eviction_policy = "legacy";
+  options.lifetime_config = DiskLifetimeConfig{};
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(*options.lifetime_config),
+      [this] { return seconds_.load(std::memory_order_relaxed); });
+  node_ = KvNodeServerWiringTestPeer::Create(options);
+  ASSERT_TRUE(node_->Healthy());
+  DiskSlabStoreTestPeer::SetPayloadWriteHook(
+      &KvNodeServerWiringTestPeer::Slab(*node_), [this] {
+        seconds_.store(uint64_t{UINT32_MAX} + 101, std::memory_order_relaxed);
+        return true;
+      });
+  char data[] = "committed";
+  const BlockKey key{99800, 0};
+  ASSERT_EQ(node_->CacheDirectForKey(key, data, 9, sizeof(data)), Status::kOk);
+  EXPECT_TRUE(node_->LifetimeRestartRequired());
+  EXPECT_TRUE(node_->Healthy());
+  EXPECT_EQ(MetricVal(node_->MetricsText(),
+                      "dfkv_slab_lifetime_init_clock_hard_exhausted_total"),
+            1);
+  EXPECT_EQ(
+      MetricVal(node_->MetricsText(), "dfkv_slab_metadata_io_errors_total"), 0);
+  std::string value;
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*node_, key, &value),
+            Status::kOk);
+  EXPECT_EQ(value, "committed");
 }

@@ -664,6 +664,9 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_metadata_io_errors_total", "counter",
            "Failed slots.tbl or epoch-state durability operations",
            ss.metadata_io_errors);
+    metric("dfkv_slab_lifetime_init_clock_hard_exhausted_total", "counter",
+           "NEW and recovered residents left unscored at hard clock exhaustion",
+           ss.lifetime_init_clock_hard_exhausted);
     metric("dfkv_slab_unclean_resets_total", "counter",
            "Dirty prior epochs discarded during cold recovery",
            ss.unclean_resets);

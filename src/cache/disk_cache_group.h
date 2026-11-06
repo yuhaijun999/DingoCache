@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "cache/disk_lifetime_clock.h"
+#include "cache/disk_lifetime_math.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
@@ -97,6 +98,10 @@ class DiskCacheGroup {
     // Empty in normal legacy/file startup. Not a policy enable switch or a
     // complete admission/drain gate; file and custom engines reject injection.
     std::shared_ptr<DiskLifetimeClock> lifetime_clock{};
+    // Internal, value-owned scoring snapshot. Absent in normal legacy/file;
+    // clock injection alone does not enable resident scoring metadata.
+    // Does not open the public lifetime readiness gate or change victims.
+    std::optional<DiskLifetimeConfig> lifetime_config{};
   };
 
   explicit DiskCacheGroup(Options opt);

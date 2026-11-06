@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/disk_lifetime_state.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
 
@@ -144,6 +145,9 @@ size_t SlabAllocator::FlatKeyIndex::BucketForTest(const BlockKey& key) const {
 }
 
 SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
+  // Lifetime metadata always belongs to a committed generation; never allow
+  // state tracking without the matching physical-resident identity storage.
+  if (opt_.track_lifetime_state) opt_.track_resident_identity = true;
   if (opt_.align == 0) opt_.align = 1;
   if (opt_.num_extents == 0) opt_.num_extents = 1;
   if (opt_.max_waste < 0) opt_.max_waste = 0;
@@ -284,14 +288,20 @@ size_t SlabAllocator::ClassForExactSize(uint32_t slot_size) {
   return classes_.size();
 }
 
-void SlabAllocator::CommitResidentGeneration(const BlockKey& key,
-                                             uint64_t generation) {
+void SlabAllocator::CommitResidentGeneration(
+    const BlockKey& key, uint64_t generation,
+    const DiskLifetimeState* lifetime_state) {
   const std::lock_guard<std::mutex> lock(mu_);
   const uint32_t* index = index_.Find(key);
   assert(opt_.track_resident_identity && index != nullptr && generation != 0);
   assert(slots_[*index].live && !slots_[*index].remove_pending);
   assert(resident_generations_[*index] == 0);
+  assert(lifetime_state == nullptr || opt_.track_lifetime_state);
+  assert(!opt_.track_lifetime_state ||
+         !resident_lifetime_states_[*index].has_value());
   resident_generations_[*index] = generation;
+  if (opt_.track_lifetime_state && lifetime_state != nullptr)
+    resident_lifetime_states_[*index] = *lifetime_state;
 }
 
 uint64_t SlabAllocator::ResidentGeneration(const BlockKey& key) const {
@@ -307,10 +317,12 @@ uint32_t SlabAllocator::AcquireSlotMetaLocked() {
     free_slot_meta_head_ = slots_[index].free_next;
     slots_[index] = SlotMeta{};
     if (opt_.track_resident_identity) resident_generations_[index] = 0;
+    if (opt_.track_lifetime_state) resident_lifetime_states_[index].reset();
     return index;
   }
   slots_.emplace_back();
   if (opt_.track_resident_identity) resident_generations_.push_back(0);
+  if (opt_.track_lifetime_state) resident_lifetime_states_.emplace_back();
   return static_cast<uint32_t>(slots_.size() - 1);
 }
 
@@ -521,6 +533,8 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
   slots_.reserve(slots_.size() + entries.size());
   if (opt_.track_resident_identity)
     resident_generations_.reserve(slots_.size() + entries.size());
+  if (opt_.track_lifetime_state)
+    resident_lifetime_states_.reserve(slots_.size() + entries.size());
   index_.Reserve(index_.size() + entries.size());
 
 
@@ -600,6 +614,7 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
   if (meta.refs > 0 && extent.pinned > 0) --extent.pinned;
   index_.Erase(meta.key);
   if (opt_.track_resident_identity) resident_generations_[index] = 0;
+  if (opt_.track_lifetime_state) resident_lifetime_states_[index].reset();
   PushFreeLocked(cls, extent_index, physical_slot);
   ++extent.free_slots;
   extent.useful_bytes -= useful_bytes;

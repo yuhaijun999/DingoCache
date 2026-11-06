@@ -24,9 +24,11 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
+#include "cache/disk_lifetime_state.h"
 #include "common/kv_types.h"
 
 namespace dfkv {
@@ -75,6 +77,9 @@ class SlabAllocator {
     // forbids new binding/reclaim decisions, not already-bound free-slot use
     // or finalization after successful persistence. Empty preserves legacy.
     std::function<bool()> can_reclaim{};
+    // Internal lifetime storage. Enabling it also enables resident identity so
+    // the generation and state commit under the same allocator lock.
+    bool track_lifetime_state = false;
   };
 
   // Target write parallelism per class: Put keeps up to this many extents with
@@ -172,8 +177,13 @@ class SlabAllocator {
   friend class SlabAllocatorTestPeer;
   // Internal commit preconditions: caller serializes the resident lifecycle,
   // tracking is enabled, key is resident, generation is reserved/nonzero and
-  // not yet installed. This is not an external fallible request interface.
-  void CommitResidentGeneration(const BlockKey& key, uint64_t generation);
+  // not yet installed. A supplied state requires lifetime tracking. With that
+  // tracking enabled, nullptr deliberately leaves the committed resident
+  // uninitialized (hard-stop drain), rather than inventing a default state.
+  // This is not an external fallible request interface.
+  void CommitResidentGeneration(
+      const BlockKey& key, uint64_t generation,
+      const DiskLifetimeState* lifetime_state = nullptr);
   // Physical ownership only, including pending removal. Does not touch CLOCK.
   // Zero means disabled, absent or uncommitted; never an exportable identity.
   uint64_t ResidentGeneration(const BlockKey& key) const;
@@ -332,6 +342,10 @@ class SlabAllocator {
   // physical FreeSlotLocked clears ownership, not payload visibility changes.
   // Capacity follows metadata high-water usage, not current resident count.
   std::vector<uint64_t> resident_generations_;
+  // Enabled-only parallel storage; nullopt distinguishes an uncommitted or
+  // deliberately uninitialized resident from a valid state whose anchor is 0.
+  // Only physical removal clears a committed state, not payload visibility.
+  std::vector<std::optional<DiskLifetimeState>> resident_lifetime_states_;
   uint32_t free_slot_meta_head_ = kNoSlot;
   uint32_t global_ring_head_ = kNoSlot;
   uint32_t global_hand_ = kNoSlot;

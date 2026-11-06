@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Initialize staged lifetime resident metadata with physical identity ownership,
+  and expose hard-clock initialization skips without failing committed writes.
+  Public lifetime policy selection remains gated; legacy victim rules stay intact.
+
 - Keep disk-read provenance with coalesced payloads across TCP, direct and
   asynchronous reads. Shared RAM promotions retain the original resident
   identity; failed, empty and fallback reads cannot inherit an older source.
