@@ -1,7 +1,8 @@
 # Q3b：内部全盘水位公平调度
 
 仅通过既有 `DiskSlabStore::Options::lifetime_class_eviction` 内部门控运行。
-默认false，Group/CLI不转发，公开lifetime和disk-ACK启动闸门未开放。
+默认false，Q3c增加Group同名内部选项显式转发，CLI不设置；
+公开lifetime仍未开放，内部write-back显式disk-ACK门禁见 `docs/DISK_LIFETIME_Q3C.md`。
 
 ## 算法与预算
 
@@ -45,7 +46,7 @@
 预算不抢占已开始的同步I/O，不能用此证明墙钟p99上界。真实硬件、内存/RSS、
 吞吐和p99仍是后续验收，不在本轮宣称通过。
 
-本轮只闭环Q3b；下一步Q3c写回背压端到端及激活/ACK门禁，D4与R45仍后置。
+本轮只闭环Q3b；Q3c写回背压及ACK门禁见对应文档，D4与R45仍后置。
 
 GCC13/x86_64静态布局：allocator568→576B（含对齐，RAM实例也承担固定8B），
 Store1728→1760B（四个计数32B），Stats528→560B；SlotMeta104B、links20B、

@@ -103,6 +103,10 @@ class DiskCacheGroup {
     // clock injection alone does not enable resident scoring metadata.
     // Does not open the public lifetime readiness gate or change victims.
     std::optional<DiskLifetimeConfig> lifetime_config{};
+    // Internal integration only; never set by CLI/environment policy parsing.
+    // Requires real slabs and scoring config. RAM write-back must explicitly
+    // select disk-ACK before any disk is opened. Public readiness stays gated.
+    bool lifetime_class_eviction = false;
   };
 
   explicit DiskCacheGroup(Options opt);

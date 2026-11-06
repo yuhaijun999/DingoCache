@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Connect internally gated lifetime eviction through disk groups and node
+  write-back. Require explicit disk-ACK for this internal RAM write-back path
+  before opening any disk; retain typed budget backpressure and legacy ACK
+  behavior. Public lifetime activation remains gated.
+
 - Add internally gated lifetime watermark eviction with fair per-band cursors,
   per-victim score merging and one shared tick visit budget. Keep existing
   pressure-latch semantics, clear only successful slot records, and export

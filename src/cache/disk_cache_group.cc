@@ -52,7 +52,8 @@ bool MatchesPolicyName(std::string_view text, std::string_view expected) {
 // Report the settled request and Stage 0 gate without parsing inactive values.
 // Only the entrypoint can later refine an API argument's provenance to a flag.
 void RecordDiskEvictionConfig(const DiskEvictionConfigResult& config,
-                              const DiskEvictionConfigInput& input) {
+                              const DiskEvictionConfigInput& input,
+                              bool internal_eviction) {
   namespace cd = config_dump;
   cd::Source policy_source = cd::Source::kDefault;
   if (config.source == DiskEvictionPolicySource::kCommandLine) {
@@ -76,8 +77,13 @@ void RecordDiskEvictionConfig(const DiskEvictionConfigResult& config,
   cd::Record("disk_eviction_requested", requested, policy_source);
   // These are built-in readiness decisions, not independently configurable
   // knobs.
-  cd::Record("disk_eviction_effective", slab ? "legacy" : "not_applicable",
+  cd::Record("disk_eviction_effective",
+             internal_eviction ? "internal_test_only"
+                               : (slab ? "legacy" : "not_applicable"),
              cd::Source::kDefault);
+  cd::Record("disk_eviction_internal_test",
+             internal_eviction ? "lifetime" : "off",
+             internal_eviction ? cd::Source::kArg : cd::Source::kDefault);
   cd::Record("disk_eviction_staged",
              slab && requested == "lifetime" ? "true" : "false",
              cd::Source::kDefault);
@@ -334,6 +340,44 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   }
   const bool use_slab = config.engine == DiskEvictionEngine::kSlab;
   engine_ = use_slab ? "slab" : "file";
+  if (opt.lifetime_class_eviction) {
+    if (!use_slab || opt.engine_factory || !opt.lifetime_config.has_value()) {
+      fail("internal lifetime eviction requires real slabs and scoring config");
+      return;
+    }
+    // Node constructs this group BEFORE parsing/allocating its RAM tier.
+    // Enforce the new write-back contract here, before recovery can dirty any
+    // disk. Match InitRamTier's enable values and writearound exception;
+    // missing write mode defaults to writeback. Unlike legacy fallback,
+    // applicable unknown modes must be rejected before opening storage.
+    const char* ram = std::getenv("DFKV_RAM_TIER");
+    const std::string_view ram_text = ram != nullptr ? ram : "";
+    const bool ram_enabled = ram_text == "1" || ram_text == "on" ||
+                             ram_text == "true" || ram_text == "yes";
+    const char* mode = std::getenv("DFKV_RAM_WRITE_MODE");
+    const std::string_view mode_text = mode != nullptr ? mode : "";
+    const char* ack = std::getenv("DFKV_PUT_ACK_MODE");
+    const std::string_view ack_text = ack != nullptr ? ack : "";
+    if (ram_enabled && !mode_text.empty() && mode_text != "writeback" &&
+        mode_text != "writearound") {
+      fail("DFKV_RAM_WRITE_MODE='" + std::string(mode_text) +
+           "' must be 'writeback' or 'writearound' for internal lifetime");
+      return;
+    }
+    if (ram_enabled && !ack_text.empty() && ack_text != "ram" &&
+        ack_text != "disk") {
+      fail("DFKV_PUT_ACK_MODE='" + std::string(ack_text) +
+           "' must be 'ram' or 'disk' for internal lifetime");
+      return;
+    }
+    if (ram_enabled && mode_text != "writearound" && ack_text != "disk") {
+      fail("DFKV_PUT_ACK_MODE='" + std::string(ack_text) +
+           "' requires explicit 'disk' for internal lifetime RAM write-back "
+           "(DFKV_RAM_WRITE_MODE='" +
+           std::string(mode_text) + "')");
+      return;
+    }
+  }
   if (opt.lifetime_config) {
     if (!use_slab || opt.engine_factory) {
       fail("lifetime scoring metadata requires real slab engines");
@@ -456,6 +500,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       so.reclaim_interval_ms = reclaim_ms;
       so.lifetime_clock = lifetime_clock_;
       so.lifetime_config = opt.lifetime_config;
+      so.lifetime_class_eviction = opt.lifetime_class_eviction;
       std::string error;
       if (!DiskSlabStore::ValidateGeometry(so, &error)) {
         fail(so.dir + ": " + error +
@@ -508,7 +553,8 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     disks_.push_back(std::move(store));
     ring_.AddNode(dir, disk_weight);
   }
-  if (healthy_) RecordDiskEvictionConfig(config, config_input);
+  if (healthy_)
+    RecordDiskEvictionConfig(config, config_input, opt.lifetime_class_eviction);
   ring_.Build();
   if (disks_.size() > 1) {
     auto points = ring_.NodePointCounts();

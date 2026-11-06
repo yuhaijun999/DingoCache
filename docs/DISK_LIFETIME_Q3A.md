@@ -1,7 +1,7 @@
 # Q3a：双索引与内部类内回收
 
 当前已接两套评分索引，以及**内部显式门控**的前台选择、后台回收及预算。
-公开 lifetime、Group/Node 新策略激活和 disk-ACK 启动门禁尚未开放。
+公开lifetime仍未开放；Q3c已接通Group/Node内部执行及开盘前disk-ACK门禁。
 普通 shadow 配置仍使用 legacy victim；RAM CLOCK 不变。
 
 ## 两套索引
@@ -19,8 +19,9 @@
 
 ## 本轮前台选择与预算
 
-- `DiskSlabStore::Options::lifetime_class_eviction` 默认 false，Group/CLI
-  不转发该内部测试开关。开启要求有效 scoring/clock；可设置后台周期。
+- `DiskSlabStore::Options::lifetime_class_eviction` 默认 false。Q3c增加Group
+  同名内部选项显式转发，CLI不设置；shadow config/clock不会自动启用。
+  开启要求有效scoring/clock；可设置后台周期。
   新后台路径先运行Q3b评分水位，再运行class回收，不混入legacy donor。
 - 一片 allocator 锁内最多访问1024个 resident，使用同一 now。
   各档轮转检查本片首个合法候选，按 score、anchor、住户 generation
@@ -40,7 +41,7 @@
 - RAM typed 写回对精确预算原因有限重试，未 ACK 写最终完成 CacheFull
   且不单独标 unhealthy；真实 I/O 保留隔离。防御性遇到已 RAM-ACK 的
   预算失败保留唯一 dirty/flush-pin 副本，不能丢弃或宣称完成 drain。
-  这不代替将来 Group/Node 激活前必须实施的显式 disk-ACK 启动闸门。
+  新内部Group/Node路径由Q3c实施显式disk-ACK启动门禁，不依赖此防御分支。
 
 ## 本轮后台 class reclaim
 
@@ -82,5 +83,5 @@ SlotMeta104、links20、queue12字节不变；既有 enabled版本8B/class保留
 
 Q3a 的内部类内实现本轮收口；不冒称完整策略、性能或公开激活已验收。
 Q3b全盘水位公平选择见 `docs/DISK_LIFETIME_Q3B.md`；
-完整Q3c端到端激活/ACK门禁及D4桶/donor待后续。
+Q3c写回接线/ACK门禁见 `docs/DISK_LIFETIME_Q3C.md`，D4桶/donor待后续。
 L12真实MR/READY/RXE/kernel io_uring数据面继续按用户约定后置，不算通过。
