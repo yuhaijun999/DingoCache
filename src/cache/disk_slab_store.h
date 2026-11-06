@@ -91,8 +91,8 @@ class DiskSlabStore : public StoreEngine {
     // a usable clock with matching H and also enables resident identities.
     // Absent by default; does not select a new eviction policy.
     std::optional<DiskLifetimeConfig> lifetime_config{};
-    // Internal foreground-only selector test gate, never set by group/CLI.
-    // Requires scoring and reclaim_interval_ms=0 until background integration.
+    // Internal class selector gate, never set by group/CLI. Requires scoring;
+    // its background path does not run the still-staged watermarks or donors.
     bool lifetime_class_eviction = false;
   };
 
@@ -116,6 +116,10 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_scan_budget_exhausted = 0;
     uint64_t lifetime_class_no_candidate = 0;
     uint64_t lifetime_class_victims = 0;
+    uint64_t lifetime_background_scan_visits = 0;
+    uint64_t lifetime_background_scan_slices = 0;
+    uint64_t lifetime_background_budget_exhausted = 0;
+    uint64_t lifetime_background_no_candidate = 0;
     uint64_t dio_write_fallbacks = 0;
     uint64_t dio_read_fallbacks = 0;
     uint64_t table_syncs = 0;
@@ -471,6 +475,10 @@ class DiskSlabStore : public StoreEngine {
   uint64_t lifetime_scan_budget_exhausted_ = 0;
   uint64_t lifetime_class_no_candidate_ = 0;
   uint64_t lifetime_class_victims_ = 0;
+  uint64_t lifetime_background_scan_visits_ = 0;
+  uint64_t lifetime_background_scan_slices_ = 0;
+  uint64_t lifetime_background_budget_exhausted_ = 0;
+  uint64_t lifetime_background_no_candidate_ = 0;
   // Invoked only between class slices, after releasing BOTH lifecycle locks.
   std::function<void()> lifetime_scan_yield_hook_for_test_{};
   LifetimeReadCounters lifetime_reads_{};  // under mu_
@@ -528,6 +536,11 @@ class DiskSlabStore : public StoreEngine {
   // and rebalancing extents from cold classes to hot ones on a full store.
   // Does not acquire mu_; allocator callbacks may call this under their lock.
   bool CanStartReclaim() const;
+  // Reclaimer-thread-only pending targets keep budget-limited work eligible
+  // on quiet ticks. Tests call manually only with the thread disabled.
+  void ReclaimLifetimeTick(size_t max_victims = 4096);
+  bool ReclaimLifetimeClass(size_t cls_index, size_t target_free,
+                            size_t max_victims);
   void ReclaimTick(const std::function<void()>& after_watermark_evict = {},
                    const std::function<void()>& before_lock_for_test = {});
   // Rebalance rate cap: extents moved per tick per hot class. Each move evicts
@@ -542,6 +555,7 @@ class DiskSlabStore : public StoreEngine {
   bool uring_write_enabled_ = false;
   // The batched-write submission ring is thread_local (see disk_slab_store.cc):
   // one per flush worker, no shared lock across the blocking CQE wait.
+  std::vector<size_t> lifetime_reclaim_targets_;
   std::vector<uint64_t> reclaim_last_puts_;  // reclaim-thread-local puts snapshot
   NewPutDemandLatch watermark_latch_;  // under mu_
   uint64_t new_put_bytes_since_tick_ = 0;  // successful NEW commits, under mu_

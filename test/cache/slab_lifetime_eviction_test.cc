@@ -474,19 +474,13 @@ class LifetimeClassStoreTest : public ::testing::Test {
   std::unique_ptr<DiskSlabStore> store_;
 };
 
-TEST_F(LifetimeClassStoreTest,
-       GateRejectsMissingScoringOrBackgroundBeforeOpen) {
-  for (const bool missing_scoring : {true, false}) {
-    DiskSlabStore::Options options = Options(2);
-    if (missing_scoring)
-      options.lifetime_config.reset();
-    else
-      options.reclaim_interval_ms = 1;
-    const DiskSlabStore rejected(options);
-    EXPECT_FALSE(rejected.Healthy());
-    EXPECT_FALSE(rejected.StartupError().empty());
-    EXPECT_FALSE(std::filesystem::exists(dir_));
-  }
+TEST_F(LifetimeClassStoreTest, GateRejectsMissingScoringBeforeOpen) {
+  DiskSlabStore::Options options = Options(2);
+  options.lifetime_config.reset();
+  const DiskSlabStore rejected(options);
+  EXPECT_FALSE(rejected.Healthy());
+  EXPECT_FALSE(rejected.StartupError().empty());
+  EXPECT_FALSE(std::filesystem::exists(dir_));
 }
 
 TEST_F(LifetimeClassStoreTest, ScalarDirectAndBatchReclaimTheCheckedResident) {

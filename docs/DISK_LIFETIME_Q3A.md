@@ -1,6 +1,6 @@
-# Q3a：双索引与内部前台类内选择
+# Q3a：双索引与内部类内回收
 
-当前已接两套评分索引，以及**内部显式门控**的前台选择与预算。
+当前已接两套评分索引，以及**内部显式门控**的前台选择、后台回收及预算。
 公开 lifetime、Group/Node 新策略激活和 disk-ACK 启动门禁尚未开放。
 普通 shadow 配置仍使用 legacy victim；RAM CLOCK 不变。
 
@@ -20,8 +20,8 @@
 ## 本轮前台选择与预算
 
 - `DiskSlabStore::Options::lifetime_class_eviction` 默认 false，Group/CLI
-  不转发该内部测试开关。开启要求有效 scoring/clock 及后台周期为0；
-  不允许混入尚未接通的 legacy 后台 reclaim。
+  不转发该内部测试开关。开启要求有效 scoring/clock；可设置后台周期。
+  新 class 后台路径不会混入尚未接通的 legacy 水位/donor。
 - 一片 allocator 锁内最多访问1024个 resident，使用同一 now。
   各档轮转检查本片首个合法候选，按 score、anchor、住户 generation
   比较；KEEP 是软线，pin 不能淘汰。只保证实际检查候选中的最低分。
@@ -42,21 +42,44 @@
   预算失败保留唯一 dirty/flush-pin 副本，不能丢弃或宣称完成 drain。
   这不代替将来 Group/Node 激活前必须实施的显式 disk-ACK 启动闸门。
 
+## 本轮后台 class reclaim
+
+- 复用同一评分/失效函数，但不为每个 victim 重新领取前台 PUT 预算。
+  每 class 每 tick 默认最多4096成功 victim、累计最多16384次访问；
+  访问上限始终为本 tick 配置成功上限的4倍，不随剩余 batch 缩减重算。
+- 单次 allocator 持锁的所有 victim 扫描合计最多1024次访问、128个
+  成功 victim；不是每个 victim 单独最多1024后再无限累加。
+- 每片先清所有已完成失效的 payload/tenant 账，释放 D/A 后再续片。
+  真失效失败、硬时钟耗尽立即停止；先前成功失效仍保留，不回滚复活。
+  保留 target、unbound pool 和整条归还的停止条件，避免级联缩容。
+- 共享队列 cursor 保留跨 tick 位置；单独保存待完成的 headroom target，
+  即使没有新 PUT，安静 tick 仍会续扫。达到目标后清掉任务，不空转扫描。
+- 全 pin/当前无候选与访问或成功件数到限分开计数；保留待做任务到后续
+  tick，不在同一 tick 无限重试。后台暂缓不变成某个客户端的 CacheFull。
+- ReclaimTick 在内部开关下直接进入新 class 路径，不先运行旧全局水位
+  或 donor GROW；普通 shadow/legacy 路径保持原行为。
+- 四个 background 计数与前台计数分开，`reclaimed_slots` 仍统计真实
+  后台成功删除量。扫描计数不是 p99 的硬界，失效 I/O 仍遵守既有契约。
+
 ## 内存与验收边界
 
-当前 GCC13/x86_64：allocator544→568B（固定+24，含RAM），Store1592→1672B
-（含选项、5个计数及测试同步hook）；SlotMeta104、links20、queue12字节不变。
-启用的链接按 metadata 高水位保留容量，另有每 class 8字节 mutation version。
-`sizeof(LifetimeScan)=640`，仅由唯一 owner 的 helper 持有，不是逐住户字段。
-禁用时不分配这些版本/链接/队头；不以结构成本冒充 RSS、锁延迟或 p99 验收。
+本轮 GCC13/x86_64：allocator568B不变，Store1672→1728B（固定+56，含4个
+后台计数和pending vector）；StoreOptions200B不变，Stats496→528B。
+SlotMeta104、links20、queue12字节不变；既有 enabled版本8B/class保留。
+新增 pending target 每class一个size_t（本ABI为8B），只在新后台路径分配。
+`sizeof(LifetimeScan)=640`，前台按owner、后台按当前class/tick持有，不是逐住户
+字段。不以结构成本冒充 RSS、锁延迟或 p99 验收。
 
 - 生命周期：`test/cache/slab_lifetime_storage_test.cc`。
 - 类内选择与真实 Store：`test/cache/slab_lifetime_eviction_test.cc`，包含
   M=1/4/63、长 pin 前缀、变热耗尽、pin 变化、版本饱和、真正失效故障、
   owner/follower及三项批次部分成功；不是只验证独立容器。
 - typed RAM 终局与混批：`test/cache/ram_tier_test.cc`。
+- 后台回收：`test/cache/slab_lifetime_background_test.cc`，涵盖完整持锁片
+  访问上界、安静tick续扫、全pin、部分成功后失效失败、时钟硬终局、两层锁
+  释放及真实线程运行/析构join/干净重启。
 - 固定维度扫描/预算指标见 `docs/METRICS.md`。
 
-**尚未完成整个Q3a**：后台 class reclaim 的同片/每 tick 预算还未接通。
-Q3b全盘水位公平选择、完整Q3c端到端激活/ACK门禁及D4桶/donor仍待后续。
+Q3a 的内部类内实现本轮收口；不冒称完整策略、性能或公开激活已验收。
+下一步 Q3b 全盘水位公平选择；完整Q3c端到端激活/ACK门禁及D4桶/donor待后续。
 L12真实MR/READY/RXE/kernel io_uring数据面继续按用户约定后置，不算通过。

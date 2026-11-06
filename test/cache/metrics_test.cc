@@ -160,11 +160,16 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
   EXPECT_NE(text.find("dfkv_storage_healthy 1"), std::string::npos) << text;
   // The foreground selector remains internally gated: ordinary slab traffic
   // exports these bounded-cardinality counters without recording new scans.
-  for (const char* name : {"dfkv_slab_lifetime_class_scan_visits_total",
-                           "dfkv_slab_lifetime_class_scan_slices_total",
-                           "dfkv_slab_lifetime_scan_budget_exhausted_total",
-                           "dfkv_slab_lifetime_class_no_candidate_total",
-                           "dfkv_slab_lifetime_class_victims_total"}) {
+  for (const char* name :
+       {"dfkv_slab_lifetime_class_scan_visits_total",
+        "dfkv_slab_lifetime_class_scan_slices_total",
+        "dfkv_slab_lifetime_scan_budget_exhausted_total",
+        "dfkv_slab_lifetime_class_no_candidate_total",
+        "dfkv_slab_lifetime_class_victims_total",
+        "dfkv_slab_lifetime_background_scan_visits_total",
+        "dfkv_slab_lifetime_background_scan_slices_total",
+        "dfkv_slab_lifetime_background_budget_exhausted_total",
+        "dfkv_slab_lifetime_background_no_candidate_total"}) {
     EXPECT_NE(text.find(std::string(name) + " 0\n"), std::string::npos);
   }
   s->Stop();

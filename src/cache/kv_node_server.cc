@@ -682,6 +682,18 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_class_victims_total", "counter",
            "Residents durably removed by foreground lifetime class scans",
            ss.lifetime_class_victims);
+    metric("dfkv_slab_lifetime_background_scan_visits_total", "counter",
+           "Resident visits in internal background class reclaim",
+           ss.lifetime_background_scan_visits);
+    metric("dfkv_slab_lifetime_background_scan_slices_total", "counter",
+           "Background class allocator lock slices",
+           ss.lifetime_background_scan_slices);
+    metric("dfkv_slab_lifetime_background_budget_exhausted_total", "counter",
+           "Class ticks deferred at a scan or successful-victim cap",
+           ss.lifetime_background_budget_exhausted);
+    metric("dfkv_slab_lifetime_background_no_candidate_total", "counter",
+           "Background class scans with no eligible candidate",
+           ss.lifetime_background_no_candidate);
     metric("dfkv_slab_lifetime_read_success_total", "counter",
            "Nonzero successful business reads notified to lifetime metadata",
            ss.lifetime_reads.successful);

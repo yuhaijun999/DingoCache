@@ -854,12 +854,8 @@ bool DiskSlabStore::ValidateExistingDataFiles(const Options& options,
 
 bool DiskSlabStore::ValidateOptions() {
   std::string error;
-  if (opt_.lifetime_class_eviction &&
-      (!opt_.lifetime_config || opt_.reclaim_interval_ms != 0)) {
-    return SetStartupError(
-        "staged lifetime class eviction requires scoring and no background "
-        "reclaim");
-  }
+  if (opt_.lifetime_class_eviction && !opt_.lifetime_config)
+    return SetStartupError("staged lifetime class eviction requires scoring");
   if (opt_.lifetime_config) {
     if (!ValidateDiskLifetimeConfig(*opt_.lifetime_config, &error))
       return SetStartupError(error);
@@ -2433,6 +2429,78 @@ uint64_t DiskSlabStore::EvictedBytes() const {
   return evicted_bytes_;
 }
 
+bool DiskSlabStore::ReclaimLifetimeClass(size_t cls_index, size_t target_free,
+                                         size_t max_victims) {
+  if (!opt_.lifetime_config || !opt_.lifetime_clock || max_victims == 0)
+    return false;
+  SlabAllocator::LifetimeScan scan(*opt_.lifetime_config, *opt_.lifetime_clock);
+  // A background tick has its own budget, NOT a fresh 2*N+2 grant per victim.
+  scan.initialized = true;
+  scan.visit_limit = max_victims > UINT64_MAX / 4
+                         ? UINT64_MAX - 1
+                         : static_cast<uint64_t>(max_victims) * 4;
+  scan.slice_limit = scan.visit_limit + 1;  // Also bound zero-visit attempts.
+  size_t remaining = max_victims;
+  for (;;) {
+    std::vector<BlockKey> evicted;
+    std::unique_lock<std::mutex> lock(mu_);
+    if (!CanStartReclaim()) return false;
+    const uint64_t before = scan.visits;
+    const SlabAllocator::LifetimeReclaimResult result =
+        alloc_->ReclaimLifetimeClass(cls_index, target_free,
+                                     std::min<size_t>(128, remaining), scan,
+                                     &evicted);
+    lifetime_background_scan_visits_ += scan.visits - before;
+    ++lifetime_background_scan_slices_;
+    for (const BlockKey& key : evicted)
+      evicted_bytes_ += ErasePayloadLocked(key.Filename());
+    reclaimed_.fetch_add(result.victims, std::memory_order_relaxed);
+    remaining -= result.victims;
+    if (scan.result == SlabAllocator::LifetimeScanResult::kNoCandidate) {
+      ++lifetime_background_no_candidate_;
+      return true;  // Pins may disappear before the next otherwise-quiet tick.
+    }
+    if (scan.result == SlabAllocator::LifetimeScanResult::kBudgetExhausted ||
+        (result.more && (remaining == 0 || scan.visits >= scan.visit_limit))) {
+      ++lifetime_background_budget_exhausted_;
+      return true;
+    }
+    if (!result.more) return false;
+    // The allocator released A; clear every completed invalidation before
+    // releasing D. A hook can exercise real reads/removes at this boundary.
+    lock.unlock();
+    if (lifetime_scan_yield_hook_for_test_)
+      lifetime_scan_yield_hook_for_test_();
+    std::this_thread::yield();
+  }
+}
+
+void DiskSlabStore::ReclaimLifetimeTick(size_t max_victims) {
+  if (!CanStartReclaim() || max_victims == 0) return;
+  const std::vector<SlabAllocator::ClassStat> classes = alloc_->Classes();
+  reclaim_last_puts_.resize(classes.size(), 0);
+  lifetime_reclaim_targets_.resize(classes.size(), 0);
+  for (size_t i = 0; i < classes.size(); ++i) {
+    const SlabAllocator::ClassStat& cls = classes[i];
+    const uint64_t delta = cls.puts - reclaim_last_puts_[i];
+    reclaim_last_puts_[i] = cls.puts;
+    const size_t capacity = cls.resident + cls.free_slots;
+    size_t& target = lifetime_reclaim_targets_[i];
+    target = std::min(target, capacity / 4);
+    if (delta != 0) {
+      const uint64_t demand = delta > UINT64_MAX / 2 ? UINT64_MAX : 2 * delta;
+      target =
+          std::max(target, static_cast<size_t>(std::min<uint64_t>(
+                               std::max<uint64_t>(64, demand), capacity / 4)));
+    }
+    if (target <= cls.free_slots) {
+      target = 0;
+      continue;
+    }
+    if (!ReclaimLifetimeClass(i, target, max_victims)) target = 0;
+  }
+}
+
 // One reclaimer pass, two phases per hot class (new inserts since last pass):
 //
 // GROW: on a demand shift over a full store, the hot class should absorb
@@ -2461,6 +2529,10 @@ void DiskSlabStore::ReclaimTick(
   if (!CanStartReclaim()) return;
   // Private test seam: pause work already admitted, before acquiring mu_.
   if (before_lock_for_test) before_lock_for_test();
+  if (opt_.lifetime_class_eviction) {
+    ReclaimLifetimeTick();
+    return;  // Do not mix in unimplemented lifetime watermark/donor policies.
+  }
   // Successful NEW commits renew pressure eligibility. Inactive history
   // expires after 128 quiet observations; required active drain is preserved.
   // Sampling and composite mutation share mu_.
@@ -2700,6 +2772,11 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.lifetime_scan_budget_exhausted = lifetime_scan_budget_exhausted_;
   st.lifetime_class_no_candidate = lifetime_class_no_candidate_;
   st.lifetime_class_victims = lifetime_class_victims_;
+  st.lifetime_background_scan_visits = lifetime_background_scan_visits_;
+  st.lifetime_background_scan_slices = lifetime_background_scan_slices_;
+  st.lifetime_background_budget_exhausted =
+      lifetime_background_budget_exhausted_;
+  st.lifetime_background_no_candidate = lifetime_background_no_candidate_;
   st.lifetime_reads = lifetime_reads_;
   st.payload_bytes = committed_payload_bytes_;
   st.lifetime_init_clock_hard_exhausted = lifetime_init_clock_hard_exhausted_;

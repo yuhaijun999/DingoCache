@@ -22,6 +22,14 @@ class SlabAllocatorTestPeer {
  public:
   using LifetimeScan = SlabAllocator::LifetimeScan;
   using LifetimeScanResult = SlabAllocator::LifetimeScanResult;
+  using LifetimeReclaimResult = SlabAllocator::LifetimeReclaimResult;
+  static LifetimeReclaimResult ReclaimLifetimeClass(
+      SlabAllocator& allocator, size_t cls, size_t target, size_t max_victims,
+      LifetimeScan& scan, std::vector<BlockKey>* evicted) {
+    return allocator.ReclaimLifetimeClass(cls, target, max_victims, scan,
+                                          evicted);
+  }
+
   static bool PutWithLifetimeScan(SlabAllocator& allocator, const BlockKey& key,
                                   size_t len, SlabAllocator::SlotRef* ref,
                                   std::vector<BlockKey>* evicted,

@@ -797,7 +797,8 @@ void SlabAllocator::BumpLifetimeVersionLocked(uint32_t meta_index) {
 bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
                                             LifetimeScan& scan,
                                             std::vector<BlockKey>* evicted,
-                                            bool* reclaim_denied) {
+                                            bool* reclaim_denied,
+                                            uint32_t max_visits) {
   const Class& cls = classes_[cls_index];
   if (!scan.initialized) {
     const uint64_t residents = cls.resident_count;
@@ -840,12 +841,14 @@ bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
   }
   uint32_t best = kNoSlot;
   int64_t best_score = 0;
+  const uint32_t slice_limit = std::min<uint32_t>(1024, max_visits);
   uint32_t slice_visits = 0;
   bool pending = true;
-  while (pending && slice_visits < 1024 && scan.visits < scan.visit_limit) {
+  while (pending && slice_visits < slice_limit &&
+         scan.visits < scan.visit_limit) {
     pending = false;
-    for (size_t band = 0;
-         band < bands && slice_visits < 1024 && scan.visits < scan.visit_limit;
+    for (size_t band = 0; band < bands && slice_visits < slice_limit &&
+                          scan.visits < scan.visit_limit;
          ++band) {
       if (scan.done[band]) continue;
       const uint32_t current = scan.cursors[band];
@@ -1287,6 +1290,35 @@ size_t SlabAllocator::ReclaimClass(size_t cls_index, size_t target_free,
     if (cls.free_count <= before) break;
   }
   return count;
+}
+
+SlabAllocator::LifetimeReclaimResult SlabAllocator::ReclaimLifetimeClass(
+    size_t cls_index, size_t target_free, size_t max_victims,
+    LifetimeScan& scan, std::vector<BlockKey>* evicted) {
+  const std::lock_guard<std::mutex> lock(mu_);
+  LifetimeReclaimResult result;
+  if (cls_index >= classes_.size() || max_victims == 0) return result;
+  assert(scan.initialized);  // Caller installed one shared background tick cap.
+  const Class& cls = classes_[cls_index];
+  const uint64_t start_visits = scan.visits;
+  while (result.victims < max_victims && cls.free_count < target_free &&
+         scan.visits - start_visits < 1024) {
+    if (unbound_ > 0) return result;
+    const size_t before = cls.free_count;
+    bool denied = false;
+    const uint32_t remaining =
+        1024 - static_cast<uint32_t>(scan.visits - start_visits);
+    if (!EvictLifetimeFromLocked(cls_index, scan, evicted, &denied,
+                                 remaining)) {
+      result.more = !denied && scan.result == LifetimeScanResult::kRetry;
+      return result;
+    }
+    ++result.victims;
+    // Match legacy's extent-return guard: do not cascade into another shrink.
+    if (cls.free_count <= before) return result;
+  }
+  result.more = cls.free_count < target_free && unbound_ == 0;
+  return result;
 }
 
 size_t SlabAllocator::EvictColdToTarget(uint64_t target_bytes,

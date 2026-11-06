@@ -209,8 +209,10 @@ class SlabAllocator {
     kEvicted = 4,          // One checked resident was durably removed.
     kPersistenceError = 5  // Stop immediately; do not escalate to a donor.
   };
-  // Owned by one logical PUT, never shared with followers or recreated between
-  // slices. Only traversal positions survive unlocking, never candidate scores.
+  // Owned by one logical PUT or one background class tick, never shared across
+  // owners or recreated between slices. Foreground uses 2*N+2 visits;
+  // background installs its own tick limit. Only positions survive unlocking,
+  // not scores.
   struct LifetimeScan {
     LifetimeScan(const DiskLifetimeConfig& scoring,
                  const DiskLifetimeClock& time)
@@ -231,7 +233,17 @@ class SlabAllocator {
   };
   bool EvictLifetimeFromLocked(size_t cls_index, LifetimeScan& scan,
                                std::vector<BlockKey>* evicted,
-                               bool* reclaim_denied);
+                               bool* reclaim_denied,
+                               uint32_t max_visits = 1024);
+  struct LifetimeReclaimResult {
+    size_t victims = 0;
+    bool more = false;  // Release D and A before continuing this tick.
+  };
+  LifetimeReclaimResult ReclaimLifetimeClass(size_t cls_index,
+                                             size_t target_free,
+                                             size_t max_victims,
+                                             LifetimeScan& scan,
+                                             std::vector<BlockKey>* evicted);
   void BumpLifetimeVersionLocked(uint32_t meta_index);
   // Physical ownership only, including pending removal. Does not touch CLOCK.
   // Zero means disabled, absent or uncommitted; never an exportable identity.

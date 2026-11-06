@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add internally gated lifetime background class reclaim with 1024-visit lock
+  slices and shared per-class tick budgets. Resume pending headroom on quiet
+  ticks while keeping legacy watermarks/donors out of this staged path.
+
 - Add internally gated foreground lifetime class selection with 1024-visit
   slices and per-PUT cumulative budgets, shared by single and batched writes.
   Preserve typed budget backpressure through finite RAM flush retries without
