@@ -196,6 +196,17 @@ TEST_F(DiskLifetimeResidentTest, HardCrossingPreservesCommittedDataButNotHeat) {
   std::string value;
   EXPECT_EQ(store_->Range(Key(1), 0, 0, &value), Status::kOk);
   EXPECT_EQ(value, "ok");
+  // A committed resident without state is a real hard-clock outcome, not
+  // corrupted/unavailable metadata. Reuse the identity of these exact bytes.
+  store_->NotifyLifetimeReadSuccess(Key(1), result.identity, value.size());
+  const DiskSlabStore::LifetimeReadCounters reads =
+      store_->GetStats().lifetime_reads;
+  EXPECT_EQ(reads.successful, 1U);
+  EXPECT_EQ(reads.clock_hard_exhausted, 1U);
+  EXPECT_EQ(reads.state_unavailable, 0U);
+  EXPECT_EQ(reads.applied, 0U);
+  EXPECT_FALSE(State(Key(1)).has_value());
+  EXPECT_TRUE(store_->Healthy());
   EXPECT_EQ(store_->CacheWithResult(Key(1), "no", 2).outcome,
             DiskWriteOutcome::kKeptExisting);
   EXPECT_EQ(store_->GetStats().lifetime_init_clock_hard_exhausted, 1U);

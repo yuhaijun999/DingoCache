@@ -84,6 +84,9 @@ class DiskSlabStoreTestPeer {
 };
 class KvNodeServerTestPeer {
  public:
+  static bool TracksPullHeat(const KvNodeServer& server) {
+    return server.group_.TracksLifetimeState();
+  }
   static DiskSlabStore::LifetimeReadCounters PullHeatCounters(
       const KvNodeServer& server) {
     return server.group_.SlabStats().lifetime_reads;
@@ -543,20 +546,23 @@ class RdmaPullHeatTest : public ::testing::Test {
              ::testing::UnitTest::GetInstance()->current_test_info()->line()));
     fs::remove_all(dir_);
     clock_ = std::make_shared<DiskLifetimeClock>(
-        DiskLifetimeHorizon(config_), [this] { return seconds_.load(); });
+        DiskLifetimeHorizon(config_), [this] {
+          samples_.fetch_add(1, std::memory_order_relaxed);
+          return seconds_.load(std::memory_order_relaxed);
+        });
   }
   void TearDown() override {
     transport_.SetPullReadSuccessHandler({});
     node_.reset();
     fs::remove_all(dir_);
   }
-  void Create() {
+  void Create(bool scored = true) {
     DiskCacheGroup::Options options;
     options.cache_dirs = {dir_.string()};
     options.capacity_bytes = 1ull << 30;
     options.engine = "slab";
     options.eviction_policy = "legacy";
-    options.lifetime_config = config_;
+    if (scored) options.lifetime_config = config_;
     options.lifetime_clock = clock_;
     node_ = std::make_unique<KvNodeServer>(options);
     ASSERT_TRUE(node_->Healthy());
@@ -608,12 +614,50 @@ class RdmaPullHeatTest : public ::testing::Test {
   fs::path dir_;
   DiskLifetimeConfig config_;
   std::atomic<uint64_t> seconds_{100};
+  std::atomic<uint64_t> samples_{0};
   std::shared_ptr<DiskLifetimeClock> clock_;
   std::unique_ptr<KvNodeServer> node_;
   RdmaServer transport_{RdmaServer::Handler{}, kMaxMsg};
   const BlockKey key_{99201, 0};
   alignas(4096) char staging_[4096] = {};
 };
+
+TEST_F(RdmaPullHeatTest, ClockOnlyLegacyGrantNeverSamplesCompletionTime) {
+  const ScopedEnv ram_on("DFKV_RAM_TIER", "1");
+  const ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
+  const ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
+  const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+  const ScopedEnv writearound("DFKV_RAM_WRITE_MODE", "writearound");
+  ASSERT_NO_FATAL_FAILURE(Create(false));  // Clock present, scoring absent.
+  ASSERT_TRUE(node_->ram_enabled());
+  ASSERT_FALSE(KvNodeServerTestPeer::TracksPullHeat(*node_));
+  char value[] = "value";
+  ASSERT_EQ(node_->CacheDirectForKey(key_, value, 5, sizeof(value)),
+            Status::kOk);
+  RamTier& ram = KvNodeServerTestPeer::Ram(*node_);
+  ASSERT_TRUE(ram.PutDurable(key_, "value", 5));
+  PreparedRead read;
+  ASSERT_TRUE(node_->RamPinnedHitForKey(key_, 0, 5, &read));
+  ASSERT_EQ(Finish(read), Status::kOk);
+  EXPECT_FALSE(read.source_identity().valid());
+  const uint64_t before = samples_.load();
+  seconds_.store(uint64_t{UINT32_MAX} + 101);
+  bool recorded = false;
+  Grant(read.source_identity(), recorded);  // Actual transport observer chain.
+  EXPECT_TRUE(recorded);
+  EXPECT_EQ(samples_.load(), before);
+  EXPECT_EQ(Counters().successful, 0U);
+  EXPECT_TRUE(read.Abort());
+  seconds_.store(100);
+  EXPECT_FALSE(node_->LifetimeRestartRequired());  // No accidental hard sample.
+  char output[8] = {};
+  size_t bytes = 0;
+  ASSERT_EQ(node_->RangeIntoForKey(key_, 0, 5, output, sizeof(output), &bytes),
+            Status::kOk);
+  EXPECT_EQ(std::string(output, bytes), "value");
+  EXPECT_EQ(Counters().successful, 0U);
+}
 
 TEST_F(RdmaPullHeatTest, StorageCompletionIsNotGrantAndGrantIsExactlyOnce) {
   ASSERT_NO_FATAL_FAILURE(Create());

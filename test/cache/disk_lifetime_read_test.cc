@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -31,6 +34,15 @@ class DiskSlabStoreTestPeer {
       const DiskSlabStore& store, const BlockKey& key) {
     const std::lock_guard<std::mutex> lock(store.mu_);
     return SlabAllocatorTestPeer::LifetimeSnapshotFor(*store.alloc_, key);
+  }
+  static std::unique_lock<std::mutex> HoldLifecycle(DiskSlabStore& store) {
+    return std::unique_lock<std::mutex>(store.mu_);
+  }
+  static std::pair<size_t, size_t> MetadataCapacity(
+      const DiskSlabStore& store) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    return {SlabAllocatorTestPeer::GenerationCapacity(*store.alloc_),
+            SlabAllocatorTestPeer::LifetimeStateCapacity(*store.alloc_)};
   }
   static void ReadHook(DiskSlabStore& store, std::function<void()> hook) {
     store.read_acquired_hook_for_test_ = std::move(hook);
@@ -129,6 +141,114 @@ TEST_F(DiskLifetimeReadTest, AppliesAtNotificationTimeNotStorageReadTime) {
   EXPECT_FALSE(state.first_early_read());
   EXPECT_FALSE(state.write_armed());
   EXPECT_EQ(Counters().applied, 1U);
+}
+
+TEST_F(DiskLifetimeReadTest,
+       ReorderedCompletedReadsUseMonotonicApplicationTime) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  const uint64_t early = 100 + config_.protect_sec - 1;
+  seconds_.store(early);
+  std::string first_bytes;
+  DiskResidentIdentity first_source;
+  ASSERT_EQ(store_->RangeWithIdentity(key_, 0, 0, &first_bytes, &first_source),
+            Status::kOk);
+  seconds_.store(early + 2);
+  std::string second_bytes;
+  DiskResidentIdentity second_source;
+  ASSERT_EQ(
+      store_->RangeWithIdentity(key_, 0, 0, &second_bytes, &second_source),
+      Status::kOk);
+  ASSERT_TRUE(first_source == identity);
+  ASSERT_TRUE(second_source == identity);
+  ASSERT_EQ(first_bytes, "value");
+  ASSERT_EQ(second_bytes, first_bytes);
+
+  store_->NotifyLifetimeReadSuccess(key_, second_source, second_bytes.size());
+  seconds_.store(early);  // Older completion arrives after the newer event.
+  store_->NotifyLifetimeReadSuccess(key_, first_source, first_bytes.size());
+  const DiskLifetimeState state = State();
+  EXPECT_EQ(state.anchor, config_.protect_sec + 1);
+  EXPECT_EQ(state.actual_reads, 2U);
+  EXPECT_EQ(state.scoring_reads(), 2U);
+  EXPECT_FALSE(state.first_early_read());
+  EXPECT_FALSE(state.write_armed());
+  EXPECT_EQ(Counters().applied, 2U);
+}
+
+TEST_F(DiskLifetimeReadTest, LifecycleLockWaitSamplesOnlyAfterUnlock) {
+  for (const bool cross_hard : {false, true}) {
+    SCOPED_TRACE(cross_hard);
+    store_.reset();
+    std::filesystem::remove_all(dir_);
+    seconds_.store(100);
+    clock_ = std::make_shared<DiskLifetimeClock>(
+        DiskLifetimeHorizon(config_), [this] {
+          samples_.fetch_add(1, std::memory_order_relaxed);
+          return seconds_.load(std::memory_order_relaxed);
+        });
+    ASSERT_NO_FATAL_FAILURE(Create());
+    Put();
+    seconds_.store(100 + config_.protect_sec - 1);
+    std::string bytes;
+    DiskResidentIdentity source;
+    ASSERT_EQ(store_->RangeWithIdentity(key_, 0, 0, &bytes, &source),
+              Status::kOk);
+    std::unique_lock<std::mutex> lifecycle =
+        DiskSlabStoreTestPeer::HoldLifecycle(*store_);
+    const uint64_t before = samples_.load();
+    std::promise<void> entered;
+    std::promise<void> finished;
+    const std::future<void> requested = entered.get_future();
+    const std::future<void> completion = finished.get_future();
+    std::thread notifier([&] {
+      entered.set_value();
+      store_->NotifyLifetimeReadSuccess(key_, source, bytes.size());
+      finished.set_value();
+    });
+    requested.wait();
+    // D is owned by this thread. The bounded wait observes an outstanding
+    // operation, not a throughput/p99 threshold; unlock on every branch.
+    const std::future_status waiting =
+        completion.wait_for(std::chrono::milliseconds(30));
+    const uint64_t while_locked = samples_.load();
+    seconds_.store(cross_hard ? uint64_t{UINT32_MAX} + 101
+                              : 101 + config_.protect_sec);
+    lifecycle.unlock();
+    notifier.join();
+    EXPECT_EQ(waiting, std::future_status::timeout);
+    EXPECT_EQ(while_locked, before);
+    EXPECT_EQ(Counters().successful, 1U);
+    EXPECT_EQ(Counters().applied, cross_hard ? 0U : 1U);
+    EXPECT_EQ(Counters().clock_hard_exhausted, cross_hard ? 1U : 0U);
+    EXPECT_EQ(State().anchor, cross_hard ? 0U : config_.protect_sec + 1);
+    EXPECT_FALSE(State().first_early_read());
+  }
+}
+
+TEST_F(DiskLifetimeReadTest, ReadHeatKeepsMetadataCapacityAtItsHighWaterMark) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  Put();
+  const BlockKey other{2, 0};
+  ASSERT_EQ(store_->Cache(other, "other", 5), Status::kOk);
+  const std::pair<size_t, size_t> allocated =
+      DiskSlabStoreTestPeer::MetadataCapacity(*store_);
+  ASSERT_GE(allocated.first, 2U);
+  ASSERT_GE(allocated.second, 2U);
+  ASSERT_EQ(store_->Remove(other), Status::kOk);
+  std::string bytes;
+  DiskResidentIdentity source;
+  ASSERT_EQ(store_->RangeWithIdentity(key_, 0, 0, &bytes, &source),
+            Status::kOk);
+  for (unsigned i = 0; i < 100; ++i)
+    store_->NotifyLifetimeReadSuccess(key_, source, bytes.size());
+  EXPECT_EQ(DiskSlabStoreTestPeer::MetadataCapacity(*store_), allocated);
+  EXPECT_EQ(Counters().applied, 100U);
+  RecordProperty("generation_capacity_bytes",
+                 std::to_string(allocated.first * sizeof(uint64_t)));
+  RecordProperty("state_capacity_bytes",
+                 std::to_string(allocated.second *
+                                sizeof(std::optional<DiskLifetimeState>)));
 }
 
 TEST_F(DiskLifetimeReadTest, InclusiveProtectBoundaryAndSameSecondEachCount) {

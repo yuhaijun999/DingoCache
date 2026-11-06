@@ -3725,6 +3725,135 @@ TEST_F(LifetimeSuccessReadTest, OldRamSourceNeverHeatsSameKeyReplacement) {
   ExpectConservation(1);
 }
 
+TEST_F(LifetimeSuccessReadTest,
+       ForegroundRewriteRetiresOldRamWithScoringEnabled) {
+  for (const bool write_back : {false, true}) {
+    for (const bool batch : {false, true}) {
+      for (const bool pinned : {false, true}) {
+        SCOPED_TRACE("write_back=" + std::to_string(write_back) +
+                     " batch=" + std::to_string(batch) +
+                     " pinned=" + std::to_string(pinned));
+        node_.reset();
+        fs::remove_all(dir_ / "slab");
+        ASSERT_NO_FATAL_FAILURE(CreateScored());
+        ASSERT_TRUE(node_->ram_enabled());
+        ASSERT_FALSE(node_->ram_ack_enabled());
+        KvNodeServerWiringTestPeer::SetWriteBack(*node_, write_back);
+        RamTier& ram = KvNodeServerWiringTestPeer::Ram(*node_);
+        // Keep the real InitRam typed sinks/workers, including disk-ACK
+        // behavior; do not substitute a bool flush callback for this
+        // scoring-mode test.
+        ASSERT_TRUE(RamTierTestPeer::HasTypedSingle(ram));
+        ASSERT_TRUE(RamTierTestPeer::HasTypedBatch(ram));
+        const BlockKey key{99940 + uint64_t{write_back} * 4 +
+                               uint64_t{batch} * 2 + uint64_t{pinned},
+                           0};
+        const DiskWriteResult original = Seed(key, "old");
+        ASSERT_EQ(original.status, Status::kOk);
+        ASSERT_TRUE(original.identity.valid());
+        ASSERT_TRUE(ram.PutDurable(key, "old", 3, original.identity));
+        alignas(4096) char staging[4096] = {};
+        PreparedRead old_send =
+            node_->PrepareReadForKey(key, 0, 3, staging, sizeof(staging));
+        ASSERT_EQ(old_send.status(), Status::kOk);
+        ASSERT_FALSE(old_send.needs_io());
+        ASSERT_TRUE(old_send.source_registered());
+        ASSERT_EQ(old_send.FinishStorage(Status::kOk, 3), Status::kOk);
+        const DiskResidentIdentity old_source = old_send.source_identity();
+        ASSERT_TRUE(old_source == original.identity);
+        if (!pinned) {
+          ASSERT_TRUE(old_send.Abort());
+        }
+        // Preparation/storage completion is not a grant.
+        ExpectConservation(0);
+        // Independent backing disappearance, not pressure/victim-selection
+        // proof.
+        ASSERT_EQ(KvNodeServerWiringTestPeer::DropDisk(*node_, key),
+                  Status::kOk);
+        ASSERT_TRUE(ram.Contains(key));
+        alignas(4096) char incoming[4096] = {};
+        std::memcpy(incoming, "new", 3);
+        const uint64_t flushes_before =
+            KvNodeServerWiringTestPeer::FlushObjects(*node_);
+        FlushBarrier done;
+        Status written = Status::kInvalid;
+        std::thread writer([&] {
+          if (batch) {
+            const std::vector<Status> results = node_->CacheDirectBatchForKeys(
+                {{key, incoming, 3, sizeof(incoming)}});
+            if (results.size() == 1) written = results[0];
+          } else {
+            written =
+                node_->CacheDirectForKey(key, incoming, 3, sizeof(incoming));
+          }
+          done.Block();
+        });
+        const bool completed_with_pin = done.AwaitEntry();
+        EXPECT_TRUE(completed_with_pin) << "PUT must not wait for old RAM SEND";
+        // On a regression, release the old pin before joining the writer. Never
+        // let a fatal assertion strand a joinable writer or its completion
+        // gate.
+        if (!completed_with_pin) old_send.Abort();
+        done.Open();
+        writer.join();
+        ASSERT_EQ(written, Status::kOk);
+        ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*node_));
+        if (pinned && completed_with_pin) {
+          EXPECT_TRUE(old_send.owns_cleanup());
+          EXPECT_EQ(std::string(old_send.data(), old_send.payload_len()),
+                    "old");
+        }
+        if (write_back && !batch && !pinned) {
+          // With no old send pin, this PUT must use a new real RAM owner and
+          // complete its production typed flush before the disk ACK returns.
+          EXPECT_GT(KvNodeServerWiringTestPeer::FlushObjects(*node_),
+                    flushes_before);
+          EXPECT_TRUE(ram.Contains(key));
+        }
+        // Authenticate the replacement by reading its bytes, not by treating
+        // KEEP_EXISTING as proof that incoming PUT bytes were published.
+        const char* new_data = nullptr;
+        size_t new_size = 0;
+        DiskResidentIdentity replacement_source;
+        ASSERT_EQ(node_->RangeDirectForKey(key, 0, 3, staging, sizeof(staging),
+                                           &new_data, &new_size, nullptr,
+                                           &replacement_source),
+                  Status::kOk);
+        ASSERT_NE(new_data, nullptr);
+        EXPECT_EQ(std::string(new_data, new_size), "new");
+        ASSERT_TRUE(replacement_source.valid());
+        EXPECT_FALSE(replacement_source == old_source);
+        EXPECT_NE(replacement_source.generation, old_source.generation);
+        EXPECT_EQ(State(key).actual_reads, 0U);
+        std::string visible;
+        ASSERT_EQ(Read(key, &visible), Status::kOk);
+        EXPECT_EQ(visible, "new");
+        const DiskLifetimeState fresh = State(key);
+        EXPECT_EQ(fresh.actual_reads, 1U);
+        EXPECT_EQ(Counters().applied, 1U);
+        ExpectConservation(1);
+        node_->NotifyLifetimeReadSuccessForKey(key, old_source, 3);
+        const DiskLifetimeState after_delayed_grant = State(key);
+        EXPECT_EQ(after_delayed_grant.anchor, fresh.anchor);
+        EXPECT_EQ(after_delayed_grant.put_at, fresh.put_at);
+        EXPECT_EQ(after_delayed_grant.hstate, fresh.hstate);
+        EXPECT_EQ(after_delayed_grant.actual_reads, fresh.actual_reads);
+        EXPECT_EQ(after_delayed_grant.history_unknown, fresh.history_unknown);
+        EXPECT_EQ(Counters().race_lost, 1U);
+        EXPECT_EQ(Counters().applied, 1U);
+        ExpectConservation(2);
+        if (pinned && completed_with_pin) {
+          EXPECT_TRUE(old_send.Abort());
+        }
+        EXPECT_FALSE(old_send.owns_cleanup());
+        // SEND-pin teardown is not another success event.
+        ExpectConservation(2);
+        EXPECT_TRUE(node_->Healthy());
+      }
+    }
+  }
+}
+
 TEST_F(LifetimeSuccessReadTest, CopyFollowersCountRequestsRatherThanOneIo) {
   const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
   for (const bool into : {false, true}) {
@@ -3989,6 +4118,81 @@ TEST_F(LifetimeSuccessReadTest, SourcePreservationDoesNotBypassPromotionFence) {
   EXPECT_FALSE(KvNodeServerWiringTestPeer::Ram(*node_).Contains(key));
   EXPECT_FALSE(store.IsCached(key));
   ExpectConservation(0);  // PULL preparation is still deferred to D.
+}
+
+TEST_F(LifetimeSuccessReadTest,
+       ConcurrentRemoveFencesLatePromotionBeforeForegroundRewrite) {
+  ASSERT_NO_FATAL_FAILURE(CreateScored());
+  const BlockKey key{99948, 0};
+  const DiskWriteResult original = Seed(key, "old");
+  ASSERT_EQ(original.status, Status::kOk);
+  DiskSlabStore& disk = KvNodeServerWiringTestPeer::Slab(*node_);
+  const RamTier& ram = KvNodeServerWiringTestPeer::Ram(*node_);
+  ASSERT_FALSE(ram.Contains(key));
+  FlushBarrier acquired;
+  DiskSlabStoreTestPeer::SetReadHook(disk, [&] { acquired.Block(); });
+  alignas(4096) char staging[4096] = {};
+  const char* old_data = nullptr;
+  size_t old_size = 0;
+  DiskResidentIdentity old_source;
+  Status old_status = Status::kInvalid;
+  std::thread reader([&] {
+    old_status =
+        node_->RangeDirectForKey(key, 0, 3, staging, sizeof(staging), &old_data,
+                                 &old_size, nullptr, &old_source);
+  });
+  const bool read_paused = acquired.AwaitEntry();
+  std::promise<Status> removal;
+  std::future<Status> removed = removal.get_future();
+  std::thread remover([&] {
+    std::string ignored;
+    removal.set_value(
+        node_->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove), key,
+                                    0, 0, nullptr, 0, &ignored));
+  });
+  const bool removed_while_paused =
+      removed.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  // Open on success and timeout alike, then join both before fatal assertions.
+  // The disk pin preserves old bytes, not permission to publish into RAM later.
+  acquired.Open();
+  reader.join();
+  remover.join();
+  DiskSlabStoreTestPeer::SetReadHook(disk, {});
+  EXPECT_TRUE(read_paused);
+  EXPECT_TRUE(removed_while_paused);
+  ASSERT_EQ(removed.get(), Status::kOk);
+  ASSERT_EQ(old_status, Status::kOk);
+  ASSERT_NE(old_data, nullptr);
+  EXPECT_EQ(std::string(old_data, old_size), "old");
+  EXPECT_TRUE(old_source == original.identity);
+  EXPECT_FALSE(ram.Contains(key));
+  EXPECT_FALSE(disk.IsCached(key));
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskReadLeases(*node_), 0U);
+  ExpectConservation(0);  // Direct preparation never publishes a heat event.
+  char incoming[] = "new";
+  ASSERT_EQ(node_->CacheDirectForKey(key, incoming, 3, sizeof(incoming)),
+            Status::kOk);
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*node_));
+  const char* new_data = nullptr;
+  size_t new_size = 0;
+  DiskResidentIdentity replacement_source;
+  ASSERT_EQ(
+      node_->RangeDirectForKey(key, 0, 3, staging, sizeof(staging), &new_data,
+                               &new_size, nullptr, &replacement_source),
+      Status::kOk);
+  ASSERT_NE(new_data, nullptr);
+  EXPECT_EQ(std::string(new_data, new_size), "new");
+  ASSERT_TRUE(replacement_source.valid());
+  EXPECT_FALSE(replacement_source == old_source);
+  EXPECT_NE(replacement_source.generation, old_source.generation);
+  EXPECT_EQ(State(key).actual_reads, 0U);
+  std::string visible;
+  ASSERT_EQ(Read(key, &visible), Status::kOk);
+  EXPECT_EQ(visible, "new");
+  EXPECT_EQ(State(key).actual_reads, 1U);
+  EXPECT_EQ(Counters().applied, 1U);
+  EXPECT_EQ(Counters().race_lost, 0U);
+  ExpectConservation(1);
 }
 
 TEST_F(LifetimeSuccessReadTest, CleanRecoveryFirstReadKeepsUnknownHistory) {
