@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Notify staged lifetime heat when a valid PULL grant becomes publishable,
+  preserving disk/RAM source provenance through synchronous fallback.
+  Keep grant accounting separate from RELEASE and retain legacy range handlers.
+
 - Apply staged lifetime heat once per successful nonempty synchronous request,
   including RAM hits and coalesced followers, using original resident provenance.
   Keep PULL preparation deferred until grant success and preserve legacy behavior.

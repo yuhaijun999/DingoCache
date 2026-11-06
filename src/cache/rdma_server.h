@@ -26,6 +26,7 @@
 #ifdef DFKV_WITH_URING
 #include "cache/uring_reader.h"
 #endif
+#include "cache/disk_resident_identity.h"
 #include "cache/ram_tier.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
@@ -49,6 +50,12 @@ class RdmaServer {
       const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
       size_t io_cap, const char** out_data, size_t* out_len,
       size_t* value_len)>;
+  // Preserve the read's original provenance through synchronous PULL fallback.
+  // Legacy handlers remain supported but cannot supply a disk binding.
+  using RangeWithIdentityHandler = std::function<Status(
+      const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
+      size_t io_cap, const char** out_data, size_t* out_len, size_t* value_len,
+      DiskResidentIdentity* identity)>;
   // Optional direct PUT handler: `data` points at an aligned registered buffer
   // containing exactly the raw stored value bytes.
   using CacheDirectHandler = std::function<Status(
@@ -68,7 +75,23 @@ class RdmaServer {
   // An explicit comma list enables multi-rail.
   explicit RdmaServer(Handler handler, size_t max_msg = (64u << 20),
                       const std::string& dev_name = "");
-  void set_range_handler(RangeHandler h) { range_handler_ = std::move(h); }
+  void set_range_handler(RangeHandler handler) {
+    if (!handler) {
+      range_handler_ = {};
+      return;
+    }
+    range_handler_ = [handler = std::move(handler)](
+                         const BlockKey& key, uint64_t offset, uint64_t length,
+                         char* buffer, size_t cap, const char** data,
+                         size_t* bytes, size_t* value_len,
+                         DiskResidentIdentity* identity) {
+      if (identity != nullptr) *identity = {};
+      return handler(key, offset, length, buffer, cap, data, bytes, value_len);
+    };
+  }
+  void set_range_with_identity_handler(RangeWithIdentityHandler handler) {
+    range_handler_ = std::move(handler);
+  }
   void set_cache_direct_handler(CacheDirectHandler h) {
     cache_direct_handler_ = std::move(h);
   }
@@ -83,6 +106,14 @@ class RdmaServer {
   // never RELEASE or cleanup of an already established grant.
   void SetRestartRequiredHandler(std::function<bool()> handler) {
     restart_required_handler_ = std::move(handler);
+  }
+  // Set before Start(); callback/owner must outlive Stop(). Invoked once per
+  // established nonempty PULL grant, before READY encoding, never on RELEASE.
+  // It must be thread-safe, must not throw, and must not revoke a valid grant.
+  using PullReadSuccessHandler =
+      std::function<void(const BlockKey&, const DiskResidentIdentity&, size_t)>;
+  void SetPullReadSuccessHandler(PullReadSuccessHandler handler) {
+    pull_read_success_handler_ = std::move(handler);
   }
   // Pinned arena hit lookup (B5-3 zero-copy pull GET): returns true with a
   // send-pinned arena address the dynamic-pull READY can name directly, or
@@ -175,6 +206,12 @@ class RdmaServer {
   // Call before each MR registration, including a staged retry, not after a
   // grant has succeeded. Refusal aborts preparation without publishing success.
   bool AdmitPullGrant(PreparedRead& read);
+  // Called only after validation, successful MR registration and grant
+  // ownership. Separate from busy: async I/O reserves a slot before any grant
+  // exists.
+  void RecordPullGrant(const BlockKey& key,
+                       const DiskResidentIdentity& identity, size_t bytes,
+                       bool& grant_recorded);
   void AcceptLoop();
   void Serve(int boot_fd);
   void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
@@ -209,7 +246,8 @@ class RdmaServer {
   };
 
   Handler handler_;
-  RangeHandler range_handler_;
+  RangeWithIdentityHandler range_handler_;
+  PullReadSuccessHandler pull_read_success_handler_;
   CacheDirectHandler cache_direct_handler_;
   CacheDirectBatchHandler cache_direct_batch_handler_;
   PrepareReadHandler prepare_read_handler_;

@@ -136,14 +136,16 @@ class KvNodeServer {
       const std::vector<StoreEngine::CacheBatchItem>& items);
 
   // Preparation only: the current RDMA caller uses this before PULL MR/grant
-  // establishment. It does not notify lifetime read success.
+  // establishment. It does not notify lifetime read success. Optional identity
+  // describes the returned bytes, not continued disk residency.
   // RDMA direct GET: read an O_DIRECT-aligned superset into `io_buf`; *out_data
   // points inside that same buffer at the exact requested range so the RDMA
   // layer can scatter-send it without copying into sbuf.
   Status RangeDirectForKey(const BlockKey& key, uint64_t offset,
                            uint64_t length, char* io_buf, size_t io_cap,
                            const char** out_data, size_t* out_len,
-                           size_t* value_len = nullptr);
+                           size_t* value_len = nullptr,
+                           DiskResidentIdentity* identity = nullptr);
   // Observe an arena hit without accounting. The prepared owner holds its pin
   // until the caller revokes remote access and commits, or fences and aborts.
   // Misses, dedicated values and registration fallbacks remain uncounted here.
@@ -156,6 +158,16 @@ class KvNodeServer {
   PreparedRead PrepareReadForKey(const BlockKey& key, uint64_t offset,
                                  uint64_t length, char* staging,
                                  size_t staging_cap);
+
+  // Transport-owned logical success, after a valid PULL grant and before READY.
+  // The caller notifies once; never call on preparation or resource release.
+  // No admission recheck: an established grant remains successful when
+  // unheated.
+  void NotifyLifetimeReadSuccessForKey(const BlockKey& key,
+                                       const DiskResidentIdentity& identity,
+                                       size_t bytes) {
+    group_.NotifyLifetimeReadSuccess(key, identity, bytes);
+  }
 
   bool ram_enabled() const { return ram_ != nullptr; }
   // Resolved storage backend name ("file"|"slab"), for self-description reporting.

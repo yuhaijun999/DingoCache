@@ -20,10 +20,12 @@
 #include <utility>
 #include <vector>
 
+#include "cache/disk_resident_identity.h"
 #include "cache/rdma_request_order.h"
 #include "cache/store_engine.h"
 #include "cache/uring_reader.h"  // io_uring async-GET path (DFKV_WITH_URING only)
 #include "common/config_dump.h"
+#include "common/kv_types.h"
 #include "common/status.h"
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_topology.h"
@@ -196,6 +198,17 @@ bool RdmaServer::AdmitPullGrant(PreparedRead& read) {
   if (!restart_required_handler_ || !restart_required_handler_()) return true;
   read.Abort();
   return false;
+}
+
+void RdmaServer::RecordPullGrant(const BlockKey& key,
+                                 const DiskResidentIdentity& identity,
+                                 size_t bytes, bool& grant_recorded) {
+  if (grant_recorded) return;
+  // Consume this generation's event before invoking the observer. READY send
+  // failures and subsequent RELEASE/teardown must never replay or undo it.
+  grant_recorded = true;
+  if (bytes != 0 && pull_read_success_handler_)
+    pull_read_success_handler_(key, identity, bytes);
 }
 
 RdmaServer::RdmaServer(Handler handler, size_t max_msg,
@@ -818,6 +831,7 @@ void RdmaServer::Serve(int boot_fd) {
   };
   struct PullSlotState {
     bool busy = false;
+    bool grant_recorded = false;  // Independent of pre-grant I/O reservation.
     uint64_t generation = 1;
     size_t data_len = 0;
     size_t value_len = 0;
@@ -840,6 +854,7 @@ void RdmaServer::Serve(int boot_fd) {
       }
       mr = nullptr;
       busy = false;
+      grant_recorded = false;
       data_len = 0;
       value_len = 0;
     }
@@ -1181,11 +1196,11 @@ void RdmaServer::Serve(int boot_fd) {
     size_t first_len = 0;
   };
 
-  auto publish_pull = [&](size_t send_slot, size_t slot,
-                          const Request& request, const char* output,
-                          size_t output_len, size_t value_len,
-                          PreparedRead prepared, double elapsed_sec,
-                          Reply* reply) -> bool {
+  auto publish_pull = [&](size_t send_slot, size_t slot, const Request& request,
+                          const char* output, size_t output_len,
+                          size_t value_len, PreparedRead prepared,
+                          const DiskResidentIdentity& fallback_identity,
+                          double elapsed_sec, Reply* reply) -> bool {
     PullSlotState& state = pull_slots[slot];
     auto error_reply = [&](Status status) {
       // Revoke access before Abort can release registered RAM/staging storage.
@@ -1202,10 +1217,12 @@ void RdmaServer::Serve(int boot_fd) {
         output_len > value_len - request.fields.offset ||
         (output_len != 0 && output == nullptr))
       return error_reply(Status::kInvalid);
-    // Resolve the last disk release before registering any memory. Completion
+    // Resolve disk release before registration; Ready sources only finalize
+    // provenance here and keep their RAM pin. Empty fallback has no owner.
+    // Completion
     // publication still waits for a valid grant, so registration failure aborts
     // without promoting RAM or reporting a successful prepared read.
-    if (prepared.needs_io() &&
+    if (prepared.owns_cleanup() &&
         prepared.FinishStorage(Status::kOk, output_len) != Status::kOk) {
       prepared.Commit(Status::kIOError, 0, elapsed_sec);
       return error_reply(prepared.status());
@@ -1230,11 +1247,16 @@ void RdmaServer::Serve(int boot_fd) {
       if (prepared.status() != Status::kOk)
         return error_reply(prepared.status());
     }
+    const DiskResidentIdentity identity = prepared.status() == Status::kOk
+                                              ? prepared.source_identity()
+                                              : fallback_identity;
     state.arena_read = std::move(prepared);
     state.read_elapsed_sec = elapsed_sec;
     state.busy = true;
     state.data_len = output_len;
     state.value_len = value_len;
+    RecordPullGrant(request.fields.Key(), identity, output_len,
+                    state.grant_recorded);
     const rdma::DynamicPullReady ready{
         static_cast<uint32_t>(slot), state.generation, output_len, value_len,
         reinterpret_cast<uint64_t>(output), state.mr->rkey};
@@ -1257,6 +1279,10 @@ void RdmaServer::Serve(int boot_fd) {
         pinned.payload_len() > request.fields.length ||
         pinned.payload_len() > pinned.value_len() - request.fields.offset)
       return false;
+    // Ready RAM sources have no disk lease; this exposes byte provenance
+    // without releasing their token. The grant still owns the pin until revoke.
+    if (pinned.FinishStorage(Status::kOk, pinned.payload_len()) != Status::kOk)
+      return false;
     const double read_elapsed_sec = NowSteadySec() - started_sec;
     PullSlotState& state = pull_slots[slot];
     if (!AdmitPullGrant(pinned)) {
@@ -1275,6 +1301,8 @@ void RdmaServer::Serve(int boot_fd) {
     state.busy = true;
     state.data_len = state.arena_read.payload_len();
     state.value_len = state.arena_read.value_len();
+    RecordPullGrant(request.fields.Key(), state.arena_read.source_identity(),
+                    state.data_len, state.grant_recorded);
     const rdma::DynamicPullReady ready{
         static_cast<uint32_t>(slot), state.generation, state.data_len,
         state.value_len, reinterpret_cast<uint64_t>(state.arena_read.data()),
@@ -1359,9 +1387,10 @@ void RdmaServer::Serve(int boot_fd) {
       const char* output = nullptr;
       size_t output_len = 0;
       size_t value_len = 0;
-      const Status status =
-          range_handler_(key, fields.offset, fields.length, target,
-                         target_capacity, &output, &output_len, &value_len);
+      DiskResidentIdentity identity;
+      const Status status = range_handler_(key, fields.offset, fields.length,
+                                           target, target_capacity, &output,
+                                           &output_len, &value_len, &identity);
       if (status != Status::kOk) {
         state.Reset();
         encode_status(status, 0, fields.length == 0 ? 0 : value_len);
@@ -1383,7 +1412,7 @@ void RdmaServer::Serve(int boot_fd) {
       if (output_len != 0 && output != target)
         std::memmove(target, output, output_len);
       return publish_pull(send_slot, slot, request, target, output_len,
-                          value_len, PreparedRead{}, 0.0, reply);
+                          value_len, PreparedRead{}, identity, 0.0, reply);
     }
 
     if (fields.op == static_cast<uint8_t>(WireOp::kLeasePut)) {
@@ -1683,9 +1712,10 @@ void RdmaServer::Serve(int boot_fd) {
         const char* data = qd.read.data();
         const size_t bytes = qd.read.payload_len();
         const size_t value_len = qd.read.value_len();
-        if (!publish_pull(qd.send_slot, control.slot_index, qd.request,
-                          data, bytes, value_len, std::move(qd.read),
-                          elapsed_sec, &qd.reply)) return false;
+        if (!publish_pull(qd.send_slot, control.slot_index, qd.request, data,
+                          bytes, value_len, std::move(qd.read), {}, elapsed_sec,
+                          &qd.reply))
+          return false;
       }
       qd.disk_state = DiskState::kComplete;
       qd.ready = true;
@@ -1789,7 +1819,7 @@ void RdmaServer::Serve(int boot_fd) {
               const size_t bytes = prepared.payload_len();
               const size_t value_len = prepared.value_len();
               if (!publish_pull(qd.send_slot, control.slot_index, request, data,
-                                bytes, value_len, std::move(prepared),
+                                bytes, value_len, std::move(prepared), {},
                                 NowSteadySec() - started_sec, &qd.reply))
                 return false;
               handled = true;

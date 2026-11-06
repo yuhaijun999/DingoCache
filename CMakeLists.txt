@@ -204,6 +204,8 @@ if(DFKV_BUILD_TESTS)
       ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_lease_loopback_test.cc)
     add_executable(rdma_lease_client_test
       ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_lease_client_test.cc)
+    target_include_directories(rdma_loopback_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/cache)
     target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main)
     target_link_libraries(rdma_lease_loopback_test PRIVATE dfkv_core GTest::gtest_main)
     target_link_libraries(rdma_lease_client_test PRIVATE dfkv_core GTest::gtest_main)

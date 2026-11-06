@@ -11,6 +11,10 @@
 #include "client/key_map.h"
 #include "cache/disk_cache_group.h"
 #include "cache/disk_lifetime_clock.h"
+#include "cache/disk_lifetime_math.h"
+#include "cache/disk_resident_identity.h"
+#include "cache/disk_slab_store.h"
+#include "cache/disk_write_result.h"
 #include "cache/kv_node_server.h"
 #include "cache/ram_tier.h"
 #include "cache/rdma_server.h"
@@ -25,6 +29,7 @@
 #include "transport/rdma_verbs.h"
 #include "transport/wire.h"
 #include "utils/net_util.h"
+#include "read_coalescer_test_peer.h"
 
 #include <infiniband/verbs.h>
 
@@ -65,8 +70,46 @@ namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
 
 namespace dfkv {
+class DiskCacheGroupTestPeer {
+ public:
+  static DiskSlabStore& FirstSlab(DiskCacheGroup& group) {
+    return *static_cast<DiskSlabStore*>(group.disks_.front().get());
+  }
+};
+class DiskSlabStoreTestPeer {
+ public:
+  static void FailPullInvalidation(DiskSlabStore& store) {
+    store.record_write_hook_for_test_ = [] { return false; };
+  }
+};
 class KvNodeServerTestPeer {
  public:
+  static DiskSlabStore::LifetimeReadCounters PullHeatCounters(
+      const KvNodeServer& server) {
+    return server.group_.SlabStats().lifetime_reads;
+  }
+  static DiskWriteResult PersistPullSource(KvNodeServer& server,
+                                           const BlockKey& key) {
+    return server.group_.CacheWithResult(key, "value", 5);
+  }
+  static Status RemovePullSource(KvNodeServer& server, const BlockKey& key) {
+    return server.group_.Remove(key);
+  }
+  static void FailPullInvalidation(KvNodeServer& server) {
+    DiskSlabStoreTestPeer::FailPullInvalidation(
+        DiskCacheGroupTestPeer::FirstSlab(server.group_));
+  }
+  static void EnablePullCoalescing(KvNodeServer& server) {
+    server.coalesce_enabled_ = true;
+  }
+  static bool WaitForPublishedPullFollower(KvNodeServer& server) {
+    return ReadCoalescerTestPeer::WaitForPublishedWaiter(
+        server.read_coalescer_);
+  }
+  static void DisablePullCoalescing(KvNodeServer& server) {
+    server.coalesce_enabled_ = false;
+  }
+
   static uint64_t DiskReadLeases(const KvNodeServer& server) {
     return server.group_.SlabStats().prep_holds;
   }
@@ -94,6 +137,23 @@ class KvNodeServerTestPeer {
 };
 class RdmaServerTestPeer {
  public:
+  static bool HasRangeHandler(const RdmaServer& server) {
+    return static_cast<bool>(server.range_handler_);
+  }
+  static Status InvokeRange(RdmaServer& server, const BlockKey& key,
+                            char* buffer, size_t cap, const char** data,
+                            size_t* bytes, size_t* value_len,
+                            DiskResidentIdentity* identity) {
+    return server.range_handler_(key, 0, 5, buffer, cap, data, bytes, value_len,
+                                 identity);
+  }
+
+  static void RecordPullGrant(RdmaServer& server, const BlockKey& key,
+                              const DiskResidentIdentity& identity,
+                              size_t bytes, bool& grant_recorded) {
+    server.RecordPullGrant(key, identity, bytes, grant_recorded);
+  }
+
   static bool AdmitPullGrant(RdmaServer& server, PreparedRead& read) {
     return server.AdmitPullGrant(read);
   }
@@ -471,6 +531,391 @@ TEST_F(RdmaPullAdmissionTest,
   EXPECT_TRUE(node_->Healthy());
 }
 
+// These CPU tests explicitly simulate the post-MR-success boundary. They do
+// not register memory, publish a real grant, or require an RDMA device.
+class RdmaPullHeatTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ =
+        fs::temp_directory_path() /
+        ("dfkv_pull_heat_" +
+         std::to_string(
+             ::testing::UnitTest::GetInstance()->current_test_info()->line()));
+    fs::remove_all(dir_);
+    clock_ = std::make_shared<DiskLifetimeClock>(
+        DiskLifetimeHorizon(config_), [this] { return seconds_.load(); });
+  }
+  void TearDown() override {
+    transport_.SetPullReadSuccessHandler({});
+    node_.reset();
+    fs::remove_all(dir_);
+  }
+  void Create() {
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {dir_.string()};
+    options.capacity_bytes = 1ull << 30;
+    options.engine = "slab";
+    options.eviction_policy = "legacy";
+    options.lifetime_config = config_;
+    options.lifetime_clock = clock_;
+    node_ = std::make_unique<KvNodeServer>(options);
+    ASSERT_TRUE(node_->Healthy());
+    KvNodeServerTestPeer::DisablePullCoalescing(*node_);
+    transport_.SetPullReadSuccessHandler(
+        [this](const BlockKey& key, const DiskResidentIdentity& identity,
+               size_t bytes) {
+          node_->NotifyLifetimeReadSuccessForKey(key, identity, bytes);
+        });
+  }
+  DiskResidentIdentity Seed() {
+    const DiskWriteResult result =
+        KvNodeServerTestPeer::PersistPullSource(*node_, key_);
+    EXPECT_EQ(result.status, Status::kOk);
+    EXPECT_TRUE(result.identity.valid());
+    return result.identity;
+  }
+  PreparedRead Prepare() {
+    return node_->PrepareReadForKey(key_, 0, 5, staging_, sizeof(staging_));
+  }
+  Status Finish(PreparedRead& read) {
+    if (read.needs_io() &&
+        ::pread(read.fd(), read.staging(), read.aligned_len(),
+                static_cast<off_t>(read.aligned_off())) !=
+            static_cast<ssize_t>(read.aligned_len())) {
+      ADD_FAILURE() << "actual prepared storage read failed";
+      return read.FinishStorage(Status::kIOError, 0);
+    }
+    return read.FinishStorage(Status::kOk, read.payload_len());
+  }
+  void Grant(const DiskResidentIdentity& source, bool& recorded) {
+    RdmaServerTestPeer::RecordPullGrant(transport_, key_, source, 5, recorded);
+  }
+  DiskSlabStore::LifetimeReadCounters Counters() const {
+    const DiskSlabStore::LifetimeReadCounters counters =
+        KvNodeServerTestPeer::PullHeatCounters(*node_);
+    EXPECT_EQ(counters.successful,
+              counters.applied + counters.no_binding + counters.race_lost +
+                  counters.clock_hard_exhausted + counters.io_unhealthy +
+                  counters.state_unavailable);
+    return counters;
+  }
+  const ScopedEnv slab_{"DFKV_STORE_ENGINE", "slab"};
+  const ScopedEnv ram_off_{"DFKV_RAM_TIER", "0"};
+  const ScopedEnv buffered_{"DFKV_SLAB_WRITE", "buffered"};
+  const ScopedEnv granularity_{"DFKV_SLAB_GRANULARITY", "1048576"};
+  const ScopedEnv sync_{"DFKV_SLAB_TABLE_SYNC_MS", "0"};
+  const ScopedEnv reclaim_{"DFKV_SLAB_RECLAIM_MS", "0"};
+  fs::path dir_;
+  DiskLifetimeConfig config_;
+  std::atomic<uint64_t> seconds_{100};
+  std::shared_ptr<DiskLifetimeClock> clock_;
+  std::unique_ptr<KvNodeServer> node_;
+  RdmaServer transport_{RdmaServer::Handler{}, kMaxMsg};
+  const BlockKey key_{99201, 0};
+  alignas(4096) char staging_[4096] = {};
+};
+
+TEST_F(RdmaPullHeatTest, StorageCompletionIsNotGrantAndGrantIsExactlyOnce) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  EXPECT_FALSE(read.source_identity().valid());
+  EXPECT_EQ(Counters().successful, 0U);
+  ASSERT_EQ(Finish(read), Status::kOk);
+  EXPECT_TRUE(read.source_identity() == identity);
+  EXPECT_TRUE(read.owns_cleanup());
+  EXPECT_EQ(Counters().successful, 0U);
+  // This independent once flag is not the async slot's I/O busy reservation.
+  bool grant_recorded = false;
+  Grant(read.source_identity(), grant_recorded);
+  EXPECT_TRUE(grant_recorded);
+  Grant(read.source_identity(), grant_recorded);
+  EXPECT_EQ(Counters().applied, 1U);
+  EXPECT_TRUE(read.Abort());
+  EXPECT_FALSE(read.owns_cleanup());
+  EXPECT_EQ(Counters().applied, 1U);
+  EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 0U);
+}
+
+TEST_F(RdmaPullHeatTest, CommitBeforeGrantAndReleaseNeverDuplicatesHeat) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  Seed();
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_EQ(Finish(read), Status::kOk);
+  const DiskResidentIdentity source = read.source_identity();
+  ASSERT_TRUE(source.valid());
+  ASSERT_TRUE(read.Commit(Status::kOk, 5, 0));
+  EXPECT_EQ(Counters().successful, 0U);
+  bool recorded = false;
+  Grant(source, recorded);
+  EXPECT_FALSE(read.Abort());  // RELEASE after storage accounting is terminal.
+  Grant(source, recorded);
+  EXPECT_EQ(Counters().applied, 1U);
+  EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 0U);
+}
+
+TEST_F(RdmaPullHeatTest, LegacyRangeClearsSourceAndTypedRangePreservesIt) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  transport_.set_range_handler([this](const BlockKey& key, uint64_t offset,
+                                      uint64_t length, char* buffer, size_t cap,
+                                      const char** data, size_t* bytes,
+                                      size_t* value_len) {
+    return node_->RangeDirectForKey(key, offset, length, buffer, cap, data,
+                                    bytes, value_len);
+  });
+  const char* data = nullptr;
+  size_t bytes = 0;
+  size_t value_len = 0;
+  DiskResidentIdentity source = identity;
+  ASSERT_EQ(RdmaServerTestPeer::InvokeRange(transport_, key_, staging_,
+                                            sizeof(staging_), &data, &bytes,
+                                            &value_len, &source),
+            Status::kOk);
+  EXPECT_EQ(std::string(data, bytes), "value");
+  EXPECT_FALSE(source.valid());
+  transport_.set_range_handler({});
+  EXPECT_FALSE(RdmaServerTestPeer::HasRangeHandler(transport_));
+  transport_.set_range_with_identity_handler(
+      [this](const BlockKey& key, uint64_t offset, uint64_t length,
+             char* buffer, size_t cap, const char** output,
+             size_t* output_bytes, size_t* stored_bytes,
+             DiskResidentIdentity* output_identity) {
+        return node_->RangeDirectForKey(key, offset, length, buffer, cap,
+                                        output, output_bytes, stored_bytes,
+                                        output_identity);
+      });
+  ASSERT_EQ(RdmaServerTestPeer::InvokeRange(transport_, key_, staging_,
+                                            sizeof(staging_), &data, &bytes,
+                                            &value_len, &source),
+            Status::kOk);
+  EXPECT_TRUE(source == identity);
+  EXPECT_EQ(std::string(data, bytes), "value");
+  EXPECT_EQ(Counters().successful, 0U);
+  transport_.set_range_with_identity_handler({});
+  EXPECT_FALSE(RdmaServerTestPeer::HasRangeHandler(transport_));
+}
+
+TEST_F(RdmaPullHeatTest, OptionalHandlerAndEmptyGrantsStayUncounted) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  transport_.SetPullReadSuccessHandler({});
+  bool without_handler = false;
+  Grant(identity, without_handler);
+  EXPECT_TRUE(without_handler);
+  EXPECT_EQ(Counters().successful, 0U);
+  unsigned callbacks = 0;
+  transport_.SetPullReadSuccessHandler(
+      [this, &callbacks](const BlockKey& key,
+                         const DiskResidentIdentity& source, size_t bytes) {
+        ++callbacks;
+        node_->NotifyLifetimeReadSuccessForKey(key, source, bytes);
+      });
+  bool empty = false;
+  RdmaServerTestPeer::RecordPullGrant(transport_, key_, identity, 0, empty);
+  EXPECT_TRUE(empty);
+  Grant(identity, empty);
+  Grant(identity, without_handler);
+  EXPECT_EQ(callbacks, 0U);
+  bool recorded = false;
+  Grant(identity, recorded);
+  Grant(identity, recorded);
+  EXPECT_EQ(callbacks, 1U);
+  EXPECT_EQ(Counters().applied, 1U);
+  transport_.SetPullReadSuccessHandler({});
+}
+
+TEST_F(RdmaPullHeatTest, CanceledOrFailedPreparationDoesNotGrant) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  Seed();
+  PreparedRead canceled = Prepare();
+  ASSERT_EQ(canceled.status(), Status::kOk);
+  ASSERT_EQ(Finish(canceled), Status::kOk);
+  EXPECT_TRUE(canceled.Abort());  // Models registration failure before grant.
+  PreparedRead failed = Prepare();
+  ASSERT_EQ(failed.status(), Status::kOk);
+  EXPECT_EQ(failed.FinishStorage(Status::kIOError, 0), Status::kIOError);
+  EXPECT_FALSE(failed.source_identity().valid());
+  EXPECT_TRUE(failed.Abort());
+  EXPECT_EQ(Counters().successful, 0U);
+  EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 0U);
+}
+
+TEST_F(RdmaPullHeatTest, BoundAndUnboundRamKeepPinUntilGrantTeardown) {
+  const ScopedEnv ram_on("DFKV_RAM_TIER", "1");
+  const ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
+  const ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
+  const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+  ASSERT_NO_FATAL_FAILURE(Create());
+  ASSERT_TRUE(node_->ram_enabled());
+  const DiskResidentIdentity identity = Seed();
+  RamTier& ram = KvNodeServerTestPeer::Ram(*node_);
+  for (const bool bound : {true, false}) {
+    if (bound)
+      ASSERT_TRUE(ram.PutDurable(key_, "value", 5, identity));
+    else
+      ASSERT_TRUE(ram.PutDurable(key_, "value", 5));
+    PreparedRead read;
+    ASSERT_TRUE(node_->RamPinnedHitForKey(key_, 0, 5, &read));
+    ASSERT_EQ(Finish(read), Status::kOk);
+    EXPECT_EQ(read.source_identity().valid(), bound);
+    EXPECT_EQ(Counters().successful, bound ? 0U : 1U);
+    ASSERT_TRUE(ram.Remove(key_));
+    EXPECT_GT(ram.UsedBytes(), 0U);
+    bool grant_recorded = false;
+    Grant(read.source_identity(), grant_recorded);
+    EXPECT_GT(ram.UsedBytes(),
+              0U);  // Notification does not release remote pins.
+    Grant(read.source_identity(), grant_recorded);
+    EXPECT_TRUE(read.Abort());
+    EXPECT_EQ(ram.UsedBytes(), 0U);
+  }
+  EXPECT_EQ(Counters().applied, 1U);
+  EXPECT_EQ(Counters().no_binding, 1U);
+}
+
+TEST_F(RdmaPullHeatTest, PublishedFollowerHasItsOwnLogicalGrant) {
+  const ScopedEnv ram_on("DFKV_RAM_TIER", "1");
+  const ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
+  const ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
+  const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+  ASSERT_NO_FATAL_FAILURE(Create());
+  KvNodeServerTestPeer::EnablePullCoalescing(*node_);
+  const DiskResidentIdentity identity = Seed();
+  PreparedRead leader = Prepare();
+  ASSERT_EQ(leader.status(), Status::kOk);
+  ASSERT_TRUE(leader.needs_io());
+  ASSERT_TRUE(leader.source_registered());
+  alignas(4096) char follower_staging[4096] = {};
+  PreparedRead follower;
+  std::thread waiter([&] {
+    follower = node_->PrepareReadForKey(key_, 0, 5, follower_staging,
+                                        sizeof(follower_staging));
+  });
+  const bool observed_waiter =
+      KvNodeServerTestPeer::WaitForPublishedPullFollower(*node_);
+  // Complete the real shared I/O even if the bounded waiter observation fails.
+  // No fatal assertion may strand the follower before the completion wakeup.
+  const Status storage_status = Finish(leader);
+  const DiskResidentIdentity source = leader.source_identity();
+  const bool committed = leader.Commit(storage_status, 5, 0);
+  bool leader_recorded = false;
+  if (committed && storage_status == Status::kOk)
+    Grant(source, leader_recorded);
+  waiter.join();
+  EXPECT_TRUE(observed_waiter);
+  ASSERT_EQ(storage_status, Status::kOk);
+  EXPECT_TRUE(committed);
+  EXPECT_TRUE(source == identity);
+  ASSERT_EQ(follower.status(), Status::kOk);
+  EXPECT_FALSE(follower.needs_io());  // One disk I/O, then a published RAM pin.
+  EXPECT_TRUE(follower.source_registered());
+  EXPECT_EQ(Counters().applied, 1U);
+  ASSERT_EQ(Finish(follower), Status::kOk);
+  EXPECT_TRUE(follower.source_identity() == identity);
+  bool follower_recorded = false;
+  Grant(follower.source_identity(), follower_recorded);
+  Grant(source, leader_recorded);
+  EXPECT_EQ(Counters().applied, 2U);
+  EXPECT_TRUE(follower.Abort());
+  EXPECT_FALSE(
+      leader.Abort());  // Releases the leader's post-read physical pin.
+  EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 0U);
+  RamTier& ram = KvNodeServerTestPeer::Ram(*node_);
+  EXPECT_TRUE(ram.Remove(key_));
+  EXPECT_EQ(ram.UsedBytes(), 0U);
+  EXPECT_EQ(Counters().applied, 2U);
+}
+
+TEST_F(RdmaPullHeatTest, DeferredRemoveKeepsOriginalBytesButLosesHeatRace) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity original = Seed();
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_EQ(KvNodeServerTestPeer::RemovePullSource(*node_, key_), Status::kOk);
+  ASSERT_EQ(Finish(read), Status::kOk);
+  EXPECT_TRUE(read.source_identity() == original);
+  const DiskResidentIdentity replacement = Seed();
+  ASSERT_NE(original.generation, replacement.generation);
+  bool grant_recorded = false;
+  Grant(read.source_identity(), grant_recorded);
+  EXPECT_EQ(Counters().race_lost, 1U);
+  EXPECT_EQ(Counters().applied, 0U);
+  EXPECT_TRUE(read.Abort());
+  EXPECT_TRUE(node_->Healthy());
+}
+
+TEST_F(RdmaPullHeatTest, FailedFinalInvalidationCannotEstablishGrant) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  Seed();
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_EQ(KvNodeServerTestPeer::RemovePullSource(*node_, key_), Status::kOk);
+  KvNodeServerTestPeer::FailPullInvalidation(*node_);
+  EXPECT_EQ(Finish(read), Status::kIOError);
+  EXPECT_FALSE(read.source_identity().valid());
+  EXPECT_TRUE(read.Abort());
+  EXPECT_FALSE(node_->Healthy());
+  EXPECT_EQ(Counters().successful, 0U);
+}
+
+TEST_F(RdmaPullHeatTest, AlreadyPreparedGrantUsesDrainTimeAndHardStopIsSticky) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  Seed();
+  PreparedRead soft = Prepare();
+  ASSERT_EQ(soft.status(), Status::kOk);
+  ASSERT_EQ(Finish(soft), Status::kOk);
+  PreparedRead hard = Prepare();
+  ASSERT_EQ(hard.status(), Status::kOk);
+  ASSERT_EQ(Finish(hard), Status::kOk);
+  PreparedRead rollback = Prepare();
+  ASSERT_EQ(rollback.status(), Status::kOk);
+  ASSERT_EQ(Finish(rollback), Status::kOk);
+  seconds_.store(uint64_t{UINT32_MAX} - DiskLifetimeHorizon(config_) + 101);
+  bool soft_recorded = false;
+  Grant(soft.source_identity(), soft_recorded);
+  EXPECT_EQ(Counters().applied, 1U);
+  seconds_.store(uint64_t{UINT32_MAX} + 101);
+  bool hard_recorded = false;
+  Grant(hard.source_identity(), hard_recorded);
+  seconds_.store(100);
+  bool rollback_recorded = false;
+  Grant(rollback.source_identity(), rollback_recorded);
+  EXPECT_EQ(Counters().clock_hard_exhausted, 2U);
+  EXPECT_TRUE(node_->Healthy());
+  EXPECT_TRUE(soft.Abort());
+  EXPECT_TRUE(hard.Abort());
+  EXPECT_TRUE(rollback.Abort());
+  EXPECT_EQ(Counters().successful, 3U);
+}
+
+TEST_F(RdmaPullHeatTest, DirectFallbackExportsSourceWithoutHeatingStorageRead) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  for (unsigned request = 0; request < 2; ++request) {
+    const char* data = nullptr;
+    size_t bytes = 0;
+    size_t value_len = 0;
+    DiskResidentIdentity source;
+    ASSERT_EQ(node_->RangeDirectForKey(key_, 0, 5, staging_, sizeof(staging_),
+                                       &data, &bytes, &value_len, &source),
+              Status::kOk);
+    ASSERT_EQ(bytes, 5U);
+    ASSERT_NE(data, nullptr);
+    EXPECT_EQ(std::string(data, bytes), "value");
+    EXPECT_TRUE(source == identity);
+    EXPECT_EQ(Counters().applied, request);
+    bool grant_recorded = false;
+    Grant(source, grant_recorded);
+    Grant(source, grant_recorded);
+  }
+  EXPECT_EQ(Counters().applied, 2U);
+}
+
 std::string SelfHdr() { return "test/model"; }
 void ConfigureTestRecvSegment() {
   // Keep Soft-RoCE CI below modest RLIMIT_MEMLOCK. Production commits a
@@ -595,18 +1040,18 @@ struct RdmaNode {
               op, key, off, len, pl, pll, out, value_len);
         },
         max_msg);
-    rsrv->set_range_handler(
-        [this](const BlockKey& key, uint64_t off, uint64_t len,
-               char* io_buf, size_t cap, const char** out_data,
-               size_t* out_len, size_t* value_len) {
+    rsrv->set_range_with_identity_handler(
+        [this](const BlockKey& key, uint64_t off, uint64_t len, char* io_buf,
+               size_t cap, const char** out_data, size_t* out_len,
+               size_t* value_len, DiskResidentIdentity* identity) {
           size_t call = 0;
           {
             std::lock_guard<std::mutex> lock(observation_mu);
             call = ++range_direct_calls[key.Filename()];
           }
           if (before_range) before_range(call);
-          return srv->RangeDirectForKey(
-              key, off, len, io_buf, cap, out_data, out_len, value_len);
+          return srv->RangeDirectForKey(key, off, len, io_buf, cap, out_data,
+                                        out_len, value_len, identity);
         });
     rsrv->set_cache_direct_handler(
         [this](const BlockKey& key, char* data, size_t len, size_t cap) {
@@ -5428,16 +5873,17 @@ struct RdmaUringNode {
               op, key, off, len, pl, pll, out, value_len);
         },
         max_msg);
-    rsrv->set_range_handler(  // sync fallback (used when uring path is off)
-        [this](const BlockKey& key, uint64_t off, uint64_t len,
-               char* io_buf, size_t cap, const char** out_data,
-               size_t* out_len, size_t* value_len) {
+    rsrv->set_range_with_identity_handler(  // sync fallback (used when uring
+                                            // path is off)
+        [this](const BlockKey& key, uint64_t off, uint64_t len, char* io_buf,
+               size_t cap, const char** out_data, size_t* out_len,
+               size_t* value_len, DiskResidentIdentity* identity) {
           {
             std::lock_guard<std::mutex> lock(observation_mu);
             ++range_calls[key.Filename()];
           }
-          return srv->RangeDirectForKey(
-              key, off, len, io_buf, cap, out_data, out_len, value_len);
+          return srv->RangeDirectForKey(key, off, len, io_buf, cap, out_data,
+                                        out_len, value_len, identity);
         });
     rsrv->set_cache_direct_handler(
         [this](const BlockKey& key, char* data, size_t len, size_t cap) {

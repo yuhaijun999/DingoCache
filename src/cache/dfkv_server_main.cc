@@ -15,8 +15,10 @@
 #include <vector>
 
 #include "cache/disk_cache_group.h"
+#include "cache/disk_resident_identity.h"
 #include "cache/kv_node_server.h"
 #include "common/config_dump.h"
+#include "common/kv_types.h"
 #include "common/version.h"
 #include "mds/mds_registrar.h"
 #include "utils/args.h"
@@ -414,14 +416,16 @@ int main(int argc, char** argv) {
                                           value_len);
         },
         /*max_msg=*/max_msg, rdma_dev);
-    rsrv->set_range_handler(  // disk -> registered dbuf -> RDMA scatter
+    rsrv->set_range_with_identity_handler(  // disk -> registered dbuf -> RDMA
+                                            // scatter
         [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
-               char* io_buf, size_t cap, const char** out_data,
-               size_t* out_len, size_t* value_len) {
+               char* io_buf, size_t cap, const char** out_data, size_t* out_len,
+               size_t* value_len, dfkv::DiskResidentIdentity* identity) {
           return srv.RangeDirectForKey(key, off, len, io_buf, cap, out_data,
-                                       out_len, value_len);
+                                       out_len, value_len, identity);
         });
-  rsrv->set_cache_direct_handler(  // server-side direct PUT: RDMA dbuf -> O_DIRECT write
+    rsrv->set_cache_direct_handler(  // server-side direct PUT: RDMA dbuf ->
+                                     // O_DIRECT write
         [&srv](const dfkv::BlockKey& key, char* data, size_t len, size_t cap) {
           return srv.CacheDirectForKey(key, data, len, cap);
         });
@@ -429,6 +433,11 @@ int main(int argc, char** argv) {
         [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
                char* staging, size_t cap) {
           return srv.PrepareReadForKey(key, off, len, staging, cap);
+        });
+    rsrv->SetPullReadSuccessHandler(
+        [&srv](const dfkv::BlockKey& key,
+               const dfkv::DiskResidentIdentity& identity, size_t bytes) {
+          srv.NotifyLifetimeReadSuccessForKey(key, identity, bytes);
         });
     rsrv->SetRestartRequiredHandler(
         [&srv] { return srv.LifetimeRestartRequired(); });

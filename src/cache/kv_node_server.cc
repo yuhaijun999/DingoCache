@@ -1381,9 +1381,12 @@ bool KvNodeServer::RamPinnedHitForKey(const BlockKey& key, uint64_t offset,
   return true;
 }
 
-Status KvNodeServer::RangeDirectForKey(
-    const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
-    size_t io_cap, const char** out_data, size_t* out_len, size_t* value_len) {
+Status KvNodeServer::RangeDirectForKey(const BlockKey& key, uint64_t offset,
+                                       uint64_t length, char* io_buf,
+                                       size_t io_cap, const char** out_data,
+                                       size_t* out_len, size_t* value_len,
+                                       DiskResidentIdentity* identity) {
+  if (identity != nullptr) *identity = {};
   if (LifetimeRestartRequired()) {
     if (out_data != nullptr) *out_data = nullptr;
     if (out_len != nullptr) *out_len = 0;
@@ -1403,6 +1406,7 @@ Status KvNodeServer::RangeDirectForKey(
       if (out_data) *out_data = io_buf;
       if (out_len) *out_len = n;
       if (value_len) *value_len = h.value_len;
+      if (identity != nullptr && n != 0) *identity = h.identity;
       cache_hit_.fetch_add(1, std::memory_order_relaxed);
       bytes_read_.fetch_add(n, std::memory_order_relaxed);
       if (samp) get_lat_.Observe(NowSec() - t0);
@@ -1435,7 +1439,7 @@ Status KvNodeServer::RangeDirectForKey(
         },
         nullptr, read_epoch);
     if (st == Status::kOk && out_data) *out_data = io_buf;
-  } else if (ram_) {
+  } else if (ram_ || identity != nullptr) {
     st = group_.RangeDirectWithIdentity(key, offset, length, io_buf, io_cap,
                                         out_data, out_len, &read_identity,
                                         value_len);
@@ -1444,6 +1448,7 @@ Status KvNodeServer::RangeDirectForKey(
                             out_len, value_len);
   }
   if (st == Status::kOk) {
+    if (identity != nullptr && *out_len != 0) *identity = read_identity;
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
     // Only a complete value may become a durable RAM resident. A slice must
