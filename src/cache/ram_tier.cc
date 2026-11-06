@@ -1329,6 +1329,9 @@ void RamTier::FlushLoop(Shard& s) {
         const bool clock_stopped =
             typed && disk_results[i].status == Status::kCacheFull &&
             disk_results[i].reason == DiskWriteReason::kLifetimeClockExhausted;
+        const bool scan_budget_exhausted =
+            typed && disk_results[i].status == Status::kCacheFull &&
+            disk_results[i].reason == DiskWriteReason::kScanBudgetExhausted;
         const bool permanent_admission_failure =
             identity_exhausted || clock_stopped;
         entry.flushing = false;
@@ -1376,11 +1379,13 @@ void RamTier::FlushLoop(Shard& s) {
             CompletePut(completion, disk_results[i]);
           else
             CompletePut(completion, true);
-        } else if (clock_stopped && entry.client_acked) {
-          // The client already owns a successful RAM-ACK. Keep its sole copy
-          // dirty and flush-pinned instead of treating clock shutdown as I/O
-          // loss. Internal waiters still terminate; drain remains incomplete
-          // until explicit removal or a supported persistence path resolves it.
+        } else if ((clock_stopped || scan_budget_exhausted) &&
+                   entry.client_acked) {
+          // A defensive path for an already successful RAM-ACK: neither clock
+          // shutdown nor scan backpressure may discard its sole dirty copy.
+          // New lifetime write-back must require disk-ACK before activation.
+          // Waiters terminate, but drain remains incomplete until removal or a
+          // supported persistence path resolves the retained flush pin.
           CompletePut(entry.completion, disk_results[i]);
         } else if (!permanent_admission_failure &&
                    ++batch[i].tries < opt_.flush_retries) {
@@ -1397,10 +1402,12 @@ void RamTier::FlushLoop(Shard& s) {
           if (client_acked)
             post_ack_flush_failures_.fetch_add(1, std::memory_order_relaxed);
           DropLocked(s, batch[i].key);
-          // Unacknowledged permanent admission failure is not I/O corruption.
-          // Only identity exhaustion can reach this branch after RAM-ACK;
-          // losing that sole copy keeps its existing isolation behavior.
-          if (!permanent_admission_failure || client_acked)
+          // Exact unacknowledged admission/backpressure failures are not I/O
+          // corruption. Budget failures use the normal finite retry count;
+          // only their terminal health classification differs from real I/O.
+          // Identity exhaustion after RAM-ACK keeps its existing isolation.
+          if ((!permanent_admission_failure && !scan_budget_exhausted) ||
+              client_acked)
             healthy_.store(false, std::memory_order_release);
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
           // Publish every terminal side effect before waking PutCommitted()

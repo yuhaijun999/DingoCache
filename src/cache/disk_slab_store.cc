@@ -29,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -853,6 +854,12 @@ bool DiskSlabStore::ValidateExistingDataFiles(const Options& options,
 
 bool DiskSlabStore::ValidateOptions() {
   std::string error;
+  if (opt_.lifetime_class_eviction &&
+      (!opt_.lifetime_config || opt_.reclaim_interval_ms != 0)) {
+    return SetStartupError(
+        "staged lifetime class eviction requires scoring and no background "
+        "reclaim");
+  }
   if (opt_.lifetime_config) {
     if (!ValidateDiskLifetimeConfig(*opt_.lifetime_config, &error))
       return SetStartupError(error);
@@ -1543,6 +1550,56 @@ DiskWriteResult DiskSlabStore::WaitPut(
   return result;
 }
 
+DiskWriteResult DiskSlabStore::AllocateForPutLocked(
+    const BlockKey& key, size_t len, SlabAllocator::SlotRef* ref,
+    std::unique_lock<std::mutex>& lock) {
+  std::optional<SlabAllocator::LifetimeScan> scan;
+  if (opt_.lifetime_class_eviction) {
+    if (!opt_.lifetime_config || !opt_.lifetime_clock)
+      return {Status::kInvalid};
+    scan.emplace(*opt_.lifetime_config, *opt_.lifetime_clock);
+  }
+  for (;;) {
+    if (!Healthy() || alloc_->Contains(key)) return {Status::kIOError};
+    std::vector<BlockKey> evicted;
+    bool reclaim_denied = false;
+    const uint64_t visits = scan ? scan->visits : 0;
+    const uint64_t slices = scan ? scan->slices : 0;
+    const bool allocated =
+        alloc_->PutImpl(key, len, ref, &evicted, nullptr, &reclaim_denied,
+                        scan ? &*scan : nullptr);
+    // An invalidation remains committed even when a later allocation fails.
+    for (const BlockKey& victim : evicted)
+      evicted_bytes_ += ErasePayloadLocked(victim.Filename());
+    if (scan) {
+      lifetime_class_scan_visits_ += scan->visits - visits;
+      lifetime_class_scan_slices_ += scan->slices - slices;
+      if (scan->result == SlabAllocator::LifetimeScanResult::kEvicted)
+        ++lifetime_class_victims_;
+      if (scan->result == SlabAllocator::LifetimeScanResult::kNoCandidate)
+        ++lifetime_class_no_candidate_;
+    }
+    if (allocated) return {Status::kOk};
+    if (!Healthy()) return {Status::kIOError};
+    if (reclaim_denied)
+      return {Status::kCacheFull, DiskWriteReason::kLifetimeClockExhausted};
+    if (scan &&
+        scan->result == SlabAllocator::LifetimeScanResult::kBudgetExhausted) {
+      ++lifetime_scan_budget_exhausted_;
+      return {Status::kCacheFull, DiskWriteReason::kScanBudgetExhausted};
+    }
+    if (!scan || scan->result != SlabAllocator::LifetimeScanResult::kRetry)
+      return {Status::kIOError};
+    // PutImpl already released A. The installed flight still excludes another
+    // owner; committed bytes and earlier batch write-pins remain protected.
+    lock.unlock();
+    if (lifetime_scan_yield_hook_for_test_)
+      lifetime_scan_yield_hook_for_test_();
+    std::this_thread::yield();
+    lock.lock();
+  }
+}
+
 // mu_ guards only the in-memory maps; the MB-scale payload I/O runs OUTSIDE it
 // (same discipline as KVStore::Cache and RamTier::Put), so concurrent ops to one
 // disk overlap in the kernel instead of serializing behind the store lock. The
@@ -1599,21 +1656,10 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       flight = std::make_shared<PutFlight>();
       put_flights_.emplace(fn, flight);
       leader = true;
-      std::vector<BlockKey> evicted;
-      bool reclaim_denied = false;
-      const bool allocated =
-          !alloc_->Contains(key) &&
-          alloc_->PutImpl(key, len, &ref, &evicted, nullptr, &reclaim_denied);
-      // The returned list owns completed invalidations, even if a later
-      // allocation step fails. Never restore those residents' visibility.
-      for (const BlockKey& ev : evicted)
-        evicted_bytes_ += ErasePayloadLocked(ev.Filename());
-      if (!allocated) {
-        DiskWriteResult result{Status::kIOError};
-        if (reclaim_denied && Healthy()) {
-          result.status = Status::kCacheFull;
-          result.reason = DiskWriteReason::kLifetimeClockExhausted;
-        }
+      const DiskWriteResult allocation =
+          AllocateForPutLocked(key, len, &ref, lk);
+      if (allocation.status != Status::kOk) {
+        const DiskWriteResult result = allocation;
         put_flights_.erase(fn);
         CompletePut(flight, result);
         if (details != nullptr) *details = result;
@@ -1813,20 +1859,10 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
         }
         st[i].flight = std::make_shared<PutFlight>();
         put_flights_.emplace(st[i].fn, st[i].flight);
-        std::vector<BlockKey> evicted;
-        bool reclaim_denied = false;
-        const bool allocated =
-            !alloc_->Contains(it.key) &&
-            alloc_->PutImpl(it.key, it.len, &st[i].ref, &evicted, nullptr,
-                            &reclaim_denied);
-        for (const BlockKey& ev : evicted)
-          evicted_bytes_ += ErasePayloadLocked(ev.Filename());
-        if (!allocated) {
-          DiskWriteResult result{Status::kIOError};
-          if (reclaim_denied && Healthy()) {
-            result.status = Status::kCacheFull;
-            result.reason = DiskWriteReason::kLifetimeClockExhausted;
-          }
+        const DiskWriteResult allocation =
+            AllocateForPutLocked(it.key, it.len, &st[i].ref, lk);
+        if (allocation.status != Status::kOk) {
+          const DiskWriteResult result = allocation;
           out[i] = result.status;
           if (details != nullptr) (*details)[i] = result;
           put_flights_.erase(st[i].fn);
@@ -2659,6 +2695,11 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
     st.pool_extents = alloc_->PoolExtents();
   }
   std::lock_guard<std::mutex> lk(mu_);
+  st.lifetime_class_scan_visits = lifetime_class_scan_visits_;
+  st.lifetime_class_scan_slices = lifetime_class_scan_slices_;
+  st.lifetime_scan_budget_exhausted = lifetime_scan_budget_exhausted_;
+  st.lifetime_class_no_candidate = lifetime_class_no_candidate_;
+  st.lifetime_class_victims = lifetime_class_victims_;
   st.lifetime_reads = lifetime_reads_;
   st.payload_bytes = committed_payload_bytes_;
   st.lifetime_init_clock_hard_exhausted = lifetime_init_clock_hard_exhausted_;

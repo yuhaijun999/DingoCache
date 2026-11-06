@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add internally gated foreground lifetime class selection with 1024-visit
+  slices and per-PUT cumulative budgets, shared by single and batched writes.
+  Preserve typed budget backpressure through finite RAM flush retries without
+  misclassifying it as I/O failure. Public policy and background eviction stay gated.
+
 - Maintain staged class-local and disk-wide lifetime score indexes with
   configurable read bands, atomic read migration and safe removal cursors.
   These are shadow indexes only; legacy eviction and public policy gates remain.

@@ -911,6 +911,11 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.metadata_io_errors += st.metadata_io_errors;
     sum.lifetime_init_clock_hard_exhausted +=
         st.lifetime_init_clock_hard_exhausted;
+    sum.lifetime_class_scan_visits += st.lifetime_class_scan_visits;
+    sum.lifetime_class_scan_slices += st.lifetime_class_scan_slices;
+    sum.lifetime_scan_budget_exhausted += st.lifetime_scan_budget_exhausted;
+    sum.lifetime_class_no_candidate += st.lifetime_class_no_candidate;
+    sum.lifetime_class_victims += st.lifetime_class_victims;
     sum.lifetime_reads.successful += st.lifetime_reads.successful;
     sum.lifetime_reads.applied += st.lifetime_reads.applied;
     sum.lifetime_reads.no_binding += st.lifetime_reads.no_binding;

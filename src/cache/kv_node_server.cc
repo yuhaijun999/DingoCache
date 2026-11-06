@@ -667,6 +667,21 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_init_clock_hard_exhausted_total", "counter",
            "NEW and recovered residents left unscored at hard clock exhaustion",
            ss.lifetime_init_clock_hard_exhausted);
+    metric("dfkv_slab_lifetime_class_scan_visits_total", "counter",
+           "Resident visits in staged foreground lifetime class scans",
+           ss.lifetime_class_scan_visits);
+    metric("dfkv_slab_lifetime_class_scan_slices_total", "counter",
+           "Staged foreground lifetime class scan opportunities",
+           ss.lifetime_class_scan_slices);
+    metric("dfkv_slab_lifetime_scan_budget_exhausted_total", "counter",
+           "PUT owners rejected at their lifetime scan budget",
+           ss.lifetime_scan_budget_exhausted);
+    metric("dfkv_slab_lifetime_class_no_candidate_total", "counter",
+           "Stable class traversals with no eligible lifetime candidate",
+           ss.lifetime_class_no_candidate);
+    metric("dfkv_slab_lifetime_class_victims_total", "counter",
+           "Residents durably removed by foreground lifetime class scans",
+           ss.lifetime_class_victims);
     metric("dfkv_slab_lifetime_read_success_total", "counter",
            "Nonzero successful business reads notified to lifetime metadata",
            ss.lifetime_reads.successful);

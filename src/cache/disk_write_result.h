@@ -16,7 +16,10 @@ enum class DiskWriteReason : unsigned char {
   // New reclaim/bind decisions stopped at the clock's hard uint32 bound.
   // Existing bound free slots and already-started persistence may finish.
   // This is not disk corruption; only the exact CacheFull pair is terminal.
-  kLifetimeClockExhausted = 2
+  kLifetimeClockExhausted = 2,
+  // This PUT consumed its finite class-scan budget without admission. Only the
+  // exact CacheFull pair is backpressure, not proof of I/O corruption.
+  kScanBudgetExhausted = 3
 };
 
 // A terminal event, not a live-residency query or proof of equal input bytes.

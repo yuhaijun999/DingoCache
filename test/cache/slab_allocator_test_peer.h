@@ -20,6 +20,29 @@ namespace dfkv {
 
 class SlabAllocatorTestPeer {
  public:
+  using LifetimeScan = SlabAllocator::LifetimeScan;
+  using LifetimeScanResult = SlabAllocator::LifetimeScanResult;
+  static bool PutWithLifetimeScan(SlabAllocator& allocator, const BlockKey& key,
+                                  size_t len, SlabAllocator::SlotRef* ref,
+                                  std::vector<BlockKey>* evicted,
+                                  LifetimeScan& scan, bool* denied) {
+    return allocator.PutImpl(key, len, ref, evicted, nullptr, denied, &scan);
+  }
+  static bool ScanLifetimeClass(SlabAllocator& allocator, size_t cls,
+                                LifetimeScan& scan,
+                                std::vector<BlockKey>* evicted, bool* denied) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    return allocator.EvictLifetimeFromLocked(cls, scan, evicted, denied);
+  }
+  static void SetLifetimeVersion(SlabAllocator& allocator, size_t cls,
+                                 uint64_t version) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    allocator.lifetime_versions_[cls] = version;
+  }
+  static uint64_t LifetimeVersion(const SlabAllocator& allocator, size_t cls) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    return allocator.lifetime_versions_[cls];
+  }
   using LifetimeReadResult = SlabAllocator::LifetimeReadResult;
   static LifetimeReadResult ApplyLifetimeRead(SlabAllocator& allocator,
                                               const BlockKey& key,

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -1889,9 +1890,10 @@ TEST(RamTier, TypedFlushFailureReasonsControlRetryAndHealth) {
           dfkv::DiskWriteResult{Status::kIOError},
           dfkv::DiskWriteResult{Status::kIOError,
                                 dfkv::DiskWriteReason::kIdentityExhausted},
-          dfkv::DiskWriteResult{
-              Status::kIOError,
-              dfkv::DiskWriteReason::kLifetimeClockExhausted}}) {
+          dfkv::DiskWriteResult{Status::kIOError,
+                                dfkv::DiskWriteReason::kLifetimeClockExhausted},
+          dfkv::DiskWriteResult{Status::kIOError,
+                                dfkv::DiskWriteReason::kScanBudgetExhausted}}) {
       SCOPED_TRACE(acknowledged);
       SCOPED_TRACE(static_cast<int>(failure.reason));
       SCOPED_TRACE(static_cast<int>(failure.status));
@@ -2221,6 +2223,198 @@ TEST(RamTier, ClockExhaustionDoesNotHideRealIoFailureInMixedBatch) {
   EXPECT_FALSE(tier.Contains(K(80303)));
   EXPECT_FALSE(tier.Contains(K(80304)));
   EXPECT_TRUE(tier.Contains(K(80305)));
+  EXPECT_EQ(tier.FlushDropped(), 2U);
+  EXPECT_EQ(tier.DirtyObjects(), 0U);
+}
+
+TEST(RamTier, ScanBudgetRetriesTerminateFollowersWithoutIoIsolation) {
+  for (const bool batched : {false, true}) {
+    SCOPED_TRACE(batched);
+    FlushSink gate;
+    gate.close();
+    RamTier::Options options = Opts(64 * 4096);
+    options.flush_retries = 3;
+    options.reclaim_interval_ms = 0;
+    std::atomic<unsigned> calls{0};
+    std::atomic<bool> allow_success{false};
+    const auto flush_one = [&](const BlockKey& key, char* data, size_t len,
+                               size_t cap) {
+      ++calls;
+      gate.fn()(key, data, len, cap);
+      return allow_success.load()
+                 ? dfkv::DiskWriteResult{Status::kOk}
+                 : dfkv::DiskWriteResult{
+                       Status::kCacheFull,
+                       dfkv::DiskWriteReason::kScanBudgetExhausted};
+    };
+    RamTier tier(options, nullptr);
+    const OpenFlushOnExit release{gate};
+    if (batched) {
+      tier.set_flush_results(
+          {}, [&](const std::vector<RamTier::FlushItem>& items) {
+            std::vector<dfkv::DiskWriteResult> results;
+            results.reserve(items.size());
+            for (const RamTier::FlushItem& item : items) {
+              results.push_back(
+                  flush_one(item.key, item.data, item.len, item.cap));
+            }
+            return results;
+          });
+    } else {
+      tier.set_flush_results(flush_one);
+    }
+    RamTierTestPeer::Completion owner;
+    RamTierTestPeer::Completion follower;
+    ASSERT_EQ(RamTierTestPeer::Admit(tier, K(80310), "owner", &owner),
+              RamTierTestPeer::Admission::kAccepted);
+    ASSERT_TRUE(gate.await_calls(1));
+    ASSERT_EQ(RamTierTestPeer::Admit(tier, K(80310), "different", &follower),
+              RamTierTestPeer::Admission::kDuplicate);
+    ASSERT_EQ(owner, follower);
+    gate.open();
+    ASSERT_TRUE(RamTierTestPeer::AwaitDone(owner));
+    ASSERT_TRUE(RamTierTestPeer::AwaitDone(follower));
+    for (const RamTierTestPeer::Completion& completion : {owner, follower}) {
+      const RamTier::PutResult result = RamTierTestPeer::Result(completion);
+      EXPECT_EQ(result.status, Status::kCacheFull);
+      EXPECT_EQ(result.reason, dfkv::DiskWriteReason::kScanBudgetExhausted);
+      EXPECT_EQ(result.disposition, RamTier::PutDisposition::kComplete);
+      EXPECT_FALSE(result.identity.valid());
+    }
+    EXPECT_EQ(calls.load(), 3U);
+    EXPECT_TRUE(tier.healthy());
+    EXPECT_EQ(tier.FlushDropped(), 1U);
+    EXPECT_EQ(tier.PostAckFlushFailures(), 0U);
+    EXPECT_EQ(tier.DirtyObjects(), 0U);
+    EXPECT_FALSE(tier.Contains(K(80310)));
+    EXPECT_FALSE(RamTierTestPeer::Writing(tier, K(80310)));
+    EXPECT_TRUE(tier.WaitForDrain(std::chrono::milliseconds(0)));
+    // A distinct logical retry must not join the completed failed flight.
+    // Continuous budget backpressure exceeds one flush retry limit without
+    // turning into I/O isolation or retaining an in-flight owner.
+    const RamTier::PutResult retried = tier.PutCommitted(K(80310), "retry", 5);
+    EXPECT_EQ(retried.status, Status::kCacheFull);
+    EXPECT_EQ(retried.reason, dfkv::DiskWriteReason::kScanBudgetExhausted);
+    EXPECT_EQ(calls.load(), 6U);
+    EXPECT_EQ(tier.FlushDropped(), 2U);
+    EXPECT_TRUE(tier.healthy());
+    EXPECT_FALSE(RamTierTestPeer::Writing(tier, K(80310)));
+    allow_success.store(true);
+    EXPECT_EQ(tier.PutCommitted(K(80310), "new", 3).status, Status::kOk);
+    EXPECT_EQ(calls.load(), 7U);
+  }
+}
+
+TEST(RamTier, ScanBudgetRetainsAckedPayloadUntilExplicitRemove) {
+  FlushSink gate;
+  gate.close();
+  RamTier::Options options = Opts(64 * 4096);
+  options.flush_retries = 3;
+  options.reclaim_interval_ms = 0;
+  RamTier tier(options, nullptr);
+  const OpenFlushOnExit release{gate};
+  tier.set_flush_results(
+      [&](const BlockKey& key, char* data, size_t len, size_t cap) {
+        gate.fn()(key, data, len, cap);
+        return dfkv::DiskWriteResult{
+            Status::kCacheFull, dfkv::DiskWriteReason::kScanBudgetExhausted};
+      });
+  ASSERT_EQ(tier.PutWriteBack(K(80311), "owner", 5).status, Status::kOk);
+  ASSERT_TRUE(gate.await_calls(1));
+  RamTierTestPeer::Completion follower;
+  ASSERT_EQ(RamTierTestPeer::Admit(tier, K(80311), "different", &follower),
+            RamTierTestPeer::Admission::kDuplicate);
+  const uint64_t charged = tier.UsedBytes();
+  gate.open();
+  ASSERT_TRUE(RamTierTestPeer::AwaitDone(follower));
+  const RamTier::PutResult result = RamTierTestPeer::Result(follower);
+  EXPECT_EQ(result.status, Status::kCacheFull);
+  EXPECT_EQ(result.reason, dfkv::DiskWriteReason::kScanBudgetExhausted);
+  EXPECT_EQ(gate.calls, 1);
+  EXPECT_TRUE(tier.healthy());
+  EXPECT_EQ(tier.PostAckFlushFailures(), 0U);
+  EXPECT_EQ(tier.FlushDropped(), 0U);
+  EXPECT_EQ(tier.DirtyObjects(), 1U);
+  EXPECT_EQ(tier.DirtyBytes(), charged);
+  EXPECT_TRUE(RamTierTestPeer::FlushPinned(tier, K(80311)));
+  EXPECT_FALSE(tier.WaitForDrain(std::chrono::milliseconds(0)));
+  RamTier::Hit hit;
+  ASSERT_TRUE(tier.GetPrep(K(80311), 0, 5, &hit));
+  EXPECT_EQ(std::string(hit.ptr, hit.len), "owner");
+  EXPECT_FALSE(hit.identity.valid());
+  ASSERT_TRUE(tier.Remove(K(80311)));
+  EXPECT_FALSE(tier.Contains(K(80311)));
+  EXPECT_EQ(tier.UsedBytes(), charged);  // The read still owns its pin.
+  hit = RamTier::Hit{};
+  EXPECT_EQ(tier.UsedBytes(), 0U);
+  EXPECT_EQ(tier.DirtyObjects(), 0U);
+  EXPECT_TRUE(tier.WaitForDrain(std::chrono::milliseconds(0)));
+}
+
+TEST(RamTier, ScanBudgetMixedBatchKeepsResultsAndRealIoIsolation) {
+  FlushSink gate;
+  gate.close();
+  RamTier::Options options = Opts(64 * 4096);
+  options.flush_retries = 3;
+  options.reclaim_interval_ms = 0;
+  std::atomic<unsigned> budget_calls{0};
+  std::atomic<unsigned> io_calls{0};
+  std::vector<size_t> sizes;
+  RamTier tier(options, nullptr);
+  const OpenFlushOnExit release{gate};
+  tier.set_flush_results(
+      [](const BlockKey&, char*, size_t, size_t) {
+        ADD_FAILURE() << "the installed batch callback must handle this flush";
+        return dfkv::DiskWriteResult{Status::kIOError};
+      },
+      [&](const std::vector<RamTier::FlushItem>& items) {
+        sizes.push_back(items.size());
+        gate.fn()(items[0].key, items[0].data, items[0].len, items[0].cap);
+        std::vector<dfkv::DiskWriteResult> results;
+        results.reserve(items.size());
+        for (const RamTier::FlushItem& item : items) {
+          if (item.key == K(80313)) {
+            ++budget_calls;
+            results.push_back({Status::kCacheFull,
+                               dfkv::DiskWriteReason::kScanBudgetExhausted});
+          } else if (item.key == K(80314)) {
+            ++io_calls;
+            results.push_back({Status::kIOError});
+          } else {
+            results.push_back({Status::kOk});
+          }
+        }
+        return results;
+      });
+  RamTierTestPeer::Completion seed;
+  ASSERT_EQ(RamTierTestPeer::Admit(tier, K(80312), "seed", &seed),
+            RamTierTestPeer::Admission::kAccepted);
+  ASSERT_TRUE(gate.await_calls(1));
+  std::vector<RamTierTestPeer::Completion> completions(3);
+  for (size_t index = 0; index < completions.size(); ++index) {
+    ASSERT_EQ(RamTierTestPeer::Admit(tier, K(80313 + index), "value",
+                                     &completions[index]),
+              RamTierTestPeer::Admission::kAccepted);
+  }
+  gate.open();
+  ASSERT_TRUE(RamTierTestPeer::AwaitDone(seed));
+  for (const RamTierTestPeer::Completion& completion : completions) {
+    ASSERT_TRUE(RamTierTestPeer::AwaitDone(completion));
+  }
+  const RamTier::PutResult budget = RamTierTestPeer::Result(completions[0]);
+  EXPECT_EQ(budget.status, Status::kCacheFull);
+  EXPECT_EQ(budget.reason, dfkv::DiskWriteReason::kScanBudgetExhausted);
+  const RamTier::PutResult failed = RamTierTestPeer::Result(completions[1]);
+  EXPECT_EQ(failed.status, Status::kIOError);
+  EXPECT_EQ(failed.reason, dfkv::DiskWriteReason::kNone);
+  EXPECT_EQ(RamTierTestPeer::Result(completions[2]).status, Status::kOk);
+  EXPECT_EQ(budget_calls.load(), 3U);
+  EXPECT_EQ(io_calls.load(), 3U);
+  EXPECT_EQ(sizes, (std::vector<size_t>{1, 3, 2, 2}));
+  EXPECT_FALSE(tier.healthy());
+  EXPECT_FALSE(tier.Contains(K(80313)));
+  EXPECT_FALSE(tier.Contains(K(80314)));
+  EXPECT_TRUE(tier.Contains(K(80315)));
   EXPECT_EQ(tier.FlushDropped(), 2U);
   EXPECT_EQ(tier.DirtyObjects(), 0U);
 }

@@ -201,6 +201,38 @@ class SlabAllocator {
   LifetimeReadResult ApplyLifetimeRead(const BlockKey& key, uint64_t generation,
                                        const DiskLifetimeConfig& config,
                                        const DiskLifetimeClock& clock);
+  enum class LifetimeScanResult : unsigned char {
+    kIdle = 0,             // No class scan was needed in this allocation.
+    kRetry = 1,            // More class work remains; release D and A first.
+    kBudgetExhausted = 2,  // This owner must terminate, not restart its budget.
+    kNoCandidate = 3,      // Completed the current stable class traversal.
+    kEvicted = 4,          // One checked resident was durably removed.
+    kPersistenceError = 5  // Stop immediately; do not escalate to a donor.
+  };
+  // Owned by one logical PUT, never shared with followers or recreated between
+  // slices. Only traversal positions survive unlocking, never candidate scores.
+  struct LifetimeScan {
+    LifetimeScan(const DiskLifetimeConfig& scoring,
+                 const DiskLifetimeClock& time)
+        : config(scoring), clock(time) {}
+    const DiskLifetimeConfig& config;
+    const DiskLifetimeClock& clock;
+    uint64_t visits = 0;
+    uint64_t slices = 0;
+    uint64_t visit_limit = 0;
+    uint64_t slice_limit = 0;
+    uint64_t version = 0;
+    bool initialized = false;
+    bool progress_initialized = false;
+    std::array<uint32_t, 64> starts{};
+    std::array<uint32_t, 64> cursors{};
+    std::array<bool, 64> done{};
+    LifetimeScanResult result = LifetimeScanResult::kIdle;
+  };
+  bool EvictLifetimeFromLocked(size_t cls_index, LifetimeScan& scan,
+                               std::vector<BlockKey>* evicted,
+                               bool* reclaim_denied);
+  void BumpLifetimeVersionLocked(uint32_t meta_index);
   // Physical ownership only, including pending removal. Does not touch CLOCK.
   // Zero means disabled, absent or uncommitted; never an exportable identity.
   uint64_t ResidentGeneration(const BlockKey& key) const;
@@ -299,7 +331,7 @@ class SlabAllocator {
   // only on false; optional growth refusal may still use an existing free slot.
   bool PutImpl(const BlockKey& key, size_t len, SlotRef* out,
                std::vector<BlockKey>* evicted, SlotHandle* out_handle,
-               bool* reclaim_denied);
+               bool* reclaim_denied, LifetimeScan* scan = nullptr);
   bool ReclaimAllowed(bool* reclaim_denied = nullptr) const;
   size_t ClassForLen(size_t aligned_len);
   size_t ClassForExactSize(uint32_t slot_size);
@@ -382,12 +414,14 @@ class SlabAllocator {
   // deliberately uninitialized resident from a valid state whose anchor is 0.
   // Only physical removal clears a committed state, not payload visibility.
   std::vector<std::optional<DiskLifetimeState>> resident_lifetime_states_;
-  // Shadow indexes until Q3a selection is connected. Legacy rings remain
-  // authoritative for eviction in this stage. Disabled paths allocate neither
-  // links nor queue heads; SlotMeta and the RAM per-slot layout stay unchanged.
+  // Optional score indexes, used only by the internal foreground selector.
+  // Legacy rings remain authoritative without that Store gate. Disabled paths
+  // allocate no links or queue heads; the RAM per-slot layout stays unchanged.
   std::vector<LifetimeLinks> lifetime_links_;
   // Row 0 is global; row cls+1 is class-local, each with MAX_READS+1 bands.
   std::vector<LifetimeQueue> lifetime_queues_;
+  // Enabled-only class mutation versions, including pin eligibility changes.
+  std::vector<uint64_t> lifetime_versions_;
   uint32_t free_slot_meta_head_ = kNoSlot;
   uint32_t global_ring_head_ = kNoSlot;
   uint32_t global_hand_ = kNoSlot;

@@ -91,6 +91,9 @@ class DiskSlabStore : public StoreEngine {
     // a usable clock with matching H and also enables resident identities.
     // Absent by default; does not select a new eviction policy.
     std::optional<DiskLifetimeConfig> lifetime_config{};
+    // Internal foreground-only selector test gate, never set by group/CLI.
+    // Requires scoring and reclaim_interval_ms=0 until background integration.
+    bool lifetime_class_eviction = false;
   };
 
   // Enabled, nonempty logical successes partition into exactly one outcome.
@@ -108,6 +111,11 @@ class DiskSlabStore : public StoreEngine {
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
   struct Stats {
     LifetimeReadCounters lifetime_reads{};
+    uint64_t lifetime_class_scan_visits = 0;
+    uint64_t lifetime_class_scan_slices = 0;
+    uint64_t lifetime_scan_budget_exhausted = 0;
+    uint64_t lifetime_class_no_candidate = 0;
+    uint64_t lifetime_class_victims = 0;
     uint64_t dio_write_fallbacks = 0;
     uint64_t dio_read_fallbacks = 0;
     uint64_t table_syncs = 0;
@@ -377,6 +385,11 @@ class DiskSlabStore : public StoreEngine {
   Status FinishReadLocked(const BlockKey& key, const std::string& fn,
                           Status status, size_t bytes,
                           DiskResidentIdentity* identity);
+  // Returns with lock held. The caller retains its unique PutFlight across
+  // all slices; this helper never re-enters owner/follower arbitration.
+  DiskWriteResult AllocateForPutLocked(const BlockKey& key, size_t len,
+                                       SlabAllocator::SlotRef* ref,
+                                       std::unique_lock<std::mutex>& lock);
   struct PutFlight {
     std::mutex mu;
     std::condition_variable cv;
@@ -453,6 +466,13 @@ class DiskSlabStore : public StoreEngine {
   // unlocked window, inflight_/deferred_remove_ protect it from Remove;
   // payload_len_ install after the write is the reader-visible commit).
   mutable std::mutex mu_;
+  uint64_t lifetime_class_scan_visits_ = 0;
+  uint64_t lifetime_class_scan_slices_ = 0;
+  uint64_t lifetime_scan_budget_exhausted_ = 0;
+  uint64_t lifetime_class_no_candidate_ = 0;
+  uint64_t lifetime_class_victims_ = 0;
+  // Invoked only between class slices, after releasing BOTH lifecycle locks.
+  std::function<void()> lifetime_scan_yield_hook_for_test_{};
   LifetimeReadCounters lifetime_reads_{};  // under mu_
   uint64_t committed_payload_bytes_ = 0;  // under mu_
   uint64_t lifetime_init_clock_hard_exhausted_ = 0;  // under mu_

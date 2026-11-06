@@ -180,6 +180,7 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
   }
 
   if (opt_.track_lifetime_state) {
+    lifetime_versions_.resize(classes_.size());
     lifetime_queues_.resize((classes_.size() + 1) *
                             (opt_.lifetime_max_reads + 1));
   }
@@ -383,6 +384,7 @@ void SlabAllocator::LinkLifetimeLocked(uint32_t meta_index) {
   const DiskLifetimeState& state = *resident_lifetime_states_[meta_index];
   // fw contributes one effective scoring read; widen before adding, matching
   // DiskLifetimeBand rather than the raw six-bit read counter alone.
+  BumpLifetimeVersionLocked(meta_index);
   links.band = std::min<uint32_t>(
       static_cast<uint32_t>(state.scoring_reads()) + state.first_early_read(),
       opt_.lifetime_max_reads);
@@ -415,6 +417,7 @@ void SlabAllocator::LinkLifetimeLocked(uint32_t meta_index) {
 void SlabAllocator::UnlinkLifetimeLocked(uint32_t meta_index) {
   LifetimeLinks& links = lifetime_links_[meta_index];
   if (links.band == kNoSlot) return;
+  BumpLifetimeVersionLocked(meta_index);
   for (size_t index = 0; index < links.indexes.size(); ++index) {
     LifetimeQueue& queue = LifetimeQueueFor(meta_index, index, links.band);
     const LifetimeLink link = links.indexes[index];
@@ -784,6 +787,125 @@ bool SlabAllocator::EvictOneFrom(size_t cls_index,
   return false;
 }
 
+void SlabAllocator::BumpLifetimeVersionLocked(uint32_t meta_index) {
+  if (!opt_.track_lifetime_state) return;
+  uint64_t& version = lifetime_versions_[slots_[meta_index].ref.cls];
+  // Saturation forces every later slice to rebuild progress, never an ABA wrap.
+  if (version != UINT64_MAX) ++version;
+}
+
+bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
+                                            LifetimeScan& scan,
+                                            std::vector<BlockKey>* evicted,
+                                            bool* reclaim_denied) {
+  const Class& cls = classes_[cls_index];
+  if (!scan.initialized) {
+    const uint64_t residents = cls.resident_count;
+    if (residents > (UINT64_MAX - 2) / 2) {
+      scan.result = LifetimeScanResult::kBudgetExhausted;
+      return false;
+    }
+    scan.visit_limit = 2 * residents + 2;
+    scan.slice_limit =
+        scan.visit_limit / 1024 + (scan.visit_limit % 1024 != 0) + 1;
+    scan.initialized = true;
+  }
+  if (scan.visits >= scan.visit_limit || scan.slices >= scan.slice_limit) {
+    scan.result = LifetimeScanResult::kBudgetExhausted;
+    return false;
+  }
+  ++scan.slices;  // An empty or version-retry slice still costs an opportunity.
+  if (!ReclaimAllowed(reclaim_denied)) return false;
+  uint32_t now = 0;
+  if (!scan.clock.TryDrainNow(&now)) {
+    *reclaim_denied = true;
+    return false;
+  }
+  const uint64_t version = lifetime_versions_[cls_index];
+  const size_t bands = opt_.lifetime_max_reads + 1;
+  if (!scan.progress_initialized || version == UINT64_MAX ||
+      scan.version != version) {
+    // Saved positions are usable only while membership, heat and pin
+    // eligibility are unchanged. Other owners may move the shared cursor;
+    // this owner's own cursors prevent that from faking complete coverage.
+    for (size_t band = 0; band < bands; ++band) {
+      const LifetimeQueue& queue =
+          lifetime_queues_[(cls_index + 1) * bands + band];
+      scan.starts[band] = queue.cursor;
+      scan.cursors[band] = queue.cursor;
+      scan.done[band] = queue.cursor == kNoSlot;
+    }
+    scan.version = version;
+    scan.progress_initialized = true;
+  }
+  uint32_t best = kNoSlot;
+  int64_t best_score = 0;
+  uint32_t slice_visits = 0;
+  bool pending = true;
+  while (pending && slice_visits < 1024 && scan.visits < scan.visit_limit) {
+    pending = false;
+    for (size_t band = 0;
+         band < bands && slice_visits < 1024 && scan.visits < scan.visit_limit;
+         ++band) {
+      if (scan.done[band]) continue;
+      const uint32_t current = scan.cursors[band];
+      const SlotMeta& meta = slots_[current];
+      LifetimeQueue& queue = lifetime_queues_[(cls_index + 1) * bands + band];
+      const uint32_t next = lifetime_links_[current].indexes[1].next;
+      scan.cursors[band] = next == kNoSlot ? queue.head : next;
+      queue.cursor = scan.cursors[band];
+      ++slice_visits;
+      ++scan.visits;
+      scan.done[band] = scan.cursors[band] == scan.starts[band];
+      if (meta.live && !meta.remove_pending && meta.refs == 0 &&
+          resident_generations_[current] != 0 &&
+          resident_lifetime_states_[current].has_value()) {
+        const DiskLifetimeState& state = *resident_lifetime_states_[current];
+        const int64_t score = DiskLifetimeScore(
+            scan.config, state.anchor, state.scoring_reads(),
+            state.first_early_read(), state.write_armed(), now);
+        // Generations are unique for this store instance and never reused.
+        if (best == kNoSlot || score < best_score ||
+            (score == best_score &&
+             (state.anchor < resident_lifetime_states_[best]->anchor ||
+              (state.anchor == resident_lifetime_states_[best]->anchor &&
+               resident_generations_[current] <
+                   resident_generations_[best])))) {
+          best = current;
+          best_score = score;
+        }
+        scan.done[band] = true;  // First checked eligible member in this band.
+      }
+      pending = pending || !scan.done[band];
+    }
+  }
+  if (best != kNoSlot) {
+    if (!ReclaimAllowed(reclaim_denied)) return false;
+    // No lock boundary since scoring: pin, generation and membership cannot
+    // have changed. Persist exactly one invalidation before freeing anything.
+    if (opt_.on_slot_evict && !opt_.on_slot_evict(slots_[best].ref)) {
+      scan.result = LifetimeScanResult::kPersistenceError;
+      return false;
+    }
+    const BlockKey victim = slots_[best].key;
+    FreeSlotLocked(best);
+    if (evicted != nullptr) evicted->push_back(victim);
+    ++evictions_;
+    scan.result = LifetimeScanResult::kEvicted;
+    return true;
+  }
+  // A loop may stop at its visit cap before reaching a later pending band.
+  pending = false;
+  for (size_t band = 0; band < bands; ++band) pending |= !scan.done[band];
+  if (!pending)
+    scan.result = LifetimeScanResult::kNoCandidate;
+  else if (scan.visits >= scan.visit_limit || scan.slices >= scan.slice_limit)
+    scan.result = LifetimeScanResult::kBudgetExhausted;
+  else
+    scan.result = LifetimeScanResult::kRetry;
+  return false;
+}
+
 SlabAllocator::ExtentBindResult SlabAllocator::StealExtentFor(
     size_t target_cls, std::vector<BlockKey>* evicted, size_t min_donor_extents,
     bool* reclaim_denied) {
@@ -921,11 +1043,15 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
 
 bool SlabAllocator::PutImpl(const BlockKey& key, size_t len, SlotRef* out,
                             std::vector<BlockKey>* evicted,
-                            SlotHandle* out_handle, bool* reclaim_denied) {
+                            SlotHandle* out_handle, bool* reclaim_denied,
+                            LifetimeScan* scan) {
   std::lock_guard<std::mutex> lock(mu_);
   bool local_denied = false;
   if (reclaim_denied == nullptr) reclaim_denied = &local_denied;
   *reclaim_denied = false;
+  bool class_pending =
+      scan != nullptr && scan->result == LifetimeScanResult::kRetry;
+  if (scan != nullptr) scan->result = LifetimeScanResult::kIdle;
   if (out_handle) *out_handle = SlotHandle{};
   ++activity_seq_;
   if (uint32_t* existing = index_.Find(key)) {
@@ -945,7 +1071,7 @@ bool SlabAllocator::PutImpl(const BlockKey& key, size_t len, SlotRef* out,
   Slot placement{0, 0};
   for (;;) {
     Class& cls = classes_[cls_index];
-    while (cls.ext_rr.size() < kStripeWays) {
+    while (!class_pending && cls.ext_rr.size() < kStripeWays) {
       const ExtentBindResult bind = BindFreeExtent(cls_index, reclaim_denied);
       if (bind == ExtentBindResult::kBound) continue;
       if (bind == ExtentBindResult::kPersistenceError) return false;
@@ -957,19 +1083,30 @@ bool SlabAllocator::PutImpl(const BlockKey& key, size_t len, SlotRef* out,
       break;
     }
     if (*reclaim_denied) return false;
-    if (cls.bound_extents < kStripeWays) {
+    if (!class_pending && cls.bound_extents < kStripeWays) {
       const ExtentBindResult grow =
           StealExtentFor(cls_index, evicted, kStripeWays, reclaim_denied);
       if (grow == ExtentBindResult::kBound) continue;
       if (grow == ExtentBindResult::kPersistenceError || *reclaim_denied)
         return false;
     }
-    const ExtentBindResult cold =
-        StealColdExtentFor(cls_index, evicted, reclaim_denied);
-    if (cold == ExtentBindResult::kBound) continue;
-    if (cold == ExtentBindResult::kPersistenceError || *reclaim_denied)
-      return false;
-    if (EvictOneFrom(cls_index, evicted, reclaim_denied)) continue;
+    if (!class_pending) {
+      const ExtentBindResult cold =
+          StealColdExtentFor(cls_index, evicted, reclaim_denied);
+      if (cold == ExtentBindResult::kBound) continue;
+      if (cold == ExtentBindResult::kPersistenceError || *reclaim_denied)
+        return false;
+    }
+    if (scan != nullptr) {
+      if (EvictLifetimeFromLocked(cls_index, *scan, evicted, reclaim_denied)) {
+        class_pending = false;
+        continue;
+      }
+      if (*reclaim_denied || scan->result != LifetimeScanResult::kNoCandidate)
+        return false;
+    } else if (EvictOneFrom(cls_index, evicted, reclaim_denied)) {
+      continue;
+    }
     if (*reclaim_denied) return false;
     const ExtentBindResult steal =
         StealExtentFor(cls_index, evicted, 0, reclaim_denied);
@@ -1027,7 +1164,10 @@ bool SlabAllocator::GetAndPin(const BlockKey& key, SlotRef* out) {
   const uint32_t index = *found;
   TouchLocked(index);
   SlotMeta& meta = slots_[index];
-  if (meta.refs == 0) ++extents_[meta.ref.extent].pinned;
+  if (meta.refs == 0) {
+    ++extents_[meta.ref.extent].pinned;
+    BumpLifetimeVersionLocked(index);
+  }
   ++meta.refs;
   if (out) *out = meta.ref;
   return true;
@@ -1060,7 +1200,10 @@ bool SlabAllocator::Pin(const BlockKey& key) {
   if (index == nullptr) return false;
   SlotMeta& meta = slots_[*index];
   if (meta.remove_pending) return false;
-  if (meta.refs == 0) ++extents_[meta.ref.extent].pinned;
+  if (meta.refs == 0) {
+    ++extents_[meta.ref.extent].pinned;
+    BumpLifetimeVersionLocked(*index);
+  }
   ++meta.refs;
   return true;
 }
@@ -1074,6 +1217,7 @@ bool SlabAllocator::Unpin(const BlockKey& key) {
   if (meta.refs == 0) return false;
   --meta.refs;
   if (meta.refs == 0) {
+    BumpLifetimeVersionLocked(index);
     if (extents_[meta.ref.extent].pinned > 0) --extents_[meta.ref.extent].pinned;
     if (meta.remove_pending) FreeSlotLocked(index);
   }
@@ -1085,7 +1229,10 @@ bool SlabAllocator::Pin(const BlockKey& key, SlotHandle handle) {
   if (!handle.valid() || handle.index >= slots_.size()) return false;
   SlotMeta& meta = slots_[handle.index];
   if (!meta.live || !(meta.key == key) || meta.remove_pending) return false;
-  if (meta.refs == 0) ++extents_[meta.ref.extent].pinned;
+  if (meta.refs == 0) {
+    ++extents_[meta.ref.extent].pinned;
+    BumpLifetimeVersionLocked(handle.index);
+  }
   ++meta.refs;
   return true;
 }
@@ -1097,6 +1244,7 @@ bool SlabAllocator::Unpin(const BlockKey& key, SlotHandle handle) {
   if (!meta.live || !(meta.key == key) || meta.refs == 0) return false;
   --meta.refs;
   if (meta.refs == 0) {
+    BumpLifetimeVersionLocked(handle.index);
     if (extents_[meta.ref.extent].pinned > 0) --extents_[meta.ref.extent].pinned;
     if (meta.remove_pending) FreeSlotLocked(handle.index);
   }
