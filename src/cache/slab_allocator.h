@@ -20,6 +20,7 @@
 #ifndef DFKV_SLAB_ALLOCATOR_H_
 #define DFKV_SLAB_ALLOCATOR_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -29,7 +30,6 @@
 #include <vector>
 
 #include "cache/disk_lifetime_clock.h"
-#include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_state.h"
 #include "common/kv_types.h"
@@ -83,6 +83,8 @@ class SlabAllocator {
     // Internal lifetime storage. Enabling it also enables resident identity so
     // the generation and state commit under the same allocator lock.
     bool track_lifetime_state = false;
+    // Validated disk MAX_READS (1..63); ignored when tracking is disabled.
+    uint32_t lifetime_max_reads = 2;
   };
 
   // Target write parallelism per class: Put keeps up to this many extents with
@@ -238,6 +240,21 @@ class SlabAllocator {
     bool live = false;
   };
 
+  struct LifetimeLink {
+    uint32_t prev = kNoSlot;
+    uint32_t next = kNoSlot;
+  };
+  struct LifetimeLinks {
+    // Index 0 spans the disk; index 1 is restricted to the resident's class.
+    std::array<LifetimeLink, 2> indexes{};
+    uint32_t band = kNoSlot;  // Uncommitted/uninitialized residents are absent.
+  };
+  struct LifetimeQueue {
+    uint32_t head = kNoSlot;
+    uint32_t tail = kNoSlot;
+    uint32_t cursor = kNoSlot;
+  };
+
   struct Class {
     uint32_t slot_size = 0;
     uint32_t slots_per_extent = 0;
@@ -307,6 +324,10 @@ class SlabAllocator {
   void LinkBeforeGlobalHandLocked(uint32_t meta_index);
   void LinkResidentLocked(uint32_t meta_index);
   void FreeSlotLocked(uint32_t meta_index);
+  void LinkLifetimeLocked(uint32_t meta_index);
+  void UnlinkLifetimeLocked(uint32_t meta_index);
+  LifetimeQueue& LifetimeQueueFor(uint32_t meta_index, size_t index,
+                                  uint32_t band);
   void TouchLocked(uint32_t meta_index);
   uint64_t DecayedHeat(uint64_t heat, uint64_t heat_seq) const;
   uint64_t ExtentHeatLocked(const ExtentMeta& extent) const;
@@ -361,6 +382,12 @@ class SlabAllocator {
   // deliberately uninitialized resident from a valid state whose anchor is 0.
   // Only physical removal clears a committed state, not payload visibility.
   std::vector<std::optional<DiskLifetimeState>> resident_lifetime_states_;
+  // Shadow indexes until Q3a selection is connected. Legacy rings remain
+  // authoritative for eviction in this stage. Disabled paths allocate neither
+  // links nor queue heads; SlotMeta and the RAM per-slot layout stay unchanged.
+  std::vector<LifetimeLinks> lifetime_links_;
+  // Row 0 is global; row cls+1 is class-local, each with MAX_READS+1 bands.
+  std::vector<LifetimeQueue> lifetime_queues_;
   uint32_t free_slot_meta_head_ = kNoSlot;
   uint32_t global_ring_head_ = kNoSlot;
   uint32_t global_hand_ = kNoSlot;

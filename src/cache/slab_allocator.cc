@@ -151,6 +151,9 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
   // Lifetime metadata always belongs to a committed generation; never allow
   // state tracking without the matching physical-resident identity storage.
   if (opt_.track_lifetime_state) opt_.track_resident_identity = true;
+  if (opt_.track_lifetime_state) {
+    assert(opt_.lifetime_max_reads >= 1 && opt_.lifetime_max_reads <= 63);
+  }
   if (opt_.align == 0) opt_.align = 1;
   if (opt_.num_extents == 0) opt_.num_extents = 1;
   if (opt_.max_waste < 0) opt_.max_waste = 0;
@@ -174,6 +177,11 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
     const uint64_t next = CanonicalSlotSize(slot_size + opt_.align);
     if (next <= slot_size) break;
     slot_size = next;
+  }
+
+  if (opt_.track_lifetime_state) {
+    lifetime_queues_.resize((classes_.size() + 1) *
+                            (opt_.lifetime_max_reads + 1));
   }
 
   if (const char* w = std::getenv("DFKV_SLAB_COLD_STEAL_WINDOW")) {
@@ -303,8 +311,10 @@ void SlabAllocator::CommitResidentGeneration(
   assert(!opt_.track_lifetime_state ||
          !resident_lifetime_states_[*index].has_value());
   resident_generations_[*index] = generation;
-  if (opt_.track_lifetime_state && lifetime_state != nullptr)
+  if (opt_.track_lifetime_state && lifetime_state != nullptr) {
     resident_lifetime_states_[*index] = *lifetime_state;
+    LinkLifetimeLocked(*index);
+  }
 }
 
 SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
@@ -325,9 +335,14 @@ SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
   std::optional<DiskLifetimeState>& resident_state =
       resident_lifetime_states_[*index];
   if (!resident_state.has_value()) return LifetimeReadResult::kStateUnavailable;
-  DiskLifetimeState& state = *resident_state;
-  if (!ApplyDiskLifetimeRead(config, applied_at, &state))
+  DiskLifetimeState next_state = *resident_state;
+  if (!ApplyDiskLifetimeRead(config, applied_at, &next_state))
     return LifetimeReadResult::kStateUnavailable;
+  // Even a saturated read changes anchor and must move BOTH indexes. Compute
+  // the new state first so a rejected update leaves state and links untouched.
+  UnlinkLifetimeLocked(*index);
+  resident_state = next_state;
+  LinkLifetimeLocked(*index);
   return LifetimeReadResult::kApplied;
 }
 
@@ -349,8 +364,73 @@ uint32_t SlabAllocator::AcquireSlotMetaLocked() {
   }
   slots_.emplace_back();
   if (opt_.track_resident_identity) resident_generations_.push_back(0);
-  if (opt_.track_lifetime_state) resident_lifetime_states_.emplace_back();
+  if (opt_.track_lifetime_state) {
+    resident_lifetime_states_.emplace_back();
+    lifetime_links_.emplace_back();
+  }
   return static_cast<uint32_t>(slots_.size() - 1);
+}
+
+SlabAllocator::LifetimeQueue& SlabAllocator::LifetimeQueueFor(
+    uint32_t meta_index, size_t index, uint32_t band) {
+  const size_t row = index == 0 ? 0 : slots_[meta_index].ref.cls + 1;
+  return lifetime_queues_[row * (opt_.lifetime_max_reads + 1) + band];
+}
+
+void SlabAllocator::LinkLifetimeLocked(uint32_t meta_index) {
+  LifetimeLinks& links = lifetime_links_[meta_index];
+  assert(links.band == kNoSlot);
+  const DiskLifetimeState& state = *resident_lifetime_states_[meta_index];
+  // fw contributes one effective scoring read; widen before adding, matching
+  // DiskLifetimeBand rather than the raw six-bit read counter alone.
+  links.band = std::min<uint32_t>(
+      static_cast<uint32_t>(state.scoring_reads()) + state.first_early_read(),
+      opt_.lifetime_max_reads);
+  for (size_t index = 0; index < links.indexes.size(); ++index) {
+    LifetimeQueue& queue = LifetimeQueueFor(meta_index, index, links.band);
+    // Actual commits/reads normally append in O(1). Recovery or delayed commit
+    // publication may have an older anchor; keep the same sorted invariant in
+    // both indexes instead of assuming enumeration order is chronological.
+    uint32_t prev = queue.tail;
+    while (prev != kNoSlot &&
+           resident_lifetime_states_[prev]->anchor > state.anchor) {
+      prev = lifetime_links_[prev].indexes[index].prev;
+    }
+    const uint32_t next = prev == kNoSlot
+                              ? queue.head
+                              : lifetime_links_[prev].indexes[index].next;
+    links.indexes[index] = {prev, next};
+    if (prev == kNoSlot)
+      queue.head = meta_index;
+    else
+      lifetime_links_[prev].indexes[index].next = meta_index;
+    if (next == kNoSlot)
+      queue.tail = meta_index;
+    else
+      lifetime_links_[next].indexes[index].prev = meta_index;
+    if (queue.cursor == kNoSlot) queue.cursor = meta_index;
+  }
+}
+
+void SlabAllocator::UnlinkLifetimeLocked(uint32_t meta_index) {
+  LifetimeLinks& links = lifetime_links_[meta_index];
+  if (links.band == kNoSlot) return;
+  for (size_t index = 0; index < links.indexes.size(); ++index) {
+    LifetimeQueue& queue = LifetimeQueueFor(meta_index, index, links.band);
+    const LifetimeLink link = links.indexes[index];
+    if (link.prev == kNoSlot)
+      queue.head = link.next;
+    else
+      lifetime_links_[link.prev].indexes[index].next = link.next;
+    if (link.next == kNoSlot)
+      queue.tail = link.prev;
+    else
+      lifetime_links_[link.next].indexes[index].prev = link.prev;
+    // A continuation points to a surviving successor, wrapping only at tail.
+    if (queue.cursor == meta_index)
+      queue.cursor = link.next == kNoSlot ? queue.head : link.next;
+  }
+  links = LifetimeLinks{};
 }
 
 void SlabAllocator::LinkBeforeHandLocked(uint32_t index) {
@@ -560,8 +640,10 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
   slots_.reserve(slots_.size() + entries.size());
   if (opt_.track_resident_identity)
     resident_generations_.reserve(slots_.size() + entries.size());
-  if (opt_.track_lifetime_state)
+  if (opt_.track_lifetime_state) {
     resident_lifetime_states_.reserve(slots_.size() + entries.size());
+    lifetime_links_.reserve(slots_.size() + entries.size());
+  }
   index_.Reserve(index_.size() + entries.size());
 
 
@@ -598,6 +680,7 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
 }
 
 void SlabAllocator::FreeSlotLocked(uint32_t index) {
+  if (opt_.track_lifetime_state) UnlinkLifetimeLocked(index);
   SlotMeta& meta = slots_[index];
   const uint32_t cls_index = meta.ref.cls;
   const uint32_t extent_index = meta.ref.extent;

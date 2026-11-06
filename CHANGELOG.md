@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Maintain staged class-local and disk-wide lifetime score indexes with
+  configurable read bands, atomic read migration and safe removal cursors.
+  These are shadow indexes only; legacy eviction and public policy gates remain.
+
 - Notify staged lifetime heat when a valid PULL grant becomes publishable,
   preserving disk/RAM source provenance through synchronous fallback.
   Keep grant accounting separate from RELEASE and retain legacy range handlers.

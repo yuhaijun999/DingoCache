@@ -15,6 +15,7 @@
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_state.h"
+#include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
 #include "cache/store_engine.h"
@@ -29,6 +30,19 @@ class DiskSlabStoreTestPeer {
       const DiskSlabStore& store, const BlockKey& key) {
     const std::lock_guard<std::mutex> lock(store.mu_);
     return SlabAllocatorTestPeer::LifetimeSnapshotFor(*store.alloc_, key);
+  }
+  static bool IndexesValid(const DiskSlabStore& store) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    return SlabAllocatorTestPeer::LifetimeIndexesValid(*store.alloc_);
+  }
+  static size_t QueueCount(const DiskSlabStore& store) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    return SlabAllocatorTestPeer::LifetimeQueueCount(*store.alloc_);
+  }
+  static std::vector<BlockKey> GlobalBand(const DiskSlabStore& store,
+                                          uint32_t band) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    return SlabAllocatorTestPeer::LifetimeQueueKeys(*store.alloc_, 0, band);
   }
   static size_t Capacity(const DiskSlabStore& store) {
     return SlabAllocatorTestPeer::LifetimeStateCapacity(*store.alloc_);
@@ -101,6 +115,48 @@ class DiskLifetimeResidentTest : public ::testing::Test {
   std::unique_ptr<DiskSlabStore> store_;
   std::filesystem::path dir_;
 };
+
+TEST_F(DiskLifetimeResidentTest, ConfiguredReadCapControlsBothIndexes) {
+  for (const uint64_t max_reads : {1, 2, 4, 63}) {
+    SCOPED_TRACE(max_reads);
+    store_.reset();
+    std::filesystem::remove_all(dir_);
+    config_.max_reads = max_reads;
+    config_.bucket_sec = 864000;  // 240-day coverage, including MAX_READS=63.
+    std::string error;
+    ASSERT_TRUE(ValidateDiskLifetimeConfig(config_, &error)) << error;
+    clock_ = std::make_shared<DiskLifetimeClock>(
+        DiskLifetimeHorizon(config_),
+        [this] { return seconds_.load(std::memory_order_relaxed); });
+    ASSERT_NO_FATAL_FAILURE(Create());
+    const BlockKey key = Key(71);
+    const DiskWriteResult written = store_->CacheWithResult(key, "new", 3);
+    ASSERT_EQ(written.status, Status::kOk);
+    ASSERT_TRUE(written.identity.valid());
+    // The 8 KiB geometry has two canonical classes plus the global row.
+    EXPECT_EQ(DiskSlabStoreTestPeer::QueueCount(*store_), 3 * (max_reads + 1));
+    EXPECT_EQ(DiskSlabStoreTestPeer::GlobalBand(*store_, 0),
+              std::vector<BlockKey>{key});
+    for (uint64_t read = 0; read < 65; ++read) {
+      std::string bytes;
+      DiskResidentIdentity source;
+      ASSERT_EQ(store_->RangeWithIdentity(key, 0, 0, &bytes, &source),
+                Status::kOk);
+      ASSERT_EQ(bytes, "new");
+      store_->NotifyLifetimeReadSuccess(key, source, bytes.size());
+      ASSERT_TRUE(DiskSlabStoreTestPeer::IndexesValid(*store_));
+    }
+    EXPECT_EQ(DiskSlabStoreTestPeer::GlobalBand(
+                  *store_, static_cast<uint32_t>(max_reads)),
+              std::vector<BlockKey>{key});
+    EXPECT_EQ(store_->GetStats().lifetime_reads.applied, 65U);
+    ASSERT_EQ(store_->Remove(key), Status::kOk);
+    EXPECT_TRUE(DiskSlabStoreTestPeer::IndexesValid(*store_));
+    EXPECT_TRUE(DiskSlabStoreTestPeer::GlobalBand(
+                    *store_, static_cast<uint32_t>(max_reads))
+                    .empty());
+  }
+}
 
 TEST_F(DiskLifetimeResidentTest,
        NewCommitUsesActualCommitTimeAndKeepsFirstState) {

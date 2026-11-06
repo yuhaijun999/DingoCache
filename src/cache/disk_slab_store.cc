@@ -546,6 +546,10 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   SlabAllocator::Options ao;
   ao.track_resident_identity = opt_.track_resident_identity;
   ao.track_lifetime_state = opt_.lifetime_config.has_value();
+  if (opt_.lifetime_config) {
+    ao.lifetime_max_reads =
+        static_cast<uint32_t>(opt_.lifetime_config->max_reads);
+  }
   if (opt_.lifetime_clock)
     ao.can_reclaim = [this] { return CanStartReclaim(); };
   ao.extent_bytes = opt_.extent_bytes;
