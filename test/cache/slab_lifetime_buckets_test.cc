@@ -442,11 +442,11 @@ class LifetimeBucketStoreTest : public ::testing::Test {
     store_.reset();
     std::filesystem::remove_all(dir_);
   }
-  void Create(bool enabled = true, bool scoring = true) {
+  void Create(bool enabled = true, bool scoring = true, uint32_t extents = 1) {
     DiskSlabStore::Options options;
     options.dir = dir_.string();
     options.extent_bytes = 8 * 4096;
-    options.capacity_bytes = options.extent_bytes;
+    options.capacity_bytes = options.extent_bytes * extents;
     options.reclaim_interval_ms = 0;
     options.table_sync_ms = 0;
     options.slot_granularity = 4096;
@@ -508,14 +508,86 @@ TEST_F(LifetimeBucketStoreTest,
   EXPECT_EQ(store_->TenantUsedBytes(7), 0U);
   EXPECT_EQ(store_->Count(), 1U);
   EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 0), 1U);
+  const DiskSlabStore::Stats hidden = store_->GetStats();
+  EXPECT_EQ(hidden.payload_bytes, 0U);
+  EXPECT_EQ(hidden.allocated_bytes, 4096U);
+  EXPECT_EQ(hidden.allocator_payload_bytes, 3U);
+  EXPECT_EQ(hidden.allocator_fragmentation_bytes, 4093U);
   DiskSlabStoreTestPeer::FailMetadata(*store_);
   lease = ReadLease{};
   EXPECT_FALSE(store_->Healthy());
+  const DiskSlabStore::Stats failed = store_->GetStats();
+  EXPECT_EQ(failed.payload_bytes, 0U);
+  EXPECT_EQ(failed.allocator_payload_bytes, 3U);
+  EXPECT_EQ(failed.allocator_fragmentation_bytes, 4093U);
   EXPECT_EQ(store_->Count(), 1U);
   EXPECT_EQ(store_->TenantUsedBytes(7), 0U);
   EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 0), 1U);
   EXPECT_NE(DiskSlabStoreTestPeer::Token(*store_, Key(1)), 0U);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(*store_));
+}
+
+TEST_F(LifetimeBucketStoreTest, LastPinReleaseClearsHiddenAllocatorPayload) {
+  for (const bool lifetime : {false, true}) {
+    SCOPED_TRACE(lifetime);
+    ASSERT_NO_FATAL_FAILURE(Create(lifetime, lifetime));
+    ASSERT_NO_FATAL_FAILURE(Put(1));
+    ReadLease first;
+    ReadLease last;
+    ASSERT_EQ(store_->RangeDirectPrep(Key(1), 0, 0, 4096, &first), Status::kOk);
+    ASSERT_EQ(store_->RangeDirectPrep(Key(1), 0, 0, 4096, &last), Status::kOk);
+    ASSERT_EQ(store_->Remove(Key(1)), Status::kOk);
+    first = ReadLease{};
+    const DiskSlabStore::Stats hidden = store_->GetStats();
+    EXPECT_EQ(hidden.payload_bytes, 0U);
+    EXPECT_EQ(hidden.committed_objects, 0U);
+    EXPECT_EQ(hidden.allocator_objects, 1U);
+    EXPECT_EQ(hidden.allocator_payload_bytes, 3U);
+    EXPECT_EQ(hidden.allocator_fragmentation_bytes, 4093U);
+    last = ReadLease{};
+    const DiskSlabStore::Stats freed = store_->GetStats();
+    EXPECT_EQ(freed.payload_bytes, 0U);
+    EXPECT_EQ(freed.allocated_bytes, 0U);
+    EXPECT_EQ(freed.allocator_payload_bytes, 0U);
+    EXPECT_EQ(freed.allocator_fragmentation_bytes, 0U);
+    EXPECT_EQ(freed.allocator_objects, 0U);
+    EXPECT_EQ(store_->TenantUsedBytes(7), 0U);
+    EXPECT_TRUE(store_->Healthy());
+    last = ReadLease{};
+    EXPECT_EQ(store_->GetStats().allocator_fragmentation_bytes, 0U);
+    store_.reset();
+    std::filesystem::remove_all(dir_);
+  }
+}
+
+TEST_F(LifetimeBucketStoreTest,
+       AllocatorPayloadSumsClassesAndRebuildsOnRecovery) {
+  ASSERT_NO_FATAL_FAILURE(Create(true, true, 2));
+  ASSERT_NO_FATAL_FAILURE(Put(1));
+  const std::string large(5000, 'l');
+  const std::string small(1000, 's');
+  ASSERT_EQ(store_->Cache(Key(2), large.data(), large.size()), Status::kOk);
+  ASSERT_EQ(store_->Cache(Key(3), small.data(), small.size()), Status::kOk);
+  const DiskSlabStore::Stats before = store_->GetStats();
+  EXPECT_EQ(before.payload_bytes, 6003U);
+  EXPECT_EQ(before.allocated_bytes, 16384U);
+  EXPECT_EQ(before.allocator_payload_bytes, 6003U);
+  EXPECT_EQ(before.allocator_fragmentation_bytes, 10381U);
+  store_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create(true, true, 2));
+  const DiskSlabStore::Stats recovered = store_->GetStats();
+  EXPECT_EQ(recovered.payload_bytes, 6003U);
+  EXPECT_EQ(recovered.allocator_payload_bytes, 6003U);
+  EXPECT_EQ(recovered.allocator_fragmentation_bytes, 10381U);
+  std::string value;
+  ASSERT_EQ(store_->Range(Key(2), 0, 0, &value), Status::kOk);
+  EXPECT_EQ(value, large);
+  ASSERT_EQ(store_->Remove(Key(1)), Status::kOk);
+  ASSERT_EQ(store_->Remove(Key(2)), Status::kOk);
+  const DiskSlabStore::Stats remaining = store_->GetStats();
+  EXPECT_EQ(remaining.payload_bytes, 1000U);
+  EXPECT_EQ(remaining.allocator_payload_bytes, 1000U);
+  EXPECT_EQ(remaining.allocator_fragmentation_bytes, 3096U);
 }
 
 TEST_F(LifetimeBucketStoreTest, RecoveryUsesActualNowRatherThanAnchorZero) {

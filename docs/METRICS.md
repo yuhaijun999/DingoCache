@@ -266,7 +266,9 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_read_clock_hard_exhausted_total` | counter | 原住户仍匹配，但实际应用时超过32位时钟硬界限；保留逻辑读成功，不伪报已计热或I/O失败。软门禁后的可表示排空阶段仍正常计热 |
 | `dfkv_slab_lifetime_read_io_unhealthy_total` / `dfkv_slab_lifetime_read_state_unavailable_total` | counter | 已成功的读在通知时遇盘I/O隔离 / 匹配住户的评分state缺失或时间不变量错误（正常应为0）；均不改原读状态。失败GET本身不发送通知 |
 | `dfkv_slab_eviction_record_clears_total` / `dfkv_slab_record_writes_total` | counter | allocator 复用前持久清除记录 / 已提交 slots.tbl record 写数 |
-| `dfkv_slab_capacity_bytes` / `dfkv_slab_allocated_bytes` / `dfkv_slab_payload_bytes` / `dfkv_slab_internal_fragmentation_bytes` | gauge | 物理 payload 容量 / 已占 slot / 逻辑 payload / 内部碎片 |
+| `dfkv_slab_capacity_bytes` / `dfkv_slab_allocated_bytes` / `dfkv_slab_payload_bytes` / `dfkv_slab_internal_fragmentation_bytes` | gauge | 物理 payload 容量 / 已占 slot / reader-visible 已提交逻辑 payload / 旧口径 allocated-visible 差额。保留旧公式不变；该差额可能包含隐藏、在途或等待最后一个 pin 释放的住户 payload，不能只解释为 slot 碎片 |
+| `dfkv_slab_allocator_payload_bytes` / `dfkv_slab_allocator_fragmentation_bytes` | gauge | All allocator residents' useful bytes (including hidden/in-flight residents) / resident slot slack. Computed by summing useful bytes and allocated-minus-useful bytes from one existing per-class allocator snapshot, not reader-visible payload, filesystem fragmentation or durable I/O byte counts. |
+| `dfkv_slab_disk_allocated_bytes` / `dfkv_slab_disk_payload_bytes` / `dfkv_slab_disk_allocator_payload_bytes` / `dfkv_slab_disk_allocator_fragmentation_bytes` | gauge | Per-disk occupied slots / visible logical payload / resident useful bytes / resident slot slack, using existing `disk` / `disk_index` labels and per-disk Stats snapshot. Gauges recompute from current residents after recovery; unlike eviction counters, they are not reset to zero if valid residents recover. |
 | `dfkv_slab_allocator_objects` / `dfkv_slab_committed_objects` | gauge | allocator resident（含未提交写）/ reader-visible 已提交对象 |
 | `dfkv_slab_classes` / `dfkv_slab_bound_extents` / `dfkv_slab_pool_extents` | gauge | live class 数 / 已绑定 extent / 未绑定共享池 extent |
 | `dfkv_slab_class_extents{slot_size}` / `dfkv_slab_class_resident_objects{slot_size}` / `dfkv_slab_class_free_slots{slot_size}` | gauge | 每个 live size class 的 extent、resident、可立即分配 slot |
@@ -287,6 +289,12 @@ legacy slab 值为零，file 不导出 slab 系列。计数随进程/Store 重�
 
 上述通知原因互斥：success = applied + no_binding + race_lost + clock_hard_exhausted + io_unhealthy + state_unavailable。优先级为I/O隔离、无绑定、旧实例/epoch/可见性/代际、硬时钟、状态可用性，再应用。硬界限造成的未初始化state按clock原因记，不混成state_unavailable。无评分配置的legacy及仅clock注入不采新应用时间、不加新热锁、计数为0；file不输出slab指标。所有新指标不带key/request标签。
 
+
+Allocator useful bytes and resident slot slack share one per-class snapshot.
+The separately observed visible payload, per-disk snapshots and aggregate scrape
+are not an atomic cross-disk transaction under concurrent mutation; do not infer
+an exact instantaneous cross-series identity from an active scrape. At quiescence,
+allocated bytes equal allocator useful bytes plus resident slot slack.
 
 PUT 准入门（**仅 `--put-inflight-limit > 0` 时输出**）：
 | `dfkv_put_busy_total` | counter | 被准入门以 kCacheFull 快速拒绝的 PUT（受控 miss，替代深队列尾延迟） |

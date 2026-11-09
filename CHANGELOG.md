@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Expose allocator-resident useful bytes and slot slack separately from visible
+  committed payload, including per-disk allocation gauges. Preserve the existing
+  allocated-minus-visible gap metric and distinguish pinned/in-flight payload.
+
 - Export donor victims and payload bytes still scoring above KEEP, alongside
   unscored-victim counts, globally and per disk. Count successful releases only;
   valid recovered scoring state remains distinct from missing state.

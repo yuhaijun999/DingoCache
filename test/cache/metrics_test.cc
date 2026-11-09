@@ -22,6 +22,7 @@
 #include "cache/disk_cache_group.h"
 #include "cache/disk_slab_store.h"
 #include "cache/slab_allocator.h"
+#include "cache/store_engine.h"
 #include "common/status.h"
 
 namespace dfkv {
@@ -172,6 +173,10 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
       << text;
   EXPECT_NE(text.find("dfkv_slab_payload_bytes 3000"), std::string::npos)
       << text;
+  EXPECT_NE(text.find("dfkv_slab_allocator_payload_bytes 3000\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("dfkv_slab_allocator_fragmentation_bytes 1096\n"),
+            std::string::npos);
   EXPECT_NE(text.find("dfkv_slab_internal_fragmentation_bytes 1096"),
             std::string::npos)
       << text;
@@ -238,8 +243,15 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
         "dfkv_slab_lifetime_donor_unscored_victims_total"}) {
     EXPECT_NE(text.find(std::string(name) + " 0\n"), std::string::npos);
   }
-  const std::string labels =
-      "{disk=\"" + dir.string() + "\",disk_index=\"0\"} 0\n";
+  const std::string disk_labels =
+      R"({disk=")" + dir.string() + R"(",disk_index="0"} )";
+  EXPECT_NE(text.find("dfkv_slab_disk_allocator_payload_bytes" + disk_labels +
+                      "3000\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("dfkv_slab_disk_allocator_fragmentation_bytes" +
+                      disk_labels + "1096\n"),
+            std::string::npos);
+  const std::string labels = disk_labels + "0\n";
   for (const char* name :
        {"dfkv_slab_disk_lifetime_donor_released_residents_total",
         "dfkv_slab_disk_lifetime_donor_freed_slot_bytes_total",
@@ -637,6 +649,95 @@ TEST(Metrics, DonorBytesAggregateAcrossDisksAndResetOnRecovery) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, AllocatorGaugesDistinguishPinnedRemovalFromSlotSlack) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "4096");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_allocator";
+  fs::remove_all(dir);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 2ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+  ASSERT_EQ(group.DiskCount(), 2U);
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(group, disk);
+    const std::string value(disk == 0 ? 17 : 31, 'v');
+    ASSERT_EQ(store.Cache({1, 0}, value.data(), value.size()), Status::kOk);
+  }
+  // Check both accounting views against real pinned/removal transitions.
+  // No synthetic Stats or resident mutation is used by this test.
+  const auto expect_snapshot = [&](const std::string& text,
+                                   const std::string& prefix,
+                                   const std::string& labels, uint64_t visible,
+                                   uint64_t resident, uint64_t allocated) {
+    EXPECT_NE(text.find(prefix + "payload_bytes" + labels + " " +
+                        std::to_string(visible) + "\n"),
+              std::string::npos);
+    EXPECT_NE(text.find(prefix + "allocated_bytes" + labels + " " +
+                        std::to_string(allocated) + "\n"),
+              std::string::npos);
+    EXPECT_NE(text.find(prefix + "allocator_payload_bytes" + labels + " " +
+                        std::to_string(resident) + "\n"),
+              std::string::npos);
+    EXPECT_NE(text.find(prefix + "allocator_fragmentation_bytes" + labels +
+                        " " + std::to_string(allocated - resident) + "\n"),
+              std::string::npos);
+  };
+  const auto labels = [&](size_t disk) {
+    return "{disk=\"" + options.cache_dirs[disk] + "\",disk_index=\"" +
+           std::to_string(disk) + "\"}";
+  };
+  const std::string initial = server->MetricsText();
+  expect_snapshot(initial, "dfkv_slab_", "", 48, 48, 8192);
+  expect_snapshot(initial, "dfkv_slab_disk_", labels(0), 17, 17, 4096);
+  expect_snapshot(initial, "dfkv_slab_disk_", labels(1), 31, 31, 4096);
+  DiskSlabStore& removed = DiskCacheGroupTestPeer::Slab(group, 0);
+  ReadLease lease;
+  ASSERT_EQ(removed.RangeDirectPrep({1, 0}, 0, 0, 4096, &lease), Status::kOk);
+  ASSERT_EQ(removed.Remove({1, 0}), Status::kOk);
+  EXPECT_FALSE(removed.IsCached({1, 0}));
+  const std::string hidden = server->MetricsText();
+  expect_snapshot(hidden, "dfkv_slab_", "", 31, 48, 8192);
+  expect_snapshot(hidden, "dfkv_slab_disk_", labels(0), 0, 17, 4096);
+  expect_snapshot(hidden, "dfkv_slab_disk_", labels(1), 31, 31, 4096);
+  // Preserve the old allocated-visible gap: it includes the hidden 17 bytes,
+  // unlike the new resident slot slack (8192 - 48 = 8144).
+  EXPECT_NE(hidden.find("dfkv_slab_internal_fragmentation_bytes 8161\n"),
+            std::string::npos);
+  lease = ReadLease{};
+  const std::string released = server->MetricsText();
+  expect_snapshot(released, "dfkv_slab_", "", 31, 31, 4096);
+  expect_snapshot(released, "dfkv_slab_disk_", labels(0), 0, 0, 0);
+  expect_snapshot(released, "dfkv_slab_disk_", labels(1), 31, 31, 4096);
+  server.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  const std::string recovered = server->MetricsText();
+  expect_snapshot(recovered, "dfkv_slab_", "", 31, 31, 4096);
+  expect_snapshot(recovered, "dfkv_slab_disk_", labels(0), 0, 0, 0);
+  expect_snapshot(recovered, "dfkv_slab_disk_", labels(1), 31, 31, 4096);
+  DiskSlabStore& survivor =
+      DiskCacheGroupTestPeer::Slab(KvNodeServerTestPeer::Group(*server), 1);
+  std::string value;
+  EXPECT_EQ(survivor.Range({1, 0}, 0, 0, &value), Status::kOk);
+  EXPECT_EQ(value, std::string(31, 'v'));
+  ASSERT_EQ(survivor.Remove({1, 0}), Status::kOk);
+  const std::string empty = server->MetricsText();
+  expect_snapshot(empty, "dfkv_slab_", "", 0, 0, 0);
+  expect_snapshot(empty, "dfkv_slab_disk_", labels(0), 0, 0, 0);
+  expect_snapshot(empty, "dfkv_slab_disk_", labels(1), 0, 0, 0);
+  server.reset();
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, PrometheusFormatAndIdentity) {
   ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
   std::string addr;
@@ -668,6 +769,14 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
   EXPECT_NE(text.find(",engine=\"file\",write_mode=\"n/a\""),
             std::string::npos) << text;
   EXPECT_EQ(text.find("dfkv_slab_capacity_bytes"), std::string::npos) << text;
+  for (const char* name :
+       {"dfkv_slab_allocator_payload_bytes",
+        "dfkv_slab_allocator_fragmentation_bytes",
+        "dfkv_slab_disk_allocator_payload_bytes",
+        "dfkv_slab_disk_allocator_fragmentation_bytes",
+        "dfkv_slab_disk_payload_bytes", "dfkv_slab_disk_allocated_bytes"}) {
+    EXPECT_EQ(text.find(name), std::string::npos);
+  }
   EXPECT_EQ(text.find("dfkv_slab_watermark_freed_payload_bytes_total"),
             std::string::npos)
       << text;

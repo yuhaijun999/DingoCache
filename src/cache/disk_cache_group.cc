@@ -1108,6 +1108,8 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.capacity_bytes += st.capacity_bytes;
     sum.allocated_bytes += st.allocated_bytes;
     sum.payload_bytes += st.payload_bytes;
+    sum.allocator_payload_bytes += st.allocator_payload_bytes;
+    sum.allocator_fragmentation_bytes += st.allocator_fragmentation_bytes;
     sum.allocator_objects += st.allocator_objects;
     sum.committed_objects += st.committed_objects;
     sum.class_count += st.class_count;

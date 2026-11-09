@@ -196,6 +196,10 @@ class DiskSlabStore : public StoreEngine {
     uint64_t rebuild_mmap_scans = 0;
     uint64_t capacity_bytes = 0;
     uint64_t allocated_bytes = 0;
+    // Reserved resident lengths, including uncommitted and hidden residents.
+    // These two fields share one class snapshot, not the visible payload view.
+    uint64_t allocator_payload_bytes = 0;
+    uint64_t allocator_fragmentation_bytes = 0;
     uint64_t payload_bytes = 0;
     uint64_t allocator_objects = 0;
     uint64_t committed_objects = 0;

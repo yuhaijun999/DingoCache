@@ -2883,9 +2883,16 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
     st.extent_returns = alloc_->ExtentReturns();
     st.allocated_bytes = alloc_->UsedBytes();
     st.allocator_objects = alloc_->Count();
-    const auto classes = alloc_->Classes();
+    const std::vector<SlabAllocator::ClassStat> classes = alloc_->Classes();
     st.class_count = classes.size();
-    for (const auto& cls : classes) st.bound_extents += cls.extents;
+    for (const SlabAllocator::ClassStat& cls : classes) {
+      st.bound_extents += cls.extents;
+      st.allocator_payload_bytes += cls.useful_bytes;
+      // Use one allocator snapshot, not an earlier UsedBytes sample minus
+      // the independently sampled reader-visible committed payload.
+      st.allocator_fragmentation_bytes +=
+          cls.allocated_bytes - cls.useful_bytes;
+    }
     st.pool_extents = alloc_->PoolExtents();
   }
   std::lock_guard<std::mutex> lk(mu_);

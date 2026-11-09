@@ -2154,7 +2154,11 @@ TEST_F(DiskSlabTest,
       });
       EXPECT_TRUE(gate.WaitEnteredFor());
       EXPECT_EQ(store.Remove(key), Status::kOk);
-      EXPECT_EQ(store.GetStats().committed_objects, 0U);
+      const DiskSlabStore::Stats reserved = store.GetStats();
+      EXPECT_EQ(reserved.committed_objects, 0U);
+      EXPECT_EQ(reserved.payload_bytes, 0U);
+      EXPECT_EQ(reserved.allocator_payload_bytes, 3000U);
+      EXPECT_EQ(reserved.allocator_fragmentation_bytes, 1096U);
       gate.Release(true);
       writer.join();
       EXPECT_EQ(records, 2U);  // valid record followed by deferred tombstone
@@ -2162,8 +2166,13 @@ TEST_F(DiskSlabTest,
       EXPECT_EQ(store.Count(), fail_invalidation ? 1U : 0U);
       EXPECT_EQ(store.UsedBytes(), fail_invalidation ? 4096U : 0U);
       EXPECT_EQ(store.GetStats().committed_objects, 0U);
-      EXPECT_EQ(store.GetStats().payload_bytes, 0U);
-      EXPECT_EQ(store.GetStats().inflight, 0U);
+      const DiskSlabStore::Stats final_stats = store.GetStats();
+      EXPECT_EQ(final_stats.payload_bytes, 0U);
+      EXPECT_EQ(final_stats.allocator_payload_bytes,
+                fail_invalidation ? 3000U : 0U);
+      EXPECT_EQ(final_stats.allocator_fragmentation_bytes,
+                fail_invalidation ? 1096U : 0U);
+      EXPECT_EQ(final_stats.inflight, 0U);
       EXPECT_EQ(store.TenantUsedBytes(key.tenant_hash), 0U);
       // No second owner may publish after a failed remove; successful removal
       // permits a new committed write (disable this test's hooks first).

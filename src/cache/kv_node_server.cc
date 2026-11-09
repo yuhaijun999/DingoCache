@@ -600,6 +600,14 @@ std::string KvNodeServer::MetricsText() const {
            "counter", "Payload bytes of released donor residents above KEEP");
     header("dfkv_slab_disk_lifetime_donor_unscored_victims_total", "counter",
            "Released donor residents without valid lifetime scoring state");
+    header("dfkv_slab_disk_allocated_bytes", "gauge",
+           "Slot bytes occupied by allocator residents");
+    header("dfkv_slab_disk_payload_bytes", "gauge",
+           "Reader-visible committed payload bytes");
+    header("dfkv_slab_disk_allocator_payload_bytes", "gauge",
+           "Useful bytes of all allocator residents including hidden writes");
+    header("dfkv_slab_disk_allocator_fragmentation_bytes", "gauge",
+           "Resident slot slack from one allocator class snapshot");
     for (size_t i = 0; i < group_.DiskCount(); ++i) {
       const auto st = group_.DiskWatermarkObservation(i);
       const std::string labels =
@@ -622,6 +630,12 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      sample("dfkv_slab_disk_allocated_bytes", disk.allocated_bytes);
+      sample("dfkv_slab_disk_payload_bytes", disk.payload_bytes);
+      sample("dfkv_slab_disk_allocator_payload_bytes",
+             disk.allocator_payload_bytes);
+      sample("dfkv_slab_disk_allocator_fragmentation_bytes",
+             disk.allocator_fragmentation_bytes);
       sample("dfkv_slab_disk_lifetime_donor_protected_victims_total",
              disk.lifetime_donor_protected_victims);
       sample("dfkv_slab_disk_lifetime_donor_protected_payload_bytes_total",
@@ -875,6 +889,12 @@ std::string KvNodeServer::MetricsText() const {
            "Slot bytes occupied by allocator residents", ss.allocated_bytes);
     metric("dfkv_slab_payload_bytes", "gauge",
            "Logical committed payload bytes", ss.payload_bytes);
+    metric("dfkv_slab_allocator_payload_bytes", "gauge",
+           "Useful bytes of all allocator residents including hidden writes",
+           ss.allocator_payload_bytes);
+    metric("dfkv_slab_allocator_fragmentation_bytes", "gauge",
+           "Resident slot slack from one allocator class snapshot",
+           ss.allocator_fragmentation_bytes);
     metric("dfkv_slab_internal_fragmentation_bytes", "gauge",
            "Allocated slot bytes not carrying logical payload",
            ss.allocated_bytes >= ss.payload_bytes
