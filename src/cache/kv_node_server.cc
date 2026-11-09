@@ -582,6 +582,12 @@ std::string KvNodeServer::MetricsText() const {
     header("dfkv_slab_disk_lifetime_background_freed_payload_bytes_total",
            "counter",
            "Payload bytes removed by lifetime background class reclaim");
+    header("dfkv_slab_disk_lifetime_class_victims_total", "counter",
+           "Successful foreground lifetime class victims");
+    header("dfkv_slab_disk_lifetime_class_freed_slot_bytes_total", "counter",
+           "Slot bytes removed by foreground lifetime class reclaim");
+    header("dfkv_slab_disk_lifetime_class_freed_payload_bytes_total", "counter",
+           "Payload bytes removed by foreground lifetime class reclaim");
     for (size_t i = 0; i < group_.DiskCount(); ++i) {
       const auto st = group_.DiskWatermarkObservation(i);
       const std::string labels =
@@ -604,6 +610,12 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      sample("dfkv_slab_disk_lifetime_class_victims_total",
+             disk.lifetime_class_victims);
+      sample("dfkv_slab_disk_lifetime_class_freed_slot_bytes_total",
+             disk.lifetime_class_freed_slot_bytes);
+      sample("dfkv_slab_disk_lifetime_class_freed_payload_bytes_total",
+             disk.lifetime_class_freed_payload_bytes);
       sample("dfkv_slab_disk_lifetime_background_victims_total",
              disk.lifetime_background_victims);
       sample("dfkv_slab_disk_lifetime_background_freed_slot_bytes_total",
@@ -704,6 +716,12 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_class_victims_total", "counter",
            "Residents durably removed by foreground lifetime class scans",
            ss.lifetime_class_victims);
+    metric("dfkv_slab_lifetime_class_freed_slot_bytes_total", "counter",
+           "Slot bytes removed by foreground lifetime class reclaim",
+           ss.lifetime_class_freed_slot_bytes);
+    metric("dfkv_slab_lifetime_class_freed_payload_bytes_total", "counter",
+           "Payload bytes removed by foreground lifetime class reclaim",
+           ss.lifetime_class_freed_payload_bytes);
     metric("dfkv_slab_lifetime_background_scan_visits_total", "counter",
            "Resident visits in internal background class reclaim",
            ss.lifetime_background_scan_visits);

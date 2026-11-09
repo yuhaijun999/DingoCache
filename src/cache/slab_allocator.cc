@@ -994,9 +994,14 @@ bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
       return false;
     }
     const BlockKey victim = slots_[best].key;
+    const uint32_t slot_bytes = slots_[best].ref.slot_size;
+    const uint64_t payload_bytes = slots_[best].useful_bytes;
     FreeSlotLocked(best);
     if (evicted != nullptr) evicted->push_back(victim);
     ++evictions_;
+    ++scan.victims;
+    scan.freed_slot_bytes += slot_bytes;
+    scan.freed_payload_bytes += payload_bytes;
     scan.result = LifetimeScanResult::kEvicted;
     return true;
   }

@@ -233,6 +233,8 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_scan_budget_exhausted_total` | counter | PUT owners rejected at their lifetime scan budget. |
 | `dfkv_slab_lifetime_class_no_candidate_total` | counter | Stable class traversals with no eligible lifetime candidate. |
 | `dfkv_slab_lifetime_class_victims_total` | counter | Residents durably removed by foreground lifetime class scans. |
+| `dfkv_slab_lifetime_class_freed_payload_bytes_total` / `dfkv_slab_lifetime_class_freed_slot_bytes_total` | counter | 前台 lifetime 类内成功淘汰的旧住户 payload / slot 字节，不是新 PUT 长度或 direct padded 容量；成功事件在释放前快照、按 owner 调用差额计入 |
+| `dfkv_slab_disk_lifetime_class_victims_total` / `dfkv_slab_disk_lifetime_class_freed_payload_bytes_total` / `dfkv_slab_disk_lifetime_class_freed_slot_bytes_total` | counter | 上述对象数与两种字节口径的每盘值，复用 `disk` / `disk_index` 标签；不混入 donor、水位或后台 class |
 | `dfkv_slab_lifetime_background_scan_visits_total` | counter | Resident visits in internal background class reclaim. |
 | `dfkv_slab_lifetime_background_scan_slices_total` | counter | Background class allocator lock slices. |
 | `dfkv_slab_lifetime_background_budget_exhausted_total` | counter | Class ticks deferred at a scan or successful-victim cap. |
@@ -267,11 +269,16 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_class_read_heat{slot_size}` / `dfkv_slab_class_put_total{slot_size}` | gauge / counter | 每 class 的衰减读热度 / 累计 PUT |
 | `dfkv_slab_failed_disks` / `dfkv_slab_healthy` | gauge | fail-closed disk 数 / 全部 slab disk 是否健康 |
 
-后台 lifetime 成功计数在 staged/explicit legacy 或 file 下不代表新策略生效：
+前台和后台 lifetime 成功计数在 staged/explicit legacy 或 file 下不代表新策略生效：
 legacy slab 值为零，file 不导出 slab 系列。计数随进程/Store 重建重置，不恢复历史
 淘汰量；普通 Remove 不计作后台回收。每盘与汇总为分别取样，并发回收时不保证同一
 抓取中所有样本原子一致。每盘完整 stats 抓取会读取 allocator/class 信息，仅用于
 观测，不进入业务读写热路径。
+
+前台只消费 class 成功事件快照，不能把 PUT 返回的混合 `evicted` 列表全算作 class，
+也不以最终扫描结果枚举代替累计事件。旧住户已经成功淘汰后，即使新 payload 写入
+失败，仍保留该淘汰量；反之，旧住户失效失败、pin/预算阻止淘汰、重复 PUT 保留
+已有值时不增。恢复后的计数从零开始，恢复 payload 使用已提交记录的真实长度。
 
 上述通知原因互斥：success = applied + no_binding + race_lost + clock_hard_exhausted + io_unhealthy + state_unavailable。优先级为I/O隔离、无绑定、旧实例/epoch/可见性/代际、硬时钟、状态可用性，再应用。硬界限造成的未初始化state按clock原因记，不混成state_unavailable。无评分配置的legacy及仅clock注入不采新应用时间、不加新热锁、计数为0；file不输出slab指标。所有新指标不带key/request标签。
 

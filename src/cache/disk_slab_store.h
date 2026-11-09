@@ -119,6 +119,8 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_scan_budget_exhausted = 0;
     uint64_t lifetime_class_no_candidate = 0;
     uint64_t lifetime_class_victims = 0;
+    uint64_t lifetime_class_freed_slot_bytes = 0;
+    uint64_t lifetime_class_freed_payload_bytes = 0;
     uint64_t lifetime_background_scan_visits = 0;
     uint64_t lifetime_background_scan_slices = 0;
     uint64_t lifetime_background_budget_exhausted = 0;
@@ -505,6 +507,9 @@ class DiskSlabStore : public StoreEngine {
   uint64_t lifetime_scan_budget_exhausted_ = 0;
   uint64_t lifetime_class_no_candidate_ = 0;
   uint64_t lifetime_class_victims_ = 0;
+  // Successful foreground class byte counters, guarded by mu_.
+  uint64_t lifetime_class_freed_slot_bytes_ = 0;
+  uint64_t lifetime_class_freed_payload_bytes_ = 0;
   uint64_t lifetime_background_scan_visits_ = 0;
   uint64_t lifetime_background_scan_slices_ = 0;
   uint64_t lifetime_background_budget_exhausted_ = 0;

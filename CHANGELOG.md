@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Expose foreground lifetime class payload and slot bytes using successful
+  class-event snapshots, excluding donor victims. Preserve completed eviction
+  accounting when the incoming write fails, with aggregate and per-disk series.
+
 - Export successful lifetime background class victims, payload bytes and slot
   bytes separately, both per disk and in aggregate. Preserve successful work
   before later invalidation failure; exclude watermark and donor reclamation.

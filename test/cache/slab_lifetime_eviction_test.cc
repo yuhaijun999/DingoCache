@@ -48,6 +48,10 @@ class DiskSlabStoreTestPeer {
     if (store.table_fd_ >= 0) close(store.table_fd_);
     store.table_fd_ = -1;
   }
+  static void FailPayloadWrite(DiskSlabStore& store) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    store.payload_write_hook_for_test_ = [] { return false; };
+  }
   static bool PreserveWritePin(DiskSlabStore& store, const BlockKey& key) {
     const std::lock_guard<std::mutex> lock(store.mu_);
     if (!store.alloc_->Pin(key)) return false;
@@ -93,6 +97,38 @@ void AddResident(SlabAllocator& allocator, uint64_t id,
   if (pin) {
     ASSERT_TRUE(allocator.Pin(Key(id)));
   }
+}
+
+TEST(SlabLifetimeEviction, SuccessfulEventCountersSurviveLaterFailure) {
+  SlabAllocator::Options options = AllocatorOptions(2);
+  unsigned attempts = 0;
+  options.on_slot_evict = [&](const SlabAllocator::SlotRef&) {
+    return ++attempts == 1;
+  };
+  SlabAllocator allocator(options);
+  for (uint64_t id = 1; id <= 2; ++id) {
+    SlabAllocator::SlotRef ref;
+    std::vector<BlockKey> evicted;
+    ASSERT_TRUE(allocator.Put(Key(id), id == 1 ? 17 : 31, &ref, &evicted));
+    ASSERT_TRUE(evicted.empty());
+    const DiskLifetimeState state = RecoveredDiskLifetimeState(1);
+    SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(id), id, &state);
+  }
+  const DiskLifetimeConfig config;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [] { return 0; });
+  Scan scan(config, clock);
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                       &evicted, &denied));
+  ASSERT_FALSE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                        &evicted, &denied));
+  EXPECT_EQ(scan.result, ScanResult::kPersistenceError);
+  EXPECT_EQ(scan.victims, 1U);
+  EXPECT_EQ(scan.freed_slot_bytes, 4096U);
+  EXPECT_EQ(scan.freed_payload_bytes, 17U);
+  EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+  EXPECT_TRUE(allocator.Contains(Key(2)));
 }
 
 TEST(SlabLifetimeEviction, ComparesDifferentBandsAndIgnoresSoftKeepAsPin) {
@@ -502,10 +538,64 @@ TEST_F(LifetimeClassStoreTest, ScalarDirectAndBatchReclaimTheCheckedResident) {
     EXPECT_EQ(bytes, "new");
     const DiskSlabStore::Stats stats = store_->GetStats();
     EXPECT_EQ(stats.lifetime_class_victims, 1U);
+    EXPECT_EQ(stats.lifetime_class_freed_slot_bytes, 4096U);
+    EXPECT_EQ(stats.lifetime_class_freed_payload_bytes, 3U);
     EXPECT_EQ(stats.lifetime_class_scan_visits, 2U);
     EXPECT_EQ(stats.lifetime_scan_budget_exhausted, 0U);
     EXPECT_EQ(DiskSlabStoreTestPeer::Flights(*store_), 0U);
     EXPECT_TRUE(DiskSlabStoreTestPeer::IndexesValid(*store_));
+  }
+}
+
+TEST_F(LifetimeClassStoreTest, DonorRebindIsNotForegroundClassEviction) {
+  ASSERT_NO_FATAL_FAILURE(Create(2));
+  const std::string first(17, 'a');
+  const std::string second(31, 'b');
+  ASSERT_EQ(store_->Cache(Key(1), first.data(), first.size()), Status::kOk);
+  ASSERT_EQ(store_->Cache(Key(2), second.data(), second.size()), Status::kOk);
+  const std::string large(5000, 'x');
+  ASSERT_EQ(store_->Cache(Key(3), large.data(), large.size()), Status::kOk);
+  const DiskSlabStore::Stats donor = store_->GetStats();
+  EXPECT_EQ(donor.lifetime_donor_released_residents, 2U);
+  EXPECT_EQ(store_->EvictedBytes(), 48U);
+  EXPECT_EQ(donor.lifetime_class_victims, 0U);
+  EXPECT_EQ(donor.lifetime_class_freed_slot_bytes, 0U);
+  EXPECT_EQ(donor.lifetime_class_freed_payload_bytes, 0U);
+  EXPECT_EQ(store_->Count(), 1U);
+  EXPECT_FALSE(store_->IsCached(Key(1)));
+  EXPECT_FALSE(store_->IsCached(Key(2)));
+  const std::string next(5001, 'y');
+  ASSERT_EQ(store_->Cache(Key(4), next.data(), next.size()), Status::kOk);
+  const DiskSlabStore::Stats class_reclaim = store_->GetStats();
+  EXPECT_EQ(class_reclaim.lifetime_donor_released_residents, 2U);
+  EXPECT_EQ(class_reclaim.lifetime_class_victims, 1U);
+  EXPECT_EQ(class_reclaim.lifetime_class_freed_slot_bytes, 8192U);
+  EXPECT_EQ(class_reclaim.lifetime_class_freed_payload_bytes, 5000U);
+  EXPECT_EQ(store_->EvictedBytes(), 5048U);
+  store_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create(2));
+  ASSERT_EQ(store_->Cache(Key(5), large.data(), large.size()), Status::kOk);
+  EXPECT_EQ(store_->GetStats().lifetime_class_freed_slot_bytes, 8192U);
+  EXPECT_EQ(store_->GetStats().lifetime_class_freed_payload_bytes, 5001U);
+}
+
+TEST_F(LifetimeClassStoreTest, FailedNewWriteRetainsSuccessfulEvictionBytes) {
+  for (const char* mode : {"scalar", "direct", "batch"}) {
+    SCOPED_TRACE(mode);
+    store_.reset();
+    std::filesystem::remove_all(dir_);
+    ASSERT_NO_FATAL_FAILURE(Create(2));
+    ASSERT_NO_FATAL_FAILURE(Seed(2, false));
+    DiskSlabStoreTestPeer::FailPayloadWrite(*store_);
+    EXPECT_EQ(Write(mode, Key(3)).status, Status::kIOError);
+    const DiskSlabStore::Stats stats = store_->GetStats();
+    EXPECT_EQ(stats.lifetime_class_victims, 1U);
+    EXPECT_EQ(stats.lifetime_class_freed_slot_bytes, 4096U);
+    EXPECT_EQ(stats.lifetime_class_freed_payload_bytes, 3U);
+    EXPECT_EQ(store_->EvictedBytes(), 3U);
+    EXPECT_EQ(stats.payload_bytes, 3U);
+    EXPECT_EQ(store_->Count(), 1U);
+    EXPECT_FALSE(store_->IsCached(Key(3)));
   }
 }
 
@@ -578,6 +668,8 @@ TEST_F(LifetimeClassStoreTest, FailureDoesNotFreeOrReclassifyVictimAsBudget) {
   EXPECT_EQ(store_->Count(), 2U);
   EXPECT_EQ(DiskSlabStoreTestPeer::Flights(*store_), 0U);
   EXPECT_EQ(store_->GetStats().lifetime_class_victims, 0U);
+  EXPECT_EQ(store_->GetStats().lifetime_class_freed_slot_bytes, 0U);
+  EXPECT_EQ(store_->GetStats().lifetime_class_freed_payload_bytes, 0U);
   EXPECT_TRUE(DiskSlabStoreTestPeer::IndexesValid(*store_));
 }
 
@@ -610,6 +702,9 @@ TEST_F(LifetimeClassStoreTest, BudgetExhaustionPropagatesOnEveryWritePath) {
     EXPECT_LE(stats.lifetime_class_scan_visits, 2 * kResidents + 2);
     EXPECT_LE(stats.lifetime_class_scan_slices, 4U);
     EXPECT_EQ(stats.lifetime_scan_budget_exhausted, 1U);
+    EXPECT_EQ(stats.lifetime_class_victims, 0U);
+    EXPECT_EQ(stats.lifetime_class_freed_slot_bytes, 0U);
+    EXPECT_EQ(stats.lifetime_class_freed_payload_bytes, 0U);
     EXPECT_GE(yields, 1U);
     EXPECT_EQ(DiskSlabStoreTestPeer::Flights(*store_), 0U);
     EXPECT_TRUE(DiskSlabStoreTestPeer::IndexesValid(*store_));

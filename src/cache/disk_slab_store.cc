@@ -1583,6 +1583,9 @@ DiskWriteResult DiskSlabStore::AllocateForPutLocked(
     bool reclaim_denied = false;
     const uint64_t visits = scan ? scan->visits : 0;
     const uint64_t slices = scan ? scan->slices : 0;
+    const uint64_t victims = scan ? scan->victims : 0;
+    const uint64_t slot_bytes = scan ? scan->freed_slot_bytes : 0;
+    const uint64_t payload_bytes = scan ? scan->freed_payload_bytes : 0;
     const bool allocated =
         alloc_->PutImpl(key, len, ref, &evicted, nullptr, &reclaim_denied,
                         scan ? &*scan : nullptr);
@@ -1592,8 +1595,12 @@ DiskWriteResult DiskSlabStore::AllocateForPutLocked(
     if (scan) {
       lifetime_class_scan_visits_ += scan->visits - visits;
       lifetime_class_scan_slices_ += scan->slices - slices;
-      if (scan->result == SlabAllocator::LifetimeScanResult::kEvicted)
-        ++lifetime_class_victims_;
+      // The returned list may also contain donor victims. Consume only the
+      // class-success snapshots, even if later allocation/payload I/O fails.
+      lifetime_class_victims_ += scan->victims - victims;
+      lifetime_class_freed_slot_bytes_ += scan->freed_slot_bytes - slot_bytes;
+      lifetime_class_freed_payload_bytes_ +=
+          scan->freed_payload_bytes - payload_bytes;
       if (scan->result == SlabAllocator::LifetimeScanResult::kNoCandidate)
         ++lifetime_class_no_candidate_;
     }
@@ -2882,6 +2889,8 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.lifetime_scan_budget_exhausted = lifetime_scan_budget_exhausted_;
   st.lifetime_class_no_candidate = lifetime_class_no_candidate_;
   st.lifetime_class_victims = lifetime_class_victims_;
+  st.lifetime_class_freed_slot_bytes = lifetime_class_freed_slot_bytes_;
+  st.lifetime_class_freed_payload_bytes = lifetime_class_freed_payload_bytes_;
   st.lifetime_background_scan_visits = lifetime_background_scan_visits_;
   st.lifetime_background_scan_slices = lifetime_background_scan_slices_;
   st.lifetime_background_budget_exhausted =

@@ -1048,6 +1048,9 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_scan_budget_exhausted += st.lifetime_scan_budget_exhausted;
     sum.lifetime_class_no_candidate += st.lifetime_class_no_candidate;
     sum.lifetime_class_victims += st.lifetime_class_victims;
+    sum.lifetime_class_freed_slot_bytes += st.lifetime_class_freed_slot_bytes;
+    sum.lifetime_class_freed_payload_bytes +=
+        st.lifetime_class_freed_payload_bytes;
     sum.lifetime_background_scan_visits += st.lifetime_background_scan_visits;
     sum.lifetime_background_scan_slices += st.lifetime_background_scan_slices;
     sum.lifetime_background_budget_exhausted +=

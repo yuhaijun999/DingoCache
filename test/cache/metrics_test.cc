@@ -209,6 +209,8 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
         "dfkv_slab_lifetime_scan_budget_exhausted_total",
         "dfkv_slab_lifetime_class_no_candidate_total",
         "dfkv_slab_lifetime_class_victims_total",
+        "dfkv_slab_lifetime_class_freed_payload_bytes_total",
+        "dfkv_slab_lifetime_class_freed_slot_bytes_total",
         "dfkv_slab_lifetime_background_scan_visits_total",
         "dfkv_slab_lifetime_background_scan_slices_total",
         "dfkv_slab_lifetime_background_budget_exhausted_total",
@@ -404,6 +406,91 @@ TEST(Metrics, BackgroundClassBytesAggregateAndResumeAcrossDisks) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, ForegroundClassBytesExcludeIncomingWritesAndRepeatedPuts) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "134217728");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_foreground";
+  fs::remove_all(dir);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 2ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+  ASSERT_EQ(group.DiskCount(), 2U);
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(group, disk);
+    const std::string old_value(disk == 0 ? 17 : 31, 'v');
+    // Fill the real eight-slot extent; later PUTs cannot use spare capacity.
+    for (uint64_t key = 1; key <= 8; ++key) {
+      ASSERT_EQ(store.Cache({key, 0}, old_value.data(), old_value.size()),
+                Status::kOk);
+    }
+    ASSERT_EQ(store.Count(), 8U);
+  }
+  const std::string new_value(101, 'n');
+  for (unsigned stage = 0; stage < 3; ++stage) {
+    SCOPED_TRACE(stage);
+    const uint64_t key = stage == 2 ? 10 : 9;
+    const uint64_t victims = stage == 2 ? 2 : 1;
+    for (size_t disk = 0; disk < 2; ++disk) {
+      DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(group, disk);
+      ASSERT_EQ(store.Cache({key, 0}, new_value.data(), new_value.size()),
+                Status::kOk);
+      EXPECT_EQ(store.Count(), 8U);
+    }
+    // Stage one repeats the same resident. Victim payloads are 17/31 bytes,
+    // not the incoming 101 bytes, and no background/watermark/donor ran.
+    const std::string text = server->MetricsText();
+    EXPECT_NE(text.find("dfkv_slab_lifetime_class_victims_total " +
+                        std::to_string(2 * victims) + "\n"),
+              std::string::npos)
+        << text;
+    EXPECT_NE(text.find("dfkv_slab_lifetime_class_freed_payload_bytes_total " +
+                        std::to_string(48 * victims) + "\n"),
+              std::string::npos)
+        << text;
+    EXPECT_NE(text.find("dfkv_slab_lifetime_class_freed_slot_bytes_total " +
+                        std::to_string(268435456 * victims) + "\n"),
+              std::string::npos)
+        << text;
+    EXPECT_NE(text.find("dfkv_evicted_bytes_total " +
+                        std::to_string(48 * victims) + "\n"),
+              std::string::npos);
+    for (const char* name :
+         {"dfkv_slab_lifetime_background_victims_total",
+          "dfkv_slab_watermark_slot_removals_total",
+          "dfkv_slab_lifetime_donor_released_residents_total"}) {
+      EXPECT_NE(text.find(std::string(name) + " 0\n"), std::string::npos);
+    }
+    for (size_t disk = 0; disk < 2; ++disk) {
+      const std::string labels = "{disk=\"" + options.cache_dirs[disk] +
+                                 "\",disk_index=\"" + std::to_string(disk) +
+                                 "\"} ";
+      EXPECT_NE(text.find("dfkv_slab_disk_lifetime_class_victims_total" +
+                          labels + std::to_string(victims) + "\n"),
+                std::string::npos);
+      EXPECT_NE(
+          text.find("dfkv_slab_disk_lifetime_class_freed_payload_bytes_total" +
+                    labels + std::to_string((disk == 0 ? 17 : 31) * victims) +
+                    "\n"),
+          std::string::npos);
+      EXPECT_NE(
+          text.find("dfkv_slab_disk_lifetime_class_freed_slot_bytes_total" +
+                    labels + std::to_string(134217728 * victims) + "\n"),
+          std::string::npos);
+    }
+  }
+  server.reset();
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, PrometheusFormatAndIdentity) {
   ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
   std::string addr;
@@ -450,6 +537,11 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
             std::string::npos);
   EXPECT_EQ(text.find("dfkv_slab_disk_lifetime_background_"),
             std::string::npos);
+  EXPECT_EQ(text.find("dfkv_slab_lifetime_class_freed_payload_bytes_total"),
+            std::string::npos);
+  EXPECT_EQ(text.find("dfkv_slab_lifetime_class_freed_slot_bytes_total"),
+            std::string::npos);
+  EXPECT_EQ(text.find("dfkv_slab_disk_lifetime_class_"), std::string::npos);
   server->Stop();
   server.reset();
   fs::remove_all(dir);

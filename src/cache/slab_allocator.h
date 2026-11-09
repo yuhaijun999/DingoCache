@@ -244,6 +244,11 @@ class SlabAllocator {
     const DiskLifetimeClock& clock;
     uint64_t visits = 0;
     uint64_t slices = 0;
+    // Cumulative successful class events for this owner, not its final result.
+    // Donor work never contributes. Snapshot payload before freeing its slot.
+    uint64_t victims = 0;
+    uint64_t freed_slot_bytes = 0;
+    uint64_t freed_payload_bytes = 0;
     uint64_t visit_limit = 0;
     uint64_t slice_limit = 0;
     uint64_t version = 0;
