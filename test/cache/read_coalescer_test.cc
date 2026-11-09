@@ -521,6 +521,8 @@ TEST(ReadCoalescer, SharedBytesCarryOriginalIdentity) {
     bool finish = false;
     dfkv::DiskResidentIdentity leader_identity;
     dfkv::DiskResidentIdentity follower_identity = fallback;
+    ReadCoalescer::Outcome leader_outcome;
+    ReadCoalescer::Outcome follower_outcome;
     char leader_bytes[4] = {};
     char follower_bytes[4] = {};
     size_t leader_len = 0;
@@ -544,7 +546,8 @@ TEST(ReadCoalescer, SharedBytesCarryOriginalIdentity) {
                         *n = *value_len = 4;
                         *identity = original;
                         return Status::kOk;
-                      }),
+                      },
+                      &leader_outcome),
                   Status::kOk);
       });
       std::unique_lock<std::mutex> lock(mutex);
@@ -552,15 +555,16 @@ TEST(ReadCoalescer, SharedBytesCarryOriginalIdentity) {
     }
     int independent_reads = 0;
     std::thread follower([&] {
-      EXPECT_EQ(
-          coalescer.ReadWithIdentity(key, 0, 4, follower_bytes, 4,
-                                     &follower_len, nullptr, &follower_identity,
-                                     [&](char*, size_t, size_t*, size_t*,
-                                         dfkv::DiskResidentIdentity*) {
-                                       ++independent_reads;
-                                       return Status::kIOError;
-                                     }),
-          Status::kOk);
+      EXPECT_EQ(coalescer.ReadWithIdentity(
+                    key, 0, 4, follower_bytes, 4, &follower_len, nullptr,
+                    &follower_identity,
+                    [&](char*, size_t, size_t*, size_t*,
+                        dfkv::DiskResidentIdentity*) {
+                      ++independent_reads;
+                      return Status::kIOError;
+                    },
+                    &follower_outcome),
+                Status::kOk);
     });
     const bool joined =
         dfkv::ReadCoalescerTestPeer::WaitForCopyWaiter(coalescer);
@@ -577,12 +581,18 @@ TEST(ReadCoalescer, SharedBytesCarryOriginalIdentity) {
       leader.join();
       EXPECT_EQ(leader_identity, original);
       EXPECT_EQ(std::string(leader_bytes, leader_len), "old!");
+      EXPECT_TRUE(leader_outcome.leader);
+      EXPECT_TRUE(leader_outcome.had_waiters);
+      EXPECT_FALSE(leader_outcome.copied_follower);
     }
     follower.join();
     EXPECT_TRUE(joined);
     EXPECT_EQ(independent_reads, 0);
     EXPECT_EQ(follower_identity, original);
     EXPECT_EQ(std::string(follower_bytes, follower_len), "old!");
+    EXPECT_FALSE(follower_outcome.leader);
+    EXPECT_FALSE(follower_outcome.had_waiters);
+    EXPECT_TRUE(follower_outcome.copied_follower);
   }
 }
 
@@ -598,6 +608,7 @@ TEST(ReadCoalescer, FallbackUsesOnlyItsOwnIdentity) {
     char buffer[4] = {};
     size_t length = 0;
     dfkv::DiskResidentIdentity identity = original;
+    ReadCoalescer::Outcome outcome;
     Status result = Status::kInvalid;
     auto read = [&] {
       result = coalescer.ReadWithIdentity(
@@ -608,7 +619,8 @@ TEST(ReadCoalescer, FallbackUsesOnlyItsOwnIdentity) {
             *n = 4;
             *source = replacement;
             return Status::kOk;
-          });
+          },
+          &outcome);
     };
     if (scenario == 0) {
       read();
@@ -627,6 +639,9 @@ TEST(ReadCoalescer, FallbackUsesOnlyItsOwnIdentity) {
     EXPECT_EQ(result, Status::kOk);
     EXPECT_EQ(identity, replacement);
     EXPECT_EQ(std::string(buffer, length), "new!");
+    EXPECT_FALSE(outcome.leader);
+    EXPECT_FALSE(outcome.had_waiters);
+    EXPECT_FALSE(outcome.copied_follower);
     coalescer.CompleteAsync(token, Status::kOk, "old!", 4, nullptr, nullptr,
                             nullptr, nullptr, original);
     EXPECT_EQ(identity, replacement);  // Late completion cannot relabel bytes.
@@ -642,6 +657,7 @@ TEST(ReadCoalescer, FailedAndEmptyFillsClearIdentity) {
       uint64_t token = 0;
       if (self_fallback) token = coalescer.TryRegisterAsync(key, 0, 4, true, 4);
       dfkv::DiskResidentIdentity identity = stale;
+      ReadCoalescer::Outcome outcome;
       char bytes[4] = {};
       size_t length = 99;
       const Status result = coalescer.ReadWithIdentity(
@@ -651,9 +667,13 @@ TEST(ReadCoalescer, FailedAndEmptyFillsClearIdentity) {
             *source = stale;  // Even a misbehaving fill cannot export on error.
             *n = failed ? 4 : 0;
             return failed ? Status::kIOError : Status::kOk;
-          });
+          },
+          &outcome);
       EXPECT_EQ(result, failed ? Status::kIOError : Status::kOk);
       EXPECT_FALSE(identity.valid());
+      EXPECT_EQ(outcome.leader, !self_fallback);
+      EXPECT_FALSE(outcome.had_waiters);
+      EXPECT_FALSE(outcome.copied_follower);
       if (!failed) {
         EXPECT_EQ(length, 0U);
       }
@@ -671,13 +691,15 @@ TEST(ReadCoalescer, SharedIdentityFollowsNonemptyCopiedSlice) {
     char buffer[4] = {};
     size_t length = 99;
     dfkv::DiskResidentIdentity identity = original;
+    ReadCoalescer::Outcome outcome;
     std::thread follower([&] {
       EXPECT_EQ(
           coalescer.ReadWithIdentity(
               key, 0, 4, buffer, capacity, &length, nullptr, &identity,
               [](char*, size_t, size_t*, size_t*, dfkv::DiskResidentIdentity*) {
                 return Status::kIOError;
-              }),
+              },
+              &outcome),
           Status::kOk);
     });
     const bool joined =
@@ -689,8 +711,56 @@ TEST(ReadCoalescer, SharedIdentityFollowsNonemptyCopiedSlice) {
     EXPECT_EQ(length, capacity);
     EXPECT_EQ(std::string(buffer, length), std::string("old!", capacity));
     EXPECT_EQ(identity.valid(), capacity > 0);
+    EXPECT_FALSE(outcome.leader);
+    EXPECT_FALSE(outcome.had_waiters);
+    EXPECT_TRUE(outcome.copied_follower);
     if (capacity > 0) {
       EXPECT_EQ(identity, original);
     }
   }
+}
+
+TEST(ReadCoalescer, ReusedOutcomeDoesNotRetainPreviousRole) {
+  ReadCoalescer coalescer;
+  ReadCoalescer::Outcome outcome;
+  char buffer[4] = {};
+  size_t length = 0;
+  const auto read = [&](const BlockKey& key) {
+    return coalescer.Read(
+        key, 0, 4, buffer, sizeof(buffer), &length, nullptr,
+        [](char* bytes, size_t, size_t* count, size_t*) {
+          std::memcpy(bytes, "self", 4);
+          *count = 4;
+          return Status::kOk;
+        },
+        &outcome);
+  };
+
+  const uint64_t shared = coalescer.TryRegisterAsync(K(804), 0, 4, false);
+  ASSERT_NE(shared, 0U);
+  std::thread follower([&] { EXPECT_EQ(read(K(804)), Status::kOk); });
+  const bool joined = dfkv::ReadCoalescerTestPeer::WaitForCopyWaiter(coalescer);
+  EXPECT_TRUE(coalescer.CompleteAsync(shared, Status::kOk, "peer", 4));
+  follower.join();
+  EXPECT_TRUE(joined);
+  EXPECT_FALSE(outcome.leader);
+  EXPECT_TRUE(outcome.copied_follower);
+  EXPECT_EQ(std::string(buffer, length), "peer");
+
+  // Reusing a copied-follower output for a new flight must report only leader.
+  ASSERT_EQ(read(K(805)), Status::kOk);
+  EXPECT_TRUE(outcome.leader);
+  EXPECT_FALSE(outcome.had_waiters);
+  EXPECT_FALSE(outcome.copied_follower);
+
+  // The same output then enters a same-thread own-fill fallback, not a leader.
+  const uint64_t independent = coalescer.TryRegisterAsync(K(805), 0, 4, false);
+  ASSERT_NE(independent, 0U);
+  EXPECT_EQ(read(K(805)), Status::kOk);
+  EXPECT_FALSE(outcome.leader);
+  EXPECT_FALSE(outcome.had_waiters);
+  EXPECT_FALSE(outcome.copied_follower);
+  EXPECT_EQ(std::string(buffer, length), "self");
+  EXPECT_FALSE(
+      coalescer.CompleteAsync(independent, Status::kIOError, nullptr, 0));
 }

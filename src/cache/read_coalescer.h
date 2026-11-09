@@ -257,11 +257,13 @@ class ReadCoalescer {
     coalesced_.fetch_add(1, std::memory_order_relaxed);
   }
 
-  // Leader/follower outcome of a Read() call, for the caller's promotion gate
-  // on the synchronous path (only meaningful when leader is true).
+  // Reset for each Read() call. had_waiters describes only an actual leader;
+  // neither role is set when the caller independently fills after a fallback.
   struct Outcome {
     bool leader = false;
     bool had_waiters = false;
+    // The successful result came from shared flight bytes, even if empty.
+    bool copied_follower = false;
   };
 
   using FillWithMetadata =
@@ -294,6 +296,7 @@ class ReadCoalescer {
                           size_t* out_value_len, DiskResidentIdentity* identity,
                           const FillWithIdentity& fill, Outcome* oc = nullptr,
                           uint64_t fence_epoch = 0) {
+    if (oc) *oc = Outcome{};
     if (identity) *identity = {};
     auto read_own = [&](char* buffer, size_t capacity, size_t* size,
                         size_t* value_len, DiskResidentIdentity* source) {
@@ -384,6 +387,7 @@ class ReadCoalescer {
     if (out_len) *out_len = c;
     if (out_value_len) *out_value_len = f->value_len;
     if (identity && c > 0) *identity = f->identity;
+    if (oc) oc->copied_follower = true;
     coalesced_.fetch_add(1, std::memory_order_relaxed);
     return Status::kOk;
   }

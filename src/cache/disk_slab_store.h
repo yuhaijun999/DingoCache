@@ -99,8 +99,18 @@ class DiskSlabStore : public StoreEngine {
     bool lifetime_recovery_two_reads = false;
   };
 
-  // Enabled, nonempty logical successes partition into exactly one outcome.
-  // Real I/O health wins over binding/race/clock diagnostics; GET is unchanged.
+  // Caller-observed completion path, not physical I/O or current residency.
+  enum class LifetimeReadSource : unsigned char {
+    kUnclassified = 0,   // No completion-path classification was supplied.
+    kRam = 1,            // A synchronous request copied a RAM resident.
+    kDisk = 2,           // An independent synchronous storage read completed.
+    kCopyLeader = 3,     // A synchronous coalescer leader completed its read.
+    kCopyFollower = 4,   // A follower copied the completed shared result.
+    kTransportGrant = 5  // A transport established a successful read grant.
+  };
+
+  // Enabled, nonempty logical successes partition separately by outcome and
+  // source. Real I/O health wins over binding/race/clock diagnostics.
   struct LifetimeReadCounters {
     uint64_t successful = 0;
     uint64_t applied = 0;
@@ -109,6 +119,12 @@ class DiskSlabStore : public StoreEngine {
     uint64_t clock_hard_exhausted = 0;
     uint64_t io_unhealthy = 0;
     uint64_t state_unavailable = 0;
+    uint64_t source_unclassified = 0;
+    uint64_t source_ram = 0;
+    uint64_t source_disk = 0;
+    uint64_t source_copy_leader = 0;
+    uint64_t source_copy_follower = 0;
+    uint64_t source_transport_grant = 0;
   };
 
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
@@ -359,9 +375,9 @@ class DiskSlabStore : public StoreEngine {
   // captured identity proves byte provenance, not current residency: recheck
   // the same generation before heating, never reconstruct it from the key.
   bool TracksLifetimeState() const { return opt_.lifetime_config.has_value(); }
-  void NotifyLifetimeReadSuccess(const BlockKey& key,
-                                 const DiskResidentIdentity& identity,
-                                 size_t bytes);
+  void NotifyLifetimeReadSuccess(
+      const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
+      LifetimeReadSource source = LifetimeReadSource::kUnclassified);
   Stats GetStats() const;
   std::vector<SlabAllocator::ClassStat> ClassStats() const;
   bool Healthy() const override {

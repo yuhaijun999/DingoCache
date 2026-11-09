@@ -2774,11 +2774,34 @@ std::vector<SlabAllocator::ClassStat> DiskSlabStore::ClassStats() const {
 }
 
 void DiskSlabStore::NotifyLifetimeReadSuccess(
-    const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes) {
+    const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
+    LifetimeReadSource source) {
   // Keep disabled and empty successes off the lifetime lock/clock path.
   if (!opt_.lifetime_config.has_value() || bytes == 0) return;
   const std::lock_guard<std::mutex> lock(mu_);
   ++lifetime_reads_.successful;
+  // Source is an independent partition, including notifications left unheated.
+  // The caller supplies one valid enumerator; do not infer it from identity.
+  switch (source) {
+    case LifetimeReadSource::kUnclassified:
+      ++lifetime_reads_.source_unclassified;
+      break;
+    case LifetimeReadSource::kRam:
+      ++lifetime_reads_.source_ram;
+      break;
+    case LifetimeReadSource::kDisk:
+      ++lifetime_reads_.source_disk;
+      break;
+    case LifetimeReadSource::kCopyLeader:
+      ++lifetime_reads_.source_copy_leader;
+      break;
+    case LifetimeReadSource::kCopyFollower:
+      ++lifetime_reads_.source_copy_follower;
+      break;
+    case LifetimeReadSource::kTransportGrant:
+      ++lifetime_reads_.source_transport_grant;
+      break;
+  }
   if (!Healthy()) {
     ++lifetime_reads_.io_unhealthy;
     return;

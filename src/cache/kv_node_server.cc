@@ -19,7 +19,9 @@
 #include <vector>
 
 #include "cache/disk_resident_identity.h"
+#include "cache/disk_slab_store.h"
 #include "cache/ram_tier.h"
+#include "cache/read_coalescer.h"
 #include "cache/store_engine.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
@@ -614,6 +616,18 @@ std::string KvNodeServer::MetricsText() const {
            "Retained protection expiry bucket vector backing bytes");
     header("dfkv_slab_disk_lifetime_bucket_token_bytes", "gauge",
            "Retained resident expiry token vector backing bytes");
+    header("dfkv_slab_disk_lifetime_read_source_unclassified_total", "counter",
+           "Successful notifications without a completion path");
+    header("dfkv_slab_disk_lifetime_read_source_ram_total", "counter",
+           "Successful synchronous reads copied from RAM");
+    header("dfkv_slab_disk_lifetime_read_source_disk_total", "counter",
+           "Successful independent synchronous storage reads");
+    header("dfkv_slab_disk_lifetime_read_source_copy_leader_total", "counter",
+           "Successful synchronous copy coalescer leaders");
+    header("dfkv_slab_disk_lifetime_read_source_copy_follower_total", "counter",
+           "Successful reads copied from shared flight bytes");
+    header("dfkv_slab_disk_lifetime_read_source_transport_grant_total",
+           "counter", "Successful transport read grant notifications");
     header("dfkv_slab_disk_lifetime_read_success_total", "counter",
            "Nonzero successful business reads notified to lifetime metadata");
     header("dfkv_slab_disk_lifetime_read_applied_total", "counter",
@@ -650,6 +664,18 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      sample("dfkv_slab_disk_lifetime_read_source_unclassified_total",
+             disk.lifetime_reads.source_unclassified);
+      sample("dfkv_slab_disk_lifetime_read_source_ram_total",
+             disk.lifetime_reads.source_ram);
+      sample("dfkv_slab_disk_lifetime_read_source_disk_total",
+             disk.lifetime_reads.source_disk);
+      sample("dfkv_slab_disk_lifetime_read_source_copy_leader_total",
+             disk.lifetime_reads.source_copy_leader);
+      sample("dfkv_slab_disk_lifetime_read_source_copy_follower_total",
+             disk.lifetime_reads.source_copy_follower);
+      sample("dfkv_slab_disk_lifetime_read_source_transport_grant_total",
+             disk.lifetime_reads.source_transport_grant);
       sample("dfkv_slab_disk_lifetime_read_success_total",
              disk.lifetime_reads.successful);
       sample("dfkv_slab_disk_lifetime_read_applied_total",
@@ -870,6 +896,24 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_background_no_candidate_total", "counter",
            "Background class scans with no eligible candidate",
            ss.lifetime_background_no_candidate);
+    metric("dfkv_slab_lifetime_read_source_unclassified_total", "counter",
+           "Successful notifications without a completion path",
+           ss.lifetime_reads.source_unclassified);
+    metric("dfkv_slab_lifetime_read_source_ram_total", "counter",
+           "Successful synchronous reads copied from RAM",
+           ss.lifetime_reads.source_ram);
+    metric("dfkv_slab_lifetime_read_source_disk_total", "counter",
+           "Successful independent synchronous storage reads",
+           ss.lifetime_reads.source_disk);
+    metric("dfkv_slab_lifetime_read_source_copy_leader_total", "counter",
+           "Successful synchronous copy coalescer leaders",
+           ss.lifetime_reads.source_copy_leader);
+    metric("dfkv_slab_lifetime_read_source_copy_follower_total", "counter",
+           "Successful reads copied from shared flight bytes",
+           ss.lifetime_reads.source_copy_follower);
+    metric("dfkv_slab_lifetime_read_source_transport_grant_total", "counter",
+           "Successful transport read grant notifications",
+           ss.lifetime_reads.source_transport_grant);
     metric("dfkv_slab_lifetime_read_success_total", "counter",
            "Nonzero successful business reads notified to lifetime metadata",
            ss.lifetime_reads.successful);
@@ -1239,6 +1283,8 @@ Status KvNodeServer::ProcessRequestForKey(
       double t0 = samp ? NowSec() : 0.0;
       const bool track_lifetime = group_.TracksLifetimeState();
       DiskResidentIdentity read_identity;
+      DiskSlabStore::LifetimeReadSource read_source =
+          DiskSlabStore::LifetimeReadSource::kDisk;
       bool ram_served = false;
       if (ram_) {  // RAM hot tier: serve straight from the arena (copy out), no disk
         RamTier::Hit h;
@@ -1246,6 +1292,7 @@ Status KvNodeServer::ProcessRequestForKey(
           out_data->assign(h.ptr, h.len);
           if (out_value_len) *out_value_len = h.value_len;
           if (track_lifetime) read_identity = h.identity;
+          read_source = DiskSlabStore::LifetimeReadSource::kRam;
           st = Status::kOk;
           cache_hit_.fetch_add(1, std::memory_order_relaxed);
           bytes_read_.fetch_add(out_data->size(), std::memory_order_relaxed);
@@ -1285,6 +1332,7 @@ Status KvNodeServer::ProcessRequestForKey(
                 static_cast<size_t>(std::min({length, avail, max_payload}));
             out_data->resize(cap);
             size_t n = 0;
+            ReadCoalescer::Outcome outcome;
             st = read_coalescer_.ReadWithIdentity(
                 key, offset, length,
                 out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
@@ -1301,7 +1349,11 @@ Status KvNodeServer::ProcessRequestForKey(
                   }
                   return s;
                 },
-                nullptr, read_epoch);
+                track_lifetime ? &outcome : nullptr, read_epoch);
+            if (outcome.leader)
+              read_source = DiskSlabStore::LifetimeReadSource::kCopyLeader;
+            else if (outcome.copied_follower)
+              read_source = DiskSlabStore::LifetimeReadSource::kCopyFollower;
             out_data->resize(st == Status::kOk ? n : 0);
           } else {
             out_data->clear();  // A nested admission recheck may refuse now.
@@ -1324,7 +1376,8 @@ Status KvNodeServer::ProcessRequestForKey(
       // Every request, including each copy follower, reaches this point once.
       // The RAM Hit scope has ended; no RAM lock/pin is needed by notification.
       if (track_lifetime && st == Status::kOk)
-        group_.NotifyLifetimeReadSuccess(key, read_identity, out_data->size());
+        group_.NotifyLifetimeReadSuccess(key, read_identity, out_data->size(),
+                                         read_source);
       if (samp) get_lat_.Observe(NowSec() - t0);
       break;
     }
@@ -1416,6 +1469,8 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
   }
   const bool track_lifetime = group_.TracksLifetimeState();
   DiskResidentIdentity read_identity;
+  DiskSlabStore::LifetimeReadSource read_source =
+      DiskSlabStore::LifetimeReadSource::kDisk;
   size_t local_size = 0;
   if (out_len == nullptr) out_len = &local_size;
   bool samp = lat_sampler_.ShouldSample();
@@ -1432,7 +1487,8 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
       cache_hit_.fetch_add(1, std::memory_order_relaxed);
       bytes_read_.fetch_add(n, std::memory_order_relaxed);
       if (track_lifetime)
-        group_.NotifyLifetimeReadSuccess(key, read_identity, n);
+        group_.NotifyLifetimeReadSuccess(
+            key, read_identity, n, DiskSlabStore::LifetimeReadSource::kRam);
       if (samp) get_lat_.Observe(NowSec() - t0);
       return Status::kOk;
     }
@@ -1440,6 +1496,7 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
   const uint64_t read_epoch = CaptureReadEpoch(key);
   Status st;
   if (coalesce_enabled_ && (read_epoch & 1) == 0) {
+    ReadCoalescer::Outcome outcome;
     st = read_coalescer_.ReadWithIdentity(
         key, offset, length, dst, dst_cap, out_len, value_len,
         track_lifetime ? &read_identity : nullptr,
@@ -1448,7 +1505,11 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
           return group_.RangeIntoWithIdentity(key, offset, length, buf, cap, n,
                                               identity, stored_len);
         },
-        nullptr, read_epoch);
+        track_lifetime ? &outcome : nullptr, read_epoch);
+    if (outcome.leader)
+      read_source = DiskSlabStore::LifetimeReadSource::kCopyLeader;
+    else if (outcome.copied_follower)
+      read_source = DiskSlabStore::LifetimeReadSource::kCopyFollower;
   } else {
     st = track_lifetime
              ? group_.RangeIntoWithIdentity(key, offset, length, dst, dst_cap,
@@ -1460,7 +1521,8 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
     if (track_lifetime)
-      group_.NotifyLifetimeReadSuccess(key, read_identity, *out_len);
+      group_.NotifyLifetimeReadSuccess(key, read_identity, *out_len,
+                                       read_source);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else if (st == Status::kIOError) {

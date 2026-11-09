@@ -20,6 +20,7 @@
 
 #include "cache/disk_cache_group.h"
 #include "cache/disk_resident_identity.h"
+#include "cache/disk_slab_store.h"
 #include "cache/ram_tier.h"
 #include "cache/read_coalescer.h"
 #include "common/kv_types.h"
@@ -166,7 +167,9 @@ class KvNodeServer {
   void NotifyLifetimeReadSuccessForKey(const BlockKey& key,
                                        const DiskResidentIdentity& identity,
                                        size_t bytes) {
-    group_.NotifyLifetimeReadSuccess(key, identity, bytes);
+    group_.NotifyLifetimeReadSuccess(
+        key, identity, bytes,
+        DiskSlabStore::LifetimeReadSource::kTransportGrant);
   }
 
   bool ram_enabled() const { return ram_ != nullptr; }

@@ -3608,6 +3608,11 @@ class LifetimeSuccessReadTest : public ProductionFlushResultTest {
               counters.applied + counters.no_binding + counters.race_lost +
                   counters.clock_hard_exhausted + counters.io_unhealthy +
                   counters.state_unavailable);
+    EXPECT_EQ(counters.successful,
+              counters.source_unclassified + counters.source_ram +
+                  counters.source_disk + counters.source_copy_leader +
+                  counters.source_copy_follower +
+                  counters.source_transport_grant);
     // Callers have finished (or explicitly held) every logical completion.
     // Check the exported disk outcomes, not just the in-memory accounting.
     const std::string text = node_->MetricsText();
@@ -3620,8 +3625,17 @@ class LifetimeSuccessReadTest : public ProductionFlushResultTest {
         {"race_lost", counters.race_lost},
         {"clock_hard_exhausted", counters.clock_hard_exhausted},
         {"io_unhealthy", counters.io_unhealthy},
-        {"state_unavailable", counters.state_unavailable}};
+        {"state_unavailable", counters.state_unavailable},
+        {"source_unclassified", counters.source_unclassified},
+        {"source_ram", counters.source_ram},
+        {"source_disk", counters.source_disk},
+        {"source_copy_leader", counters.source_copy_leader},
+        {"source_copy_follower", counters.source_copy_follower},
+        {"source_transport_grant", counters.source_transport_grant}};
     for (const std::pair<const char*, uint64_t>& outcome : outcomes) {
+      EXPECT_EQ(MetricVal(text, std::string("dfkv_slab_lifetime_read_") +
+                                    outcome.first + "_total"),
+                static_cast<long>(outcome.second));
       EXPECT_NE(text.find(std::string("dfkv_slab_disk_lifetime_read_") +
                           outcome.first + "_total" + labels +
                           std::to_string(outcome.second) + "\n"),
@@ -3649,6 +3663,7 @@ TEST_F(LifetimeSuccessReadTest, RequestAndIntoCountEachLogicalSuccess) {
   EXPECT_EQ(std::string(buffer, size), "value");
   EXPECT_EQ(State(key).actual_reads, 2U);
   EXPECT_EQ(Counters().applied, 2U);
+  EXPECT_EQ(Counters().source_disk, 2U);
   EXPECT_EQ(
       MetricVal(node_->MetricsText(), "dfkv_slab_lifetime_read_success_total"),
       2);
@@ -3679,6 +3694,8 @@ TEST_F(LifetimeSuccessReadTest, TcpSocketReadHeatsDiskAndRamSources) {
     EXPECT_EQ(value, "value");
     EXPECT_EQ(State(key).actual_reads, 1U);
     EXPECT_EQ(Counters().applied, 1U);
+    EXPECT_EQ(Counters().source_ram, ram_hit ? 1U : 0U);
+    EXPECT_EQ(Counters().source_disk, ram_hit ? 0U : 1U);
     ExpectConservation(1);
   }
 }
@@ -3696,6 +3713,7 @@ TEST_F(LifetimeSuccessReadTest, RamIntoUsesItsBoundSourceAfterReleasingHit) {
   EXPECT_EQ(std::string(buffer, 5), "value");
   EXPECT_EQ(State(key).actual_reads, 1U);
   EXPECT_EQ(Counters().applied, 1U);
+  EXPECT_EQ(Counters().source_ram, 1U);
   ExpectConservation(1);
 }
 
@@ -3715,6 +3733,7 @@ TEST_F(LifetimeSuccessReadTest, UnboundRamNeverDiscoversALaterDiskBinding) {
   EXPECT_EQ(std::string(buffer, size), "ram");
   EXPECT_EQ(State(key).actual_reads, 0U);
   EXPECT_EQ(Counters().no_binding, 2U);
+  EXPECT_EQ(Counters().source_ram, 2U);
   EXPECT_EQ(MetricVal(node_->MetricsText(),
                       "dfkv_slab_lifetime_read_no_binding_total"),
             2);
@@ -3861,6 +3880,7 @@ TEST_F(LifetimeSuccessReadTest,
         EXPECT_EQ(after_delayed_grant.history_unknown, fresh.history_unknown);
         EXPECT_EQ(Counters().race_lost, 1U);
         EXPECT_EQ(Counters().applied, 1U);
+        EXPECT_EQ(Counters().source_transport_grant, 1U);
         ExpectConservation(2);
         if (pinned && completed_with_pin) {
           EXPECT_TRUE(old_send.Abort());
@@ -3922,6 +3942,9 @@ TEST_F(LifetimeSuccessReadTest, CopyFollowersCountRequestsRatherThanOneIo) {
     EXPECT_EQ(State(key).scoring_reads(), kRequests);
     EXPECT_EQ(State(key).actual_reads, 3U);
     EXPECT_EQ(Counters().applied, kRequests);
+    EXPECT_EQ(Counters().source_copy_leader, 1U);
+    EXPECT_EQ(Counters().source_copy_follower, kRequests - 1);
+    EXPECT_EQ(Counters().source_disk, 0U);
     ExpectConservation(kRequests);
   }
 }
@@ -3972,6 +3995,9 @@ TEST_F(LifetimeSuccessReadTest, TimeoutFallbackHasOnlyItsOwnSuccessEvent) {
   EXPECT_EQ(State(key).scoring_reads(), 2U);
   EXPECT_EQ(State(key).anchor, 29U);
   EXPECT_EQ(Counters().applied, 2U);
+  EXPECT_EQ(Counters().source_copy_leader, 1U);
+  EXPECT_EQ(Counters().source_copy_follower, 0U);
+  EXPECT_EQ(Counters().source_disk, 1U);  // Timeout executes its own fill.
   ExpectConservation(2);
 }
 

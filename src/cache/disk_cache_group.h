@@ -123,9 +123,10 @@ class DiskCacheGroup {
   }
   // One already-successful nonzero business read. Preparation/physical I/O
   // alone must not call this; the original source is not a residency promise.
-  void NotifyLifetimeReadSuccess(const BlockKey& key,
-                                 const DiskResidentIdentity& identity,
-                                 size_t bytes);
+  void NotifyLifetimeReadSuccess(
+      const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
+      DiskSlabStore::LifetimeReadSource source =
+          DiskSlabStore::LifetimeReadSource::kUnclassified);
   // Actively sample the optional shared clock. Once exhausted, rollback cannot
   // clear the restart requirement. Does not mark storage unhealthy, stop new
   // requests, or drain accepted work; the future server gate must do those in

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Classify lifetime logical read notifications by RAM, independent storage,
+  copy leader/follower and transport-grant completion paths. Keep coalescer
+  fallbacks distinct from copied followers, with per-disk and aggregate counters.
+
 - Export per-disk lifetime read-notification outcomes using existing counters.
   Preserve logical-read attribution and distinguish routed notifications from
   physical disk I/O; recovery virtual reads do not count as business reads.

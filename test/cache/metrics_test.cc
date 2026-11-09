@@ -266,7 +266,9 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
   const std::string labels = disk_labels + "0\n";
   for (const char* suffix :
        {"success", "applied", "no_binding", "race_lost", "clock_hard_exhausted",
-        "io_unhealthy", "state_unavailable"}) {
+        "io_unhealthy", "state_unavailable", "source_unclassified",
+        "source_ram", "source_disk", "source_copy_leader",
+        "source_copy_follower", "source_transport_grant"}) {
     EXPECT_NE(text.find(std::string("dfkv_slab_disk_lifetime_read_") + suffix +
                         "_total" + labels),
               std::string::npos);
@@ -878,6 +880,7 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
 
 TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
   const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
   const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "4096");
   const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
@@ -930,7 +933,17 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
          &DiskSlabStore::LifetimeReadCounters::clock_hard_exhausted},
         {"io_unhealthy", &DiskSlabStore::LifetimeReadCounters::io_unhealthy},
         {"state_unavailable",
-         &DiskSlabStore::LifetimeReadCounters::state_unavailable}};
+         &DiskSlabStore::LifetimeReadCounters::state_unavailable},
+        {"source_unclassified",
+         &DiskSlabStore::LifetimeReadCounters::source_unclassified},
+        {"source_ram", &DiskSlabStore::LifetimeReadCounters::source_ram},
+        {"source_disk", &DiskSlabStore::LifetimeReadCounters::source_disk},
+        {"source_copy_leader",
+         &DiskSlabStore::LifetimeReadCounters::source_copy_leader},
+        {"source_copy_follower",
+         &DiskSlabStore::LifetimeReadCounters::source_copy_follower},
+        {"source_transport_grant",
+         &DiskSlabStore::LifetimeReadCounters::source_transport_grant}};
     for (const ReadMetric& metric : metrics) {
       const std::string name = std::string("dfkv_slab_disk_lifetime_read_") +
                                metric.suffix + "_total";
@@ -945,6 +958,11 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
                   actual.applied + actual.no_binding + actual.race_lost +
                       actual.clock_hard_exhausted + actual.io_unhealthy +
                       actual.state_unavailable);
+        EXPECT_EQ(actual.successful,
+                  actual.source_unclassified + actual.source_ram +
+                      actual.source_disk + actual.source_copy_leader +
+                      actual.source_copy_follower +
+                      actual.source_transport_grant);
         const std::string labels = R"({disk=")" + options.cache_dirs[disk] +
                                    R"(",disk_index=")" + std::to_string(disk) +
                                    R"(",node="reads",group="test"} )";
@@ -973,6 +991,7 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
     EXPECT_EQ(value, "value");
     ++expected[disk].successful;
     ++expected[disk].applied;
+    ++expected[disk].source_disk;
     ValueMetadata metadata;
     ASSERT_EQ(server->LookupForKey(keys[disk], &metadata), Status::kOk);
     EXPECT_EQ(metadata.value_len, 5U);
@@ -988,6 +1007,7 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
   EXPECT_EQ(std::string(buffer, size), "value");
   ++expected[1].successful;
   ++expected[1].applied;
+  ++expected[1].source_disk;
   std::string value;
   ASSERT_EQ(read({10001, 0}, 0, &value), Status::kNotFound);
   ASSERT_NO_FATAL_FAILURE(expect_outcomes());
@@ -1000,10 +1020,12 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
   server->NotifyLifetimeReadSuccessForKey(keys[0], original[0], 5);
   ++expected[0].successful;
   ++expected[0].race_lost;
+  ++expected[0].source_transport_grant;
   // An unbound notification is attributed by key route, not physical source.
   server->NotifyLifetimeReadSuccessForKey(keys[1], {}, 5);
   ++expected[1].successful;
   ++expected[1].no_binding;
+  ++expected[1].source_transport_grant;
   server->NotifyLifetimeReadSuccessForKey(keys[1], original[1], 0);
   ASSERT_NO_FATAL_FAILURE(expect_outcomes());
 
@@ -1025,6 +1047,7 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
   EXPECT_EQ(value, "value");
   ++expected[1].successful;
   ++expected[1].applied;
+  ++expected[1].source_disk;
   ASSERT_NO_FATAL_FAILURE(expect_outcomes());
   server.reset();
   fs::remove_all(dir);

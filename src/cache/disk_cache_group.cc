@@ -669,11 +669,12 @@ bool DiskCacheGroup::Healthy() const {
 }
 
 void DiskCacheGroup::NotifyLifetimeReadSuccess(
-    const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes) {
+    const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
+    DiskSlabStore::LifetimeReadSource source) {
   if (bytes == 0 || !TracksLifetimeState()) return;
   const size_t disk = RouteIndex(key);
   if (disk < slabs_.size())
-    slabs_[disk]->NotifyLifetimeReadSuccess(key, identity, bytes);
+    slabs_[disk]->NotifyLifetimeReadSuccess(key, identity, bytes, source);
 }
 
 void DiskCacheGroup::PreventCleanShutdown() {
@@ -1097,6 +1098,16 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
         st.lifetime_reads.clock_hard_exhausted;
     sum.lifetime_reads.io_unhealthy += st.lifetime_reads.io_unhealthy;
     sum.lifetime_reads.state_unavailable += st.lifetime_reads.state_unavailable;
+    sum.lifetime_reads.source_unclassified +=
+        st.lifetime_reads.source_unclassified;
+    sum.lifetime_reads.source_ram += st.lifetime_reads.source_ram;
+    sum.lifetime_reads.source_disk += st.lifetime_reads.source_disk;
+    sum.lifetime_reads.source_copy_leader +=
+        st.lifetime_reads.source_copy_leader;
+    sum.lifetime_reads.source_copy_follower +=
+        st.lifetime_reads.source_copy_follower;
+    sum.lifetime_reads.source_transport_grant +=
+        st.lifetime_reads.source_transport_grant;
     sum.unclean_resets += st.unclean_resets;
     sum.eviction_record_clears += st.eviction_record_clears;
     sum.record_writes += st.record_writes;

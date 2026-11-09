@@ -109,6 +109,11 @@ class DiskLifetimeReadTest : public ::testing::Test {
               counters.applied + counters.no_binding + counters.race_lost +
                   counters.clock_hard_exhausted + counters.io_unhealthy +
                   counters.state_unavailable);
+    EXPECT_EQ(counters.successful,
+              counters.source_unclassified + counters.source_ram +
+                  counters.source_disk + counters.source_copy_leader +
+                  counters.source_copy_follower +
+                  counters.source_transport_grant);
     return counters;
   }
   const BlockKey key_{1, 0};
@@ -119,6 +124,37 @@ class DiskLifetimeReadTest : public ::testing::Test {
   std::unique_ptr<DiskSlabStore> store_;
   std::filesystem::path dir_;
 };
+
+TEST_F(DiskLifetimeReadTest, SourcesPartitionSuccessfulNotifications) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  const DiskSlabStore::LifetimeReadSource sources[] = {
+      DiskSlabStore::LifetimeReadSource::kUnclassified,
+      DiskSlabStore::LifetimeReadSource::kRam,
+      DiskSlabStore::LifetimeReadSource::kDisk,
+      DiskSlabStore::LifetimeReadSource::kCopyLeader,
+      DiskSlabStore::LifetimeReadSource::kCopyFollower,
+      DiskSlabStore::LifetimeReadSource::kTransportGrant};
+  // These are real notification applications, not fabricated counter values.
+  // The caller supplies the path; this Store test does not simulate transport.
+  uint64_t notifications = 0;
+  for (const DiskSlabStore::LifetimeReadSource source : sources) {
+    ++notifications;
+    for (uint64_t i = 0; i < notifications; ++i) {
+      store_->NotifyLifetimeReadSuccess(key_, identity, 5, source);
+    }
+  }
+  const DiskSlabStore::LifetimeReadCounters counters = Counters();
+  EXPECT_EQ(counters.successful, 21U);
+  EXPECT_EQ(counters.applied, 21U);
+  EXPECT_EQ(counters.source_unclassified, 1U);
+  EXPECT_EQ(counters.source_ram, 2U);
+  EXPECT_EQ(counters.source_disk, 3U);
+  EXPECT_EQ(counters.source_copy_leader, 4U);
+  EXPECT_EQ(counters.source_copy_follower, 5U);
+  EXPECT_EQ(counters.source_transport_grant, 6U);
+  EXPECT_EQ(State().scoring_reads(), 21U);
+}
 
 TEST_F(DiskLifetimeReadTest, AppliesAtNotificationTimeNotStorageReadTime) {
   ASSERT_NO_FATAL_FAILURE(Create());
@@ -413,7 +449,8 @@ TEST_F(DiskLifetimeReadTest, DefaultOffAndZeroBytesNeverSampleOrCount) {
   EXPECT_FALSE(store_->TracksLifetimeState());
   const DiskResidentIdentity identity = Put();
   const uint64_t samples = samples_.load();
-  store_->NotifyLifetimeReadSuccess(key_, identity, 5);
+  store_->NotifyLifetimeReadSuccess(key_, identity, 5,
+                                    DiskSlabStore::LifetimeReadSource::kRam);
   EXPECT_EQ(samples_.load(), samples);
   EXPECT_EQ(Counters().successful, 0U);
   store_.reset();
@@ -421,7 +458,8 @@ TEST_F(DiskLifetimeReadTest, DefaultOffAndZeroBytesNeverSampleOrCount) {
   ASSERT_NO_FATAL_FAILURE(Create());
   const DiskResidentIdentity enabled = Put();
   const uint64_t enabled_samples = samples_.load();
-  store_->NotifyLifetimeReadSuccess(key_, enabled, 0);
+  store_->NotifyLifetimeReadSuccess(
+      key_, enabled, 0, DiskSlabStore::LifetimeReadSource::kTransportGrant);
   EXPECT_EQ(samples_.load(), enabled_samples);
   EXPECT_EQ(Counters().successful, 0U);
 }
