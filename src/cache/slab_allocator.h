@@ -261,6 +261,7 @@ class SlabAllocator {
   struct LifetimeReclaimResult {
     size_t victims = 0;
     bool more = false;  // Release D and A before continuing this tick.
+    uint64_t freed_slot_bytes = 0;  // Successful class victims in this call.
   };
   LifetimeReclaimResult ReclaimLifetimeClass(size_t cls_index,
                                              size_t target_free,

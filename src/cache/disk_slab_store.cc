@@ -2474,8 +2474,13 @@ bool DiskSlabStore::ReclaimLifetimeClass(size_t cls_index, size_t target_free,
                                      &evicted);
     lifetime_background_scan_visits_ += scan.visits - before;
     ++lifetime_background_scan_slices_;
-    for (const BlockKey& key : evicted)
-      evicted_bytes_ += ErasePayloadLocked(key.Filename());
+    for (const BlockKey& key : evicted) {
+      const uint32_t bytes = ErasePayloadLocked(key.Filename());
+      evicted_bytes_ += bytes;
+      lifetime_background_freed_payload_bytes_ += bytes;
+    }
+    lifetime_background_victims_ += result.victims;
+    lifetime_background_freed_slot_bytes_ += result.freed_slot_bytes;
     reclaimed_.fetch_add(result.victims, std::memory_order_relaxed);
     remaining -= result.victims;
     if (scan.result == SlabAllocator::LifetimeScanResult::kNoCandidate) {
@@ -2882,6 +2887,11 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.lifetime_background_budget_exhausted =
       lifetime_background_budget_exhausted_;
   st.lifetime_background_no_candidate = lifetime_background_no_candidate_;
+  st.lifetime_background_victims = lifetime_background_victims_;
+  st.lifetime_background_freed_slot_bytes =
+      lifetime_background_freed_slot_bytes_;
+  st.lifetime_background_freed_payload_bytes =
+      lifetime_background_freed_payload_bytes_;
   st.lifetime_watermark_budget_exhausted = lifetime_watermark_budget_exhausted_;
   st.lifetime_watermark_no_candidate = lifetime_watermark_no_candidate_;
   st.lifetime_watermark_pin_skips = lifetime_watermark_pin_skips_;

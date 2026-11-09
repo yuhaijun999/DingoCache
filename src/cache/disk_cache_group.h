@@ -213,6 +213,10 @@ class DiskCacheGroup {
   DiskSlabStore::WatermarkObservation DiskWatermarkObservation(size_t i) const {
     return slabs_[i]->GetWatermarkObservation();
   }
+  // Slab-only metrics snapshot; not a hot-path lookup.
+  DiskSlabStore::Stats DiskSlabStats(size_t i) const {
+    return slabs_[i]->GetStats();
+  }
   uint64_t TenantUsedBytes(uint64_t tenant_hash) const;
   uint64_t TenantDefaultQuotaBytes() const { return tenant_default_quota_bytes_; }
   uint64_t TenantQuotaBytes(uint64_t tenant_hash) const {

@@ -123,6 +123,10 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_background_scan_slices = 0;
     uint64_t lifetime_background_budget_exhausted = 0;
     uint64_t lifetime_background_no_candidate = 0;
+    // Successful background class victims only; excludes watermark/donor work.
+    uint64_t lifetime_background_victims = 0;
+    uint64_t lifetime_background_freed_slot_bytes = 0;
+    uint64_t lifetime_background_freed_payload_bytes = 0;
     uint64_t lifetime_watermark_budget_exhausted = 0;
     uint64_t lifetime_watermark_no_candidate = 0;
     uint64_t lifetime_watermark_pin_skips = 0;
@@ -505,6 +509,10 @@ class DiskSlabStore : public StoreEngine {
   uint64_t lifetime_background_scan_slices_ = 0;
   uint64_t lifetime_background_budget_exhausted_ = 0;
   uint64_t lifetime_background_no_candidate_ = 0;
+  // Successful background class counters, guarded by mu_.
+  uint64_t lifetime_background_victims_ = 0;
+  uint64_t lifetime_background_freed_slot_bytes_ = 0;
+  uint64_t lifetime_background_freed_payload_bytes_ = 0;
   uint64_t lifetime_watermark_budget_exhausted_ = 0;
   uint64_t lifetime_watermark_no_candidate_ = 0;
   uint64_t lifetime_watermark_pin_skips_ = 0;

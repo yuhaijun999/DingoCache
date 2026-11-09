@@ -1584,6 +1584,9 @@ SlabAllocator::LifetimeReclaimResult SlabAllocator::ReclaimLifetimeClass(
       return result;
     }
     ++result.victims;
+    // Class slot size is fixed even when the last victim returns an extent.
+    // Count after successful invalidation/free; a later failure retains this.
+    result.freed_slot_bytes += cls.slot_size;
     // Match legacy's extent-return guard: do not cascade into another shrink.
     if (cls.free_count <= before) return result;
   }

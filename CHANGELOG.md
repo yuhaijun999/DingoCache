@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export successful lifetime background class victims, payload bytes and slot
+  bytes separately, both per disk and in aggregate. Preserve successful work
+  before later invalidation failure; exclude watermark and donor reclamation.
+
 - Include successful slab watermark evictions in evicted payload-byte totals.
   Export separate aggregate and per-disk watermark payload counters, distinct
   from freed slot capacity; skipped pins and failed invalidations add no bytes.

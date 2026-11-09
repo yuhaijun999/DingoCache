@@ -237,6 +237,9 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_background_scan_slices_total` | counter | Background class allocator lock slices. |
 | `dfkv_slab_lifetime_background_budget_exhausted_total` | counter | Class ticks deferred at a scan or successful-victim cap. |
 | `dfkv_slab_lifetime_background_no_candidate_total` | counter | Background class scans with no eligible candidate. |
+| `dfkv_slab_lifetime_background_victims_total` | counter | 后台 lifetime 类内成功淘汰对象数；只计失效与释放成功的住户，不混入前台、水位或 donor |
+| `dfkv_slab_lifetime_background_freed_payload_bytes_total` / `dfkv_slab_lifetime_background_freed_slot_bytes_total` | counter | 同一路径成功移除的已提交 payload / 分配 slot 字节；两种口径分开，部分失败保留此前成功量，pin/失败/无进展不增加 |
+| `dfkv_slab_disk_lifetime_background_victims_total` / `dfkv_slab_disk_lifetime_background_freed_payload_bytes_total` / `dfkv_slab_disk_lifetime_background_freed_slot_bytes_total` | counter | 上述三项的每盘值，复用 `disk` / `disk_index` 标签；无 key/request 标签 |
 | `dfkv_slab_lifetime_watermark_budget_exhausted_total` | counter | Internal lifetime watermark ticks stopped at the shared resident-visit cap; does not imply no eligible victim. |
 | `dfkv_slab_lifetime_watermark_no_candidate_total` | counter | Internal lifetime watermark scans that completed their stable traversal without an eligible candidate; separate from budget and metadata failure. |
 | `dfkv_slab_lifetime_watermark_pin_skips_total` | counter | Pinned resident checks in internal lifetime watermark scans; repeated checks count again. |
@@ -263,6 +266,12 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_class_allocated_bytes{slot_size}` / `dfkv_slab_class_useful_bytes{slot_size}` / `dfkv_slab_class_fragmentation_bytes{slot_size}` | gauge | 每 class 的占用、有效 payload、内部碎片 |
 | `dfkv_slab_class_read_heat{slot_size}` / `dfkv_slab_class_put_total{slot_size}` | gauge / counter | 每 class 的衰减读热度 / 累计 PUT |
 | `dfkv_slab_failed_disks` / `dfkv_slab_healthy` | gauge | fail-closed disk 数 / 全部 slab disk 是否健康 |
+
+后台 lifetime 成功计数在 staged/explicit legacy 或 file 下不代表新策略生效：
+legacy slab 值为零，file 不导出 slab 系列。计数随进程/Store 重建重置，不恢复历史
+淘汰量；普通 Remove 不计作后台回收。每盘与汇总为分别取样，并发回收时不保证同一
+抓取中所有样本原子一致。每盘完整 stats 抓取会读取 allocator/class 信息，仅用于
+观测，不进入业务读写热路径。
 
 上述通知原因互斥：success = applied + no_binding + race_lost + clock_hard_exhausted + io_unhealthy + state_unavailable。优先级为I/O隔离、无绑定、旧实例/epoch/可见性/代际、硬时钟、状态可用性，再应用。硬界限造成的未初始化state按clock原因记，不混成state_unavailable。无评分配置的legacy及仅clock注入不采新应用时间、不加新热锁、计数为0；file不输出slab指标。所有新指标不带key/request标签。
 
