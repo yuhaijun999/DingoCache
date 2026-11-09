@@ -2649,7 +2649,13 @@ void DiskSlabStore::ReclaimTick(
                                                std::memory_order_relaxed);
       if (!evicted.empty()) {
         if (after_watermark_evict) after_watermark_evict();
-        for (const BlockKey& key : evicted) ErasePayloadLocked(key.Filename());
+        for (const BlockKey& key : evicted) {
+          // Consume the visible payload once, only after successful physical
+          // eviction. Keep payload totals separate from rounded slot bytes.
+          const uint32_t bytes = ErasePayloadLocked(key.Filename());
+          evicted_bytes_ += bytes;
+          watermark_freed_payload_bytes_ += bytes;
+        }
       }
       watermark_latch_.EndTick(alloc_->UsedBytes(), evict_low_bytes_);
       watermark_active_.store(watermark_latch_.active, std::memory_order_relaxed);
@@ -2884,6 +2890,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
 
   st.lifetime_reads = lifetime_reads_;
   st.payload_bytes = committed_payload_bytes_;
+  st.watermark_freed_payload_bytes = watermark_freed_payload_bytes_;
   st.lifetime_init_clock_hard_exhausted = lifetime_init_clock_hard_exhausted_;
   st.committed_objects = payload_len_.size();
   st.deferred_removes = deferred_remove_total_;

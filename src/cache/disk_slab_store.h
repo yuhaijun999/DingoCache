@@ -150,6 +150,9 @@ class DiskSlabStore : public StoreEngine {
     uint64_t watermark_slot_record_clears = 0;
     uint64_t watermark_record_clear_bytes = 0;
     uint64_t watermark_freed_slot_bytes = 0;
+    // Committed payload removed by successful watermark victims, not slot
+    // capacity or metadata I/O bytes. Failed invalidations do not contribute.
+    uint64_t watermark_freed_payload_bytes = 0;
     uint64_t watermark_scan_visits = 0;
     uint64_t watermark_max_victims_per_tick = 0;
     uint64_t watermark_max_visits_per_tick = 0;
@@ -203,14 +206,20 @@ class DiskSlabStore : public StoreEngine {
     uint64_t watermark_low_bytes;
     uint64_t reclaim_interval_ms;
     uint64_t watermark_active;
+    uint64_t watermark_freed_payload_bytes;
   };
   WatermarkObservation GetWatermarkObservation() const {
     std::lock_guard<std::mutex> lk(mu_);
-    return {watermark_high_observations_, watermark_last_high_bytes_,
-            watermark_peak_high_bytes_, run_epoch_,
+    return {watermark_high_observations_,
+            watermark_last_high_bytes_,
+            watermark_peak_high_bytes_,
+            run_epoch_,
             static_cast<uint64_t>(opt_.extent_bytes) * num_extents_,
-            evict_high_bytes_, evict_low_bytes_, opt_.reclaim_interval_ms,
-            watermark_active_.load(std::memory_order_relaxed) ? 1u : 0u};
+            evict_high_bytes_,
+            evict_low_bytes_,
+            opt_.reclaim_interval_ms,
+            watermark_active_.load(std::memory_order_relaxed) ? 1u : 0u,
+            watermark_freed_payload_bytes_};
   }
 
   // Opens (or creates) the store under Options::dir, pre-allocating extents and
@@ -512,6 +521,7 @@ class DiskSlabStore : public StoreEngine {
   std::string startup_error_;
   uint64_t table_rebuilt_ = 0;
   uint64_t evicted_bytes_ = 0;
+  uint64_t watermark_freed_payload_bytes_ = 0;  // under mu_
   uint64_t deferred_remove_total_ = 0;  // under mu_
   std::atomic<uint64_t> dio_write_fallbacks_{0};
   std::atomic<uint64_t> dio_read_fallbacks_{0};

@@ -563,7 +563,7 @@ class LifetimeWatermarkStoreTest : public ::testing::Test {
     store_.reset();
     std::filesystem::remove_all(dir_);
   }
-  void Create(uint32_t slots = 8) {
+  void Create(uint32_t slots = 8, bool lifetime = true) {
     DiskSlabStore::Options options;
     options.dir = dir_.string();
     options.extent_bytes = static_cast<uint64_t>(slots) * 4096;
@@ -571,9 +571,11 @@ class LifetimeWatermarkStoreTest : public ::testing::Test {
     options.slot_granularity = 4096;
     options.reclaim_interval_ms = 0;
     options.table_sync_ms = 0;
-    options.lifetime_config = config_;
-    options.lifetime_clock = clock_;
-    options.lifetime_class_eviction = true;
+    if (lifetime) {
+      options.lifetime_config = config_;
+      options.lifetime_clock = clock_;
+      options.lifetime_class_eviction = true;
+    }
     store_ = std::make_unique<DiskSlabStore>(options);
     ASSERT_TRUE(store_->Healthy()) << store_->StartupError();
   }
@@ -606,6 +608,7 @@ TEST_F(LifetimeWatermarkStoreTest,
   EXPECT_EQ(stats.watermark_slot_record_clears, 2U);
   EXPECT_EQ(stats.watermark_extent_clears, 0U);
   EXPECT_EQ(stats.watermark_freed_slot_bytes, 2 * 4096U);
+  EXPECT_EQ(store_->EvictedBytes(), 18U);
   EXPECT_EQ(stats.reclaimed_slots, 0U);
   EXPECT_EQ(stats.lifetime_watermark_protected_victims, 2U);
   EXPECT_EQ(stats.lifetime_watermark_budget_exhausted, 0U);
@@ -641,6 +644,56 @@ TEST_F(LifetimeWatermarkStoreTest, ValidatedSnapshotSetsActualWatermarks) {
   DiskSlabStoreTestPeer::Tick(*store_);
   EXPECT_EQ(store_->GetStats().watermark_evictions, 3U);
   EXPECT_EQ(store_->Count(), 2U);
+}
+
+TEST_F(LifetimeWatermarkStoreTest, PayloadAndSlotBytesConserveInBothPolicies) {
+  for (const bool lifetime : {false, true}) {
+    SCOPED_TRACE(lifetime ? "lifetime" : "legacy");
+    store_.reset();
+    std::filesystem::remove_all(dir_);
+    ASSERT_NO_FATAL_FAILURE(Create(8, lifetime));
+    const std::vector<size_t> sizes = {1, 100, 2048, 4096};
+    uint64_t total = 0;
+    for (size_t index = 0; index < sizes.size(); ++index) {
+      const std::string payload(sizes[index], 'x');
+      ASSERT_EQ(store_->Cache(Key(index + 1), payload.data(), payload.size()),
+                Status::kOk);
+      total += payload.size();
+    }
+    ASSERT_TRUE(DiskSlabStoreTestPeer::Pin(*store_, Key(4)));
+    DiskSlabStoreTestPeer::ConfigureWatermark(*store_, 1, 2 * 4096, 256);
+    DiskSlabStoreTestPeer::Tick(*store_);
+    ASSERT_EQ(store_->Count(), 2U);
+    EXPECT_TRUE(store_->IsCached(Key(4)));
+    uint64_t removed = 0;
+    for (size_t index = 0; index < sizes.size(); ++index) {
+      if (!store_->IsCached(Key(index + 1))) removed += sizes[index];
+    }
+    EXPECT_GT(removed, 0U);
+    const DiskSlabStore::Stats first = store_->GetStats();
+    EXPECT_EQ(first.watermark_freed_payload_bytes, removed);
+    EXPECT_EQ(store_->EvictedBytes(), removed);
+    EXPECT_EQ(first.payload_bytes + removed, total);
+    EXPECT_EQ(store_->TenantUsedBytes(7), first.payload_bytes);
+    EXPECT_EQ(first.watermark_freed_slot_bytes, 2 * 4096U);
+    EXPECT_EQ(first.watermark_slot_removals, 2U);
+    DiskSlabStoreTestPeer::Tick(*store_);
+    EXPECT_EQ(store_->GetStats().watermark_freed_payload_bytes, removed);
+    EXPECT_EQ(store_->EvictedBytes(), removed);
+    ASSERT_TRUE(DiskSlabStoreTestPeer::Unpin(*store_, Key(4)));
+    DiskSlabStoreTestPeer::ConfigureWatermark(*store_, 1, 0, 256);
+    DiskSlabStoreTestPeer::Tick(*store_);
+    const DiskSlabStore::Stats drained = store_->GetStats();
+    EXPECT_EQ(store_->Count(), 0U);
+    EXPECT_EQ(drained.payload_bytes, 0U);
+    EXPECT_EQ(drained.watermark_freed_payload_bytes, total);
+    EXPECT_EQ(store_->EvictedBytes(), total);
+    EXPECT_EQ(drained.watermark_freed_slot_bytes, 4 * 4096U);
+    EXPECT_EQ(drained.watermark_slot_removals, 4U);
+    DiskSlabStoreTestPeer::Tick(*store_);
+    EXPECT_EQ(store_->EvictedBytes(), total);
+    EXPECT_EQ(store_->GetStats().watermark_freed_payload_bytes, total);
+  }
 }
 
 TEST_F(LifetimeWatermarkStoreTest, ZeroHighDisablesOnlyWatermarkPath) {
@@ -741,6 +794,8 @@ TEST_F(LifetimeWatermarkStoreTest, PinnedQuietTicksResumeAndKeepOriginalBytes) {
     DiskSlabStoreTestPeer::Tick(*store_);
     EXPECT_EQ(store_->Count(), 4U);
     EXPECT_EQ(store_->GetStats().watermark_active, 1U);
+    EXPECT_EQ(store_->GetStats().watermark_freed_payload_bytes, 0U);
+    EXPECT_EQ(store_->EvictedBytes(), 0U);
   }
   ASSERT_TRUE(DiskSlabStoreTestPeer::Unpin(*store_, Key(4)));
   for (unsigned tick = 0; tick < 3 && store_->IsCached(Key(4)); ++tick)
@@ -767,6 +822,10 @@ TEST_F(LifetimeWatermarkStoreTest, RealMetadataFailureDoesNotReleaseResident) {
   EXPECT_EQ(stats.watermark_evictions, 0U);
   EXPECT_EQ(stats.watermark_slot_record_clears, 0U);
   EXPECT_EQ(stats.watermark_freed_slot_bytes, 0U);
+  EXPECT_EQ(stats.watermark_freed_payload_bytes, 0U);
+  EXPECT_EQ(store_->EvictedBytes(), 0U);
+  EXPECT_EQ(stats.payload_bytes, 36U);
+  EXPECT_EQ(store_->TenantUsedBytes(7), 36U);
   EXPECT_EQ(stats.metadata_io_errors, 1U);
   EXPECT_EQ(stats.lifetime_watermark_budget_exhausted, 0U);
   EXPECT_EQ(stats.lifetime_watermark_no_candidate, 0U);

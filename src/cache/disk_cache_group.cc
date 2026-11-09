@@ -1014,6 +1014,7 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.watermark_slot_record_clears += st.watermark_slot_record_clears;
     sum.watermark_record_clear_bytes += st.watermark_record_clear_bytes;
     sum.watermark_freed_slot_bytes += st.watermark_freed_slot_bytes;
+    sum.watermark_freed_payload_bytes += st.watermark_freed_payload_bytes;
     sum.watermark_scan_visits += st.watermark_scan_visits;
     sum.watermark_max_victims_per_tick =
         std::max(sum.watermark_max_victims_per_tick,

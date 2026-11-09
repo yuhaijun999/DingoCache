@@ -572,6 +572,8 @@ std::string KvNodeServer::MetricsText() const {
     header("dfkv_slab_disk_watermark_high_observations_total", "counter", "Reclaimer samples directly satisfying used greater than high; not eviction counts");
     header("dfkv_slab_disk_watermark_last_high_bytes", "gauge", "Latest direct above-high predicate input before eviction");
     header("dfkv_slab_disk_watermark_peak_high_bytes", "gauge", "Lifetime maximum of sampled above-high inputs; never phase qualification alone");
+    header("dfkv_slab_disk_watermark_freed_payload_bytes_total", "counter",
+           "Committed payload bytes removed by successful watermark victims");
     for (size_t i = 0; i < group_.DiskCount(); ++i) {
       const auto st = group_.DiskWatermarkObservation(i);
       const std::string labels =
@@ -591,6 +593,8 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_high_observations_total", st.watermark_high_observations);
       sample("dfkv_slab_disk_watermark_last_high_bytes", st.watermark_last_high_bytes);
       sample("dfkv_slab_disk_watermark_peak_high_bytes", st.watermark_peak_high_bytes);
+      sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
+             st.watermark_freed_payload_bytes);
     }
     const auto ss = group_.SlabStats();
     metric("dfkv_slab_dio_write_fallback_total", "counter",
@@ -622,6 +626,9 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_watermark_freed_slot_bytes_total", "counter",
            "Allocated slot bytes actually removed by global selector calls",
            ss.watermark_freed_slot_bytes);
+    metric("dfkv_slab_watermark_freed_payload_bytes_total", "counter",
+           "Committed payload bytes removed by successful watermark victims",
+           ss.watermark_freed_payload_bytes);
     metric("dfkv_slab_watermark_scan_visits_total", "counter",
            "Allocator global reclamation scan visits",
            ss.watermark_scan_visits);

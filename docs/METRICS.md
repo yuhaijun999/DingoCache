@@ -97,7 +97,7 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_mds_heartbeat_healthy{group,node}` | gauge | 首次注册后最近一次 heartbeat 是否成功 |
 | `dfkv_mds_heartbeat_failures_consecutive{group,node}` / `dfkv_mds_heartbeat_failures_total{group,node}` | gauge / counter | 连续 / 累计 heartbeat 失败 |
 | `dfkv_mds_last_success_age_seconds{group,node}` | gauge | 最近成功注册或 heartbeat 的年龄 |
-| `dfkv_evictions_total` / `dfkv_evicted_bytes_total` | counter | 淘汰对象数 / 字节 |
+| `dfkv_evictions_total` / `dfkv_evicted_bytes_total` | counter | 淘汰对象数 / payload 字节；slab 字节包含成功水位淘汰，不是 slot 容量或元数据写入字节 |
 | `dfkv_errors_total{op,status}` | counter | 失败 op（put/get io、invalid） |
 | `dfkv_objects` / `dfkv_used_bytes` / `dfkv_disks` | gauge | 对象数 / 占用 / 盘数 |
 | `dfkv_disk_used_bytes{disk}` / `dfkv_disk_objects{disk}` | gauge | 每盘占用 / 对象 |
@@ -213,6 +213,8 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_watermark_max_victims_per_tick` / `dfkv_slab_watermark_max_visits_per_tick` | gauge | 每盘每 tick 的 slot 移除上限 / 扫描上限；替代旧 max-extents gauge |
 | `dfkv_slab_watermark_slot_record_clears_total` / `dfkv_slab_watermark_record_clear_bytes_total` | counter | 全局回收成功的单 slot tombstone 写入数 / 单 slot 与整 extent 元数据写入字节；不代表同步持久化或物理写放大 |
 | `dfkv_slab_watermark_freed_slot_bytes_total` / `dfkv_slab_watermark_scan_visits_total` | counter | 全局回收释放的分配字节 / 扫描位置次数 |
+| `dfkv_slab_watermark_freed_payload_bytes_total` | counter | 水位成功淘汰的逻辑已提交 payload 字节，各盘求和；与 rounded slot 字节分开，pin 跳过、失效失败、普通 Remove 不增加 |
+| `dfkv_slab_disk_watermark_freed_payload_bytes_total` | counter | 同一口径的每盘计数，沿用 `disk` / `disk_index` 标签，无 key/request 标签 |
 | `dfkv_slab_disk_run_epoch` / `dfkv_slab_disk_capacity_bytes` | gauge | 按 `disk`、`disk_index` 标记的运行 epoch / 容量 |
 | `dfkv_slab_disk_watermark_high_bytes` / `dfkv_slab_disk_watermark_low_bytes` / `dfkv_slab_disk_reclaim_interval_ms` / `dfkv_slab_disk_watermark_active` | gauge | 每盘解析后的水位、回收周期及活跃状态 |
 | `dfkv_slab_disk_watermark_high_observations_total` | counter | 每盘回收线程实际观察到 used > high 的次数；不等于回收次数 |

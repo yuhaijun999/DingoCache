@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Include successful slab watermark evictions in evicted payload-byte totals.
+  Export separate aggregate and per-disk watermark payload counters, distinct
+  from freed slot capacity; skipped pins and failed invalidations add no bytes.
+
 - Enable explicit lifetime eviction on real slab stores via CLI or environment,
   with strict startup numeric validation and pre-open disk-ACK enforcement for
   RAM write-back. Keep unspecified policy staged on legacy and reject explicit

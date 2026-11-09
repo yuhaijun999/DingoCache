@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <thread>
 #include <unistd.h>
@@ -15,6 +16,44 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <vector>
+
+#include "cache/disk_cache_group.h"
+#include "cache/disk_slab_store.h"
+#include "cache/slab_allocator.h"
+#include "common/status.h"
+
+namespace dfkv {
+class KvNodeServerTestPeer {
+ public:
+  static DiskCacheGroup& Group(KvNodeServer& server) { return server.group_; }
+};
+
+class DiskCacheGroupTestPeer {
+ public:
+  static DiskSlabStore& Slab(DiskCacheGroup& group, size_t index) {
+    return *group.slabs_.at(index);
+  }
+};
+
+class DiskSlabStoreTestPeer {
+ public:
+  static void TickWatermark(DiskSlabStore& store) {
+    // No background worker runs in this test. Isolate global reclamation from
+    // the independent class headroom pass, without replacing its allocator.
+    const std::vector<SlabAllocator::ClassStat> classes =
+        store.alloc_->Classes();
+    store.reclaim_last_puts_.resize(classes.size());
+    store.lifetime_reclaim_targets_.assign(classes.size(), 0);
+    for (size_t i = 0; i < classes.size(); ++i)
+      store.reclaim_last_puts_[i] = classes[i].puts;
+    store.evict_high_bytes_ = 2 * 1048576 - 1;
+    store.evict_low_bytes_ = 1048576;
+    store.evict_max_victims_per_tick_ = 1;
+    store.ReclaimTick();
+  }
+};
+}  // namespace dfkv
 
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
@@ -190,6 +229,72 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, WatermarkPayloadBytesAggregateAcrossDisksWithoutDoubleCounting) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "1048576");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_watermark";
+  fs::remove_all(dir);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 2ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+  ASSERT_EQ(group.DiskCount(), 2U);
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(group, disk);
+    // Each disk has equal-size payloads but the disks differ, so aggregation
+    // must sum their counters rather than report either one alone.
+    const std::string value(disk == 0 ? 17 : 31, 'v');
+    ASSERT_EQ(store.Cache({1, 0}, value.data(), value.size()), Status::kOk);
+    ASSERT_EQ(store.Cache({2, 0}, value.data(), value.size()), Status::kOk);
+    ASSERT_EQ(store.Count(), 2U);
+    DiskSlabStoreTestPeer::TickWatermark(store);
+    EXPECT_EQ(store.Count(), 1U);
+  }
+  const std::string text = server->MetricsText();
+  EXPECT_NE(text.find("# TYPE dfkv_slab_watermark_freed_payload_bytes_total "
+                      "counter\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("dfkv_slab_watermark_freed_payload_bytes_total 48\n"),
+            std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_evicted_bytes_total 48\n"), std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_watermark_freed_slot_bytes_total 2097152\n"),
+            std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_payload_bytes 48\n"), std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_watermark_slot_removals_total 2\n"),
+            std::string::npos)
+      << text;
+  for (size_t disk = 0; disk < 2; ++disk) {
+    const std::string sample =
+        "dfkv_slab_disk_watermark_freed_payload_bytes_total{disk=\"" +
+        options.cache_dirs[disk] + "\",disk_index=\"" + std::to_string(disk) +
+        "\"} " + (disk == 0 ? "17" : "31") + "\n";
+    EXPECT_NE(text.find(sample), std::string::npos) << text;
+  }
+  for (size_t disk = 0; disk < 2; ++disk)
+    DiskSlabStoreTestPeer::TickWatermark(
+        DiskCacheGroupTestPeer::Slab(group, disk));
+  const std::string repeated = server->MetricsText();
+  EXPECT_NE(repeated.find("dfkv_slab_watermark_freed_payload_bytes_total 48\n"),
+            std::string::npos)
+      << repeated;
+  EXPECT_NE(repeated.find("dfkv_evicted_bytes_total 48\n"), std::string::npos)
+      << repeated;
+  server.reset();
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, PrometheusFormatAndIdentity) {
   ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
   std::string addr;
@@ -221,6 +326,12 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
   EXPECT_NE(text.find(",engine=\"file\",write_mode=\"n/a\""),
             std::string::npos) << text;
   EXPECT_EQ(text.find("dfkv_slab_capacity_bytes"), std::string::npos) << text;
+  EXPECT_EQ(text.find("dfkv_slab_watermark_freed_payload_bytes_total"),
+            std::string::npos)
+      << text;
+  EXPECT_EQ(text.find("dfkv_slab_disk_watermark_freed_payload_bytes_total"),
+            std::string::npos)
+      << text;
   server->Stop();
   server.reset();
   fs::remove_all(dir);
