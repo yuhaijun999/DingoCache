@@ -95,8 +95,8 @@ int main(int argc, char** argv) {
             out,
             "\nDisk eviction policy (passed directly, not an env facade):\n"
             "  --slab-eviction-policy <legacy|lifetime>\n"
-            "  Overrides DFKV_SLAB_EVICTION_POLICY; lifetime is not ready.\n") <
-            0 ||
+            "  Overrides DFKV_SLAB_EVICTION_POLICY; lifetime is explicit "
+            "opt-in.\n") < 0 ||
         std::fflush(out) != 0) {
       return 1;
     }

@@ -74,8 +74,8 @@ struct DiskEvictionConfigResult {
 // open storage. A missing policy requests lifetime by default; explicit
 // lifetime is valid only with slab. File permits default/explicit legacy and
 // has no effective disk eviction policy. This validates configuration, not
-// algorithm readiness: startup must separately reject an unimplemented strategy
-// before opening disks. Callers must reject a non-OK result before constructing
+// effective activation: an unspecified request remains staged legacy until
+// the default-policy flip. Callers must reject a non-OK result before opening
 // disks.
 DiskEvictionConfigResult ResolveDiskEvictionConfig(
     const DiskEvictionConfigInput& input);
@@ -101,11 +101,13 @@ class DiskCacheGroup {
     std::shared_ptr<DiskLifetimeClock> lifetime_clock{};
     // Internal, value-owned scoring snapshot. Absent in normal legacy/file;
     // clock injection alone does not enable resident scoring metadata.
-    // Does not open the public lifetime readiness gate or change victims.
+    // Alone it does not change victims. An explicit lifetime policy uses this
+    // as its base snapshot, then strictly overlays applicable environment
+    // values.
     std::optional<DiskLifetimeConfig> lifetime_config{};
-    // Internal integration only; never set by CLI/environment policy parsing.
-    // Requires real slabs and scoring config. RAM write-back must explicitly
-    // select disk-ACK before any disk is opened. Public readiness stays gated.
+    // Internal integration opt-in; explicit public lifetime also enables this
+    // path after validation. Requires real slabs and scoring config. RAM
+    // write-back must explicitly select disk-ACK before any disk is opened.
     bool lifetime_class_eviction = false;
   };
 

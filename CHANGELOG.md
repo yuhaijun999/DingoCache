@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Enable explicit lifetime eviction on real slab stores via CLI or environment,
+  with strict startup numeric validation and pre-open disk-ACK enforcement for
+  RAM write-back. Keep unspecified policy staged on legacy and reject explicit
+  lifetime on the file backend. Clean recovery seeds virtual read count two
+  with unknown history; dirty recovery retains its existing reset behavior.
+  See [R45 configuration](docs/DISK_LIFETIME_R45.md). Earlier entries below record
+  the preceding internally gated implementation steps.
+
 - Unify internally enabled lifetime extent-donor selection across foreground,
   cold-steal and background growth. Scan the full pool, bound exact inspection
   to eight extents/8192 residents, and stop immediately after selected-donor

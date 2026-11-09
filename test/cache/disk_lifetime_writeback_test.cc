@@ -404,17 +404,15 @@ TEST_F(LifetimeWritebackTest, RejectionPreservesCleanAndDirtyDiskMetadata) {
   EXPECT_EQ(MetadataSnapshot(options.cache_dirs[1]), dirty_before);
 }
 
-TEST_F(LifetimeWritebackTest, DiskAckAcceptsAndPublicLifetimeRemainsClosed) {
+TEST_F(LifetimeWritebackTest, DiskAckAcceptsExplicitPublicLifetime) {
   ASSERT_NO_FATAL_FAILURE(Create());
   EXPECT_EQ(Put(Key(9000), false), Status::kOk);
   EXPECT_EQ(Ram().RamAcks(), 0U);
   node_.reset();
-  const Snapshot before = MetadataSnapshot(Options().cache_dirs[0]);
   DiskCacheGroup::Options requested = Options();
   requested.eviction_policy = "lifetime";
-  const KvNodeServer rejected(requested);
-  EXPECT_FALSE(rejected.Healthy());
-  EXPECT_EQ(MetadataSnapshot(requested.cache_dirs[0]), before);
+  const KvNodeServer accepted(requested);
+  EXPECT_TRUE(accepted.Healthy());
 }
 
 TEST_F(LifetimeWritebackTest, InternalRunIsNotReportedAsLegacyBaseline) {

@@ -871,8 +871,11 @@ bool DiskSlabStore::ValidateExistingDataFiles(const Options& options,
 
 bool DiskSlabStore::ValidateOptions() {
   std::string error;
+  if (opt_.lifetime_recovery_two_reads && !opt_.lifetime_class_eviction)
+    return SetStartupError(
+        "formal lifetime recovery requires lifetime eviction");
   if (opt_.lifetime_class_eviction && !opt_.lifetime_config)
-    return SetStartupError("staged lifetime class eviction requires scoring");
+    return SetStartupError("lifetime eviction requires scoring");
   if (opt_.lifetime_config) {
     if (!ValidateDiskLifetimeConfig(*opt_.lifetime_config, &error))
       return SetStartupError(error);
@@ -1493,7 +1496,8 @@ void DiskSlabStore::CommitPayloadLocked(const BlockKey& resident_key,
       // Runtime commits hold mu_; recovery is exclusively owned before the
       // store is published. Neither path may initialize heat past the bound.
       if (opt_.lifetime_clock->TryDrainNow(&offset)) {
-        state = recovered ? RecoveredDiskLifetimeState(1)
+        state = recovered ? RecoveredDiskLifetimeState(
+                                opt_.lifetime_recovery_two_reads ? 2 : 1)
                           : NewDiskLifetimeState(offset);
       } else {
         // Data already committed successfully. Keep its identity but no heat;

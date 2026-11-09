@@ -462,7 +462,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--metrics-bind` | `0.0.0.0` | metrics/health 绑 IP（内网收敛） |
 | `--mds-registration-timeout-ms` / `DFKV_MDS_REGISTRATION_TIMEOUT_MS` | `60000` | 首次 MDS 注册截止（1000–600000） |
 | `--store-engine` / `DFKV_STORE_ENGINE` | `slab` | `slab` 为默认；`file` 为显式诊断 fallback |
-| `--slab-eviction-policy` / `DFKV_SLAB_EVICTION_POLICY` | 请求 lifetime，实际 staged legacy | 命令行优先且保留显式空；当前可显式设置 `legacy`。空值、未知值及尚未就绪的显式 `lifetime` 在开盘前拒绝 |
+| `--slab-eviction-policy` / `DFKV_SLAB_EVICTION_POLICY` | 请求 lifetime，实际 staged legacy | 命令行优先且保留显式空；显式 `lifetime` 启用真实 slab 新策略，`legacy` 保留旧策略；空值、未知值及 file 显式 `lifetime` 在开盘前拒绝 |
 | `--slab-write` / `DFKV_SLAB_WRITE` | `direct` | slab 数据面 O_DIRECT / buffered；文件系统不支持 DIO 时整店回退 buffered 并以 `wr=` 上报 |
 | `--ram-tier` / `DFKV_RAM_TIER` | `off` | RAM 热层（写穿+RDMA zero-copy GET） |
 | `--ram-tier-bytes` / `DFKV_RAM_TIER_BYTES` | `16 GiB` | arena 预算（pin 一次即注册） |
@@ -563,12 +563,14 @@ RAM 准入的磁盘索引查询已移到 RAM shard 锁外。每个 RAM shard 增
 
 ##### 当前磁盘淘汰策略：请求值不等于生效值
 
-阶段 0 尚未开放 lifetime，启动配置通过已有 `effective config (server)` 输出：
+R45 已开放显式 lifetime，但未切换默认策略。启动配置通过已有
+`effective config (server)` 输出：
 
 | 引擎/输入 | `disk_eviction_requested` | `disk_eviction_effective` | `disk_eviction_staged` |
 |---|---|---|---|
 | slab，未指定策略 | lifetime | legacy | true |
 | slab，显式 legacy | legacy | legacy | false |
+| slab，显式 lifetime | lifetime | lifetime | false |
 | file，未指定策略 | lifetime | not_applicable | false |
 | file，显式 legacy | legacy | not_applicable | false |
 
@@ -578,7 +580,8 @@ RAM 准入的磁盘索引查询已移到 RAM shard 锁外。每个 RAM shard 增
 `(default)` 表示内建阶段闸门的决定，不是可独立设置的环境变量。不要只看请求值
 就把 staged legacy 或 file 当作新算法运行样本。
 
-以下九项仅供 lifetime 使用，目前全部导出 `inactive`，不会解析、校验或生效：
+以下九项仅供 lifetime 使用；在 staged/explicit legacy 或 file 下导出
+`inactive`，不会解析、校验或生效：
 `DFKV_SLAB_LIFE_BASE_SEC`、`DFKV_SLAB_LIFE_READ_BONUS_SEC`、
 `DFKV_SLAB_LIFE_MAX_READS`、`DFKV_SLAB_PROTECT_SEC`、
 `DFKV_SLAB_PROTECT_SLOWDOWN`、`DFKV_SLAB_PROTECT_BOOST_SEC`、
@@ -586,10 +589,18 @@ RAM 准入的磁盘索引查询已移到 RAM shard 锁外。每个 RAM shard 增
 显式残留会显示为 `inactive (configured='原值')` 并提示已忽略；空值、非数字及越界
 值都不能因此阻断 staged/explicit legacy 或 file。已有的水位、victim 上限及 slab
 几何等旧参数不属于这个名单，仍按原规则校验。旧模式/file 的 RAM write-back 默认
-RAM-ACK 和显式 RAM-ACK 不受未来 lifetime 的 disk-ACK 新闸门影响。
+RAM-ACK 和显式 RAM-ACK 不受 lifetime 的 disk-ACK 新闸门影响。
 
-显式 `lifetime` 在阶段 4.5 前始终于开盘前拒启，不静默回退；file 显式 lifetime
-始终不适用。后续开放显式策略和最终默认切换是不同步骤，不能提前用于正式 A/B。
+显式 slab `lifetime` 会严格解析并交叉校验上述九项及既有
+`DFKV_SLAB_EVICT_LOW_PCT` / `DFKV_SLAB_EVICT_HIGH_PCT`；非法值打印包含参数名、
+原始值的错误并在开盘前退出，不静默回退。LOW/HIGH 在旧模式下仍按原有规则适用，
+不属于 inactive 名单。显式 lifetime 的 RAM write-back 必须设置
+`DFKV_PUT_ACK_MODE=disk`，
+缺省或 `ram` 在开盘前拒绝；RAM 关闭或 write-around 不受此 disk-ACK 门禁限制。
+
+file 显式 lifetime 在开盘前拒绝。显式开放不等于默认翻转，也不代表性能或
+RDMA/RXE＋io_uring 验收完成。参数默认值、约束和恢复语义见
+[R45 操作说明](DISK_LIFETIME_R45.md)。
 
 #### b. RDMA 传输面（server/client 读取方见各项说明）
 

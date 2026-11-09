@@ -19,14 +19,16 @@ DingoCache's **dfkv** is a standalone distributed KV cache for LLM inference. Ca
 
 ### Development-branch disk eviction status
 
-The development branch is preparing a lifetime policy; it is **not active yet**.
-For slab, an unspecified policy reports `requested=lifetime`, `effective=legacy`,
-`staged=true`; file reports `effective=not_applicable`. Explicit `legacy` remains
-available, while explicit `lifetime` is rejected before storage opens. Startup
-logs label lifetime-only values `inactive`; they do not change legacy or file
-behavior. See [deployment configuration](docs/DEPLOY.md#当前磁盘淘汰策略请求值不等于生效值)
-for the fields and source labels. This does not describe the pinned release
-binary used in the quickstart below.
+Explicit `--slab-eviction-policy lifetime` or
+`DFKV_SLAB_EVICTION_POLICY=lifetime` now activates the real slab lifetime policy.
+The CLI flag takes precedence over the environment; explicit `legacy` remains
+available. **The default has not switched:** unspecified slab policy still
+reports `requested=lifetime`, `effective=legacy`, `staged=true`. Explicit lifetime
+is rejected for the file backend. Lifetime RAM write-back requires explicit
+`DFKV_PUT_ACK_MODE=disk` before storage opens.
+See [R45 configuration and recovery](docs/DISK_LIFETIME_R45.md) and
+[deployment configuration](docs/DEPLOY.md#当前磁盘淘汰策略请求值不等于生效值).
+This describes the development branch, not the pinned quickstart release below.
 
 ## Architecture at a glance
 

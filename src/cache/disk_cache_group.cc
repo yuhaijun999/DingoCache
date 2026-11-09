@@ -49,12 +49,82 @@ bool MatchesPolicyName(std::string_view text, std::string_view expected) {
   return true;
 }
 
-// Report the settled request and Stage 0 gate without parsing inactive values.
+struct LifetimeParameter {
+  const char* name;
+  uint64_t DiskLifetimeConfig::*member;
+};
+
+constexpr LifetimeParameter kLifetimeParameters[] = {
+    {"DFKV_SLAB_LIFE_BASE_SEC", &DiskLifetimeConfig::base_sec},
+    {"DFKV_SLAB_LIFE_READ_BONUS_SEC", &DiskLifetimeConfig::read_bonus_sec},
+    {"DFKV_SLAB_LIFE_MAX_READS", &DiskLifetimeConfig::max_reads},
+    {"DFKV_SLAB_PROTECT_SEC", &DiskLifetimeConfig::protect_sec},
+    {"DFKV_SLAB_PROTECT_SLOWDOWN", &DiskLifetimeConfig::slowdown},
+    {"DFKV_SLAB_KEEP_SCORE_SEC", &DiskLifetimeConfig::keep_score_sec},
+    {"DFKV_SLAB_BUCKET_SEC", &DiskLifetimeConfig::bucket_sec},
+    {"DFKV_SLAB_BUCKET_COUNT", &DiskLifetimeConfig::bucket_count},
+    {"DFKV_SLAB_EVICT_LOW_PCT", &DiskLifetimeConfig::low_pct},
+    {"DFKV_SLAB_EVICT_HIGH_PCT", &DiskLifetimeConfig::high_pct},
+};
+
+// Only the explicitly active policy reads these values. Legacy/shadow must
+// tolerate stale, even invalid lifetime-only environment settings.
+bool ReadLifetimeConfig(DiskLifetimeConfig* config, std::string* error) {
+  std::string supplied;
+  for (const LifetimeParameter& parameter : kLifetimeParameters) {
+    const char* text = std::getenv(parameter.name);
+    if (text == nullptr) continue;
+    if (!ParseDiskLifetimeUnsigned(parameter.name, text,
+                                   &(config->*parameter.member), error))
+      return false;
+    supplied += std::string(parameter.name) + "='" + text + "' ";
+  }
+  if (const char* text = std::getenv("DFKV_SLAB_PROTECT_BOOST_SEC")) {
+    uint64_t boost = 0;
+    if (!ParseDiskLifetimeUnsigned("DFKV_SLAB_PROTECT_BOOST_SEC", text, &boost,
+                                   error))
+      return false;
+    config->boost_sec = boost;
+    supplied += std::string("DFKV_SLAB_PROTECT_BOOST_SEC='") + text + "' ";
+  }
+  if (ValidateDiskLifetimeConfig(*config, error)) return true;
+  // Range/relationship errors otherwise serialize decoded numbers. Retain
+  // original spellings too (for example a zero-prefixed out-of-range value).
+  if (!supplied.empty()) *error += "; supplied: " + supplied;
+  return false;
+}
+
+void RecordLifetimeConfig(const DiskLifetimeConfig& config, bool injected) {
+  namespace cd = config_dump;
+  for (const LifetimeParameter& parameter : kLifetimeParameters) {
+    const cd::Source source =
+        std::getenv(parameter.name) != nullptr
+            ? cd::Source::kEnv
+            : (injected ? cd::Source::kArg : cd::Source::kDefault);
+    cd::Record(parameter.name, std::to_string(config.*parameter.member),
+               source);
+  }
+  // Validation has proved this derived expression fits before recording it.
+  const uint64_t boost = config.boost_sec.value_or(
+      config.base_sec + config.read_bonus_sec * config.max_reads);
+  const cd::Source boost_source =
+      std::getenv("DFKV_SLAB_PROTECT_BOOST_SEC") != nullptr
+          ? cd::Source::kEnv
+          : (injected && config.boost_sec.has_value() ? cd::Source::kArg
+                                                      : cd::Source::kDefault);
+  cd::Record("DFKV_SLAB_PROTECT_BOOST_SEC", std::to_string(boost),
+             boost_source);
+}
+
+// Report the requested policy separately from the active implementation.
 // Only the entrypoint can later refine an API argument's provenance to a flag.
 void RecordDiskEvictionConfig(const DiskEvictionConfigResult& config,
                               const DiskEvictionConfigInput& input,
-                              bool internal_eviction) {
+                              bool internal_eviction,
+                              const DiskLifetimeConfig* lifetime_config,
+                              bool injected_config) {
   namespace cd = config_dump;
+  const bool formal_lifetime = lifetime_config != nullptr;
   cd::Source policy_source = cd::Source::kDefault;
   if (config.source == DiskEvictionPolicySource::kCommandLine) {
     policy_source = cd::Source::kArg;
@@ -77,16 +147,22 @@ void RecordDiskEvictionConfig(const DiskEvictionConfigResult& config,
   cd::Record("disk_eviction_requested", requested, policy_source);
   // These are built-in readiness decisions, not independently configurable
   // knobs.
-  cd::Record("disk_eviction_effective",
-             internal_eviction ? "internal_test_only"
-                               : (slab ? "legacy" : "not_applicable"),
-             cd::Source::kDefault);
+  const char* effective = slab ? "legacy" : "not_applicable";
+  if (internal_eviction) effective = "internal_test_only";
+  if (formal_lifetime) effective = "lifetime";
+  cd::Record("disk_eviction_effective", effective, cd::Source::kDefault);
   cd::Record("disk_eviction_internal_test",
-             internal_eviction ? "lifetime" : "off",
-             internal_eviction ? cd::Source::kArg : cd::Source::kDefault);
-  cd::Record("disk_eviction_staged",
-             slab && requested == "lifetime" ? "true" : "false",
-             cd::Source::kDefault);
+             internal_eviction && !formal_lifetime ? "lifetime" : "off",
+             internal_eviction && !formal_lifetime ? cd::Source::kArg
+                                                   : cd::Source::kDefault);
+  cd::Record(
+      "disk_eviction_staged",
+      slab && requested == "lifetime" && !formal_lifetime ? "true" : "false",
+      cd::Source::kDefault);
+  if (formal_lifetime && lifetime_config != nullptr) {
+    RecordLifetimeConfig(*lifetime_config, injected_config);
+    return;
+  }
   bool configured = false;
   for (const char* name :
        {"DFKV_SLAB_LIFE_BASE_SEC", "DFKV_SLAB_LIFE_READ_BONUS_SEC",
@@ -324,25 +400,29 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     fail(config.error);
     return;
   }
-  // Parsing a lifetime request is valid, but opening storage with it must wait
-  // for the implementation/recovery gate. Never silently fall back for an
-  // explicit request; an unspecified default still uses the legacy allocator.
-  if (config.policy == DiskEvictionPolicy::kLifetime &&
-      config.source != DiskEvictionPolicySource::kDefault) {
-    const char* name = config_input.cli_policy.has_value()
-                           ? "--slab-eviction-policy"
-                           : "DFKV_SLAB_EVICTION_POLICY";
-    const std::string_view value =
-        config_input.cli_policy.value_or(config_input.env_policy.value_or(""));
-    fail(std::string(name) + "='" + std::string(value) +
-         "' is not ready before stage 4.5; use 'legacy'");
-    return;
-  }
   const bool use_slab = config.engine == DiskEvictionEngine::kSlab;
+  const bool formal_lifetime =
+      use_slab && config.policy == DiskEvictionPolicy::kLifetime &&
+      config.source != DiskEvictionPolicySource::kDefault;
+  const bool injected_config = opt.lifetime_config.has_value();
+  if (formal_lifetime) {
+    DiskLifetimeConfig lifetime =
+        opt.lifetime_config.value_or(DiskLifetimeConfig{});
+    std::string error;
+    if (!ReadLifetimeConfig(&lifetime, &error)) {
+      fail(error);
+      return;
+    }
+    opt.lifetime_config = lifetime;
+    opt.lifetime_class_eviction = true;
+  }
+  // Until the separate default-policy flip, an unspecified request still uses
+  // staged legacy. Only an explicit lifetime choice enables the public path.
   engine_ = use_slab ? "slab" : "file";
   if (opt.lifetime_class_eviction) {
     if (!use_slab || opt.engine_factory || !opt.lifetime_config.has_value()) {
-      fail("internal lifetime eviction requires real slabs and scoring config");
+      fail(std::string(formal_lifetime ? "explicit" : "internal") +
+           " lifetime eviction requires real slabs and scoring config");
       return;
     }
     // Node constructs this group BEFORE parsing/allocating its RAM tier.
@@ -361,18 +441,18 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     if (ram_enabled && !mode_text.empty() && mode_text != "writeback" &&
         mode_text != "writearound") {
       fail("DFKV_RAM_WRITE_MODE='" + std::string(mode_text) +
-           "' must be 'writeback' or 'writearound' for internal lifetime");
+           "' must be 'writeback' or 'writearound' for lifetime");
       return;
     }
     if (ram_enabled && !ack_text.empty() && ack_text != "ram" &&
         ack_text != "disk") {
       fail("DFKV_PUT_ACK_MODE='" + std::string(ack_text) +
-           "' must be 'ram' or 'disk' for internal lifetime");
+           "' must be 'ram' or 'disk' for lifetime");
       return;
     }
     if (ram_enabled && mode_text != "writearound" && ack_text != "disk") {
       fail("DFKV_PUT_ACK_MODE='" + std::string(ack_text) +
-           "' requires explicit 'disk' for internal lifetime RAM write-back "
+           "' requires explicit 'disk' for lifetime RAM write-back "
            "(DFKV_RAM_WRITE_MODE='" +
            std::string(mode_text) + "')");
       return;
@@ -501,6 +581,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       so.lifetime_clock = lifetime_clock_;
       so.lifetime_config = opt.lifetime_config;
       so.lifetime_class_eviction = opt.lifetime_class_eviction;
+      so.lifetime_recovery_two_reads = formal_lifetime;
       std::string error;
       if (!DiskSlabStore::ValidateGeometry(so, &error)) {
         fail(so.dir + ": " + error +
@@ -554,7 +635,11 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     ring_.AddNode(dir, disk_weight);
   }
   if (healthy_)
-    RecordDiskEvictionConfig(config, config_input, opt.lifetime_class_eviction);
+    RecordDiskEvictionConfig(config, config_input, opt.lifetime_class_eviction,
+                             formal_lifetime && opt.lifetime_config.has_value()
+                                 ? &*opt.lifetime_config
+                                 : nullptr,
+                             injected_config);
   ring_.Build();
   if (disks_.size() > 1) {
     auto points = ring_.NodePointCounts();

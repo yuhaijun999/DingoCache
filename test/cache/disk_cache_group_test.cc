@@ -508,7 +508,7 @@ TEST_F(DiskGroupTest,
 
 TEST_F(DiskGroupTest, InvalidPolicyRejectsBeforeAnyDiskFactory) {
   for (const std::string engine : {"slab", "file"}) {
-    for (const std::string policy : {"", "unknown", "LiFeTiMe"}) {
+    for (const std::string policy : {"", "unknown"}) {
       SCOPED_TRACE(engine + ":" + policy);
       const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", policy);
       size_t constructions = 0;
@@ -551,23 +551,21 @@ TEST_F(DiskGroupTest, ExplicitLegacyOverridesPolicyEnvironment) {
   EXPECT_EQ(actual, value);
 }
 
-TEST_F(DiskGroupTest, ExplicitEmptyOrUnreadyPolicyNeverOpensDirectory) {
+TEST_F(DiskGroupTest, ExplicitEmptyPolicyNeverOpensDirectory) {
   const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "legacy");
-  for (const std::string policy : {"", "lifetime"}) {
-    SCOPED_TRACE(policy);
-    DiskCacheGroup::Options options;
-    options.cache_dirs = {base_.string()};
-    options.engine = "slab";
-    options.eviction_policy = policy;
-    const DiskCacheGroup group(options);
-    EXPECT_FALSE(group.Healthy());
-    EXPECT_EQ(group.DiskCount(), 0U);
-    EXPECT_NE(group.StartupError().find("--slab-eviction-policy"),
-              std::string::npos);
-    EXPECT_NE(group.StartupError().find("='" + policy + "'"),
-              std::string::npos);
-    EXPECT_FALSE(fs::exists(base_));
-  }
+  const std::string policy;
+  SCOPED_TRACE(policy);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {base_.string()};
+  options.engine = "slab";
+  options.eviction_policy = policy;
+  const DiskCacheGroup group(options);
+  EXPECT_FALSE(group.Healthy());
+  EXPECT_EQ(group.DiskCount(), 0U);
+  EXPECT_NE(group.StartupError().find("--slab-eviction-policy"),
+            std::string::npos);
+  EXPECT_NE(group.StartupError().find("='" + policy + "'"), std::string::npos);
+  EXPECT_FALSE(fs::exists(base_));
 }
 
 TEST_F(DiskGroupTest, DefaultSlabStillStoresDataWithInactiveLifetimeNumbers) {
@@ -590,7 +588,7 @@ TEST_F(DiskGroupTest, DefaultSlabStillStoresDataWithInactiveLifetimeNumbers) {
 }
 
 TEST_F(DiskGroupTest, KvNodeServerRejectsPolicyBeforeStorageInitialization) {
-  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "lifetime");
+  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY", "unknown");
   const ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
   KvNodeServer server(base_.string(), 1ull << 30);
   EXPECT_FALSE(server.Healthy());
@@ -603,9 +601,8 @@ TEST_F(DiskGroupTest, KvNodeServerExplicitOptionsOverridePolicyEnvironment) {
   DiskCacheGroup::Options options{{base_.string()}, 1ull << 30, "slab"};
   options.eviction_policy = "lifetime";
   KvNodeServer server(options);
-  EXPECT_FALSE(server.Healthy());
-  EXPECT_EQ(server.Start(0), Status::kIOError);
-  EXPECT_FALSE(fs::exists(base_));
+  EXPECT_TRUE(server.Healthy());
+  EXPECT_TRUE(fs::exists(base_));
 }
 
 TEST(DiskSlabGeometry, ValidatesBoundariesWithoutOpeningStorage) {
@@ -1617,14 +1614,15 @@ TEST_F(SharedLifetimeClockTest, InvalidScoringInputsRejectEveryDiskBeforeOpen) {
   }
 }
 
-TEST_F(SharedLifetimeClockTest, ScoringSnapshotDoesNotOpenPublicPolicyGate) {
+TEST_F(SharedLifetimeClockTest, ScoringSnapshotOpensExplicitLifetimePolicy) {
   DiskCacheGroup::Options options = Options();
   options.lifetime_config = DiskLifetimeConfig{};
   options.eviction_policy = "lifetime";
   const DiskCacheGroup group(options);
-  EXPECT_FALSE(group.Healthy());
-  EXPECT_NE(group.StartupError().find("stage 4.5"), std::string::npos);
-  EXPECT_FALSE(fs::exists(base_));
+  EXPECT_TRUE(group.Healthy()) << group.StartupError();
+  EXPECT_TRUE(group.TracksLifetimeState());
+  EXPECT_TRUE(group.HasLifetimeClock());
+  EXPECT_TRUE(fs::exists(base_));
 }
 
 TEST_F(SharedLifetimeClockTest,

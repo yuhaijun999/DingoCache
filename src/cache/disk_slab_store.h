@@ -91,9 +91,12 @@ class DiskSlabStore : public StoreEngine {
     // a usable clock with matching H and also enables resident identities.
     // Absent by default; does not select a new eviction policy.
     std::optional<DiskLifetimeConfig> lifetime_config{};
-    // Internal class selector gate, never set by group/CLI. Requires scoring;
-    // its background path runs score watermarks/classes, but no staged donors.
+    // Runtime selector gate. Group enables it for explicit lifetime; an
+    // injected scoring snapshot alone still preserves legacy selection.
     bool lifetime_class_eviction = false;
+    // Formal clean recovery uses virtual n=2. Internal staging fixtures keep
+    // n=1; neither seed represents successful business reads or disk history.
+    bool lifetime_recovery_two_reads = false;
   };
 
   // Enabled, nonempty logical successes partition into exactly one outcome.
