@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -158,6 +160,13 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
   assert(opt_.lifetime_bucket_count == 0 ||
          (opt_.track_lifetime_state && opt_.lifetime_bucket_sec > 0 &&
           opt_.lifetime_bucket_count <= 64));
+  assert((opt_.lifetime_donor_config == nullptr) ==
+         (opt_.lifetime_donor_clock == nullptr));
+  assert(
+      opt_.lifetime_donor_config == nullptr ||
+      (opt_.lifetime_bucket_count != 0 &&
+       opt_.lifetime_donor_config->bucket_count == opt_.lifetime_bucket_count &&
+       opt_.lifetime_donor_config->bucket_sec == opt_.lifetime_bucket_sec));
   if (opt_.align == 0) opt_.align = 1;
   if (opt_.num_extents == 0) opt_.num_extents = 1;
   if (opt_.max_waste < 0) opt_.max_waste = 0;
@@ -1003,9 +1012,157 @@ bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
   return false;
 }
 
+SlabAllocator::ExtentBindResult SlabAllocator::StealLifetimeDonorLocked(
+    size_t target_cls, size_t donor_cls, size_t min_donor_extents,
+    uint64_t cold_before, std::vector<BlockKey>* evicted,
+    bool* reclaim_denied) {
+  if (!ReclaimAllowed(reclaim_denied)) return ExtentBindResult::kReclaimDenied;
+  const DiskLifetimeConfig& config = *opt_.lifetime_donor_config;
+  const DiskLifetimeClock& clock = *opt_.lifetime_donor_clock;
+  uint32_t now = 0;
+  if (!clock.TryDrainNow(&now)) {
+    if (reclaim_denied != nullptr) *reclaim_denied = true;
+    return ExtentBindResult::kReclaimDenied;
+  }
+  const std::chrono::steady_clock::time_point started =
+      std::chrono::steady_clock::now();
+  struct Candidate {
+    uint32_t extent = kNoSlot;
+    uint64_t protected_count = 0;
+    uint64_t protected_bytes = 0;
+  };
+  const auto coarse_less = [this](const Candidate& left,
+                                  const Candidate& right) {
+    const ExtentMeta& a = extents_[left.extent];
+    const ExtentMeta& b = extents_[right.extent];
+    return std::make_tuple(left.protected_count, a.useful_bytes,
+                           UINT32_MAX - a.free_slots, left.extent) <
+           std::make_tuple(right.protected_count, b.useful_bytes,
+                           UINT32_MAX - b.free_slots, right.extent);
+  };
+  const auto precise_less = [this](const Candidate& left,
+                                   const Candidate& right) {
+    const ExtentMeta& a = extents_[left.extent];
+    const ExtentMeta& b = extents_[right.extent];
+    return std::make_tuple(left.protected_count, left.protected_bytes,
+                           a.useful_bytes, UINT32_MAX - a.free_slots,
+                           left.extent) <
+           std::make_tuple(right.protected_count, right.protected_bytes,
+                           b.useful_bytes, UINT32_MAX - b.free_slots,
+                           right.extent);
+  };
+  constexpr size_t kMaxExtents = 8;
+  constexpr uint32_t kMaxResidents = 8192;
+  std::array<Candidate, kMaxExtents> candidates{};
+  size_t count = 0;
+  Candidate fallback;
+  // Visit the entire configured pool exactly once. Keeping only the eight
+  // best individually inspectable candidates costs O(8*E), not an E-sized
+  // allocation/sort, and cannot hide a legal donor beyond a fixed prefix.
+  for (uint32_t e = 0; e < extents_.size(); ++e) {
+    ++lifetime_donor_stats_.coarse_extents;
+    const ExtentMeta& extent = extents_[e];
+    if (extent.cls == kUnbound || extent.cls == static_cast<int>(target_cls) ||
+        extent.pinned != 0 ||
+        (donor_cls < classes_.size() &&
+         extent.cls != static_cast<int>(donor_cls)) ||
+        classes_[static_cast<size_t>(extent.cls)].bound_extents <=
+            min_donor_extents ||
+        (cold_before != 0 && extent.youngest_seq >= cold_before))
+      continue;
+    const Candidate candidate{e, LifetimeProtectedEstimateLocked(e, now), 0};
+    if (fallback.extent == kNoSlot || coarse_less(candidate, fallback))
+      fallback = candidate;
+    if (extent.resident_count > kMaxResidents) continue;
+    size_t position = 0;
+    while (position < count && !coarse_less(candidate, candidates[position]))
+      ++position;
+    if (position == kMaxExtents) continue;
+    count = std::min(count + 1, kMaxExtents);
+    for (size_t at = count - 1; at > position; --at)
+      candidates[at] = candidates[at - 1];
+    candidates[position] = candidate;
+  }
+  Candidate best;
+  uint32_t visits = 0;
+  for (size_t at = 0; at < count; ++at) {
+    Candidate candidate = candidates[at];
+    const ExtentMeta& extent = extents_[candidate.extent];
+    if (extent.resident_count > kMaxResidents - visits) break;
+    candidate.protected_count = 0;
+    uint32_t current = extent.resident_head;
+    uint32_t inspected = 0;
+    bool complete = true;
+    while (current != kNoSlot && inspected < extent.resident_count) {
+      ++inspected;
+      ++visits;
+      ++lifetime_donor_stats_.precise_residents;
+      const SlotMeta& meta = slots_[current];
+      const std::optional<DiskLifetimeState>& state =
+          resident_lifetime_states_[current];
+      if (!meta.live || resident_generations_[current] == 0 ||
+          !state.has_value()) {
+        complete = false;  // Unknown is not an exactly scored resident.
+        break;
+      }
+      if (DiskLifetimeScore(config, state->anchor, state->scoring_reads(),
+                            state->first_early_read(), state->write_armed(),
+                            now) >
+          static_cast<int64_t>(config.keep_score_sec)) {
+        ++candidate.protected_count;
+        candidate.protected_bytes += meta.useful_bytes;
+      }
+      current = meta.extent_next;
+    }
+    if (!complete || current != kNoSlot || inspected != extent.resident_count)
+      continue;  // No partial extent may enter the exact ranking.
+    ++lifetime_donor_stats_.precise_extents;
+    if (best.extent == kNoSlot || precise_less(candidate, best))
+      best = candidate;
+  }
+  if (best.extent == kNoSlot && fallback.extent != kNoSlot) {
+    best = fallback;
+    ++lifetime_donor_stats_.budget_fallback;
+  }
+  lifetime_donor_stats_.selection_ns += static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started)
+          .count());
+  if (best.extent == kNoSlot) {
+    ++lifetime_donor_stats_.unavailable;
+    return ExtentBindResult::kUnavailable;
+  }
+  // No candidate crosses an A-lock boundary. Recheck health/time immediately
+  // before beginning the only persistence attempt selected by this decision.
+  if (!ReclaimAllowed(reclaim_denied) || !clock.TryDrainNow(&now)) {
+    if (reclaim_denied != nullptr) *reclaim_denied = true;
+    return ExtentBindResult::kReclaimDenied;
+  }
+  const uint32_t residents = extents_[best.extent].resident_count;
+  const std::chrono::steady_clock::time_point persistence_started =
+      std::chrono::steady_clock::now();
+  const ExtentBindResult result =
+      StealExtentLocked(best.extent, target_cls, evicted, reclaim_denied);
+  // Whole-extent invalidation/sync and release are separate from the bounded
+  // selection work. Their cost may exceed the 8192-resident inspection cap.
+  lifetime_donor_stats_.persistence_ns += static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - persistence_started)
+          .count());
+  if (result == ExtentBindResult::kPersistenceError)
+    ++lifetime_donor_stats_.persistence_errors;
+  if (result == ExtentBindResult::kBound)
+    lifetime_donor_stats_.released_residents += residents;
+  return result;
+}
+
 SlabAllocator::ExtentBindResult SlabAllocator::StealExtentFor(
     size_t target_cls, std::vector<BlockKey>* evicted, size_t min_donor_extents,
     bool* reclaim_denied) {
+  if (opt_.lifetime_donor_config != nullptr)
+    return StealLifetimeDonorLocked(target_cls, classes_.size(),
+                                    min_donor_extents, 0, evicted,
+                                    reclaim_denied);
   if (!ReclaimAllowed(reclaim_denied)) return ExtentBindResult::kReclaimDenied;
   int best = -1;
   uint64_t best_heat = std::numeric_limits<uint64_t>::max();
@@ -1042,6 +1199,12 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealColdExtentFor(
   const uint64_t window = cold_window_ ? cold_window_ : index_.size();
   if (window == 0 || put_seq_ <= window) return ExtentBindResult::kUnavailable;
   const uint64_t cold_before = put_seq_ - window;
+  if (opt_.lifetime_donor_config != nullptr) {
+    const ExtentBindResult result = StealLifetimeDonorLocked(
+        target_cls, classes_.size(), 0, cold_before, evicted, reclaim_denied);
+    if (result == ExtentBindResult::kBound) ++cold_steals_;
+    return result;
+  }
   int best = -1;
   uint64_t best_heat = std::numeric_limits<uint64_t>::max();
   uint64_t best_useful = std::numeric_limits<uint64_t>::max();
@@ -1105,11 +1268,23 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
 
 bool SlabAllocator::StealFrom(size_t donor_cls, size_t target_cls,
                               std::vector<BlockKey>* evicted) {
-  std::lock_guard<std::mutex> lock(mu_);
+  return StealFromResult(donor_cls, target_cls, evicted) ==
+         ExtentBindResult::kBound;
+}
+
+SlabAllocator::ExtentBindResult SlabAllocator::StealFromResult(
+    size_t donor_cls, size_t target_cls, std::vector<BlockKey>* evicted,
+    size_t min_donor_extents) {
+  const std::lock_guard<std::mutex> lock(mu_);
   if (donor_cls == target_cls || donor_cls >= classes_.size() ||
       target_cls >= classes_.size() || classes_[target_cls].slots_per_extent == 0)
-    return false;
-  if (!ReclaimAllowed()) return false;
+    return ExtentBindResult::kUnavailable;
+  if (classes_[donor_cls].bound_extents <= min_donor_extents)
+    return ExtentBindResult::kUnavailable;
+  if (opt_.lifetime_donor_config != nullptr)
+    return StealLifetimeDonorLocked(target_cls, donor_cls, min_donor_extents, 0,
+                                    evicted);
+  if (!ReclaimAllowed()) return ExtentBindResult::kReclaimDenied;
   int best = -1;
   uint64_t best_heat = std::numeric_limits<uint64_t>::max();
   uint64_t best_useful = std::numeric_limits<uint64_t>::max();
@@ -1128,9 +1303,9 @@ bool SlabAllocator::StealFrom(size_t donor_cls, size_t target_cls,
       best_free = extent.free_slots;
     }
   }
-  return best >= 0 &&
-         StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted) ==
-             ExtentBindResult::kBound;
+  return best >= 0 ? StealExtentLocked(static_cast<uint32_t>(best), target_cls,
+                                       evicted)
+                   : ExtentBindResult::kUnavailable;
 }
 
 bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
@@ -1615,6 +1790,11 @@ uint64_t SlabAllocator::ColdSteals() const {
   std::lock_guard<std::mutex> lock(mu_);
   return cold_steals_;
 }
+SlabAllocator::LifetimeDonorStats SlabAllocator::DonorStats() const {
+  const std::lock_guard<std::mutex> lock(mu_);
+  return lifetime_donor_stats_;
+}
+
 uint64_t SlabAllocator::WatermarkEvictions() const {
   std::lock_guard<std::mutex> lock(mu_);
   return watermark_evictions_;

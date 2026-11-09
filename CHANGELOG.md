@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Unify internally enabled lifetime extent-donor selection across foreground,
+  cold-steal and background growth. Scan the full pool, bound exact inspection
+  to eight extents/8192 residents, and stop immediately after selected-donor
+  persistence failure. Export separate selection and release-work counters.
+
 - Track internally enabled lifetime protection in per-extent expiry buckets.
   Bind registration tokens to physical residents, preserve accounting after
   failed invalidation, and avoid stale-page debits during reads or slot reuse.

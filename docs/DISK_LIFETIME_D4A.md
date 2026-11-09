@@ -54,4 +54,5 @@ KEEP0/M1/2/4/63、宽代际、并发、真实元数据失败和恢复时钟。
 测量与日志：`.omx/evidence/d4a-buckets/`；阶段报告：
 `.omx/plans/implementation-d4a-buckets.md`。本轮不宣称吞吐、p99或真实硬件验收。
 
-下一步D4b才接入三处donor的统一有界选择与持久化失败分流，尚未开始。
+D4b三处donor统一选择与失败分流见 `docs/DISK_LIFETIME_D4B.md`；
+正式恢复初值和公开显式lifetime仍待R45。

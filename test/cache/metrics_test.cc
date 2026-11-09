@@ -173,7 +173,16 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
         "dfkv_slab_lifetime_watermark_budget_exhausted_total",
         "dfkv_slab_lifetime_watermark_no_candidate_total",
         "dfkv_slab_lifetime_watermark_pin_skips_total",
-        "dfkv_slab_lifetime_watermark_protected_victims_total"}) {
+        "dfkv_slab_lifetime_watermark_protected_victims_total",
+        "dfkv_slab_lifetime_donor_coarse_extents_total",
+        "dfkv_slab_lifetime_donor_precise_extents_total",
+        "dfkv_slab_lifetime_donor_precise_residents_total",
+        "dfkv_slab_lifetime_donor_budget_fallback_total",
+        "dfkv_slab_lifetime_donor_unavailable_total",
+        "dfkv_slab_lifetime_donor_persistence_errors_total",
+        "dfkv_slab_lifetime_donor_selection_ns_total",
+        "dfkv_slab_lifetime_donor_persistence_ns_total",
+        "dfkv_slab_lifetime_donor_released_residents_total"}) {
     EXPECT_NE(text.find(std::string(name) + " 0\n"), std::string::npos);
   }
   s->Stop();

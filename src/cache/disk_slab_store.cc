@@ -554,6 +554,9 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   if (opt_.lifetime_clock)
     ao.can_reclaim = [this] { return CanStartReclaim(); };
   if (opt_.lifetime_class_eviction && opt_.lifetime_config.has_value()) {
+    // opt_ owns these immutable inputs for the entire allocator lifetime.
+    ao.lifetime_donor_config = &*opt_.lifetime_config;
+    ao.lifetime_donor_clock = opt_.lifetime_clock.get();
     ao.lifetime_bucket_sec = opt_.lifetime_config->bucket_sec;
     ao.lifetime_bucket_count =
         static_cast<uint32_t>(opt_.lifetime_config->bucket_count);
@@ -2490,6 +2493,61 @@ bool DiskSlabStore::ReclaimLifetimeClass(size_t cls_index, size_t target_free,
   }
 }
 
+bool DiskSlabStore::ReclaimLifetimeGrowTick() {
+  const std::vector<SlabAllocator::ClassStat> classes = alloc_->Classes();
+  std::vector<uint64_t> delta(classes.size(), 0);
+  std::vector<uint32_t> extents(classes.size(), 0);
+  // Do not consume reclaim_last_puts_: the class pass needs this same demand.
+  for (size_t i = 0; i < classes.size(); ++i) {
+    const uint64_t previous =
+        i < reclaim_last_puts_.size() ? reclaim_last_puts_[i] : 0;
+    delta[i] = classes[i].puts - previous;
+    extents[i] = classes[i].extents;
+  }
+  for (size_t target = 0; target < classes.size(); ++target) {
+    const SlabAllocator::ClassStat& cls = classes[target];
+    if (delta[target] == 0 || cls.slots_per_extent == 0) continue;
+    const uint64_t demand =
+        delta[target] > UINT64_MAX / 2 ? UINT64_MAX : 2 * delta[target];
+    const uint64_t want = std::max<uint64_t>(64, demand);
+    const uint64_t free_slots = cls.free_slots;
+    if (free_slots >= want || alloc_->PoolExtents() != 0) continue;
+    const uint64_t deficit = want - free_slots;
+    size_t remaining = static_cast<size_t>(std::min<uint64_t>(
+        kGrowExtentsPerTick, deficit / cls.slots_per_extent +
+                                 (deficit % cls.slots_per_extent != 0)));
+    while (remaining != 0) {
+      size_t donor = classes.size();
+      for (size_t d = 0; d < classes.size(); ++d) {
+        if (d == target || extents[d] <= SlabAllocator::kStripeWays ||
+            delta[d] > delta[target] / 4)
+          continue;
+        if (donor == classes.size() || delta[d] < delta[donor] ||
+            (delta[d] == delta[donor] && extents[d] > extents[donor]))
+          donor = d;
+      }
+      if (donor == classes.size()) break;
+      std::vector<BlockKey> evicted;
+      const std::lock_guard<std::mutex> lock(mu_);
+      if (!CanStartReclaim()) return false;
+      if (alloc_->PoolExtents() != 0) break;
+      const SlabAllocator::ExtentBindResult result = alloc_->StealFromResult(
+          donor, target, &evicted, SlabAllocator::kStripeWays);
+      for (const BlockKey& key : evicted)
+        evicted_bytes_ += ErasePayloadLocked(key.Filename());
+      if (result == SlabAllocator::ExtentBindResult::kUnavailable) {
+        extents[donor] = 0;
+        continue;
+      }
+      if (result != SlabAllocator::ExtentBindResult::kBound) return false;
+      --extents[donor];
+      rebalanced_.fetch_add(1, std::memory_order_relaxed);
+      --remaining;
+    }
+  }
+  return true;
+}
+
 void DiskSlabStore::ReclaimLifetimeTick(size_t max_victims) {
   if (!CanStartReclaim() || max_victims == 0) return;
   const std::vector<SlabAllocator::ClassStat> classes = alloc_->Classes();
@@ -2610,8 +2668,9 @@ void DiskSlabStore::ReclaimTick(
   }
   if (!CanStartReclaim()) return;
   if (opt_.lifetime_class_eviction) {
+    if (!ReclaimLifetimeGrowTick()) return;
     ReclaimLifetimeTick();
-    return;  // Lifetime donor growth remains a separate, disabled stage.
+    return;  // Never mix the legacy GROW/CLOCK path into lifetime reclaim.
   }
   const auto classes = alloc_->Classes();
   if (reclaim_last_puts_.size() < classes.size())
@@ -2761,6 +2820,16 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.failed = !Healthy();
   st.failed_disks = st.failed ? 1 : 0;
   if (alloc_) {
+    const SlabAllocator::LifetimeDonorStats donor = alloc_->DonorStats();
+    st.lifetime_donor_coarse_extents = donor.coarse_extents;
+    st.lifetime_donor_precise_extents = donor.precise_extents;
+    st.lifetime_donor_precise_residents = donor.precise_residents;
+    st.lifetime_donor_budget_fallback = donor.budget_fallback;
+    st.lifetime_donor_unavailable = donor.unavailable;
+    st.lifetime_donor_persistence_errors = donor.persistence_errors;
+    st.lifetime_donor_selection_ns = donor.selection_ns;
+    st.lifetime_donor_persistence_ns = donor.persistence_ns;
+    st.lifetime_donor_released_residents = donor.released_residents;
     st.steals = alloc_->Steals();
     st.cold_steals = alloc_->ColdSteals();
     st.watermark_evictions = alloc_->WatermarkEvictions();

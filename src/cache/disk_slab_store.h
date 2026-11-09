@@ -124,6 +124,15 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_watermark_no_candidate = 0;
     uint64_t lifetime_watermark_pin_skips = 0;
     uint64_t lifetime_watermark_protected_victims = 0;
+    uint64_t lifetime_donor_coarse_extents = 0;
+    uint64_t lifetime_donor_precise_extents = 0;
+    uint64_t lifetime_donor_precise_residents = 0;
+    uint64_t lifetime_donor_budget_fallback = 0;
+    uint64_t lifetime_donor_unavailable = 0;
+    uint64_t lifetime_donor_persistence_errors = 0;
+    uint64_t lifetime_donor_selection_ns = 0;
+    uint64_t lifetime_donor_persistence_ns = 0;
+    uint64_t lifetime_donor_released_residents = 0;
 
     uint64_t dio_write_fallbacks = 0;
     uint64_t dio_read_fallbacks = 0;
@@ -548,6 +557,7 @@ class DiskSlabStore : public StoreEngine {
   bool CanStartReclaim() const;
   // Reclaimer-thread-only pending targets keep budget-limited work eligible
   // on quiet ticks. Tests call manually only with the thread disabled.
+  bool ReclaimLifetimeGrowTick();
   void ReclaimLifetimeTick(size_t max_victims = 4096);
   bool ReclaimLifetimeClass(size_t cls_index, size_t target_free,
                             size_t max_victims);

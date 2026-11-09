@@ -973,6 +973,17 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_watermark_pin_skips += st.lifetime_watermark_pin_skips;
     sum.lifetime_watermark_protected_victims +=
         st.lifetime_watermark_protected_victims;
+    sum.lifetime_donor_coarse_extents += st.lifetime_donor_coarse_extents;
+    sum.lifetime_donor_precise_extents += st.lifetime_donor_precise_extents;
+    sum.lifetime_donor_precise_residents += st.lifetime_donor_precise_residents;
+    sum.lifetime_donor_budget_fallback += st.lifetime_donor_budget_fallback;
+    sum.lifetime_donor_unavailable += st.lifetime_donor_unavailable;
+    sum.lifetime_donor_persistence_errors +=
+        st.lifetime_donor_persistence_errors;
+    sum.lifetime_donor_selection_ns += st.lifetime_donor_selection_ns;
+    sum.lifetime_donor_persistence_ns += st.lifetime_donor_persistence_ns;
+    sum.lifetime_donor_released_residents +=
+        st.lifetime_donor_released_residents;
 
     sum.lifetime_reads.successful += st.lifetime_reads.successful;
     sum.lifetime_reads.applied += st.lifetime_reads.applied;

@@ -702,6 +702,29 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_watermark_protected_victims_total", "counter",
            "Lifetime watermark protected victims.",
            ss.lifetime_watermark_protected_victims);
+    metric("dfkv_slab_lifetime_donor_coarse_extents_total", "counter",
+           "Lifetime donor coarse extents.", ss.lifetime_donor_coarse_extents);
+    metric("dfkv_slab_lifetime_donor_precise_extents_total", "counter",
+           "Lifetime donor precise extents.",
+           ss.lifetime_donor_precise_extents);
+    metric("dfkv_slab_lifetime_donor_precise_residents_total", "counter",
+           "Lifetime donor precise residents.",
+           ss.lifetime_donor_precise_residents);
+    metric("dfkv_slab_lifetime_donor_budget_fallback_total", "counter",
+           "Lifetime donor budget fallback.",
+           ss.lifetime_donor_budget_fallback);
+    metric("dfkv_slab_lifetime_donor_unavailable_total", "counter",
+           "Lifetime donor unavailable.", ss.lifetime_donor_unavailable);
+    metric("dfkv_slab_lifetime_donor_persistence_errors_total", "counter",
+           "Lifetime donor persistence errors.",
+           ss.lifetime_donor_persistence_errors);
+    metric("dfkv_slab_lifetime_donor_selection_ns_total", "counter",
+           "Lifetime donor selection ns.", ss.lifetime_donor_selection_ns);
+    metric("dfkv_slab_lifetime_donor_persistence_ns_total", "counter",
+           "Lifetime donor persistence ns.", ss.lifetime_donor_persistence_ns);
+    metric("dfkv_slab_lifetime_donor_released_residents_total", "counter",
+           "Lifetime donor released residents.",
+           ss.lifetime_donor_released_residents);
     metric("dfkv_slab_lifetime_background_no_candidate_total", "counter",
            "Background class scans with no eligible candidate",
            ss.lifetime_background_no_candidate);

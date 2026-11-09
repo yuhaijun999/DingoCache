@@ -20,6 +20,47 @@ namespace dfkv {
 
 class SlabAllocatorTestPeer {
  public:
+  using ExtentBindResult = SlabAllocator::ExtentBindResult;
+  static ExtentBindResult StealGeneric(SlabAllocator& allocator, size_t target,
+                                       std::vector<BlockKey>* evicted,
+                                       size_t floor = 0) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    bool denied = false;
+    return allocator.StealExtentFor(target, evicted, floor, &denied);
+  }
+  static ExtentBindResult StealCold(SlabAllocator& allocator, size_t target,
+                                    std::vector<BlockKey>* evicted) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    bool denied = false;
+    return allocator.StealColdExtentFor(target, evicted, &denied);
+  }
+  static ExtentBindResult StealRestricted(SlabAllocator& allocator,
+                                          size_t donor, size_t target,
+                                          std::vector<BlockKey>* evicted,
+                                          size_t floor = 0) {
+    return allocator.StealFromResult(donor, target, evicted, floor);
+  }
+  static ExtentBindResult BindExtent(SlabAllocator& allocator, size_t cls,
+                                     uint32_t extent) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    return allocator.BindExtentLocked(cls, extent, false);
+  }
+  static void SetColdEligibility(SlabAllocator& allocator, uint64_t sequence,
+                                 uint64_t window,
+                                 const std::vector<uint64_t>& youngest) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    allocator.cold_steal_enabled_ = true;
+    allocator.put_seq_ = sequence;
+    allocator.cold_window_ = window;
+    for (size_t extent = 0; extent < youngest.size(); ++extent)
+      allocator.extents_[extent].youngest_seq = youngest[extent];
+  }
+  static size_t ClassIndex(const SlabAllocator& allocator, uint32_t slot_size) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    for (size_t cls = 0; cls < allocator.classes_.size(); ++cls)
+      if (allocator.classes_[cls].slot_size == slot_size) return cls;
+    return allocator.classes_.size();
+  }
   static size_t EvictLifetimeToTarget(SlabAllocator& allocator, uint64_t target,
                                       size_t max_victims,
                                       const DiskLifetimeConfig& config,

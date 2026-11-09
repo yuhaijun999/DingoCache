@@ -89,6 +89,10 @@ class SlabAllocator {
     // Derived from validated config, never independent environment reads.
     uint64_t lifetime_bucket_sec = 0;
     uint32_t lifetime_bucket_count = 0;
+    // Borrowed immutable donor context. The owning Store must outlive this
+    // allocator, as for can_reclaim. Both are null in legacy/RAM/shadow paths.
+    const DiskLifetimeConfig* lifetime_donor_config = nullptr;
+    const DiskLifetimeClock* lifetime_donor_clock = nullptr;
   };
 
   // Target write parallelism per class: Put keeps up to this many extents with
@@ -157,6 +161,18 @@ class SlabAllocator {
   uint64_t Evictions() const;
   uint64_t Steals() const;
   uint64_t ColdSteals() const;
+  struct LifetimeDonorStats {
+    uint64_t coarse_extents = 0;
+    uint64_t precise_extents = 0;
+    uint64_t precise_residents = 0;
+    uint64_t budget_fallback = 0;
+    uint64_t unavailable = 0;
+    uint64_t persistence_errors = 0;
+    uint64_t selection_ns = 0;
+    uint64_t persistence_ns = 0;
+    uint64_t released_residents = 0;
+  };
+  LifetimeDonorStats DonorStats() const;
   uint64_t WatermarkEvictions() const;
   // Local candidate: reclaim slots in refreshed actual-read/new-write order
   // until allocated bytes reach target_bytes. A call removes at most max_victims
@@ -396,6 +412,16 @@ class SlabAllocator {
   ExtentBindResult StealExtentLocked(uint32_t extent, size_t target_cls,
                                      std::vector<BlockKey>* evicted,
                                      bool* reclaim_denied = nullptr);
+  // New disk paths retain the distinction between no donor and failed
+  // persistence. The public bool wrapper preserves legacy callers.
+  ExtentBindResult StealFromResult(size_t donor_cls, size_t target_cls,
+                                   std::vector<BlockKey>* evicted,
+                                   size_t min_donor_extents = 0);
+  ExtentBindResult StealLifetimeDonorLocked(size_t target_cls, size_t donor_cls,
+                                            size_t min_donor_extents,
+                                            uint64_t cold_before,
+                                            std::vector<BlockKey>* evicted,
+                                            bool* reclaim_denied = nullptr);
 
   uint32_t AcquireSlotMetaLocked();
   void LinkBeforeHandLocked(uint32_t meta_index);
@@ -483,6 +509,7 @@ class SlabAllocator {
   uint64_t evictions_ = 0;
   uint64_t steals_ = 0;
   uint64_t cold_steals_ = 0;
+  LifetimeDonorStats lifetime_donor_stats_;
   uint64_t watermark_evictions_ = 0;
   uint64_t watermark_scan_steps_ = 0;
   uint64_t extent_returns_ = 0;

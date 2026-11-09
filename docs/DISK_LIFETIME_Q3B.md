@@ -47,7 +47,7 @@
 吞吐和p99仍是后续验收，不在本轮宣称通过。
 
 本轮只闭环Q3b；Q3c写回背压/ACK门禁及D4a保护桶账务见对应文档，
-D4b donor与R45仍后置。
+D4b donor见 `docs/DISK_LIFETIME_D4B.md`，R45仍后置。
 
 GCC13/x86_64静态布局：allocator568→576B（含对齐，RAM实例也承担固定8B），
 Store1728→1760B（四个计数32B），Stats528→560B；SlotMeta104B、links20B、
