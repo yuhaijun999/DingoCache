@@ -183,6 +183,90 @@ TEST(SlabLifetimeDonor, AllEntriesCountOnlyOccupiedDonorSlots) {
   }
 }
 
+TEST(SlabLifetimeDonor, ProtectedLossIsExactOnAllEntriesIncludingFallback) {
+  for (const bool missing_state : {false, true}) {
+    for (unsigned entry = 0; entry < 3; ++entry) {
+      SCOPED_TRACE(missing_state);
+      SCOPED_TRACE(entry);
+      const DiskLifetimeConfig config = Config();
+      uint64_t seconds = 0;
+      const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                    [&] { return seconds; });
+      SlabAllocator allocator(Options(config, clock));
+      std::vector<SlabAllocator::RestoreEntry> entries{
+          {Key(1), 4096, 0, 0, 17},
+          {Key(2), 4096, 0, 1, 31},
+          {Key(4), 4096, 1, 0, 101}};
+      if (missing_state) entries.push_back({Key(3), 4096, 0, 2, 7});
+      ASSERT_TRUE(allocator.RestoreBulk(entries));
+      seconds = 100;
+      DiskLifetimeState protected_state = RecoveredDiskLifetimeState(1);
+      protected_state.anchor = 100;
+      DiskLifetimeState expired = RecoveredDiskLifetimeState(1);
+      expired.anchor = 80;  // Score exactly KEEP at now100, not protected.
+      SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(1), 1,
+                                              &protected_state, &config, 100);
+      SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(2), 2, &expired,
+                                              &config, 100);
+      SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(4), 4,
+                                              &protected_state, &config, 100);
+      if (missing_state) {
+        SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(3), 3, nullptr,
+                                                &config, 100);
+      }
+      ASSERT_TRUE(allocator.Pin(Key(4)));
+      SlabAllocatorTestPeer::SetColdEligibility(allocator, 30, 10, {1, 1});
+      std::vector<BlockKey> evicted;
+      const Result result =
+          entry == 0
+              ? SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted)
+              : (entry == 1
+                     ? SlabAllocatorTestPeer::StealCold(allocator, 1, &evicted)
+                     : SlabAllocatorTestPeer::StealRestricted(allocator, 0, 1,
+                                                              &evicted));
+      ASSERT_EQ(result, Result::kBound);
+      const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+      EXPECT_EQ(stats.released_residents, missing_state ? 3U : 2U);
+      EXPECT_EQ(stats.protected_victims, 1U);
+      EXPECT_EQ(stats.protected_payload_bytes, 17U);
+      EXPECT_EQ(stats.unscored_victims, missing_state ? 1U : 0U);
+      EXPECT_EQ(stats.budget_fallback, missing_state ? 1U : 0U);
+      EXPECT_TRUE(allocator.Contains(Key(4)));
+      ExpectValid(allocator);
+    }
+  }
+}
+
+TEST(SlabLifetimeDonor, ProtectedLossUsesRecheckedPreWipeTime) {
+  const DiskLifetimeConfig config = Config();
+  uint64_t seconds = 0;
+  bool advance = false;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&] {
+    const uint64_t sampled = seconds;
+    if (advance) seconds = 20;
+    return sampled;
+  });
+  SlabAllocator::Options options = Options(config, clock, 4, 1);
+  options.on_extent_bind = [&](uint32_t) {
+    seconds = 1000;  // Persistence delay must not change the victim snapshot.
+    return true;
+  };
+  SlabAllocator allocator(options);
+  ASSERT_NO_FATAL_FAILURE(
+      Restore(allocator, {{Key(1), 4096, 0, 0, 17}, {Key(2), 4096, 0, 1, 31}},
+              config, 1, {0, 1}));
+  seconds = 19;
+  advance = true;
+  std::vector<BlockKey> evicted;
+  ASSERT_EQ(SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted),
+            Result::kBound);
+  const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+  EXPECT_EQ(stats.released_residents, 2U);
+  EXPECT_EQ(stats.protected_victims, 1U);
+  EXPECT_EQ(stats.protected_payload_bytes, 31U);
+  EXPECT_EQ(stats.unscored_victims, 0U);
+}
+
 TEST(SlabLifetimeDonor, ExactInspectionIsLimitedToEightCompleteExtents) {
   const DiskLifetimeConfig config = Config();
   uint64_t seconds = 0;
@@ -345,7 +429,9 @@ TEST(SlabLifetimeDonor,
   for (uint32_t slot = 0; slot < 8193; ++slot)
     entries.push_back({Key(slot + 1), 4096, 0, slot, 1});
   seconds = 100;
-  ASSERT_NO_FATAL_FAILURE(Restore(allocator, entries, config, 100));
+  std::vector<uint32_t> anchors(entries.size(), 0);
+  anchors.back() = 100;  // The last release exceeds the selection budget.
+  ASSERT_NO_FATAL_FAILURE(Restore(allocator, entries, config, 100, anchors));
   std::vector<BlockKey> evicted;
   EXPECT_EQ(SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted),
             Result::kBound);
@@ -356,6 +442,9 @@ TEST(SlabLifetimeDonor,
   EXPECT_EQ(stats.precise_residents, 0U);
   EXPECT_EQ(stats.budget_fallback, 1U);
   EXPECT_EQ(stats.released_residents, 8193U);
+  EXPECT_EQ(stats.protected_victims, 1U);
+  EXPECT_EQ(stats.protected_payload_bytes, 1U);
+  EXPECT_EQ(stats.unscored_victims, 0U);
   EXPECT_EQ(stats.freed_slot_bytes, 8193ULL * 4096);
   EXPECT_EQ(stats.freed_payload_bytes, 8193U);
   EXPECT_EQ(allocator.Count(), 0U);
@@ -388,6 +477,9 @@ TEST(SlabLifetimeDonor,
   EXPECT_EQ(stats.released_residents, 0U);
   EXPECT_EQ(stats.freed_slot_bytes, 0U);
   EXPECT_EQ(stats.freed_payload_bytes, 0U);
+  EXPECT_EQ(stats.protected_victims, 0U);
+  EXPECT_EQ(stats.protected_payload_bytes, 0U);
+  EXPECT_EQ(stats.unscored_victims, 0U);
   ExpectValid(allocator);
 }
 
@@ -417,6 +509,9 @@ TEST(SlabLifetimeDonor, BoundEmptyExtentsAreEligibleOnAllThreeEntries) {
     EXPECT_EQ(allocator.DonorStats().released_residents, 0U);
     EXPECT_EQ(allocator.DonorStats().freed_slot_bytes, 0U);
     EXPECT_EQ(allocator.DonorStats().freed_payload_bytes, 0U);
+    EXPECT_EQ(allocator.DonorStats().protected_victims, 0U);
+    EXPECT_EQ(allocator.DonorStats().protected_payload_bytes, 0U);
+    EXPECT_EQ(allocator.DonorStats().unscored_victims, 0U);
     EXPECT_TRUE(SlabAllocatorTestPeer::BucketRowEmpty(allocator, 0));
     EXPECT_EQ(allocator.DonorStats().precise_residents, 1U);
     ExpectValid(allocator);
@@ -624,6 +719,9 @@ TEST_F(LifetimeDonorStoreTest, GrowRespectsTwoExtentLimitAndEightExtentFloor) {
     EXPECT_EQ(stats.lifetime_donor_released_residents, 0U);
     EXPECT_EQ(stats.lifetime_donor_freed_slot_bytes, 0U);
     EXPECT_EQ(stats.lifetime_donor_freed_payload_bytes, 0U);
+    EXPECT_EQ(stats.lifetime_donor_protected_victims, 0U);
+    EXPECT_EQ(stats.lifetime_donor_protected_payload_bytes, 0U);
+    EXPECT_EQ(stats.lifetime_donor_unscored_victims, 0U);
     EXPECT_EQ(stats.lifetime_donor_persistence_errors, 0U);
     for (uint64_t id = 1; id <= 2; ++id) {
       std::string value;
@@ -652,6 +750,9 @@ TEST_F(LifetimeDonorStoreTest, GrowCountsResidentBytesNotExtentCapacity) {
   EXPECT_EQ(stats.lifetime_donor_released_residents, 4U);
   EXPECT_EQ(stats.lifetime_donor_freed_slot_bytes, 4U * 4096);
   EXPECT_EQ(stats.lifetime_donor_freed_payload_bytes, 68U);
+  EXPECT_EQ(stats.lifetime_donor_protected_victims, 4U);
+  EXPECT_EQ(stats.lifetime_donor_protected_payload_bytes, 68U);
+  EXPECT_EQ(stats.lifetime_donor_unscored_victims, 0U);
   EXPECT_EQ(stats.lifetime_class_victims, 0U);
   EXPECT_EQ(stats.lifetime_background_victims, 0U);
   EXPECT_EQ(stats.watermark_slot_removals, 0U);
@@ -721,6 +822,9 @@ TEST_F(LifetimeDonorStoreTest,
   EXPECT_EQ(stats.lifetime_donor_released_residents, 0U);
   EXPECT_EQ(stats.lifetime_donor_freed_slot_bytes, 0U);
   EXPECT_EQ(stats.lifetime_donor_freed_payload_bytes, 0U);
+  EXPECT_EQ(stats.lifetime_donor_protected_victims, 0U);
+  EXPECT_EQ(stats.lifetime_donor_protected_payload_bytes, 0U);
+  EXPECT_EQ(stats.lifetime_donor_unscored_victims, 0U);
   EXPECT_EQ(stats.lifetime_donor_persistence_errors, 1U);
   EXPECT_EQ(stats.lifetime_donor_coarse_extents, 19U);
   EXPECT_EQ(stats.rebalanced_extents, 0U);

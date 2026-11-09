@@ -612,6 +612,9 @@ TEST_F(LifetimeClassStoreTest, FailedNewWriteRetainsSuccessfulDonorBytes) {
     EXPECT_EQ(stats.lifetime_donor_released_residents, 2U);
     EXPECT_EQ(stats.lifetime_donor_freed_slot_bytes, 8192U);
     EXPECT_EQ(stats.lifetime_donor_freed_payload_bytes, 8U);
+    EXPECT_EQ(stats.lifetime_donor_protected_victims, 2U);
+    EXPECT_EQ(stats.lifetime_donor_protected_payload_bytes, 8U);
+    EXPECT_EQ(stats.lifetime_donor_unscored_victims, 0U);
     EXPECT_EQ(stats.lifetime_class_victims, 0U);
     EXPECT_EQ(stats.lifetime_background_victims, 0U);
     EXPECT_EQ(stats.watermark_slot_removals, 0U);

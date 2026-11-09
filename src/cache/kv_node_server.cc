@@ -594,6 +594,12 @@ std::string KvNodeServer::MetricsText() const {
            "Occupied slot bytes removed by lifetime extent donor reclaim");
     header("dfkv_slab_disk_lifetime_donor_freed_payload_bytes_total", "counter",
            "Payload bytes removed by lifetime extent donor reclaim");
+    header("dfkv_slab_disk_lifetime_donor_protected_victims_total", "counter",
+           "Released donor residents scoring strictly above KEEP");
+    header("dfkv_slab_disk_lifetime_donor_protected_payload_bytes_total",
+           "counter", "Payload bytes of released donor residents above KEEP");
+    header("dfkv_slab_disk_lifetime_donor_unscored_victims_total", "counter",
+           "Released donor residents without valid lifetime scoring state");
     for (size_t i = 0; i < group_.DiskCount(); ++i) {
       const auto st = group_.DiskWatermarkObservation(i);
       const std::string labels =
@@ -616,6 +622,12 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      sample("dfkv_slab_disk_lifetime_donor_protected_victims_total",
+             disk.lifetime_donor_protected_victims);
+      sample("dfkv_slab_disk_lifetime_donor_protected_payload_bytes_total",
+             disk.lifetime_donor_protected_payload_bytes);
+      sample("dfkv_slab_disk_lifetime_donor_unscored_victims_total",
+             disk.lifetime_donor_unscored_victims);
       sample("dfkv_slab_disk_lifetime_donor_released_residents_total",
              disk.lifetime_donor_released_residents);
       sample("dfkv_slab_disk_lifetime_donor_freed_slot_bytes_total",
@@ -792,6 +804,15 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_donor_freed_payload_bytes_total", "counter",
            "Payload bytes removed by lifetime extent donor reclaim",
            ss.lifetime_donor_freed_payload_bytes);
+    metric("dfkv_slab_lifetime_donor_protected_victims_total", "counter",
+           "Released donor residents scoring strictly above KEEP",
+           ss.lifetime_donor_protected_victims);
+    metric("dfkv_slab_lifetime_donor_protected_payload_bytes_total", "counter",
+           "Payload bytes of released donor residents above KEEP",
+           ss.lifetime_donor_protected_payload_bytes);
+    metric("dfkv_slab_lifetime_donor_unscored_victims_total", "counter",
+           "Released donor residents without valid lifetime scoring state",
+           ss.lifetime_donor_unscored_victims);
     metric("dfkv_slab_lifetime_background_no_candidate_total", "counter",
            "Background class scans with no eligible candidate",
            ss.lifetime_background_no_candidate);

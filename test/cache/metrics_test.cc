@@ -232,7 +232,10 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
         "dfkv_slab_lifetime_donor_persistence_ns_total",
         "dfkv_slab_lifetime_donor_released_residents_total",
         "dfkv_slab_lifetime_donor_freed_slot_bytes_total",
-        "dfkv_slab_lifetime_donor_freed_payload_bytes_total"}) {
+        "dfkv_slab_lifetime_donor_freed_payload_bytes_total",
+        "dfkv_slab_lifetime_donor_protected_victims_total",
+        "dfkv_slab_lifetime_donor_protected_payload_bytes_total",
+        "dfkv_slab_lifetime_donor_unscored_victims_total"}) {
     EXPECT_NE(text.find(std::string(name) + " 0\n"), std::string::npos);
   }
   const std::string labels =
@@ -240,7 +243,10 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
   for (const char* name :
        {"dfkv_slab_disk_lifetime_donor_released_residents_total",
         "dfkv_slab_disk_lifetime_donor_freed_slot_bytes_total",
-        "dfkv_slab_disk_lifetime_donor_freed_payload_bytes_total"}) {
+        "dfkv_slab_disk_lifetime_donor_freed_payload_bytes_total",
+        "dfkv_slab_disk_lifetime_donor_protected_victims_total",
+        "dfkv_slab_disk_lifetime_donor_protected_payload_bytes_total",
+        "dfkv_slab_disk_lifetime_donor_unscored_victims_total"}) {
     EXPECT_NE(text.find(std::string(name) + labels), std::string::npos);
   }
   s->Stop();
@@ -550,6 +556,15 @@ TEST(Metrics, DonorBytesAggregateAcrossDisksAndResetOnRecovery) {
       text.find("dfkv_slab_lifetime_donor_freed_slot_bytes_total 4194304\n"),
       std::string::npos);
   EXPECT_NE(text.find("dfkv_evicted_bytes_total 96\n"), std::string::npos);
+  // These NEW residents are still above KEEP. Donor release can evict them,
+  // but must report their protection separately from missing scoring state.
+  EXPECT_NE(text.find("dfkv_slab_lifetime_donor_protected_victims_total 4\n"),
+            std::string::npos);
+  EXPECT_NE(
+      text.find("dfkv_slab_lifetime_donor_protected_payload_bytes_total 96\n"),
+      std::string::npos);
+  EXPECT_NE(text.find("dfkv_slab_lifetime_donor_unscored_victims_total 0\n"),
+            std::string::npos);
   for (const char* name : {"dfkv_slab_lifetime_class_victims_total",
                            "dfkv_slab_lifetime_background_victims_total",
                            "dfkv_slab_watermark_slot_removals_total"}) {
@@ -570,14 +585,30 @@ TEST(Metrics, DonorBytesAggregateAcrossDisksAndResetOnRecovery) {
     EXPECT_NE(text.find("dfkv_slab_disk_lifetime_donor_freed_slot_bytes_total" +
                         labels + "2097152\n"),
               std::string::npos);
+    EXPECT_NE(
+        text.find("dfkv_slab_disk_lifetime_donor_protected_victims_total" +
+                  labels + "2\n"),
+        std::string::npos);
+    EXPECT_NE(
+        text.find(
+            "dfkv_slab_disk_lifetime_donor_protected_payload_bytes_total" +
+            labels + std::to_string(disk == 0 ? 34 : 62) + "\n"),
+        std::string::npos);
+    EXPECT_NE(text.find("dfkv_slab_disk_lifetime_donor_unscored_victims_total" +
+                        labels + "0\n"),
+              std::string::npos);
   }
   server.reset();
   server = std::make_unique<KvNodeServer>(options);
   ASSERT_TRUE(server->Healthy());
   const std::string recovered = server->MetricsText();
-  for (const char* name : {"dfkv_slab_lifetime_donor_released_residents_total",
-                           "dfkv_slab_lifetime_donor_freed_payload_bytes_total",
-                           "dfkv_slab_lifetime_donor_freed_slot_bytes_total"}) {
+  for (const char* name :
+       {"dfkv_slab_lifetime_donor_released_residents_total",
+        "dfkv_slab_lifetime_donor_freed_payload_bytes_total",
+        "dfkv_slab_lifetime_donor_freed_slot_bytes_total",
+        "dfkv_slab_lifetime_donor_protected_victims_total",
+        "dfkv_slab_lifetime_donor_protected_payload_bytes_total",
+        "dfkv_slab_lifetime_donor_unscored_victims_total"}) {
     EXPECT_NE(recovered.find(std::string(name) + " 0\n"), std::string::npos);
   }
   for (size_t disk = 0; disk < 2; ++disk) {
@@ -595,7 +626,10 @@ TEST(Metrics, DonorBytesAggregateAcrossDisksAndResetOnRecovery) {
     for (const char* name :
          {"dfkv_slab_disk_lifetime_donor_released_residents_total",
           "dfkv_slab_disk_lifetime_donor_freed_payload_bytes_total",
-          "dfkv_slab_disk_lifetime_donor_freed_slot_bytes_total"}) {
+          "dfkv_slab_disk_lifetime_donor_freed_slot_bytes_total",
+          "dfkv_slab_disk_lifetime_donor_protected_victims_total",
+          "dfkv_slab_disk_lifetime_donor_protected_payload_bytes_total",
+          "dfkv_slab_disk_lifetime_donor_unscored_victims_total"}) {
       EXPECT_NE(recovered.find(std::string(name) + labels), std::string::npos);
     }
   }
@@ -659,6 +693,12 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
   EXPECT_EQ(text.find("dfkv_slab_lifetime_donor_freed_slot_bytes_total"),
             std::string::npos);
   EXPECT_EQ(text.find("dfkv_slab_disk_lifetime_donor_"), std::string::npos);
+  EXPECT_EQ(text.find("dfkv_slab_lifetime_donor_protected_victims_total"),
+            std::string::npos);
+  EXPECT_EQ(text.find("dfkv_slab_lifetime_donor_protected_payload_bytes_total"),
+            std::string::npos);
+  EXPECT_EQ(text.find("dfkv_slab_lifetime_donor_unscored_victims_total"),
+            std::string::npos);
   server->Stop();
   server.reset();
   fs::remove_all(dir);

@@ -1154,7 +1154,7 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealLifetimeDonorLocked(
   const std::chrono::steady_clock::time_point persistence_started =
       std::chrono::steady_clock::now();
   const ExtentBindResult result =
-      StealExtentLocked(best.extent, target_cls, evicted, reclaim_denied);
+      StealExtentLocked(best.extent, target_cls, evicted, now, reclaim_denied);
   // Whole-extent invalidation/sync and release are separate from the bounded
   // selection work. Their cost may exceed the 8192-resident inspection cap.
   lifetime_donor_stats_.persistence_ns += static_cast<uint64_t>(
@@ -1203,7 +1203,7 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentFor(
     }
   }
   if (best < 0) return ExtentBindResult::kUnavailable;
-  return StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted,
+  return StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted, 0,
                            reclaim_denied);
 }
 
@@ -1243,14 +1243,14 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealColdExtentFor(
   }
   if (best < 0) return ExtentBindResult::kUnavailable;
   const ExtentBindResult result = StealExtentLocked(
-      static_cast<uint32_t>(best), target_cls, evicted, reclaim_denied);
+      static_cast<uint32_t>(best), target_cls, evicted, 0, reclaim_denied);
   if (result == ExtentBindResult::kBound) ++cold_steals_;
   return result;
 }
 
 SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
     uint32_t extent_index, size_t target_cls, std::vector<BlockKey>* evicted,
-    bool* reclaim_denied) {
+    uint32_t lifetime_now, bool* reclaim_denied) {
   ExtentMeta& extent = extents_[extent_index];
   const int old_cls = extent.cls;
   if (old_cls == kUnbound || target_cls >= classes_.size() ||
@@ -1264,6 +1264,24 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
   while (extent.resident_head != kNoSlot) {
     const uint32_t index = extent.resident_head;
     BlockKey victim = slots_[index].key;
+    if (opt_.lifetime_donor_config != nullptr) {
+      // The wipe succeeded, so this resident will be released. Use the final
+      // pre-wipe time even if I/O crossed KEEP; never reuse a bucket estimate.
+      const DiskLifetimeConfig& config = *opt_.lifetime_donor_config;
+      const std::optional<DiskLifetimeState>& state =
+          resident_lifetime_states_[index];
+      if (!state.has_value() || resident_generations_[index] == 0) {
+        ++lifetime_donor_stats_.unscored_victims;
+      } else if (DiskLifetimeScore(config, state->anchor,
+                                   state->scoring_reads(),
+                                   state->first_early_read(),
+                                   state->write_armed(), lifetime_now) >
+                 static_cast<int64_t>(config.keep_score_sec)) {
+        ++lifetime_donor_stats_.protected_victims;
+        lifetime_donor_stats_.protected_payload_bytes +=
+            slots_[index].useful_bytes;
+      }
+    }
     FreeSlotLocked(index);
     if (evicted) evicted->push_back(std::move(victim));
     ++evictions_;
@@ -1319,7 +1337,7 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealFromResult(
     }
   }
   return best >= 0 ? StealExtentLocked(static_cast<uint32_t>(best), target_cls,
-                                       evicted)
+                                       evicted, 0)
                    : ExtentBindResult::kUnavailable;
 }
 

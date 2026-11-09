@@ -144,6 +144,9 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_donor_released_residents = 0;
     uint64_t lifetime_donor_freed_slot_bytes = 0;
     uint64_t lifetime_donor_freed_payload_bytes = 0;
+    uint64_t lifetime_donor_protected_victims = 0;
+    uint64_t lifetime_donor_protected_payload_bytes = 0;
+    uint64_t lifetime_donor_unscored_victims = 0;
 
     uint64_t dio_write_fallbacks = 0;
     uint64_t dio_read_fallbacks = 0;

@@ -174,6 +174,10 @@ class SlabAllocator {
     // Occupied resident slots and payload, not the whole rebound extent.
     uint64_t freed_slot_bytes = 0;
     uint64_t freed_payload_bytes = 0;
+    // Successful loss at the pre-wipe time, not selection's bucket estimate.
+    uint64_t protected_victims = 0;
+    uint64_t protected_payload_bytes = 0;
+    uint64_t unscored_victims = 0;
   };
   LifetimeDonorStats DonorStats() const;
   uint64_t WatermarkEvictions() const;
@@ -418,8 +422,11 @@ class SlabAllocator {
   ExtentBindResult StealColdExtentFor(size_t cls,
                                       std::vector<BlockKey>* evicted,
                                       bool* reclaim_denied = nullptr);
+  // lifetime_now is the final pre-wipe clock snapshot in lifetime mode;
+  // legacy callers pass zero and do not score or record protection losses.
   ExtentBindResult StealExtentLocked(uint32_t extent, size_t target_cls,
                                      std::vector<BlockKey>* evicted,
+                                     uint32_t lifetime_now,
                                      bool* reclaim_denied = nullptr);
   // New disk paths retain the distinction between no donor and failed
   // persistence. The public bool wrapper preserves legacy callers.

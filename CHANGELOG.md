@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export donor victims and payload bytes still scoring above KEEP, alongside
+  unscored-victim counts, globally and per disk. Count successful releases only;
+  valid recovered scoring state remains distinct from missing state.
+
 - Export lifetime extent-donor payload and occupied-slot bytes, with aggregate
   and per-disk released-resident counts. Keep donor accounting separate from
   class and watermark reclaim; empty or failed donors add no victim bytes.
