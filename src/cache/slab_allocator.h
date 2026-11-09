@@ -180,6 +180,15 @@ class SlabAllocator {
     uint64_t unscored_victims = 0;
   };
   LifetimeDonorStats DonorStats() const;
+  struct LifetimeBucketMemory {
+    uint64_t entries =
+        0;  // Logical bucket positions, including unbound extents.
+    uint64_t bucket_bytes = 0;  // Reserved bucket element backing storage.
+    uint64_t token_bytes = 0;   // Reserved token element backing storage.
+  };
+  // O(1) locked capacity snapshot, not active/protected registration counts,
+  // allocator overhead, vector object sizes or process/recovery peak memory.
+  LifetimeBucketMemory BucketMemory() const;
   uint64_t WatermarkEvictions() const;
   // Local candidate: reclaim slots in refreshed actual-read/new-write order
   // until allocated bytes reach target_bytes. A call removes at most max_victims

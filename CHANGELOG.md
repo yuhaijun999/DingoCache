@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export lifetime expiry bucket entry counts and retained bucket/token vector
+  backing bytes, globally and per disk. Include empty extents and distinguish
+  retained capacity from active protection registrations or total process RSS.
+
 - Expose allocator-resident useful bytes and slot slack separately from visible
   committed payload, including per-disk allocation gauges. Preserve the existing
   allocated-minus-visible gap metric and distinguish pinned/in-flight payload.

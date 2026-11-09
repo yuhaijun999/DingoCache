@@ -1831,6 +1831,15 @@ SlabAllocator::LifetimeDonorStats SlabAllocator::DonorStats() const {
   return lifetime_donor_stats_;
 }
 
+SlabAllocator::LifetimeBucketMemory SlabAllocator::BucketMemory() const {
+  const std::lock_guard<std::mutex> lock(mu_);
+  LifetimeBucketMemory memory;
+  memory.entries = lifetime_buckets_.size();
+  memory.bucket_bytes = lifetime_buckets_.capacity() * sizeof(LifetimeBucket);
+  memory.token_bytes = lifetime_bucket_tokens_.capacity() * sizeof(uint64_t);
+  return memory;
+}
+
 uint64_t SlabAllocator::WatermarkEvictions() const {
   std::lock_guard<std::mutex> lock(mu_);
   return watermark_evictions_;

@@ -608,6 +608,12 @@ std::string KvNodeServer::MetricsText() const {
            "Useful bytes of all allocator residents including hidden writes");
     header("dfkv_slab_disk_allocator_fragmentation_bytes", "gauge",
            "Resident slot slack from one allocator class snapshot");
+    header("dfkv_slab_disk_lifetime_bucket_entries", "gauge",
+           "Logical protection expiry bucket entries including empty extents");
+    header("dfkv_slab_disk_lifetime_bucket_bytes", "gauge",
+           "Retained protection expiry bucket vector backing bytes");
+    header("dfkv_slab_disk_lifetime_bucket_token_bytes", "gauge",
+           "Retained resident expiry token vector backing bytes");
     for (size_t i = 0; i < group_.DiskCount(); ++i) {
       const auto st = group_.DiskWatermarkObservation(i);
       const std::string labels =
@@ -630,6 +636,12 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      sample("dfkv_slab_disk_lifetime_bucket_entries",
+             disk.lifetime_bucket_entries);
+      sample("dfkv_slab_disk_lifetime_bucket_bytes",
+             disk.lifetime_bucket_bytes);
+      sample("dfkv_slab_disk_lifetime_bucket_token_bytes",
+             disk.lifetime_bucket_token_bytes);
       sample("dfkv_slab_disk_allocated_bytes", disk.allocated_bytes);
       sample("dfkv_slab_disk_payload_bytes", disk.payload_bytes);
       sample("dfkv_slab_disk_allocator_payload_bytes",
@@ -900,6 +912,15 @@ std::string KvNodeServer::MetricsText() const {
            ss.allocated_bytes >= ss.payload_bytes
                ? ss.allocated_bytes - ss.payload_bytes
                : 0);
+    metric("dfkv_slab_lifetime_bucket_entries", "gauge",
+           "Logical protection expiry bucket entries including empty extents",
+           ss.lifetime_bucket_entries);
+    metric("dfkv_slab_lifetime_bucket_bytes", "gauge",
+           "Retained protection expiry bucket vector backing bytes",
+           ss.lifetime_bucket_bytes);
+    metric("dfkv_slab_lifetime_bucket_token_bytes", "gauge",
+           "Retained resident expiry token vector backing bytes",
+           ss.lifetime_bucket_token_bytes);
     metric("dfkv_slab_allocator_objects", "gauge",
            "Allocator residents including uncommitted writes",
            ss.allocator_objects);

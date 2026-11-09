@@ -2842,6 +2842,10 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.failed = !Healthy();
   st.failed_disks = st.failed ? 1 : 0;
   if (alloc_) {
+    const SlabAllocator::LifetimeBucketMemory memory = alloc_->BucketMemory();
+    st.lifetime_bucket_entries = memory.entries;
+    st.lifetime_bucket_bytes = memory.bucket_bytes;
+    st.lifetime_bucket_token_bytes = memory.token_bytes;
     const SlabAllocator::LifetimeDonorStats donor = alloc_->DonorStats();
     st.lifetime_donor_coarse_extents = donor.coarse_extents;
     st.lifetime_donor_precise_extents = donor.precise_extents;

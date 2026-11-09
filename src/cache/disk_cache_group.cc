@@ -1085,6 +1085,9 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_donor_protected_payload_bytes +=
         st.lifetime_donor_protected_payload_bytes;
     sum.lifetime_donor_unscored_victims += st.lifetime_donor_unscored_victims;
+    sum.lifetime_bucket_entries += st.lifetime_bucket_entries;
+    sum.lifetime_bucket_bytes += st.lifetime_bucket_bytes;
+    sum.lifetime_bucket_token_bytes += st.lifetime_bucket_token_bytes;
 
     sum.lifetime_reads.successful += st.lifetime_reads.successful;
     sum.lifetime_reads.applied += st.lifetime_reads.applied;

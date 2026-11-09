@@ -122,9 +122,85 @@ TEST(SlabLifetimeBuckets, DisabledAllocatorsNeverAllocateBucketStorage) {
     EXPECT_EQ(SlabAllocatorTestPeer::BucketPageCount(allocator), 0U);
     EXPECT_EQ(SlabAllocatorTestPeer::BucketTokenSize(allocator), 0U);
     EXPECT_EQ(SlabAllocatorTestPeer::BucketTokenCapacity(allocator), 0U);
+    const SlabAllocator::LifetimeBucketMemory memory = allocator.BucketMemory();
+    EXPECT_EQ(memory.entries, 0U);
+    EXPECT_EQ(memory.bucket_bytes, 0U);
+    EXPECT_EQ(memory.token_bytes, 0U);
     EXPECT_EQ(SlabAllocatorTestPeer::ProtectedEstimate(allocator, 0, 0), 0U);
     ExpectValid(allocator);
   }
+}
+
+TEST(SlabLifetimeBuckets, MemoryViewTracksCapacityNotActiveRegistrations) {
+  for (const uint64_t max_reads : {2U, 63U}) {
+    SCOPED_TRACE(max_reads);
+    DiskLifetimeConfig config = Config();
+    config.max_reads = max_reads;
+    config.bucket_count = max_reads == 63 ? 64 : 8;
+    std::string error;
+    ASSERT_TRUE(ValidateDiskLifetimeConfig(config, &error)) << error;
+    SlabAllocator allocator(Options(config, 8, 2));
+    const SlabAllocator::LifetimeBucketMemory empty = allocator.BucketMemory();
+    EXPECT_EQ(empty.entries, 2 * config.bucket_count);
+    EXPECT_GE(empty.bucket_bytes,
+              empty.entries * SlabAllocatorTestPeer::BucketPageBytes());
+    EXPECT_EQ(empty.token_bytes, 0U);
+    const DiskLifetimeState state = NewDiskLifetimeState(0);
+    for (uint64_t id = 1; id <= 9; ++id)
+      ASSERT_NO_FATAL_FAILURE(Seed(allocator, id, &state, config));
+    const SlabAllocator::LifetimeBucketMemory populated =
+        allocator.BucketMemory();
+    EXPECT_EQ(populated.entries, empty.entries);
+    EXPECT_EQ(populated.bucket_bytes, empty.bucket_bytes);
+    EXPECT_GE(populated.token_bytes, 9 * sizeof(uint64_t));
+    EXPECT_EQ(populated.token_bytes,
+              SlabAllocatorTestPeer::BucketTokenCapacity(allocator) *
+                  sizeof(uint64_t));
+    for (uint64_t id = 1; id <= 9; ++id)
+      ASSERT_EQ(allocator.Remove(Key(id)),
+                SlabAllocator::RemoveResult::kRemoved);
+    ASSERT_EQ(allocator.Count(), 0U);
+    std::vector<BlockKey> evicted;
+    EXPECT_EQ(SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted),
+              SlabAllocatorTestPeer::ExtentBindResult::kBound);
+    EXPECT_TRUE(evicted.empty());
+    ASSERT_NO_FATAL_FAILURE(Seed(allocator, 10, &state, config));
+    const SlabAllocator::LifetimeBucketMemory reused = allocator.BucketMemory();
+    EXPECT_EQ(reused.entries, populated.entries);
+    EXPECT_EQ(reused.bucket_bytes, populated.bucket_bytes);
+    EXPECT_EQ(reused.token_bytes, populated.token_bytes);
+    ExpectValid(allocator);
+  }
+}
+
+TEST(SlabLifetimeBuckets, MemorySnapshotIsSafeDuringSlotMetadataGrowth) {
+  const DiskLifetimeConfig config = Config();
+  SlabAllocator allocator(Options(config, 128));
+  std::atomic<bool> done{false};
+  bool writer_ok = true;
+  std::thread writer([&] {
+    for (uint64_t id = 1; id <= 128; ++id) {
+      SlabAllocator::SlotRef ref;
+      std::vector<BlockKey> evicted;
+      if (!allocator.Put(Key(id), 1, &ref, &evicted) || !evicted.empty()) {
+        writer_ok = false;
+        break;
+      }
+      std::this_thread::yield();
+    }
+    done.store(true);
+  });
+  do {
+    const SlabAllocator::LifetimeBucketMemory memory = allocator.BucketMemory();
+    EXPECT_EQ(memory.entries, config.bucket_count);
+    EXPECT_GE(memory.bucket_bytes,
+              memory.entries * SlabAllocatorTestPeer::BucketPageBytes());
+    EXPECT_EQ(memory.token_bytes % sizeof(uint64_t), 0U);
+  } while (!done.load());
+  writer.join();
+  ASSERT_TRUE(writer_ok);
+  EXPECT_GE(allocator.BucketMemory().token_bytes, 128 * sizeof(uint64_t));
+  ExpectValid(allocator);
 }
 
 TEST(SlabLifetimeBuckets, UnknownAndUncommittedResidentsDoNotRegister) {
@@ -473,6 +549,10 @@ TEST_F(LifetimeBucketStoreTest, LegacyAndShadowDoNotAllocateBuckets) {
     ASSERT_NO_FATAL_FAILURE(Create(false, scoring));
     ASSERT_NO_FATAL_FAILURE(Put(1));
     EXPECT_EQ(DiskSlabStoreTestPeer::Pages(*store_), 0U);
+    const DiskSlabStore::Stats memory = store_->GetStats();
+    EXPECT_EQ(memory.lifetime_bucket_entries, 0U);
+    EXPECT_EQ(memory.lifetime_bucket_bytes, 0U);
+    EXPECT_EQ(memory.lifetime_bucket_token_bytes, 0U);
     EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 0), 0U);
     EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(*store_));
     store_.reset();
@@ -485,11 +565,21 @@ TEST_F(LifetimeBucketStoreTest,
   ASSERT_NO_FATAL_FAILURE(Create());
   ASSERT_NO_FATAL_FAILURE(Put(1));
   EXPECT_EQ(DiskSlabStoreTestPeer::Pages(*store_), config_.bucket_count);
+  const DiskSlabStore::Stats memory = store_->GetStats();
+  EXPECT_EQ(memory.lifetime_bucket_entries, config_.bucket_count);
+  EXPECT_GE(memory.lifetime_bucket_bytes,
+            config_.bucket_count * SlabAllocatorTestPeer::BucketPageBytes());
+  EXPECT_GE(memory.lifetime_bucket_token_bytes, sizeof(uint64_t));
   EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 0), 1U);
   const uint64_t token = DiskSlabStoreTestPeer::Token(*store_, Key(1));
   DiskSlabStoreTestPeer::FailMetadata(*store_);
   EXPECT_EQ(store_->Remove(Key(1)), Status::kIOError);
   EXPECT_FALSE(store_->Healthy());
+  const DiskSlabStore::Stats failed = store_->GetStats();
+  EXPECT_EQ(failed.lifetime_bucket_entries, memory.lifetime_bucket_entries);
+  EXPECT_EQ(failed.lifetime_bucket_bytes, memory.lifetime_bucket_bytes);
+  EXPECT_EQ(failed.lifetime_bucket_token_bytes,
+            memory.lifetime_bucket_token_bytes);
   EXPECT_EQ(store_->Count(), 1U);
   EXPECT_EQ(DiskSlabStoreTestPeer::Token(*store_, Key(1)), token);
   EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 0), 1U);
