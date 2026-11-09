@@ -85,6 +85,10 @@ class SlabAllocator {
     bool track_lifetime_state = false;
     // Validated disk MAX_READS (1..63); ignored when tracking is disabled.
     uint32_t lifetime_max_reads = 2;
+    // Internal protection accounting; zero count disables all bucket storage.
+    // Derived from validated config, never independent environment reads.
+    uint64_t lifetime_bucket_sec = 0;
+    uint32_t lifetime_bucket_count = 0;
   };
 
   // Target write parallelism per class: Put keeps up to this many extents with
@@ -185,10 +189,13 @@ class SlabAllocator {
   // not yet installed. A supplied state requires lifetime tracking. With that
   // tracking enabled, nullptr deliberately leaves the committed resident
   // uninitialized (hard-stop drain), rather than inventing a default state.
+  // With buckets enabled, state requires the matching validated config and
+  // actual current offset (not a recovered state's anchor). Both stay under A.
   // This is not an external fallible request interface.
   void CommitResidentGeneration(
       const BlockKey& key, uint64_t generation,
-      const DiskLifetimeState* lifetime_state = nullptr);
+      const DiskLifetimeState* lifetime_state = nullptr,
+      const DiskLifetimeConfig* config = nullptr, uint32_t now = 0);
   enum class LifetimeReadResult : unsigned char {
     kApplied = 0,             // Updated the matched resident.
     kResidentChanged = 1,     // No matching live generation remains.
@@ -257,6 +264,15 @@ class SlabAllocator {
                                const DiskLifetimeClock& clock,
                                std::vector<BlockKey>* evicted,
                                LifetimeWatermarkStats* stats = nullptr);
+  // A-lock-only physical accounting. Tokens belong to the current dense
+  // resident; hiding visibility does not clear them. Config/time must match
+  // the owning Store's immutable snapshot and nondecreasing clock.
+  void RegisterLifetimeBucketLocked(uint32_t index,
+                                    const DiskLifetimeConfig& config,
+                                    uint32_t now);
+  void UnregisterLifetimeBucketLocked(uint32_t index);
+  void ResetLifetimeBucketsLocked(uint32_t extent);
+  uint64_t LifetimeProtectedEstimateLocked(uint32_t extent, uint64_t now) const;
   void BumpLifetimeVersionLocked(uint32_t meta_index);
   // Physical ownership only, including pending removal. Does not touch CLOCK.
   // Zero means disabled, absent or uncommitted; never an exportable identity.
@@ -305,6 +321,11 @@ class SlabAllocator {
     // Index 0 spans the disk; index 1 is restricted to the resident's class.
     std::array<LifetimeLink, 2> indexes{};
     uint32_t band = kNoSlot;  // Uncommitted/uninitialized residents are absent.
+  };
+  struct LifetimeBucket {
+    // Absolute expiry-page + 1; zero means this ring position is unused.
+    uint64_t generation = 0;
+    uint64_t count = 0;  // Covers all supported extent/slot geometries.
   };
   struct LifetimeQueue {
     uint32_t head = kNoSlot;
@@ -445,6 +466,10 @@ class SlabAllocator {
   std::vector<LifetimeLinks> lifetime_links_;
   // Row 0 is global; row cls+1 is class-local, each with MAX_READS+1 bands.
   std::vector<LifetimeQueue> lifetime_queues_;
+  // Enabled-only physical ledger. No duplicate resident generation is needed:
+  // owner validation and every token transition share A with slot reuse.
+  std::vector<uint64_t> lifetime_bucket_tokens_;
+  std::vector<LifetimeBucket> lifetime_buckets_;
   uint32_t lifetime_next_band_ =
       0;  // Global watermark turn, including quiet ticks.
   // Enabled-only class mutation versions, including pin eligibility changes.

@@ -83,5 +83,6 @@ SlotMeta104、links20、queue12字节不变；既有 enabled版本8B/class保留
 
 Q3a 的内部类内实现本轮收口；不冒称完整策略、性能或公开激活已验收。
 Q3b全盘水位公平选择见 `docs/DISK_LIFETIME_Q3B.md`；
-Q3c写回接线/ACK门禁见 `docs/DISK_LIFETIME_Q3C.md`，D4桶/donor待后续。
+Q3c写回接线/ACK门禁见 `docs/DISK_LIFETIME_Q3C.md`；
+D4a保护桶账务见 `docs/DISK_LIFETIME_D4A.md`，D4b donor选择待后续。
 L12真实MR/READY/RXE/kernel io_uring数据面继续按用户约定后置，不算通过。

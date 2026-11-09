@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Track internally enabled lifetime protection in per-extent expiry buckets.
+  Bind registration tokens to physical residents, preserve accounting after
+  failed invalidation, and avoid stale-page debits during reads or slot reuse.
+  Donor ranking and public lifetime readiness remain unchanged.
+
 - Connect internally gated lifetime eviction through disk groups and node
   write-back. Require explicit disk-ACK for this internal RAM write-back path
   before opening any disk; retain typed budget backpressure and legacy ACK

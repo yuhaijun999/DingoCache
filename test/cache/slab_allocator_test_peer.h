@@ -86,8 +86,74 @@ class SlabAllocatorTestPeer {
   }
   static void CommitGeneration(
       SlabAllocator* allocator, const BlockKey& key, uint64_t generation,
-      const DiskLifetimeState* lifetime_state = nullptr) {
-    allocator->CommitResidentGeneration(key, generation, lifetime_state);
+      const DiskLifetimeState* lifetime_state = nullptr,
+      const DiskLifetimeConfig* config = nullptr, uint32_t now = 0) {
+    allocator->CommitResidentGeneration(key, generation, lifetime_state, config,
+                                        now);
+  }
+  static uint64_t ProtectedEstimate(const SlabAllocator& allocator,
+                                    uint32_t extent, uint64_t now) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    return allocator.LifetimeProtectedEstimateLocked(extent, now);
+  }
+  static uint64_t BucketToken(const SlabAllocator& allocator,
+                              const BlockKey& key) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    const uint32_t* index = allocator.index_.Find(key);
+    return index != nullptr && *index < allocator.lifetime_bucket_tokens_.size()
+               ? allocator.lifetime_bucket_tokens_[*index]
+               : 0;
+  }
+  static size_t BucketPageCount(const SlabAllocator& allocator) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    return allocator.lifetime_buckets_.size();
+  }
+  static size_t BucketTokenSize(const SlabAllocator& allocator) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    return allocator.lifetime_bucket_tokens_.size();
+  }
+  static size_t BucketTokenCapacity(const SlabAllocator& allocator) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    return allocator.lifetime_bucket_tokens_.capacity();
+  }
+  static bool BucketRowEmpty(const SlabAllocator& allocator, uint32_t extent) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    const size_t bands = allocator.opt_.lifetime_bucket_count;
+    for (size_t band = 0; band < bands; ++band) {
+      const SlabAllocator::LifetimeBucket& page =
+          allocator.lifetime_buckets_[extent * bands + band];
+      if (page.generation != 0 || page.count != 0) return false;
+    }
+    return true;
+  }
+  static size_t BucketPageBytes() {
+    return sizeof(SlabAllocator::LifetimeBucket);
+  }
+  static bool LifetimeBucketsValid(const SlabAllocator& allocator) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    const size_t bands = allocator.opt_.lifetime_bucket_count;
+    if (bands == 0)
+      return allocator.lifetime_buckets_.empty() &&
+             allocator.lifetime_bucket_tokens_.empty();
+    if (allocator.lifetime_bucket_tokens_.size() != allocator.slots_.size() ||
+        allocator.lifetime_buckets_.size() != allocator.extents_.size() * bands)
+      return false;
+    std::vector<uint64_t> counts(allocator.lifetime_buckets_.size(), 0);
+    for (size_t index = 0; index < allocator.slots_.size(); ++index) {
+      const uint64_t token = allocator.lifetime_bucket_tokens_[index];
+      if (token == 0) continue;
+      if (!allocator.slots_[index].live ||
+          allocator.resident_generations_[index] == 0 ||
+          !allocator.resident_lifetime_states_[index].has_value())
+        return false;
+      const size_t page = allocator.slots_[index].ref.extent * bands +
+                          static_cast<size_t>((token - 1) % bands);
+      if (allocator.lifetime_buckets_[page].generation == token) ++counts[page];
+    }
+    for (size_t page = 0; page < counts.size(); ++page) {
+      if (allocator.lifetime_buckets_[page].count != counts[page]) return false;
+    }
+    return true;
   }
   static uint64_t Generation(const SlabAllocator& allocator,
                              const BlockKey& key) {

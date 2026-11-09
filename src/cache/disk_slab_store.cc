@@ -553,6 +553,11 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   }
   if (opt_.lifetime_clock)
     ao.can_reclaim = [this] { return CanStartReclaim(); };
+  if (opt_.lifetime_class_eviction && opt_.lifetime_config.has_value()) {
+    ao.lifetime_bucket_sec = opt_.lifetime_config->bucket_sec;
+    ao.lifetime_bucket_count =
+        static_cast<uint32_t>(opt_.lifetime_config->bucket_count);
+  }
   ao.extent_bytes = opt_.extent_bytes;
   ao.num_extents = num_extents_;
   ao.align = static_cast<uint32_t>(opt_.slot_granularity);  // slot_size is a granularity multiple
@@ -1480,10 +1485,10 @@ void DiskSlabStore::CommitPayloadLocked(const BlockKey& resident_key,
                                         uint64_t generation, bool recovered) {
   if (resident_identity_) {
     std::optional<DiskLifetimeState> state;
+    uint32_t offset = 0;
     if (opt_.lifetime_config) {
       // Runtime commits hold mu_; recovery is exclusively owned before the
       // store is published. Neither path may initialize heat past the bound.
-      uint32_t offset = 0;
       if (opt_.lifetime_clock->TryDrainNow(&offset)) {
         state = recovered ? RecoveredDiskLifetimeState(1)
                           : NewDiskLifetimeState(offset);
@@ -1493,8 +1498,9 @@ void DiskSlabStore::CommitPayloadLocked(const BlockKey& resident_key,
         ++lifetime_init_clock_hard_exhausted_;
       }
     }
-    alloc_->CommitResidentGeneration(resident_key, generation,
-                                     state ? &*state : nullptr);
+    alloc_->CommitResidentGeneration(
+        resident_key, generation, state ? &*state : nullptr,
+        opt_.lifetime_config ? &*opt_.lifetime_config : nullptr, offset);
   }
   auto [it, inserted] = payload_len_.try_emplace(key, payload_len);
   if (inserted) {

@@ -155,10 +155,18 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
   if (opt_.track_lifetime_state) {
     assert(opt_.lifetime_max_reads >= 1 && opt_.lifetime_max_reads <= 63);
   }
+  assert(opt_.lifetime_bucket_count == 0 ||
+         (opt_.track_lifetime_state && opt_.lifetime_bucket_sec > 0 &&
+          opt_.lifetime_bucket_count <= 64));
   if (opt_.align == 0) opt_.align = 1;
   if (opt_.num_extents == 0) opt_.num_extents = 1;
   if (opt_.max_waste < 0) opt_.max_waste = 0;
   extents_.assign(opt_.num_extents, ExtentMeta{});
+  if (opt_.lifetime_bucket_count != 0) {
+    assert(opt_.num_extents <= SIZE_MAX / opt_.lifetime_bucket_count);
+    lifetime_buckets_.resize(static_cast<size_t>(opt_.num_extents) *
+                             opt_.lifetime_bucket_count);
+  }
   unbound_ = opt_.num_extents;
 
   // Establish the complete canonical class lattice once. Class indices and
@@ -303,7 +311,8 @@ size_t SlabAllocator::ClassForExactSize(uint32_t slot_size) {
 
 void SlabAllocator::CommitResidentGeneration(
     const BlockKey& key, uint64_t generation,
-    const DiskLifetimeState* lifetime_state) {
+    const DiskLifetimeState* lifetime_state, const DiskLifetimeConfig* config,
+    uint32_t now) {
   const std::lock_guard<std::mutex> lock(mu_);
   const uint32_t* index = index_.Find(key);
   assert(opt_.track_resident_identity && index != nullptr && generation != 0);
@@ -316,6 +325,10 @@ void SlabAllocator::CommitResidentGeneration(
   if (opt_.track_lifetime_state && lifetime_state != nullptr) {
     resident_lifetime_states_[*index] = *lifetime_state;
     LinkLifetimeLocked(*index);
+    if (opt_.lifetime_bucket_count != 0) {
+      assert(config != nullptr);
+      RegisterLifetimeBucketLocked(*index, *config, now);
+    }
   }
 }
 
@@ -342,9 +355,11 @@ SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
     return LifetimeReadResult::kStateUnavailable;
   // Even a saturated read changes anchor and must move BOTH indexes. Compute
   // the new state first so a rejected update leaves state and links untouched.
+  UnregisterLifetimeBucketLocked(*index);
   UnlinkLifetimeLocked(*index);
   resident_state = next_state;
   LinkLifetimeLocked(*index);
+  RegisterLifetimeBucketLocked(*index, config, applied_at);
   return LifetimeReadResult::kApplied;
 }
 
@@ -361,7 +376,10 @@ uint32_t SlabAllocator::AcquireSlotMetaLocked() {
     free_slot_meta_head_ = slots_[index].free_next;
     slots_[index] = SlotMeta{};
     if (opt_.track_resident_identity) resident_generations_[index] = 0;
-    if (opt_.track_lifetime_state) resident_lifetime_states_[index].reset();
+    if (opt_.track_lifetime_state) {
+      resident_lifetime_states_[index].reset();
+      if (opt_.lifetime_bucket_count != 0) lifetime_bucket_tokens_[index] = 0;
+    }
     return index;
   }
   slots_.emplace_back();
@@ -369,8 +387,76 @@ uint32_t SlabAllocator::AcquireSlotMetaLocked() {
   if (opt_.track_lifetime_state) {
     resident_lifetime_states_.emplace_back();
     lifetime_links_.emplace_back();
+    if (opt_.lifetime_bucket_count != 0) lifetime_bucket_tokens_.push_back(0);
   }
   return static_cast<uint32_t>(slots_.size() - 1);
+}
+
+void SlabAllocator::RegisterLifetimeBucketLocked(
+    uint32_t index, const DiskLifetimeConfig& config, uint32_t now) {
+  if (opt_.lifetime_bucket_count == 0) return;
+  assert(lifetime_bucket_tokens_[index] == 0);
+  const std::optional<DiskLifetimeState>& resident_state =
+      resident_lifetime_states_[index];
+  assert(config.bucket_sec == opt_.lifetime_bucket_sec &&
+         config.bucket_count == opt_.lifetime_bucket_count);
+  if (!resident_state.has_value()) return;  // Unknown is not a scoring state.
+  const DiskLifetimeState& state = *resident_state;
+  const uint64_t end =
+      DiskLifetimeProtectEnd(config, state.anchor, state.scoring_reads(),
+                             state.first_early_read(), state.write_armed());
+  if (end <= now) return;  // An expired recovered resident never registered.
+  // Use the page containing the last protected second. An exact boundary
+  // expires there, while other deadlines are conservatively rounded upward.
+  const uint64_t generation = (end - 1) / opt_.lifetime_bucket_sec + 1;
+  LifetimeBucket& bucket =
+      lifetime_buckets_[static_cast<size_t>(slots_[index].ref.extent) *
+                            opt_.lifetime_bucket_count +
+                        (generation - 1) % opt_.lifetime_bucket_count];
+  if (bucket.generation != generation) {
+    // Coverage B*G >= H excludes collisions between live pages. A lazy reset
+    // may discard only an expired page, never another protected generation.
+    assert(bucket.count == 0 ||
+           bucket.generation <= now / opt_.lifetime_bucket_sec);
+    bucket = {generation, 0};
+  }
+  ++bucket.count;
+  lifetime_bucket_tokens_[index] = generation;
+}
+
+void SlabAllocator::UnregisterLifetimeBucketLocked(uint32_t index) {
+  if (opt_.lifetime_bucket_count == 0) return;
+  const uint64_t generation = lifetime_bucket_tokens_[index];
+  if (generation == 0) return;  // Never infer registration from old heat state.
+  lifetime_bucket_tokens_[index] = 0;
+  LifetimeBucket& bucket =
+      lifetime_buckets_[static_cast<size_t>(slots_[index].ref.extent) *
+                            opt_.lifetime_bucket_count +
+                        (generation - 1) % opt_.lifetime_bucket_count];
+  if (bucket.generation == generation) {
+    assert(bucket.count != 0);
+    --bucket.count;
+  }  // An old token must not subtract a newer occupant of the ring position.
+}
+
+void SlabAllocator::ResetLifetimeBucketsLocked(uint32_t extent) {
+  if (opt_.lifetime_bucket_count == 0) return;
+  const size_t first = static_cast<size_t>(extent) * opt_.lifetime_bucket_count;
+  std::fill_n(lifetime_buckets_.begin() + first, opt_.lifetime_bucket_count,
+              LifetimeBucket{});
+}
+
+uint64_t SlabAllocator::LifetimeProtectedEstimateLocked(uint32_t extent,
+                                                        uint64_t now) const {
+  if (opt_.lifetime_bucket_count == 0 || extent >= extents_.size()) return 0;
+  const uint64_t current_page = now / opt_.lifetime_bucket_sec;
+  const size_t first = static_cast<size_t>(extent) * opt_.lifetime_bucket_count;
+  uint64_t count = 0;
+  for (uint32_t page = 0; page < opt_.lifetime_bucket_count; ++page) {
+    const LifetimeBucket& bucket = lifetime_buckets_[first + page];
+    if (bucket.generation > current_page) count += bucket.count;
+  }
+  return count;  // Approximate only; query never rotates or clears pages.
 }
 
 SlabAllocator::LifetimeQueue& SlabAllocator::LifetimeQueueFor(
@@ -575,6 +661,7 @@ SlabAllocator::ExtentBindResult SlabAllocator::BindExtentLocked(
 
   ExtentMeta& extent = extents_[extent_index];
   extent = ExtentMeta{};
+  ResetLifetimeBucketsLocked(extent_index);
   extent.cls = static_cast<int>(cls_index);
   extent.total_slots = cls.slots_per_extent;
   extent.free_slots = cls.slots_per_extent;
@@ -647,6 +734,8 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
   if (opt_.track_lifetime_state) {
     resident_lifetime_states_.reserve(slots_.size() + entries.size());
     lifetime_links_.reserve(slots_.size() + entries.size());
+    if (opt_.lifetime_bucket_count != 0)
+      lifetime_bucket_tokens_.reserve(slots_.size() + entries.size());
   }
   index_.Reserve(index_.size() + entries.size());
 
@@ -684,7 +773,10 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
 }
 
 void SlabAllocator::FreeSlotLocked(uint32_t index) {
-  if (opt_.track_lifetime_state) UnlinkLifetimeLocked(index);
+  if (opt_.track_lifetime_state) {
+    UnregisterLifetimeBucketLocked(index);
+    UnlinkLifetimeLocked(index);
+  }
   SlotMeta& meta = slots_[index];
   const uint32_t cls_index = meta.ref.cls;
   const uint32_t extent_index = meta.ref.extent;
@@ -743,6 +835,7 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
     DropExtentFreeLocked(cls, extent_index);
     --cls.bound_extents;
     extent = ExtentMeta{};
+    ResetLifetimeBucketsLocked(extent_index);
     ++unbound_;
     ++extent_returns_;
   }
@@ -1001,6 +1094,7 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
     DropExtentFreeLocked(classes_[static_cast<size_t>(old_cls)], extent_index);
     --classes_[static_cast<size_t>(old_cls)].bound_extents;
     extents_[extent_index] = ExtentMeta{};
+    ResetLifetimeBucketsLocked(extent_index);
     ++unbound_;
   }
   const ExtentBindResult result =
