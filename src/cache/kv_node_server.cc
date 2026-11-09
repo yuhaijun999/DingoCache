@@ -612,6 +612,10 @@ std::string KvNodeServer::MetricsText() const {
            "Resident slot slack from one allocator class snapshot");
     header("dfkv_slab_disk_lifetime_bucket_entries", "gauge",
            "Logical protection expiry bucket entries including empty extents");
+    header("dfkv_slab_disk_lifetime_recovered_objects", "gauge",
+           "Allocator residents with recovered lifetime state");
+    header("dfkv_slab_disk_lifetime_recovered_unread_objects", "gauge",
+           "Recovered allocator residents with no applied real reads");
     header("dfkv_slab_disk_lifetime_bucket_bytes", "gauge",
            "Retained protection expiry bucket vector backing bytes");
     header("dfkv_slab_disk_lifetime_bucket_token_bytes", "gauge",
@@ -664,6 +668,10 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      sample("dfkv_slab_disk_lifetime_recovered_objects",
+             disk.lifetime_recovered_objects);
+      sample("dfkv_slab_disk_lifetime_recovered_unread_objects",
+             disk.lifetime_recovered_unread_objects);
       sample("dfkv_slab_disk_lifetime_read_source_unclassified_total",
              disk.lifetime_reads.source_unclassified);
       sample("dfkv_slab_disk_lifetime_read_source_ram_total",
@@ -987,6 +995,12 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_bucket_entries", "gauge",
            "Logical protection expiry bucket entries including empty extents",
            ss.lifetime_bucket_entries);
+    metric("dfkv_slab_lifetime_recovered_objects", "gauge",
+           "Allocator residents with recovered lifetime state",
+           ss.lifetime_recovered_objects);
+    metric("dfkv_slab_lifetime_recovered_unread_objects", "gauge",
+           "Recovered allocator residents with no applied real reads",
+           ss.lifetime_recovered_unread_objects);
     metric("dfkv_slab_lifetime_bucket_bytes", "gauge",
            "Retained protection expiry bucket vector backing bytes",
            ss.lifetime_bucket_bytes);

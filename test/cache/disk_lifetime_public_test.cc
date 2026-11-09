@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -16,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -27,6 +30,7 @@
 #include "cache/disk_slab_store.h"
 #include "cache/kv_node_server.h"
 #include "cache/slab_allocator.h"
+#include "cache/store_engine.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -91,6 +95,9 @@ class DiskSlabStoreTestPeer {
     return store.opt_.lifetime_recovery_two_reads;
   }
   static void Tick(DiskSlabStore& store) { store.ReclaimTick(); }
+  static void FailRecordWrites(DiskSlabStore& store) {
+    store.record_write_hook_for_test_ = [] { return false; };
+  }
 };
 
 namespace {
@@ -228,6 +235,20 @@ class DiskLifetimePublicTest : public testing::Test {
                                        *state, 0),
               DiskLifetimeReadClass::kUnread);
     EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(store));
+  }
+  void ExpectPopulation(const DiskSlabStore& store, uint64_t recovered,
+                        uint64_t unread) {
+    uint64_t total_recovered = 0;
+    uint64_t total_unread = 0;
+    const std::vector<SlabAllocator::ClassStat> classes = store.ClassStats();
+    for (const SlabAllocator::ClassStat& cls : classes) {
+      EXPECT_LE(cls.recovered_unread_residents, cls.recovered_residents);
+      EXPECT_LE(cls.recovered_residents, cls.resident);
+      total_recovered += cls.recovered_residents;
+      total_unread += cls.recovered_unread_residents;
+    }
+    EXPECT_EQ(total_recovered, recovered);
+    EXPECT_EQ(total_unread, unread);
   }
   std::filesystem::path base_;
   std::atomic<uint64_t> seconds_{0};
@@ -437,11 +458,13 @@ TEST_F(DiskLifetimePublicTest,
       ASSERT_TRUE(seed.Healthy()) << seed.StartupError();
       ASSERT_EQ(seed.Cache({1, 0}, "bytes", 5), Status::kOk);
       ASSERT_EQ(seed.Cache({2, 0}, "bytes", 5), Status::kOk);
+      ExpectPopulation(seed, 0, 0);
     }
     DiskSlabStore recovered(options);
     ASSERT_TRUE(recovered.Healthy()) << recovered.StartupError();
     ASSERT_NO_FATAL_FAILURE(CheckRecovered(recovered, {1, 0}));
     ASSERT_NO_FATAL_FAILURE(CheckRecovered(recovered, {2, 0}));
+    ExpectPopulation(recovered, 2, 2);
     const uint32_t band =
         static_cast<uint32_t>(std::min<uint64_t>(3, max_reads));
     seconds_.store(1);
@@ -467,6 +490,9 @@ TEST_F(DiskLifetimePublicTest,
       EXPECT_EQ(keys.back(), (BlockKey{1, 0}));
     }
     EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
+    ExpectPopulation(recovered, 2, 1);
+    ASSERT_NO_FATAL_FAILURE(Read(recovered, {1, 0}));
+    ExpectPopulation(recovered, 2, 1);  // Only the first real read leaves W.
     seconds_.store(0);
   }
 }
@@ -496,7 +522,9 @@ TEST_F(DiskLifetimePublicTest,
     DiskSlabStore recovered(options);
     ASSERT_TRUE(recovered.Healthy());
     ASSERT_NO_FATAL_FAILURE(CheckRecovered(recovered, {1, 0}));
+    ExpectPopulation(recovered, 1, 1);
     ASSERT_NO_FATAL_FAILURE(Read(recovered, {1, 0}));
+    ExpectPopulation(recovered, 1, 0);
   }
 }
 
@@ -517,6 +545,7 @@ TEST_F(DiskLifetimePublicTest, PublicLifetimeLegacyLifetimePreservesBytes) {
     EXPECT_EQ(bytes, "bytes");
     if (policy == "legacy") {
       EXPECT_FALSE(group.TracksLifetimeState());
+      ExpectPopulation(DiskCacheGroupTestPeer::Slab(group), 0, 0);
     } else {
       EXPECT_TRUE(DiskSlabStoreTestPeer::FormalRecovery(
           DiskCacheGroupTestPeer::Slab(group)));
@@ -533,6 +562,7 @@ TEST_F(DiskLifetimePublicTest, DirtyFormalRestartClearsRecordsAndHeat) {
   ASSERT_TRUE(recovered.Healthy()) << recovered.StartupError();
   EXPECT_FALSE(recovered.IsCached({1, 0}));
   EXPECT_FALSE(DiskSlabStoreTestPeer::State(recovered, {1, 0}).has_value());
+  ExpectPopulation(recovered, 0, 0);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
 }
 
@@ -573,6 +603,145 @@ TEST_F(DiskLifetimePublicTest, MultiplePublicSlabsShareOriginAndRecoverySeed) {
   }
 }
 
+TEST_F(DiskLifetimePublicTest,
+       RecoveredPopulationTracksClassesAndMetadataReuse) {
+  DiskSlabStore::Options options = StoreOptions();
+  // Small writes stripe across extents. Leave a free extent for the larger
+  // class so this recovery-accounting fixture never needs a donor victim.
+  options.capacity_bytes = 4 * options.extent_bytes;
+  const std::string large(5000, 'x');
+  {
+    DiskSlabStore seed(options);
+    ASSERT_TRUE(seed.Healthy());
+    ASSERT_EQ(seed.Cache({1, 0}, "bytes", 5), Status::kOk);
+    ASSERT_EQ(seed.Cache({2, 0}, "bytes", 5), Status::kOk);
+    ASSERT_EQ(seed.Cache({3, 0}, large.data(), large.size()), Status::kOk);
+    ASSERT_EQ(seed.Count(), 3U);
+    ASSERT_TRUE(seed.IsCached({1, 0}));
+    ASSERT_TRUE(seed.IsCached({2, 0}));
+    ASSERT_TRUE(seed.IsCached({3, 0}));
+    ExpectPopulation(seed, 0, 0);
+  }
+  DiskSlabStore recovered(options);
+  ASSERT_TRUE(recovered.Healthy());
+  ExpectPopulation(recovered, 3, 3);
+  std::string bytes;
+  DiskResidentIdentity mismatched;
+  ASSERT_EQ(recovered.RangeWithIdentity({1, 0}, 0, 5, &bytes, &mismatched),
+            Status::kOk);
+  ASSERT_EQ(bytes, "bytes");
+  // A wrong-generation notification must not consume recovered unread state.
+  ++mismatched.generation;
+  recovered.NotifyLifetimeReadSuccess({1, 0}, mismatched, bytes.size());
+  ExpectPopulation(recovered, 3, 3);
+  EXPECT_EQ(recovered.GetStats().lifetime_reads.race_lost, 1U);
+  ASSERT_NO_FATAL_FAILURE(Read(recovered, {1, 0}));
+  ASSERT_NO_FATAL_FAILURE(Read(recovered, {1, 0}));
+  ExpectPopulation(recovered, 3, 2);
+  const std::vector<SlabAllocator::ClassStat> classes = recovered.ClassStats();
+  for (const SlabAllocator::ClassStat& cls : classes) {
+    EXPECT_EQ(cls.recovered_residents, cls.slot_size == 4096   ? 2U
+                                       : cls.slot_size == 8192 ? 1U
+                                                               : 0U);
+    EXPECT_EQ(cls.recovered_unread_residents,
+              cls.slot_size == 4096 || cls.slot_size == 8192 ? 1U : 0U);
+  }
+  ASSERT_EQ(recovered.Cache({4, 0}, "new", 3), Status::kOk);
+  ExpectPopulation(recovered, 3, 2);  // NEW data has no recovered history.
+  ASSERT_EQ(recovered.Remove({1, 0}), Status::kOk);
+  ExpectPopulation(recovered, 2, 2);
+  ASSERT_EQ(recovered.Remove({2, 0}), Status::kOk);
+  ExpectPopulation(recovered, 1, 1);
+  ASSERT_EQ(recovered.Cache({2, 0}, "replacement", 11), Status::kOk);
+  ExpectPopulation(recovered, 1, 1);  // Recycled metadata starts as NEW.
+  ASSERT_EQ(recovered.Remove({3, 0}), Status::kOk);
+  ExpectPopulation(recovered, 0, 0);
+  EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
+}
+
+TEST_F(DiskLifetimePublicTest,
+       RecoveredPopulationWaitsForSuccessfulLastPinRelease) {
+  for (const bool fail_invalidation : {false, true}) {
+    const DiskSlabStore::Options options =
+        StoreOptions(fail_invalidation ? "failed" : "success");
+    {
+      DiskSlabStore seed(options);
+      ASSERT_TRUE(seed.Healthy());
+      ASSERT_EQ(seed.Cache({1, 0}, "bytes", 5), Status::kOk);
+    }
+    DiskSlabStore recovered(options);
+    ASSERT_TRUE(recovered.Healthy());
+    ExpectPopulation(recovered, 1, 1);
+    ReadLease first;
+    ReadLease last;
+    ASSERT_EQ(recovered.RangeDirectPrep({1, 0}, 0, 0, 4096, &first),
+              Status::kOk);
+    ASSERT_EQ(recovered.RangeDirectPrep({1, 0}, 0, 0, 4096, &last),
+              Status::kOk);
+    ASSERT_EQ(recovered.Remove({1, 0}), Status::kOk);
+    EXPECT_FALSE(recovered.IsCached({1, 0}));
+    ExpectPopulation(recovered, 1, 1);  // Hidden, but still physically owned.
+    first = ReadLease{};
+    ExpectPopulation(recovered, 1, 1);
+    if (fail_invalidation) DiskSlabStoreTestPeer::FailRecordWrites(recovered);
+    last = ReadLease{};
+    EXPECT_EQ(recovered.Healthy(), !fail_invalidation);
+    ExpectPopulation(recovered, fail_invalidation ? 1 : 0,
+                     fail_invalidation ? 1 : 0);
+    EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
+  }
+}
+
+TEST_F(DiskLifetimePublicTest, ConcurrentFirstReadsLeaveUnreadOnlyOnce) {
+  const DiskSlabStore::Options options = StoreOptions();
+  {
+    DiskSlabStore seed(options);
+    ASSERT_TRUE(seed.Healthy());
+    ASSERT_EQ(seed.Cache({1, 0}, "bytes", 5), Status::kOk);
+  }
+  DiskSlabStore recovered(options);
+  ASSERT_TRUE(recovered.Healthy());
+  ExpectPopulation(recovered, 1, 1);
+  constexpr size_t kReaders = 4;
+  std::vector<Status> results(kReaders, Status::kInvalid);
+  std::vector<std::string> values(kReaders);
+  std::mutex start_mutex;
+  std::condition_variable start_cv;
+  bool start = false;
+  std::vector<std::thread> readers;
+  for (size_t index = 0; index < kReaders; ++index) {
+    readers.emplace_back([&, index] {
+      {
+        std::unique_lock<std::mutex> lock(start_mutex);
+        if (!start_cv.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return start; })) {
+          return;
+        }
+      }
+      DiskResidentIdentity identity;
+      results[index] =
+          recovered.RangeWithIdentity({1, 0}, 0, 5, &values[index], &identity);
+      if (results[index] == Status::kOk) {
+        recovered.NotifyLifetimeReadSuccess({1, 0}, identity,
+                                            values[index].size());
+      }
+    });
+  }
+  {
+    const std::lock_guard<std::mutex> lock(start_mutex);
+    start = true;
+  }
+  start_cv.notify_all();
+  for (std::thread& reader : readers) reader.join();
+  for (size_t index = 0; index < kReaders; ++index) {
+    EXPECT_EQ(results[index], Status::kOk);
+    EXPECT_EQ(values[index], "bytes");
+  }
+  ExpectPopulation(recovered, 1, 0);
+  EXPECT_EQ(recovered.GetStats().lifetime_reads.applied, kReaders);
+  EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
+}
+
 TEST_F(DiskLifetimePublicTest, ImmediateWatermarkCannotResurrectRecoveredKeys) {
   DiskSlabStore::Options options = StoreOptions();
   if (!options.lifetime_config.has_value()) {
@@ -590,6 +759,7 @@ TEST_F(DiskLifetimePublicTest, ImmediateWatermarkCannotResurrectRecoveredKeys) {
   {
     DiskSlabStore recovered(options);
     ASSERT_TRUE(recovered.Healthy());
+    ExpectPopulation(recovered, 8, 8);
     DiskSlabStoreTestPeer::Tick(recovered);
     EXPECT_GT(recovered.Count(), 0U);
     EXPECT_LE(recovered.Count(), 4U);
@@ -597,17 +767,22 @@ TEST_F(DiskLifetimePublicTest, ImmediateWatermarkCannotResurrectRecoveredKeys) {
       if (recovered.IsCached({key, 0})) survivors.push_back(key);
     }
     EXPECT_EQ(recovered.Count(), survivors.size());
+    ExpectPopulation(recovered, survivors.size(), survivors.size());
     EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
   }
   DiskSlabStore reopened(options);
   ASSERT_TRUE(reopened.Healthy());
   EXPECT_EQ(reopened.Count(), survivors.size());
+  ExpectPopulation(reopened, survivors.size(), survivors.size());
   for (uint64_t key = 1; key <= 8; ++key) {
     const bool survived =
         std::find(survivors.begin(), survivors.end(), key) != survivors.end();
     EXPECT_EQ(reopened.IsCached({key, 0}), survived) << "key=" << key;
-    if (survived) ASSERT_NO_FATAL_FAILURE(Read(reopened, {key, 0}));
+    if (survived) {
+      ASSERT_NO_FATAL_FAILURE(Read(reopened, {key, 0}));
+    }
   }
+  ExpectPopulation(reopened, survivors.size(), 0);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(reopened));
 }
 
@@ -624,18 +799,22 @@ TEST_F(DiskLifetimePublicTest, ImmediateDonorRebindDoesNotResurrectOldClass) {
     DiskSlabStore recovered(options);
     ASSERT_TRUE(recovered.Healthy());
     ASSERT_NO_FATAL_FAILURE(CheckRecovered(recovered, {1, 0}));
+    ExpectPopulation(recovered, 8, 8);
     ASSERT_EQ(recovered.Cache({100, 0}, large.data(), large.size()),
               Status::kOk);
     for (uint64_t key = 1; key <= 8; ++key)
       EXPECT_FALSE(recovered.IsCached({key, 0}));
     EXPECT_EQ(recovered.Count(), 1U);
+    ExpectPopulation(recovered, 0, 0);
     EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
   }
   DiskSlabStore reopened(options);
   ASSERT_TRUE(reopened.Healthy());
   EXPECT_EQ(reopened.Count(), 1U);
   ASSERT_NO_FATAL_FAILURE(CheckRecovered(reopened, {100, 0}));
+  ExpectPopulation(reopened, 1, 1);
   ASSERT_NO_FATAL_FAILURE(Read(reopened, {100, 0}, large));
+  ExpectPopulation(reopened, 1, 0);
   for (uint64_t key = 1; key <= 8; ++key)
     EXPECT_FALSE(reopened.IsCached({key, 0}));
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(reopened));

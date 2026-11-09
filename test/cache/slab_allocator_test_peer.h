@@ -236,6 +236,12 @@ class SlabAllocatorTestPeer {
   static bool LifetimeIndexesValid(const SlabAllocator& allocator) {
     const std::lock_guard<std::mutex> lock(allocator.mu_);
     if (!allocator.opt_.track_lifetime_state) {
+      for (const SlabAllocator::Class& cls : allocator.classes_) {
+        if (cls.recovered_residents != 0 ||
+            cls.recovered_unread_residents != 0) {
+          return false;
+        }
+      }
       return allocator.lifetime_links_.capacity() == 0 &&
              allocator.lifetime_queues_.capacity() == 0;
     }
@@ -289,6 +295,8 @@ class SlabAllocatorTestPeer {
         }
       }
     }
+    // Independent population oracle: [0] is recovered, [1] is still unread.
+    std::vector<std::array<uint64_t, 2>> recovered(allocator.classes_.size());
     for (size_t index = 0; index < size; ++index) {
       // Hidden pending Remove still owns its physical slot until final unpin.
       const bool eligible =
@@ -298,6 +306,23 @@ class SlabAllocatorTestPeer {
       if (seen[index][0] != eligible || seen[index][1] != eligible ||
           (allocator.lifetime_links_[index].band != SlabAllocator::kNoSlot) !=
               eligible) {
+        return false;
+      }
+      if (eligible) {
+        const uint32_t cls = allocator.slots_[index].ref.cls;
+        if (cls >= recovered.size()) return false;
+        const DiskLifetimeState& state =
+            *allocator.resident_lifetime_states_[index];
+        if (state.history_unknown) {
+          ++recovered[cls][0];
+          if (state.actual_reads == 0) ++recovered[cls][1];
+        }
+      }
+    }
+    for (size_t cls = 0; cls < allocator.classes_.size(); ++cls) {
+      if (allocator.classes_[cls].recovered_residents != recovered[cls][0] ||
+          allocator.classes_[cls].recovered_unread_residents !=
+              recovered[cls][1]) {
         return false;
       }
     }

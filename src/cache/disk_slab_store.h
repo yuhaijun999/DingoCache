@@ -166,6 +166,10 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_bucket_entries = 0;
     uint64_t lifetime_bucket_bytes = 0;
     uint64_t lifetime_bucket_token_bytes = 0;
+    // Allocator-retained residents with initialized recovered lifetime state.
+    // Unread means no applied real reads; virtual recovery seeds do not count.
+    uint64_t lifetime_recovered_objects = 0;
+    uint64_t lifetime_recovered_unread_objects = 0;
 
     uint64_t dio_write_fallbacks = 0;
     uint64_t dio_read_fallbacks = 0;

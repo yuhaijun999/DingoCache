@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export current recovered lifetime residents and their real-unread subset,
+  globally and per disk. Rebuild the gauges on recovery and retain hidden pinned
+  residents until allocator release; virtual reads do not consume the subset.
+
 - Classify lifetime logical read notifications by RAM, independent storage,
   copy leader/follower and transport-grant completion paths. Keep coalescer
   fallbacks distinct from copied followers, with per-disk and aggregate counters.

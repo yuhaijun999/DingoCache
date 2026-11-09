@@ -1089,6 +1089,9 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_bucket_entries += st.lifetime_bucket_entries;
     sum.lifetime_bucket_bytes += st.lifetime_bucket_bytes;
     sum.lifetime_bucket_token_bytes += st.lifetime_bucket_token_bytes;
+    sum.lifetime_recovered_objects += st.lifetime_recovered_objects;
+    sum.lifetime_recovered_unread_objects +=
+        st.lifetime_recovered_unread_objects;
 
     sum.lifetime_reads.successful += st.lifetime_reads.successful;
     sum.lifetime_reads.applied += st.lifetime_reads.applied;
@@ -1151,6 +1154,8 @@ std::vector<SlabAllocator::ClassStat> DiskCacheGroup::SlabClasses() const {
       sum.allocated_bytes += cls.allocated_bytes;
       sum.read_touches += cls.read_touches;
       sum.read_heat += cls.read_heat;
+      sum.recovered_residents += cls.recovered_residents;
+      sum.recovered_unread_residents += cls.recovered_unread_residents;
     }
   }
   std::vector<SlabAllocator::ClassStat> out;

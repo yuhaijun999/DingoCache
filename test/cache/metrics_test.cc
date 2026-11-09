@@ -252,7 +252,9 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
   }
   for (const char* name :
        {"dfkv_slab_lifetime_bucket_entries", "dfkv_slab_lifetime_bucket_bytes",
-        "dfkv_slab_lifetime_bucket_token_bytes"}) {
+        "dfkv_slab_lifetime_bucket_token_bytes",
+        "dfkv_slab_lifetime_recovered_objects",
+        "dfkv_slab_lifetime_recovered_unread_objects"}) {
     EXPECT_NE(text.find(std::string(name) + " 0\n"), std::string::npos);
   }
   const std::string disk_labels =
@@ -273,9 +275,12 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
                         "_total" + labels),
               std::string::npos);
   }
-  for (const char* name : {"dfkv_slab_disk_lifetime_bucket_entries",
-                           "dfkv_slab_disk_lifetime_bucket_bytes",
-                           "dfkv_slab_disk_lifetime_bucket_token_bytes"}) {
+  for (const char* name :
+       {"dfkv_slab_disk_lifetime_bucket_entries",
+        "dfkv_slab_disk_lifetime_bucket_bytes",
+        "dfkv_slab_disk_lifetime_bucket_token_bytes",
+        "dfkv_slab_disk_lifetime_recovered_objects",
+        "dfkv_slab_disk_lifetime_recovered_unread_objects"}) {
     EXPECT_NE(text.find(std::string(name) + labels), std::string::npos);
   }
   for (const char* name :
@@ -878,6 +883,157 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, RecoveredGaugesTrackReadsRemovalAndRestarts) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "4096");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_recovered";
+  fs::remove_all(dir);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 4ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  std::vector<BlockKey> keys[2];
+  for (uint64_t id = 1; id < 10000 && (keys[0].size() < 3 || keys[1].empty());
+       ++id) {
+    const BlockKey key{id, 0};
+    const size_t disk = DiskCacheGroupTestPeer::RouteIndex(
+        KvNodeServerTestPeer::Group(*server), key);
+    ASSERT_LT(disk, 2U);
+    if ((disk == 0 && keys[0].size() < 3) || (disk == 1 && keys[1].empty()))
+      keys[disk].push_back(key);
+  }
+  ASSERT_EQ(keys[0].size(), 3U);
+  ASSERT_EQ(keys[1].size(), 1U);
+  const auto expect_population = [&](uint64_t objects0, uint64_t unread0,
+                                     uint64_t objects1, uint64_t unread1) {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+    const std::string text = server->MetricsText();
+    const uint64_t objects[] = {objects0, objects1};
+    const uint64_t unread[] = {unread0, unread1};
+    uint64_t class_objects = 0;
+    uint64_t class_unread = 0;
+    const std::vector<SlabAllocator::ClassStat> classes = group.SlabClasses();
+    for (const SlabAllocator::ClassStat& cls : classes) {
+      class_objects += cls.recovered_residents;
+      class_unread += cls.recovered_unread_residents;
+    }
+    EXPECT_EQ(class_objects, objects0 + objects1);
+    EXPECT_EQ(class_unread, unread0 + unread1);
+    for (size_t disk = 0; disk < 2; ++disk) {
+      const DiskSlabStore::Stats stats = group.DiskSlabStats(disk);
+      EXPECT_EQ(stats.lifetime_recovered_objects, objects[disk]);
+      EXPECT_EQ(stats.lifetime_recovered_unread_objects, unread[disk]);
+      EXPECT_LE(stats.lifetime_recovered_unread_objects,
+                stats.lifetime_recovered_objects);
+      const std::string labels = R"({disk=")" + options.cache_dirs[disk] +
+                                 R"(",disk_index=")" + std::to_string(disk) +
+                                 R"("} )";
+      EXPECT_NE(text.find("dfkv_slab_disk_lifetime_recovered_objects" + labels +
+                          std::to_string(objects[disk]) + "\n"),
+                std::string::npos);
+      EXPECT_NE(text.find("dfkv_slab_disk_lifetime_recovered_unread_objects" +
+                          labels + std::to_string(unread[disk]) + "\n"),
+                std::string::npos);
+    }
+    EXPECT_NE(text.find("dfkv_slab_lifetime_recovered_objects " +
+                        std::to_string(objects0 + objects1) + "\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("dfkv_slab_lifetime_recovered_unread_objects " +
+                        std::to_string(unread0 + unread1) + "\n"),
+              std::string::npos);
+    for (const char* name :
+         {"dfkv_slab_lifetime_recovered_objects",
+          "dfkv_slab_lifetime_recovered_unread_objects",
+          "dfkv_slab_disk_lifetime_recovered_objects",
+          "dfkv_slab_disk_lifetime_recovered_unread_objects"}) {
+      EXPECT_NE(text.find(std::string("# TYPE ") + name + " gauge\n"),
+                std::string::npos);
+    }
+  };
+  const auto read = [&](const BlockKey& key, std::string* value) {
+    return server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                        key, 0, 0, nullptr, 0, value);
+  };
+  const std::string small(17, 's');
+  const std::string large(5000, 'l');
+  ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Cache(keys[0][0], small.data(),
+                                                       small.size()),
+            Status::kOk);
+  ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Cache(keys[0][1], large.data(),
+                                                       large.size()),
+            Status::kOk);
+  ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Cache(keys[1][0], "other", 5),
+            Status::kOk);
+  // NEW residents, even unread ones, do not carry recovered history.
+  ASSERT_NO_FATAL_FAILURE(expect_population(0, 0, 0, 0));
+  server.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  // Two size classes on disk 0 and a different population on disk 1.
+  ASSERT_NO_FATAL_FAILURE(expect_population(2, 2, 1, 1));
+  ASSERT_NO_FATAL_FAILURE(
+      expect_population(2, 2, 1, 1));  // Scrapes are read-only.
+  std::string value;
+  ASSERT_EQ(read(keys[0][0], &value), Status::kOk);
+  EXPECT_EQ(value, small);
+  ASSERT_NO_FATAL_FAILURE(expect_population(2, 1, 1, 1));
+  ASSERT_EQ(read(keys[0][0], &value), Status::kOk);
+  ASSERT_NO_FATAL_FAILURE(expect_population(2, 1, 1, 1));
+  char buffer[5] = {};
+  size_t size = 0;
+  ASSERT_EQ(
+      server->RangeIntoForKey(keys[1][0], 0, 0, buffer, sizeof(buffer), &size),
+      Status::kOk);
+  EXPECT_EQ(std::string(buffer, size), "other");
+  ASSERT_NO_FATAL_FAILURE(expect_population(2, 1, 1, 0));
+  DiskSlabStore& disk0 =
+      DiskCacheGroupTestPeer::Slab(KvNodeServerTestPeer::Group(*server), 0);
+  // A storage-only read is not a logical notification and cannot consume
+  // unread.
+  ASSERT_EQ(disk0.Range(keys[0][1], 0, 0, &value), Status::kOk);
+  EXPECT_EQ(value, large);
+  ASSERT_NO_FATAL_FAILURE(expect_population(2, 1, 1, 0));
+  ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Cache(keys[0][2], small.data(),
+                                                       small.size()),
+            Status::kOk);
+  ASSERT_NO_FATAL_FAILURE(expect_population(2, 1, 1, 0));
+  ASSERT_EQ(disk0.Remove(keys[0][0]), Status::kOk);
+  ASSERT_NO_FATAL_FAILURE(expect_population(1, 1, 1, 0));
+  ReadLease lease;
+  ASSERT_EQ(disk0.RangeDirectPrep(keys[0][1], 0, 0, 8192, &lease), Status::kOk);
+  ASSERT_EQ(disk0.Remove(keys[0][1]), Status::kOk);
+  EXPECT_FALSE(disk0.IsCached(keys[0][1]));
+  // Hidden but pinned recovered residents remain in the allocator population.
+  ASSERT_NO_FATAL_FAILURE(expect_population(1, 1, 1, 0));
+  lease = ReadLease{};
+  ASSERT_TRUE(server->Healthy());
+  ASSERT_NO_FATAL_FAILURE(expect_population(0, 0, 1, 0));
+  server.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  // The prior NEW survivor is now recovered; real-read history resets on boot.
+  ASSERT_NO_FATAL_FAILURE(expect_population(1, 1, 1, 1));
+  ASSERT_EQ(read(keys[0][2], &value), Status::kOk);
+  EXPECT_EQ(value, small);
+  ASSERT_NO_FATAL_FAILURE(expect_population(1, 0, 1, 1));
+  KvNodeServerTestPeer::Group(*server).PreventCleanShutdown();
+  server.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  EXPECT_EQ(KvNodeServerTestPeer::Group(*server).Count(), 0U);
+  ASSERT_NO_FATAL_FAILURE(expect_population(0, 0, 0, 0));
+  server.reset();
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
   const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
@@ -1094,7 +1250,11 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
         "dfkv_slab_lifetime_bucket_token_bytes",
         "dfkv_slab_disk_lifetime_bucket_entries",
         "dfkv_slab_disk_lifetime_bucket_bytes",
-        "dfkv_slab_disk_lifetime_bucket_token_bytes"}) {
+        "dfkv_slab_disk_lifetime_bucket_token_bytes",
+        "dfkv_slab_lifetime_recovered_objects",
+        "dfkv_slab_lifetime_recovered_unread_objects",
+        "dfkv_slab_disk_lifetime_recovered_objects",
+        "dfkv_slab_disk_lifetime_recovered_unread_objects"}) {
     EXPECT_EQ(text.find(name), std::string::npos);
   }
   EXPECT_EQ(text.find("dfkv_slab_watermark_freed_payload_bytes_total"),

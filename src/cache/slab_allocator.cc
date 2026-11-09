@@ -333,6 +333,11 @@ void SlabAllocator::CommitResidentGeneration(
   resident_generations_[*index] = generation;
   if (opt_.track_lifetime_state && lifetime_state != nullptr) {
     resident_lifetime_states_[*index] = *lifetime_state;
+    if (lifetime_state->history_unknown) {
+      Class& cls = classes_[slots_[*index].ref.cls];
+      ++cls.recovered_residents;
+      if (lifetime_state->actual_reads == 0) ++cls.recovered_unread_residents;
+    }
     LinkLifetimeLocked(*index);
     if (opt_.lifetime_bucket_count != 0) {
       assert(config != nullptr);
@@ -362,6 +367,14 @@ SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
   DiskLifetimeState next_state = *resident_state;
   if (!ApplyDiskLifetimeRead(config, applied_at, &next_state))
     return LifetimeReadResult::kStateUnavailable;
+  // Virtual recovery reads never leave the unread population. Only the first
+  // accepted real read does; rejected updates keep both population ledgers.
+  if (resident_state->history_unknown && resident_state->actual_reads == 0 &&
+      next_state.actual_reads != 0) {
+    Class& cls = classes_[slots_[*index].ref.cls];
+    assert(cls.recovered_unread_residents != 0);
+    --cls.recovered_unread_residents;
+  }
   // Even a saturated read changes anchor and must move BOTH indexes. Compute
   // the new state first so a rejected update leaves state and links untouched.
   UnregisterLifetimeBucketLocked(*index);
@@ -829,7 +842,21 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
   if (meta.refs > 0 && extent.pinned > 0) --extent.pinned;
   index_.Erase(meta.key);
   if (opt_.track_resident_identity) resident_generations_[index] = 0;
-  if (opt_.track_lifetime_state) resident_lifetime_states_[index].reset();
+  if (opt_.track_lifetime_state) {
+    const std::optional<DiskLifetimeState>& state =
+        resident_lifetime_states_[index];
+    if (state.has_value() && state->history_unknown) {
+      // Visibility loss and pending Remove do not release this resident.
+      // All reclaim paths debit here only after persistence permits reuse.
+      assert(cls.recovered_residents != 0);
+      --cls.recovered_residents;
+      if (state->actual_reads == 0) {
+        assert(cls.recovered_unread_residents != 0);
+        --cls.recovered_unread_residents;
+      }
+    }
+    resident_lifetime_states_[index].reset();
+  }
   PushFreeLocked(cls, extent_index, physical_slot);
   ++extent.free_slots;
   extent.useful_bytes -= useful_bytes;
@@ -1573,6 +1600,8 @@ std::vector<SlabAllocator::ClassStat> SlabAllocator::Classes() const {
     stat.allocated_bytes = static_cast<uint64_t>(cls.resident_count) * cls.slot_size;
     stat.read_touches = cls.read_touches;
     stat.read_heat = DecayedHeat(cls.read_heat, cls.heat_seq);
+    stat.recovered_residents = cls.recovered_residents;
+    stat.recovered_unread_residents = cls.recovered_unread_residents;
     result.push_back(stat);
   }
   return result;

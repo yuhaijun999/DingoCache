@@ -139,6 +139,10 @@ class SlabAllocator {
     uint64_t allocated_bytes = 0; // slot bytes occupied by residents
     uint64_t read_touches = 0;    // cumulative Get/GetAndPin hits
     uint64_t read_heat = 0;       // recent, operation-decayed read evidence
+    // Retained residents with initialized recovered state, including pins.
+    uint64_t recovered_residents = 0;
+    // Recovered residents with no applied real read since this startup.
+    uint64_t recovered_unread_residents = 0;
   };
   std::vector<ClassStat> Classes() const;
   uint32_t PoolExtents() const;
@@ -388,6 +392,8 @@ class SlabAllocator {
     uint64_t useful_bytes = 0;
     uint64_t read_touches = 0;
     uint64_t read_heat = 0;
+    uint64_t recovered_residents = 0;
+    uint64_t recovered_unread_residents = 0;
     uint64_t heat_seq = 0;
     uint32_t ring_head = kNoSlot;
     uint32_t hand = kNoSlot;

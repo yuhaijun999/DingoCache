@@ -2915,6 +2915,8 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
     for (const SlabAllocator::ClassStat& cls : classes) {
       st.bound_extents += cls.extents;
       st.allocator_payload_bytes += cls.useful_bytes;
+      st.lifetime_recovered_objects += cls.recovered_residents;
+      st.lifetime_recovered_unread_objects += cls.recovered_unread_residents;
       // Use one allocator snapshot, not an earlier UsedBytes sample minus
       // the independently sampled reader-visible committed payload.
       st.allocator_fragmentation_bytes +=
