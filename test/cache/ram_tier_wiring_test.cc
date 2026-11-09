@@ -3608,6 +3608,26 @@ class LifetimeSuccessReadTest : public ProductionFlushResultTest {
               counters.applied + counters.no_binding + counters.race_lost +
                   counters.clock_hard_exhausted + counters.io_unhealthy +
                   counters.state_unavailable);
+    // Callers have finished (or explicitly held) every logical completion.
+    // Check the exported disk outcomes, not just the in-memory accounting.
+    const std::string text = node_->MetricsText();
+    const std::string labels =
+        R"({disk=")" + (dir_ / "slab").string() + R"(",disk_index="0"} )";
+    const std::pair<const char*, uint64_t> outcomes[] = {
+        {"success", counters.successful},
+        {"applied", counters.applied},
+        {"no_binding", counters.no_binding},
+        {"race_lost", counters.race_lost},
+        {"clock_hard_exhausted", counters.clock_hard_exhausted},
+        {"io_unhealthy", counters.io_unhealthy},
+        {"state_unavailable", counters.state_unavailable}};
+    for (const std::pair<const char*, uint64_t>& outcome : outcomes) {
+      EXPECT_NE(text.find(std::string("dfkv_slab_disk_lifetime_read_") +
+                          outcome.first + "_total" + labels +
+                          std::to_string(outcome.second) + "\n"),
+                std::string::npos)
+          << outcome.first;
+    }
   }
 };
 
@@ -4206,6 +4226,7 @@ TEST_F(LifetimeSuccessReadTest, CleanRecoveryFirstReadKeepsUnknownHistory) {
   EXPECT_EQ(State(key).scoring_reads(), 1U);  // Staged seed, not R45's n=2.
   EXPECT_EQ(State(key).actual_reads, 0U);
   EXPECT_TRUE(State(key).history_unknown);
+  ExpectConservation(0);  // Recovery's virtual seed is not a business read.
   seconds_.store(140, std::memory_order_relaxed);
   std::string value;
   ASSERT_EQ(Read(key, &value), Status::kOk);

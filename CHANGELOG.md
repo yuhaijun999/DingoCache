@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export per-disk lifetime read-notification outcomes using existing counters.
+  Preserve logical-read attribution and distinguish routed notifications from
+  physical disk I/O; recovery virtual reads do not count as business reads.
+
 - Export lifetime expiry bucket entry counts and retained bucket/token vector
   backing bytes, globally and per disk. Include empty extents and distinguish
   retained capacity from active protection registrations or total process RSS.

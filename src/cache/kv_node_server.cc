@@ -614,6 +614,20 @@ std::string KvNodeServer::MetricsText() const {
            "Retained protection expiry bucket vector backing bytes");
     header("dfkv_slab_disk_lifetime_bucket_token_bytes", "gauge",
            "Retained resident expiry token vector backing bytes");
+    header("dfkv_slab_disk_lifetime_read_success_total", "counter",
+           "Nonzero successful business reads notified to lifetime metadata");
+    header("dfkv_slab_disk_lifetime_read_applied_total", "counter",
+           "Successful read notifications applied to the original resident");
+    header("dfkv_slab_disk_lifetime_read_no_binding_total", "counter",
+           "Successful reads without a disk source binding");
+    header("dfkv_slab_disk_lifetime_read_race_lost_total", "counter",
+           "Successful reads whose original resident is no longer visible");
+    header("dfkv_slab_disk_lifetime_read_clock_hard_exhausted_total", "counter",
+           "Successful reads left unheated at hard clock exhaustion");
+    header("dfkv_slab_disk_lifetime_read_io_unhealthy_total", "counter",
+           "Successful read notifications skipped by disk I/O isolation");
+    header("dfkv_slab_disk_lifetime_read_state_unavailable_total", "counter",
+           "Matching residents with unavailable or invalid lifetime state");
     for (size_t i = 0; i < group_.DiskCount(); ++i) {
       const auto st = group_.DiskWatermarkObservation(i);
       const std::string labels =
@@ -636,6 +650,20 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      sample("dfkv_slab_disk_lifetime_read_success_total",
+             disk.lifetime_reads.successful);
+      sample("dfkv_slab_disk_lifetime_read_applied_total",
+             disk.lifetime_reads.applied);
+      sample("dfkv_slab_disk_lifetime_read_no_binding_total",
+             disk.lifetime_reads.no_binding);
+      sample("dfkv_slab_disk_lifetime_read_race_lost_total",
+             disk.lifetime_reads.race_lost);
+      sample("dfkv_slab_disk_lifetime_read_clock_hard_exhausted_total",
+             disk.lifetime_reads.clock_hard_exhausted);
+      sample("dfkv_slab_disk_lifetime_read_io_unhealthy_total",
+             disk.lifetime_reads.io_unhealthy);
+      sample("dfkv_slab_disk_lifetime_read_state_unavailable_total",
+             disk.lifetime_reads.state_unavailable);
       sample("dfkv_slab_disk_lifetime_bucket_entries",
              disk.lifetime_bucket_entries);
       sample("dfkv_slab_disk_lifetime_bucket_bytes",

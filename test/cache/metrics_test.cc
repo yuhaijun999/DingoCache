@@ -20,10 +20,14 @@
 #include <vector>
 
 #include "cache/disk_cache_group.h"
+#include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
+#include "cache/disk_write_result.h"
 #include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
+#include "common/kv_types.h"
 #include "common/status.h"
+#include "transport/wire.h"
 
 namespace dfkv {
 class KvNodeServerTestPeer {
@@ -33,6 +37,9 @@ class KvNodeServerTestPeer {
 
 class DiskCacheGroupTestPeer {
  public:
+  static size_t RouteIndex(const DiskCacheGroup& group, const BlockKey& key) {
+    return group.RouteIndex(key);
+  }
   static DiskSlabStore& Slab(DiskCacheGroup& group, size_t index) {
     return *group.slabs_.at(index);
   }
@@ -257,6 +264,13 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
                       disk_labels + "1096\n"),
             std::string::npos);
   const std::string labels = disk_labels + "0\n";
+  for (const char* suffix :
+       {"success", "applied", "no_binding", "race_lost", "clock_hard_exhausted",
+        "io_unhealthy", "state_unavailable"}) {
+    EXPECT_NE(text.find(std::string("dfkv_slab_disk_lifetime_read_") + suffix +
+                        "_total" + labels),
+              std::string::npos);
+  }
   for (const char* name : {"dfkv_slab_disk_lifetime_bucket_entries",
                            "dfkv_slab_disk_lifetime_bucket_bytes",
                            "dfkv_slab_disk_lifetime_bucket_token_bytes"}) {
@@ -862,6 +876,160 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "4096");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_read_outcomes";
+  fs::remove_all(dir);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 2ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  server->set_identity("reads", "test");
+  BlockKey keys[2]{};
+  bool found[2]{};
+  for (uint64_t id = 1; id < 10000 && !(found[0] && found[1]); ++id) {
+    const BlockKey key{id, 0};
+    const size_t disk = DiskCacheGroupTestPeer::RouteIndex(
+        KvNodeServerTestPeer::Group(*server), key);
+    ASSERT_LT(disk, 2U);
+    keys[disk] = key;
+    found[disk] = true;
+  }
+  ASSERT_TRUE(found[0] && found[1]);
+  DiskResidentIdentity original[2]{};
+  for (size_t disk = 0; disk < 2; ++disk) {
+    const DiskWriteResult written =
+        KvNodeServerTestPeer::Group(*server).CacheWithResult(keys[disk],
+                                                             "value", 5);
+    ASSERT_EQ(written.status, Status::kOk);
+    ASSERT_TRUE(written.identity.valid());
+    original[disk] = written.identity;
+  }
+  DiskSlabStore::LifetimeReadCounters expected[2]{};
+  const auto expect_outcomes = [&] {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+    const std::string text = server->MetricsText();
+    struct ReadMetric {
+      const char* suffix;
+      uint64_t DiskSlabStore::LifetimeReadCounters::*field;
+    };
+    const ReadMetric metrics[] = {
+        {"success", &DiskSlabStore::LifetimeReadCounters::successful},
+        {"applied", &DiskSlabStore::LifetimeReadCounters::applied},
+        {"no_binding", &DiskSlabStore::LifetimeReadCounters::no_binding},
+        {"race_lost", &DiskSlabStore::LifetimeReadCounters::race_lost},
+        {"clock_hard_exhausted",
+         &DiskSlabStore::LifetimeReadCounters::clock_hard_exhausted},
+        {"io_unhealthy", &DiskSlabStore::LifetimeReadCounters::io_unhealthy},
+        {"state_unavailable",
+         &DiskSlabStore::LifetimeReadCounters::state_unavailable}};
+    for (const ReadMetric& metric : metrics) {
+      const std::string name = std::string("dfkv_slab_disk_lifetime_read_") +
+                               metric.suffix + "_total";
+      EXPECT_NE(text.find("# HELP " + name + " "), std::string::npos);
+      EXPECT_NE(text.find("# TYPE " + name + " counter\n"), std::string::npos);
+      uint64_t sum = 0;
+      for (size_t disk = 0; disk < 2; ++disk) {
+        const DiskSlabStore::LifetimeReadCounters actual =
+            group.DiskSlabStats(disk).lifetime_reads;
+        EXPECT_EQ(actual.*metric.field, expected[disk].*metric.field);
+        EXPECT_EQ(actual.successful,
+                  actual.applied + actual.no_binding + actual.race_lost +
+                      actual.clock_hard_exhausted + actual.io_unhealthy +
+                      actual.state_unavailable);
+        const std::string labels = R"({disk=")" + options.cache_dirs[disk] +
+                                   R"(",disk_index=")" + std::to_string(disk) +
+                                   R"(",node="reads",group="test"} )";
+        EXPECT_NE(
+            text.find(name + labels +
+                      std::to_string(expected[disk].*metric.field) + "\n"),
+            std::string::npos);
+        sum += expected[disk].*metric.field;
+      }
+      const std::string global =
+          std::string("dfkv_slab_lifetime_read_") + metric.suffix + "_total";
+      EXPECT_NE(text.find(global + "{node=\"reads\",group=\"test\"} " +
+                          std::to_string(sum) + "\n"),
+                std::string::npos);
+    }
+  };
+  ASSERT_NO_FATAL_FAILURE(expect_outcomes());
+  const auto read = [&](const BlockKey& key, uint64_t offset,
+                        std::string* value) {
+    return server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                        key, offset, 0, nullptr, 0, value);
+  };
+  for (size_t disk = 0; disk < 2; ++disk) {
+    std::string value;
+    ASSERT_EQ(read(keys[disk], 0, &value), Status::kOk);
+    EXPECT_EQ(value, "value");
+    ++expected[disk].successful;
+    ++expected[disk].applied;
+    ValueMetadata metadata;
+    ASSERT_EQ(server->LookupForKey(keys[disk], &metadata), Status::kOk);
+    EXPECT_EQ(metadata.value_len, 5U);
+    ASSERT_EQ(read(keys[disk], 5, &value), Status::kOk);
+    EXPECT_TRUE(value.empty());
+    ASSERT_EQ(read(keys[disk], 6, &value), Status::kInvalid);
+  }
+  char buffer[5]{};
+  size_t size = 0;
+  ASSERT_EQ(
+      server->RangeIntoForKey(keys[1], 0, 0, buffer, sizeof(buffer), &size),
+      Status::kOk);
+  EXPECT_EQ(std::string(buffer, size), "value");
+  ++expected[1].successful;
+  ++expected[1].applied;
+  std::string value;
+  ASSERT_EQ(read({10001, 0}, 0, &value), Status::kNotFound);
+  ASSERT_NO_FATAL_FAILURE(expect_outcomes());
+
+  // Simulate a late successful transport notification with an actual old
+  // credential. This checks export attribution, not a live transport grant.
+  ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Remove(keys[0]), Status::kOk);
+  ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Cache(keys[0], "newer", 5),
+            Status::kOk);
+  server->NotifyLifetimeReadSuccessForKey(keys[0], original[0], 5);
+  ++expected[0].successful;
+  ++expected[0].race_lost;
+  // An unbound notification is attributed by key route, not physical source.
+  server->NotifyLifetimeReadSuccessForKey(keys[1], {}, 5);
+  ++expected[1].successful;
+  ++expected[1].no_binding;
+  server->NotifyLifetimeReadSuccessForKey(keys[1], original[1], 0);
+  ASSERT_NO_FATAL_FAILURE(expect_outcomes());
+
+  server.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  server->set_identity("reads", "test");
+  expected[0] = {};
+  expected[1] = {};
+  // Recovery's virtual two reads rebuild protection but are not business reads.
+  EXPECT_EQ(
+      KvNodeServerTestPeer::Group(*server).DiskSlabStats(0).committed_objects,
+      1U);
+  EXPECT_EQ(
+      KvNodeServerTestPeer::Group(*server).DiskSlabStats(1).committed_objects,
+      1U);
+  ASSERT_NO_FATAL_FAILURE(expect_outcomes());
+  ASSERT_EQ(read(keys[1], 0, &value), Status::kOk);
+  EXPECT_EQ(value, "value");
+  ++expected[1].successful;
+  ++expected[1].applied;
+  ASSERT_NO_FATAL_FAILURE(expect_outcomes());
+  server.reset();
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, PrometheusFormatAndIdentity) {
   ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
   std::string addr;
@@ -931,6 +1099,7 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
   EXPECT_EQ(text.find("dfkv_slab_lifetime_donor_freed_slot_bytes_total"),
             std::string::npos);
   EXPECT_EQ(text.find("dfkv_slab_disk_lifetime_donor_"), std::string::npos);
+  EXPECT_EQ(text.find("dfkv_slab_disk_lifetime_read_"), std::string::npos);
   EXPECT_EQ(text.find("dfkv_slab_lifetime_donor_protected_victims_total"),
             std::string::npos);
   EXPECT_EQ(text.find("dfkv_slab_lifetime_donor_protected_payload_bytes_total"),
