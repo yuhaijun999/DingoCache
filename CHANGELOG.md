@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export lifetime extent-donor payload and occupied-slot bytes, with aggregate
+  and per-disk released-resident counts. Keep donor accounting separate from
+  class and watermark reclaim; empty or failed donors add no victim bytes.
+
 - Expose foreground lifetime class payload and slot bytes using successful
   class-event snapshots, excluding donor victims. Preserve completed eviction
   accounting when the incoming write fails, with aggregate and per-disk series.

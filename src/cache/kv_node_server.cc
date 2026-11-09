@@ -588,6 +588,12 @@ std::string KvNodeServer::MetricsText() const {
            "Slot bytes removed by foreground lifetime class reclaim");
     header("dfkv_slab_disk_lifetime_class_freed_payload_bytes_total", "counter",
            "Payload bytes removed by foreground lifetime class reclaim");
+    header("dfkv_slab_disk_lifetime_donor_released_residents_total", "counter",
+           "Residents removed by lifetime extent donor reclaim");
+    header("dfkv_slab_disk_lifetime_donor_freed_slot_bytes_total", "counter",
+           "Occupied slot bytes removed by lifetime extent donor reclaim");
+    header("dfkv_slab_disk_lifetime_donor_freed_payload_bytes_total", "counter",
+           "Payload bytes removed by lifetime extent donor reclaim");
     for (size_t i = 0; i < group_.DiskCount(); ++i) {
       const auto st = group_.DiskWatermarkObservation(i);
       const std::string labels =
@@ -610,6 +616,12 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      sample("dfkv_slab_disk_lifetime_donor_released_residents_total",
+             disk.lifetime_donor_released_residents);
+      sample("dfkv_slab_disk_lifetime_donor_freed_slot_bytes_total",
+             disk.lifetime_donor_freed_slot_bytes);
+      sample("dfkv_slab_disk_lifetime_donor_freed_payload_bytes_total",
+             disk.lifetime_donor_freed_payload_bytes);
       sample("dfkv_slab_disk_lifetime_class_victims_total",
              disk.lifetime_class_victims);
       sample("dfkv_slab_disk_lifetime_class_freed_slot_bytes_total",
@@ -774,6 +786,12 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_donor_released_residents_total", "counter",
            "Lifetime donor released residents.",
            ss.lifetime_donor_released_residents);
+    metric("dfkv_slab_lifetime_donor_freed_slot_bytes_total", "counter",
+           "Occupied slot bytes removed by lifetime extent donor reclaim",
+           ss.lifetime_donor_freed_slot_bytes);
+    metric("dfkv_slab_lifetime_donor_freed_payload_bytes_total", "counter",
+           "Payload bytes removed by lifetime extent donor reclaim",
+           ss.lifetime_donor_freed_payload_bytes);
     metric("dfkv_slab_lifetime_background_no_candidate_total", "counter",
            "Background class scans with no eligible candidate",
            ss.lifetime_background_no_candidate);

@@ -557,6 +557,8 @@ TEST_F(LifetimeClassStoreTest, DonorRebindIsNotForegroundClassEviction) {
   ASSERT_EQ(store_->Cache(Key(3), large.data(), large.size()), Status::kOk);
   const DiskSlabStore::Stats donor = store_->GetStats();
   EXPECT_EQ(donor.lifetime_donor_released_residents, 2U);
+  EXPECT_EQ(donor.lifetime_donor_freed_slot_bytes, 8192U);
+  EXPECT_EQ(donor.lifetime_donor_freed_payload_bytes, 48U);
   EXPECT_EQ(store_->EvictedBytes(), 48U);
   EXPECT_EQ(donor.lifetime_class_victims, 0U);
   EXPECT_EQ(donor.lifetime_class_freed_slot_bytes, 0U);
@@ -568,15 +570,55 @@ TEST_F(LifetimeClassStoreTest, DonorRebindIsNotForegroundClassEviction) {
   ASSERT_EQ(store_->Cache(Key(4), next.data(), next.size()), Status::kOk);
   const DiskSlabStore::Stats class_reclaim = store_->GetStats();
   EXPECT_EQ(class_reclaim.lifetime_donor_released_residents, 2U);
+  EXPECT_EQ(class_reclaim.lifetime_donor_freed_slot_bytes, 8192U);
+  EXPECT_EQ(class_reclaim.lifetime_donor_freed_payload_bytes, 48U);
   EXPECT_EQ(class_reclaim.lifetime_class_victims, 1U);
   EXPECT_EQ(class_reclaim.lifetime_class_freed_slot_bytes, 8192U);
   EXPECT_EQ(class_reclaim.lifetime_class_freed_payload_bytes, 5000U);
   EXPECT_EQ(store_->EvictedBytes(), 5048U);
   store_.reset();
   ASSERT_NO_FATAL_FAILURE(Create(2));
+  EXPECT_EQ(store_->GetStats().lifetime_donor_released_residents, 0U);
+  EXPECT_EQ(store_->GetStats().lifetime_donor_freed_slot_bytes, 0U);
+  EXPECT_EQ(store_->GetStats().lifetime_donor_freed_payload_bytes, 0U);
   ASSERT_EQ(store_->Cache(Key(5), large.data(), large.size()), Status::kOk);
   EXPECT_EQ(store_->GetStats().lifetime_class_freed_slot_bytes, 8192U);
   EXPECT_EQ(store_->GetStats().lifetime_class_freed_payload_bytes, 5001U);
+}
+
+TEST_F(LifetimeClassStoreTest, FailedNewWriteRetainsSuccessfulDonorBytes) {
+  for (const char* mode : {"scalar", "direct", "batch"}) {
+    SCOPED_TRACE(mode);
+    store_.reset();
+    std::filesystem::remove_all(dir_);
+    ASSERT_NO_FATAL_FAILURE(Create(2));
+    ASSERT_EQ(store_->Cache(Key(1), "old", 3), Status::kOk);
+    ASSERT_EQ(store_->Cache(Key(2), "prior", 5), Status::kOk);
+    DiskSlabStoreTestPeer::FailPayloadWrite(*store_);
+    std::string payload(5000, 'x');
+    DiskWriteResult result;
+    if (std::string(mode) == "batch") {
+      const std::vector<StoreEngine::CacheBatchItem> items{
+          {Key(3), payload.data(), 5000, 5000}};
+      result = store_->CacheDirectBatchWithResults(items)[0];
+    } else if (std::string(mode) == "direct") {
+      result =
+          store_->CacheDirectWithResult(Key(3), payload.data(), 5000, 5000);
+    } else {
+      result = store_->CacheWithResult(Key(3), payload.data(), 5000);
+    }
+    EXPECT_EQ(result.status, Status::kIOError);
+    const DiskSlabStore::Stats stats = store_->GetStats();
+    EXPECT_EQ(stats.lifetime_donor_released_residents, 2U);
+    EXPECT_EQ(stats.lifetime_donor_freed_slot_bytes, 8192U);
+    EXPECT_EQ(stats.lifetime_donor_freed_payload_bytes, 8U);
+    EXPECT_EQ(stats.lifetime_class_victims, 0U);
+    EXPECT_EQ(stats.lifetime_background_victims, 0U);
+    EXPECT_EQ(stats.watermark_slot_removals, 0U);
+    EXPECT_EQ(store_->EvictedBytes(), 8U);
+    EXPECT_EQ(store_->Count(), 0U);
+    EXPECT_FALSE(store_->IsCached(Key(3)));
+  }
 }
 
 TEST_F(LifetimeClassStoreTest, FailedNewWriteRetainsSuccessfulEvictionBytes) {

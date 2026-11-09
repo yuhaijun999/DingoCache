@@ -143,6 +143,46 @@ TEST(SlabLifetimeDonor, FullPoolFindsTheOnlyLegalExtentAfter64) {
   ExpectValid(allocator);
 }
 
+TEST(SlabLifetimeDonor, AllEntriesCountOnlyOccupiedDonorSlots) {
+  for (unsigned entry = 0; entry < 3; ++entry) {
+    SCOPED_TRACE(entry);
+    const DiskLifetimeConfig config = Config();
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                  [] { return 0; });
+    SlabAllocator allocator(Options(config, clock));
+    ASSERT_NO_FATAL_FAILURE(Restore(allocator,
+                                    {{Key(1), 4096, 0, 0, 17},
+                                     {Key(2), 4096, 0, 1, 31},
+                                     {Key(3), 4096, 1, 0, 101}},
+                                    config, 0));
+    // The smaller donor stays pinned; none of its bytes may be counted.
+    ASSERT_TRUE(allocator.Pin(Key(3)));
+    SlabAllocatorTestPeer::SetColdEligibility(allocator, 30, 10, {1, 1});
+    std::vector<BlockKey> evicted;
+    const Result result =
+        entry == 0
+            ? SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted)
+            : (entry == 1
+                   ? SlabAllocatorTestPeer::StealCold(allocator, 1, &evicted)
+                   : SlabAllocatorTestPeer::StealRestricted(allocator, 0, 1,
+                                                            &evicted));
+    ASSERT_EQ(result, Result::kBound);
+    EXPECT_EQ(evicted.size(), 2U);
+    const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+    EXPECT_EQ(stats.released_residents, 2U);
+    EXPECT_EQ(stats.freed_slot_bytes, 8192U);
+    EXPECT_EQ(stats.freed_payload_bytes, 48U);
+    EXPECT_EQ(allocator.UsedBytes(), 4096U);
+    EXPECT_TRUE(allocator.Contains(Key(3)));
+    evicted.clear();
+    EXPECT_EQ(SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted),
+              Result::kUnavailable);
+    EXPECT_TRUE(evicted.empty());
+    EXPECT_EQ(allocator.DonorStats().freed_payload_bytes, 48U);
+    ExpectValid(allocator);
+  }
+}
+
 TEST(SlabLifetimeDonor, ExactInspectionIsLimitedToEightCompleteExtents) {
   const DiskLifetimeConfig config = Config();
   uint64_t seconds = 0;
@@ -316,6 +356,8 @@ TEST(SlabLifetimeDonor,
   EXPECT_EQ(stats.precise_residents, 0U);
   EXPECT_EQ(stats.budget_fallback, 1U);
   EXPECT_EQ(stats.released_residents, 8193U);
+  EXPECT_EQ(stats.freed_slot_bytes, 8193ULL * 4096);
+  EXPECT_EQ(stats.freed_payload_bytes, 8193U);
   EXPECT_EQ(allocator.Count(), 0U);
   ExpectValid(allocator);
 }
@@ -344,6 +386,8 @@ TEST(SlabLifetimeDonor,
   const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
   EXPECT_EQ(stats.persistence_errors, 1U);
   EXPECT_EQ(stats.released_residents, 0U);
+  EXPECT_EQ(stats.freed_slot_bytes, 0U);
+  EXPECT_EQ(stats.freed_payload_bytes, 0U);
   ExpectValid(allocator);
 }
 
@@ -370,6 +414,9 @@ TEST(SlabLifetimeDonor, BoundEmptyExtentsAreEligibleOnAllThreeEntries) {
                                                             &evicted));
     EXPECT_EQ(result, Result::kBound);
     EXPECT_TRUE(evicted.empty());
+    EXPECT_EQ(allocator.DonorStats().released_residents, 0U);
+    EXPECT_EQ(allocator.DonorStats().freed_slot_bytes, 0U);
+    EXPECT_EQ(allocator.DonorStats().freed_payload_bytes, 0U);
     EXPECT_TRUE(SlabAllocatorTestPeer::BucketRowEmpty(allocator, 0));
     EXPECT_EQ(allocator.DonorStats().precise_residents, 1U);
     ExpectValid(allocator);
@@ -574,6 +621,9 @@ TEST_F(LifetimeDonorStoreTest, GrowRespectsTwoExtentLimitAndEightExtentFloor) {
     const DiskSlabStore::Stats stats = store_->GetStats();
     EXPECT_EQ(stats.rebalanced_extents, donors == 9 ? 1U : 2U);
     EXPECT_EQ(stats.reclaimed_slots, 0U);
+    EXPECT_EQ(stats.lifetime_donor_released_residents, 0U);
+    EXPECT_EQ(stats.lifetime_donor_freed_slot_bytes, 0U);
+    EXPECT_EQ(stats.lifetime_donor_freed_payload_bytes, 0U);
     EXPECT_EQ(stats.lifetime_donor_persistence_errors, 0U);
     for (uint64_t id = 1; id <= 2; ++id) {
       std::string value;
@@ -582,6 +632,35 @@ TEST_F(LifetimeDonorStoreTest, GrowRespectsTwoExtentLimitAndEightExtentFloor) {
     }
     EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(*store_));
   }
+}
+
+TEST_F(LifetimeDonorStoreTest, GrowCountsResidentBytesNotExtentCapacity) {
+  ASSERT_NO_FATAL_FAILURE(Create(10));
+  for (uint32_t extent = 0; extent < 9; ++extent)
+    ASSERT_TRUE(DiskSlabStoreTestPeer::Bind(*store_, 4096, extent));
+  ASSERT_TRUE(DiskSlabStoreTestPeer::Bind(*store_, 8192, 9));
+  const std::string small(17, 's');
+  for (uint64_t id = 1; id <= 36; ++id)
+    ASSERT_EQ(store_->Cache(Key(id), small.data(), small.size()), Status::kOk);
+  DiskSlabStoreTestPeer::Quiesce(*store_);
+  const std::string large(5000, 'l');
+  ASSERT_EQ(store_->Cache(Key(100), large.data(), large.size()), Status::kOk);
+  ASSERT_EQ(store_->Cache(Key(101), large.data(), large.size()), Status::kOk);
+  DiskSlabStoreTestPeer::Tick(*store_);
+  const DiskSlabStore::Stats stats = store_->GetStats();
+  EXPECT_EQ(stats.rebalanced_extents, 1U);
+  EXPECT_EQ(stats.lifetime_donor_released_residents, 4U);
+  EXPECT_EQ(stats.lifetime_donor_freed_slot_bytes, 4U * 4096);
+  EXPECT_EQ(stats.lifetime_donor_freed_payload_bytes, 68U);
+  EXPECT_EQ(stats.lifetime_class_victims, 0U);
+  EXPECT_EQ(stats.lifetime_background_victims, 0U);
+  EXPECT_EQ(stats.watermark_slot_removals, 0U);
+  EXPECT_EQ(store_->EvictedBytes(), 68U);
+  EXPECT_EQ(store_->Count(), 34U);
+  EXPECT_EQ(store_->TenantUsedBytes(7), 32U * 17 + 10000);
+  DiskSlabStoreTestPeer::Tick(*store_);
+  EXPECT_EQ(store_->GetStats().lifetime_donor_freed_payload_bytes, 68U);
+  EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(*store_));
 }
 
 TEST_F(LifetimeDonorStoreTest,
@@ -639,6 +718,9 @@ TEST_F(LifetimeDonorStoreTest,
   const DiskSlabStore::Stats stats = store_->GetStats();
   EXPECT_FALSE(store_->Healthy());
   EXPECT_EQ(stats.metadata_io_errors, 1U);
+  EXPECT_EQ(stats.lifetime_donor_released_residents, 0U);
+  EXPECT_EQ(stats.lifetime_donor_freed_slot_bytes, 0U);
+  EXPECT_EQ(stats.lifetime_donor_freed_payload_bytes, 0U);
   EXPECT_EQ(stats.lifetime_donor_persistence_errors, 1U);
   EXPECT_EQ(stats.lifetime_donor_coarse_extents, 19U);
   EXPECT_EQ(stats.rebalanced_extents, 0U);
@@ -666,6 +748,8 @@ TEST_F(LifetimeDonorStoreTest,
   EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 0), estimate);
   EXPECT_EQ(store_->GetStats().lifetime_donor_persistence_errors, 1U);
   EXPECT_EQ(store_->GetStats().metadata_io_errors, 1U);
+  EXPECT_EQ(store_->GetStats().lifetime_donor_freed_slot_bytes, 0U);
+  EXPECT_EQ(store_->GetStats().lifetime_donor_freed_payload_bytes, 0U);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(*store_));
 }
 

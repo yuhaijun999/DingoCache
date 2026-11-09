@@ -2852,6 +2852,8 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
     st.lifetime_donor_selection_ns = donor.selection_ns;
     st.lifetime_donor_persistence_ns = donor.persistence_ns;
     st.lifetime_donor_released_residents = donor.released_residents;
+    st.lifetime_donor_freed_slot_bytes = donor.freed_slot_bytes;
+    st.lifetime_donor_freed_payload_bytes = donor.freed_payload_bytes;
     st.steals = alloc_->Steals();
     st.cold_steals = alloc_->ColdSteals();
     st.watermark_evictions = alloc_->WatermarkEvictions();

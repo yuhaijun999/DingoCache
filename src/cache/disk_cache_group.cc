@@ -1078,6 +1078,9 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_donor_persistence_ns += st.lifetime_donor_persistence_ns;
     sum.lifetime_donor_released_residents +=
         st.lifetime_donor_released_residents;
+    sum.lifetime_donor_freed_slot_bytes += st.lifetime_donor_freed_slot_bytes;
+    sum.lifetime_donor_freed_payload_bytes +=
+        st.lifetime_donor_freed_payload_bytes;
 
     sum.lifetime_reads.successful += st.lifetime_reads.successful;
     sum.lifetime_reads.applied += st.lifetime_reads.applied;

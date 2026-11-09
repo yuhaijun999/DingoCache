@@ -1143,7 +1143,14 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealLifetimeDonorLocked(
     if (reclaim_denied != nullptr) *reclaim_denied = true;
     return ExtentBindResult::kReclaimDenied;
   }
-  const uint32_t residents = extents_[best.extent].resident_count;
+  const ExtentMeta& donor = extents_[best.extent];
+  const uint32_t residents = donor.resident_count;
+  // Snapshot occupied bytes before release clears the donor. Free capacity and
+  // the incoming allocation do not belong to this successful eviction event.
+  const uint64_t slot_bytes =
+      static_cast<uint64_t>(residents) *
+      classes_[static_cast<size_t>(donor.cls)].slot_size;
+  const uint64_t payload_bytes = donor.useful_bytes;
   const std::chrono::steady_clock::time_point persistence_started =
       std::chrono::steady_clock::now();
   const ExtentBindResult result =
@@ -1156,8 +1163,11 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealLifetimeDonorLocked(
           .count());
   if (result == ExtentBindResult::kPersistenceError)
     ++lifetime_donor_stats_.persistence_errors;
-  if (result == ExtentBindResult::kBound)
+  if (result == ExtentBindResult::kBound) {
     lifetime_donor_stats_.released_residents += residents;
+    lifetime_donor_stats_.freed_slot_bytes += slot_bytes;
+    lifetime_donor_stats_.freed_payload_bytes += payload_bytes;
+  }
   return result;
 }
 

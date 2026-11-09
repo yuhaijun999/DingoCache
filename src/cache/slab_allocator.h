@@ -171,6 +171,9 @@ class SlabAllocator {
     uint64_t selection_ns = 0;
     uint64_t persistence_ns = 0;
     uint64_t released_residents = 0;
+    // Occupied resident slots and payload, not the whole rebound extent.
+    uint64_t freed_slot_bytes = 0;
+    uint64_t freed_payload_bytes = 0;
   };
   LifetimeDonorStats DonorStats() const;
   uint64_t WatermarkEvictions() const;
