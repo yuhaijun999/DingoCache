@@ -2877,6 +2877,12 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.failed = !Healthy();
   st.failed_disks = st.failed ? 1 : 0;
   if (alloc_) {
+    const SlabAllocator::MetadataMemory metadata =
+        alloc_->MetadataMemoryUsage();
+    st.metadata_slot_bytes = metadata.slot_bytes;
+    st.metadata_extent_bytes = metadata.extent_bytes;
+    st.metadata_class_bytes = metadata.class_bytes;
+    st.metadata_key_index_bytes = metadata.key_index_bytes;
     const SlabAllocator::LifetimeMemory memory = alloc_->LifetimeMemoryUsage();
     st.lifetime_bucket_entries = memory.entries;
     st.lifetime_bucket_bytes = memory.bucket_bytes;

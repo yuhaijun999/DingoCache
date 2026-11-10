@@ -212,6 +212,17 @@ class SlabAllocator {
   // allocators; these fields are not the full memory increment over a legacy
   // binary.
   LifetimeMemory LifetimeMemoryUsage() const;
+  struct MetadataMemory {
+    uint64_t slot_bytes = 0;       // SlotMeta vector backing storage.
+    uint64_t extent_bytes = 0;     // ExtentMeta vector backing storage.
+    uint64_t class_bytes = 0;      // Class vector backing storage.
+    uint64_t key_index_bytes = 0;  // Flat key-index entry vector backing.
+  };
+  // O(1) A-locked retained capacity snapshot, in every allocator mode. Includes
+  // element padding, but excludes nested Class allocations, lifetime arrays,
+  // fixed objects, heap bookkeeping and RSS; this is not total allocator
+  // memory.
+  MetadataMemory MetadataMemoryUsage() const;
   struct LifetimeBucketObservation {
     uint64_t protected_estimate =
         0;                       // Coarse live-page count, not exact scores.
@@ -532,9 +543,13 @@ class SlabAllocator {
     void Reserve(size_t expected_size);
     size_t size() const { return size_; }
     IndexStats stats() const;
+    uint64_t BackingBytes() const {
+      return entries_.capacity() * sizeof(Entry);
+    }
     size_t BucketForTest(const BlockKey& key) const;
 
    private:
+    friend class SlabAllocatorTestPeer;
     static uint64_t Hash(const BlockKey& key);
     void Rehash(size_t capacity);
 

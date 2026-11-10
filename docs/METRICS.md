@@ -281,6 +281,10 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_bucket_entries` / `dfkv_slab_disk_lifetime_bucket_entries` | gauge | Logical protection-expiry bucket vector size, B × all physical extents including unbound/empty extents; these are entries, not OS memory pages or currently protected residents. Global / per-disk values, with existing `disk` / `disk_index` labels on the latter. |
 | `dfkv_slab_lifetime_bucket_bytes` / `dfkv_slab_disk_lifetime_bucket_bytes` | gauge | Retained expiry bucket vector backing: capacity × sizeof(entry), currently 16 bytes per entry, not vector size × entry size or an allocation/RSS peak. |
 | `dfkv_slab_lifetime_bucket_token_bytes` / `dfkv_slab_disk_lifetime_bucket_token_bytes` | gauge | Retained resident expiry-token vector backing: capacity × sizeof(uint64_t). Removing residents can clear registrations without releasing backing; clean recovery constructs fresh vectors whose capacity can differ, including zero for an empty rebuilt store. |
+| `dfkv_slab_metadata_slot_bytes` / `dfkv_slab_disk_metadata_slot_bytes` | gauge | Retained SlotMeta array capacity × actual sizeof(SlotMeta), including unused capacity. Base allocator storage in all slab modes, not lifetime-only incremental memory or RSS. |
+| `dfkv_slab_metadata_extent_bytes` / `dfkv_slab_disk_metadata_extent_bytes` | gauge | Retained ExtentMeta array capacity × actual sizeof(ExtentMeta), including unused capacity. Base allocator storage in all slab modes, not lifetime-only incremental memory or RSS. |
+| `dfkv_slab_metadata_class_bytes` / `dfkv_slab_disk_metadata_class_bytes` | gauge | Retained Class array capacity × actual sizeof(Class), including unused capacity. Base allocator storage in all slab modes, not lifetime-only incremental memory or RSS. |
+| `dfkv_slab_metadata_key_index_bytes` / `dfkv_slab_disk_metadata_key_index_bytes` | gauge | Retained FlatKeyIndex::Entry array capacity × actual sizeof(FlatKeyIndex::Entry), including unused capacity. Base allocator storage in all slab modes, not lifetime-only incremental memory or RSS. |
 | `dfkv_slab_lifetime_identity_bytes` / `dfkv_slab_disk_lifetime_identity_bytes` | gauge | Resident generation vector capacity × sizeof(uint64_t). Reports actual enabled identity storage, including identity-only configurations; not an estimate of live keys. |
 | `dfkv_slab_lifetime_state_bytes` / `dfkv_slab_disk_lifetime_state_bytes` | gauge | Optional lifetime-state vector capacity × sizeof(optional<DiskLifetimeState>), including alignment and empty entries. |
 | `dfkv_slab_lifetime_link_bytes` / `dfkv_slab_disk_lifetime_link_bytes` | gauge | Dual-index link vector capacity × sizeof(LifetimeLinks); both global and class links belong to each element. |
@@ -649,6 +653,25 @@ Class/ExtentMeta/SlotMeta/key-index storage, transient reallocation copies and
 recovery/process peaks. Their sum is not complete lifetime incremental memory
 or RSS, and does not satisfy the full layout/peak acceptance gate. No key or
 request labels are added; existing dashboards and alerts keep their series.
+
+Base metadata array gauges separately report slots, extents, canonical classes
+and the flat key-index table through one O(1), allocator-locked
+`MetadataMemoryUsage()` snapshot. They use vector capacity, not live count or
+logical hash-bucket count. Deleting residents leaves retained backing visible;
+recovery rebuilds arrays and does not preserve previous high-water capacities.
+Legacy slab modes also report actual nonzero base storage; file engines omit
+these families. Global values sum disks through existing Stats aggregation;
+per-disk and global Stats are separate samples, not a cross-disk transaction.
+The four arrays are disjoint from the lifetime-vector backing above. However,
+`sizeof(Class)` covers the contained map/vector objects, not their allocations:
+free-slot map nodes/buckets, per-extent free-slot vectors and rotation vectors
+are excluded. Fixed allocator objects, heap overhead/fragmentation, temporary
+reallocation copies, peak/recovery memory and RSS are also excluded. Even the
+combined gauges therefore do not prove complete allocator or incremental
+lifetime memory. This adds one O(1) A-lock acquisition per GetStats and 32 bytes
+to Store Stats, with no per-resident state or read/write-path accounting. These
+costs have not been declared within performance budgets. Existing alerts and
+dashboards do not depend on the new families and are not renamed.
 
 The original three-field `SlabAllocator::LifetimeBucketMemory` and
 `BucketMemory()` remain available; the expanded `LifetimeMemoryUsage()` is a

@@ -172,6 +172,12 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_link_bytes = 0;
     uint64_t lifetime_queue_bytes = 0;
     uint64_t lifetime_version_bytes = 0;
+    // Retained base metadata arrays, measured as capacity * element size.
+    // Excludes nested Class allocations, fixed objects, heap overhead and RSS.
+    uint64_t metadata_slot_bytes = 0;
+    uint64_t metadata_extent_bytes = 0;
+    uint64_t metadata_class_bytes = 0;
+    uint64_t metadata_key_index_bytes = 0;
     // Allocator-retained residents with initialized recovered lifetime state.
     // Unread means no applied real reads; virtual recovery seeds do not count.
     uint64_t lifetime_recovered_objects = 0;

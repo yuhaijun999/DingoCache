@@ -1907,6 +1907,13 @@ SlabAllocator::LifetimeMemory SlabAllocator::LifetimeMemoryUsage() const {
   return memory;
 }
 
+SlabAllocator::MetadataMemory SlabAllocator::MetadataMemoryUsage() const {
+  const std::lock_guard<std::mutex> lock(mu_);
+  return {slots_.capacity() * sizeof(SlotMeta),
+          extents_.capacity() * sizeof(ExtentMeta),
+          classes_.capacity() * sizeof(Class), index_.BackingBytes()};
+}
+
 SlabAllocator::LifetimeBucketObservation SlabAllocator::ObserveLifetimeBuckets(
     const DiskLifetimeClock& clock) const {
   if (opt_.lifetime_bucket_count == 0) return {};

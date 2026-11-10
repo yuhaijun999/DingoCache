@@ -643,6 +643,15 @@ std::string KvNodeServer::MetricsText() const {
            "Retained protection expiry bucket vector backing bytes");
     header("dfkv_slab_disk_lifetime_bucket_token_bytes", "gauge",
            "Retained resident expiry token vector backing bytes");
+    header("dfkv_slab_disk_metadata_slot_bytes", "gauge",
+           "Retained slot metadata array backing bytes");
+    header("dfkv_slab_disk_metadata_extent_bytes", "gauge",
+           "Retained extent metadata array backing bytes");
+    header("dfkv_slab_disk_metadata_class_bytes", "gauge",
+           "Retained class metadata excluding nested allocations array backing "
+           "bytes");
+    header("dfkv_slab_disk_metadata_key_index_bytes", "gauge",
+           "Retained key index array backing bytes");
     header("dfkv_slab_disk_lifetime_identity_bytes", "gauge",
            "Retained resident identity vector backing bytes");
     header("dfkv_slab_disk_lifetime_state_bytes", "gauge",
@@ -760,6 +769,12 @@ std::string KvNodeServer::MetricsText() const {
              disk.lifetime_bucket_bytes);
       sample("dfkv_slab_disk_lifetime_bucket_token_bytes",
              disk.lifetime_bucket_token_bytes);
+      sample("dfkv_slab_disk_metadata_slot_bytes", disk.metadata_slot_bytes);
+      sample("dfkv_slab_disk_metadata_extent_bytes",
+             disk.metadata_extent_bytes);
+      sample("dfkv_slab_disk_metadata_class_bytes", disk.metadata_class_bytes);
+      sample("dfkv_slab_disk_metadata_key_index_bytes",
+             disk.metadata_key_index_bytes);
       sample("dfkv_slab_disk_lifetime_identity_bytes",
              disk.lifetime_identity_bytes);
       sample("dfkv_slab_disk_lifetime_state_bytes", disk.lifetime_state_bytes);
@@ -1088,6 +1103,19 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_bucket_token_bytes", "gauge",
            "Retained resident expiry token vector backing bytes",
            ss.lifetime_bucket_token_bytes);
+    metric("dfkv_slab_metadata_slot_bytes", "gauge",
+           "Retained slot metadata array backing bytes",
+           ss.metadata_slot_bytes);
+    metric("dfkv_slab_metadata_extent_bytes", "gauge",
+           "Retained extent metadata array backing bytes",
+           ss.metadata_extent_bytes);
+    metric("dfkv_slab_metadata_class_bytes", "gauge",
+           "Retained class metadata excluding nested allocations array backing "
+           "bytes",
+           ss.metadata_class_bytes);
+    metric("dfkv_slab_metadata_key_index_bytes", "gauge",
+           "Retained key index array backing bytes",
+           ss.metadata_key_index_bytes);
     metric("dfkv_slab_lifetime_identity_bytes", "gauge",
            "Retained resident identity vector backing bytes",
            ss.lifetime_identity_bytes);

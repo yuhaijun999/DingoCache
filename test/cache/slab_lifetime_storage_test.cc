@@ -75,6 +75,162 @@ bool QueueSnapshotConservesResidents(
   return global_bands == max_reads + 1 && global == classes;
 }
 
+void ExpectMetadataMemory(const SlabAllocator::MetadataMemory& actual,
+                          const SlabAllocator::MetadataMemory& expected) {
+  EXPECT_EQ(actual.slot_bytes, expected.slot_bytes);
+  EXPECT_EQ(actual.extent_bytes, expected.extent_bytes);
+  EXPECT_EQ(actual.class_bytes, expected.class_bytes);
+  EXPECT_EQ(actual.key_index_bytes, expected.key_index_bytes);
+}
+
+TEST(SlabLifetimeStorage, MetadataBackingTracksCapacityInEveryMode) {
+  for (const bool track_state : {false, true}) {
+    for (const uint32_t max_reads : {1U, 2U, 4U, 63U}) {
+      SCOPED_TRACE(track_state);
+      SCOPED_TRACE(max_reads);
+      SlabAllocator::Options options = LifetimeOptions();
+      options.track_lifetime_state = track_state;
+      options.track_resident_identity = false;
+      options.lifetime_max_reads = max_reads;
+      SlabAllocator allocator(options);
+      const SlabAllocator::MetadataMemory empty =
+          allocator.MetadataMemoryUsage();
+      EXPECT_TRUE(
+          SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, empty));
+      EXPECT_EQ(empty.slot_bytes, 0U);
+      EXPECT_EQ(empty.key_index_bytes, 0U);
+      EXPECT_GT(empty.extent_bytes, 0U);
+      EXPECT_GT(empty.class_bytes, 0U);
+      SlabAllocator::SlotRef ref;
+      std::vector<BlockKey> evicted;
+      for (uint64_t i = 1; i <= 3; ++i)
+        ASSERT_TRUE(allocator.Put({i, 0, 0}, 4096, &ref, &evicted));
+      ASSERT_TRUE(evicted.empty());
+      const SlabAllocator::MetadataMemory occupied =
+          allocator.MetadataMemoryUsage();
+      EXPECT_TRUE(
+          SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, occupied));
+      EXPECT_GT(occupied.slot_bytes, empty.slot_bytes);
+      EXPECT_GT(occupied.key_index_bytes, empty.key_index_bytes);
+      EXPECT_EQ(occupied.extent_bytes, empty.extent_bytes);
+      EXPECT_EQ(occupied.class_bytes, empty.class_bytes);
+      ASSERT_TRUE(allocator.Pin({1, 0, 0}));
+      ASSERT_EQ(allocator.Remove({1, 0, 0}),
+                SlabAllocator::RemoveResult::kDeferred);
+      EXPECT_FALSE(allocator.Contains({1, 0, 0}));
+      ExpectMetadataMemory(allocator.MetadataMemoryUsage(), occupied);
+      ASSERT_TRUE(allocator.Unpin({1, 0, 0}));
+      for (uint64_t i = 2; i <= 3; ++i)
+        ASSERT_EQ(allocator.Remove({i, 0, 0}),
+                  SlabAllocator::RemoveResult::kRemoved);
+      ASSERT_EQ(allocator.Count(), 0U);
+      ExpectMetadataMemory(allocator.MetadataMemoryUsage(), occupied);
+      ASSERT_TRUE(allocator.Put({4, 0, 0}, 4096, &ref, &evicted));
+      ExpectMetadataMemory(allocator.MetadataMemoryUsage(), occupied);
+      EXPECT_TRUE(SlabAllocatorTestPeer::MetadataMemoryMatches(
+          allocator, allocator.MetadataMemoryUsage()));
+    }
+  }
+}
+
+TEST(SlabLifetimeStorage, MetadataBackingTracksRestoreAndRejectedOperations) {
+  SlabAllocator::Options options = LifetimeOptions();
+  options.extent_bytes = 64 * 4096;
+  bool allow = false;
+  options.on_extent_evict = [&](uint32_t, uint32_t, uint32_t) { return allow; };
+  options.on_slot_evict = [&](const SlabAllocator::SlotRef&) { return allow; };
+  SlabAllocator allocator(options);
+  const SlabAllocator::MetadataMemory empty = allocator.MetadataMemoryUsage();
+  ASSERT_FALSE(allocator.RestoreBulk({{{1, 0, 0}, 4096, 0, 64, 1}}));
+  ExpectMetadataMemory(allocator.MetadataMemoryUsage(), empty);
+  std::vector<SlabAllocator::RestoreEntry> entries;
+  for (uint32_t i = 0; i < 64; ++i)
+    entries.push_back({{i + 1, 0, 0}, 4096, 0, i, 1});
+  ASSERT_TRUE(allocator.RestoreBulk(entries));
+  ASSERT_EQ(allocator.Count(), entries.size());
+  const SlabAllocator::MetadataMemory restored =
+      allocator.MetadataMemoryUsage();
+  EXPECT_TRUE(
+      SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, restored));
+  EXPECT_GT(restored.slot_bytes, empty.slot_bytes);
+  EXPECT_GT(restored.key_index_bytes, empty.key_index_bytes);
+  std::vector<BlockKey> evicted;
+  EXPECT_EQ(allocator.EvictColdToTarget(0, entries.size(), &evicted), 0U);
+  EXPECT_TRUE(evicted.empty());
+  EXPECT_EQ(allocator.Count(), entries.size());
+  ExpectMetadataMemory(allocator.MetadataMemoryUsage(), restored);
+  allow = true;
+  ASSERT_EQ(allocator.EvictColdToTarget(0, entries.size(), &evicted),
+            entries.size());
+  EXPECT_EQ(allocator.Count(), 0U);
+  ExpectMetadataMemory(allocator.MetadataMemoryUsage(), restored);
+  EXPECT_TRUE(
+      SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, restored));
+}
+
+TEST(SlabLifetimeStorage, ConcurrentMetadataSnapshotsObserveActualGrowth) {
+  SlabAllocator::Options options = LifetimeOptions();
+  options.extent_bytes = 128 * 4096;
+  SlabAllocator allocator(options);
+  const SlabAllocator::MetadataMemory empty = allocator.MetadataMemoryUsage();
+  std::atomic<bool> done{false};
+  std::atomic<bool> valid{true};
+  std::promise<void> growth_seen;
+  const std::future<void> growth = growth_seen.get_future();
+  std::thread observer([&] {
+    SlabAllocator::MetadataMemory previous = empty;
+    bool published = false;
+    while (!done.load()) {
+      const SlabAllocator::MetadataMemory current =
+          allocator.MetadataMemoryUsage();
+      if (current.slot_bytes < previous.slot_bytes ||
+          current.key_index_bytes < previous.key_index_bytes ||
+          current.extent_bytes != empty.extent_bytes ||
+          current.class_bytes != empty.class_bytes)
+        valid.store(false);
+      if (!published && current.slot_bytes > empty.slot_bytes &&
+          current.key_index_bytes > empty.key_index_bytes) {
+        growth_seen.set_value();
+        published = true;
+      }
+      previous = current;
+      std::this_thread::yield();
+    }
+  });
+  bool observed_growth = false;
+  std::vector<BlockKey> evicted;
+  SlabAllocator::SlotRef ref;
+  for (uint64_t i = 1; i <= 128; ++i) {
+    if (!allocator.Put({i, 0, 0}, 4096, &ref, &evicted)) {
+      valid.store(false);
+      break;
+    }
+    if (i == 32) {
+      // Pause the writer until a nonempty snapshot is actually observed. The
+      // timeout bounds failure and the observer is joined before assertions.
+      observed_growth =
+          growth.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+      if (!observed_growth) valid.store(false);
+    }
+  }
+  for (uint64_t i = 1; i <= 128; ++i) {
+    if (allocator.Remove({i, 0, 0}) != SlabAllocator::RemoveResult::kRemoved)
+      valid.store(false);
+  }
+  done.store(true);
+  observer.join();
+  EXPECT_TRUE(observed_growth);
+  EXPECT_TRUE(valid.load());
+  EXPECT_TRUE(evicted.empty());
+  EXPECT_EQ(allocator.Count(), 0U);
+  const SlabAllocator::MetadataMemory retained =
+      allocator.MetadataMemoryUsage();
+  EXPECT_GT(retained.slot_bytes, empty.slot_bytes);
+  EXPECT_GT(retained.key_index_bytes, empty.key_index_bytes);
+  EXPECT_TRUE(
+      SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, retained));
+}
+
 TEST(SlabLifetimeStorage, DisabledStateStorageNeverAllocatesPerSlot) {
   for (const bool track_identity : {false, true}) {
     SlabAllocator::Options options = LifetimeOptions();

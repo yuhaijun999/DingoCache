@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export retained slot, extent, class and key-index array backing bytes,
+  globally and per slab disk, including legacy mode. Keep base capacity distinct
+  from lifetime-only storage, nested allocations, complete memory and RSS.
+
 - Export conservative protection-bucket resident estimates, availability and
   retained summary-ring bytes globally and per disk. Preserve current-time
   expiry semantics and omit unavailable estimates instead of reporting zero.

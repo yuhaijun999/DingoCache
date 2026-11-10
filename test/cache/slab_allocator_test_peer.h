@@ -161,6 +161,20 @@ class SlabAllocatorTestPeer {
     const std::lock_guard<std::mutex> lock(allocator.mu_);
     return allocator.lifetime_bucket_tokens_.capacity();
   }
+  static bool MetadataMemoryMatches(
+      const SlabAllocator& allocator,
+      const SlabAllocator::MetadataMemory& memory) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    return memory.slot_bytes ==
+               allocator.slots_.capacity() * sizeof(SlabAllocator::SlotMeta) &&
+           memory.extent_bytes == allocator.extents_.capacity() *
+                                      sizeof(SlabAllocator::ExtentMeta) &&
+           memory.class_bytes ==
+               allocator.classes_.capacity() * sizeof(SlabAllocator::Class) &&
+           memory.key_index_bytes ==
+               allocator.index_.entries_.capacity() *
+                   sizeof(SlabAllocator::FlatKeyIndex::Entry);
+  }
   static bool LifetimeMemoryMatches(
       const SlabAllocator& allocator,
       const SlabAllocator::LifetimeMemory& memory) {
