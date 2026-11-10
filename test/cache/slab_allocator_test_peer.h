@@ -165,6 +165,14 @@ class SlabAllocatorTestPeer {
       const SlabAllocator& allocator,
       const SlabAllocator::MetadataMemory& memory) {
     const std::lock_guard<std::mutex> lock(allocator.mu_);
+    uint64_t rotation_bytes = 0;
+    uint64_t free_slot_bytes = 0;
+    for (const SlabAllocator::Class& cls : allocator.classes_) {
+      rotation_bytes += cls.ext_rr.capacity() * sizeof(uint32_t);
+      for (const std::pair<const uint32_t, std::vector<uint32_t>>& entry :
+           cls.free_by_ext)
+        free_slot_bytes += entry.second.capacity() * sizeof(uint32_t);
+    }
     return memory.slot_bytes ==
                allocator.slots_.capacity() * sizeof(SlabAllocator::SlotMeta) &&
            memory.extent_bytes == allocator.extents_.capacity() *
@@ -173,7 +181,9 @@ class SlabAllocatorTestPeer {
                allocator.classes_.capacity() * sizeof(SlabAllocator::Class) &&
            memory.key_index_bytes ==
                allocator.index_.entries_.capacity() *
-                   sizeof(SlabAllocator::FlatKeyIndex::Entry);
+                   sizeof(SlabAllocator::FlatKeyIndex::Entry) &&
+           memory.class_rotation_bytes == rotation_bytes &&
+           memory.class_free_slot_bytes == free_slot_bytes;
   }
   static bool LifetimeMemoryMatches(
       const SlabAllocator& allocator,

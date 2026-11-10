@@ -1103,6 +1103,8 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.metadata_extent_bytes += st.metadata_extent_bytes;
     sum.metadata_class_bytes += st.metadata_class_bytes;
     sum.metadata_key_index_bytes += st.metadata_key_index_bytes;
+    sum.metadata_class_rotation_bytes += st.metadata_class_rotation_bytes;
+    sum.metadata_class_free_slot_bytes += st.metadata_class_free_slot_bytes;
     sum.lifetime_identity_bytes += st.lifetime_identity_bytes;
     sum.lifetime_state_bytes += st.lifetime_state_bytes;
     sum.lifetime_link_bytes += st.lifetime_link_bytes;

@@ -81,6 +81,8 @@ void ExpectMetadataMemory(const SlabAllocator::MetadataMemory& actual,
   EXPECT_EQ(actual.extent_bytes, expected.extent_bytes);
   EXPECT_EQ(actual.class_bytes, expected.class_bytes);
   EXPECT_EQ(actual.key_index_bytes, expected.key_index_bytes);
+  EXPECT_EQ(actual.class_rotation_bytes, expected.class_rotation_bytes);
+  EXPECT_EQ(actual.class_free_slot_bytes, expected.class_free_slot_bytes);
 }
 
 TEST(SlabLifetimeStorage, MetadataBackingTracksCapacityInEveryMode) {
@@ -99,6 +101,8 @@ TEST(SlabLifetimeStorage, MetadataBackingTracksCapacityInEveryMode) {
           SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, empty));
       EXPECT_EQ(empty.slot_bytes, 0U);
       EXPECT_EQ(empty.key_index_bytes, 0U);
+      EXPECT_EQ(empty.class_rotation_bytes, 0U);
+      EXPECT_EQ(empty.class_free_slot_bytes, 0U);
       EXPECT_GT(empty.extent_bytes, 0U);
       EXPECT_GT(empty.class_bytes, 0U);
       SlabAllocator::SlotRef ref;
@@ -114,6 +118,8 @@ TEST(SlabLifetimeStorage, MetadataBackingTracksCapacityInEveryMode) {
       EXPECT_GT(occupied.key_index_bytes, empty.key_index_bytes);
       EXPECT_EQ(occupied.extent_bytes, empty.extent_bytes);
       EXPECT_EQ(occupied.class_bytes, empty.class_bytes);
+      EXPECT_GE(occupied.class_rotation_bytes, sizeof(uint32_t));
+      EXPECT_GE(occupied.class_free_slot_bytes, 4 * sizeof(uint32_t));
       ASSERT_TRUE(allocator.Pin({1, 0, 0}));
       ASSERT_EQ(allocator.Remove({1, 0, 0}),
                 SlabAllocator::RemoveResult::kDeferred);
@@ -154,6 +160,9 @@ TEST(SlabLifetimeStorage, MetadataBackingTracksRestoreAndRejectedOperations) {
       SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, restored));
   EXPECT_GT(restored.slot_bytes, empty.slot_bytes);
   EXPECT_GT(restored.key_index_bytes, empty.key_index_bytes);
+  // Restore takes all free slots, but pop/Take do not release their backing.
+  EXPECT_GE(restored.class_rotation_bytes, sizeof(uint32_t));
+  EXPECT_GE(restored.class_free_slot_bytes, 64 * sizeof(uint32_t));
   std::vector<BlockKey> evicted;
   EXPECT_EQ(allocator.EvictColdToTarget(0, entries.size(), &evicted), 0U);
   EXPECT_TRUE(evicted.empty());
@@ -185,11 +194,15 @@ TEST(SlabLifetimeStorage, ConcurrentMetadataSnapshotsObserveActualGrowth) {
           allocator.MetadataMemoryUsage();
       if (current.slot_bytes < previous.slot_bytes ||
           current.key_index_bytes < previous.key_index_bytes ||
+          current.class_rotation_bytes < previous.class_rotation_bytes ||
+          current.class_free_slot_bytes < previous.class_free_slot_bytes ||
           current.extent_bytes != empty.extent_bytes ||
           current.class_bytes != empty.class_bytes)
         valid.store(false);
       if (!published && current.slot_bytes > empty.slot_bytes &&
-          current.key_index_bytes > empty.key_index_bytes) {
+          current.key_index_bytes > empty.key_index_bytes &&
+          current.class_rotation_bytes > 0 &&
+          current.class_free_slot_bytes > 0) {
         growth_seen.set_value();
         published = true;
       }
@@ -227,8 +240,88 @@ TEST(SlabLifetimeStorage, ConcurrentMetadataSnapshotsObserveActualGrowth) {
       allocator.MetadataMemoryUsage();
   EXPECT_GT(retained.slot_bytes, empty.slot_bytes);
   EXPECT_GT(retained.key_index_bytes, empty.key_index_bytes);
+  EXPECT_GE(retained.class_rotation_bytes, sizeof(uint32_t));
+  EXPECT_GE(retained.class_free_slot_bytes, 128 * sizeof(uint32_t));
   EXPECT_TRUE(
       SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, retained));
+}
+
+TEST(SlabLifetimeStorage, ClassVectorBackingDropsOnSuccessfulRebindOnly) {
+  for (const bool track_state : {false, true}) {
+    SCOPED_TRACE(track_state);
+    bool allow = false;
+    SlabAllocator::Options options = LifetimeOptions();
+    options.track_lifetime_state = track_state;
+    options.on_extent_bind = [&](uint32_t) { return allow; };
+    SlabAllocator allocator(options);
+    const BlockKey key{1, 0, 0};
+    ASSERT_TRUE(allocator.RestoreBulk({{key, 4096, 0, 0, 1}}));
+    const SlabAllocator::MetadataMemory small = allocator.MetadataMemoryUsage();
+    ASSERT_TRUE(SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, small));
+    ASSERT_GE(small.class_free_slot_bytes, 4 * sizeof(uint32_t));
+    const std::vector<SlabAllocator::ClassStat> classes = allocator.Classes();
+    size_t target = classes.size();
+    for (size_t i = 0; i < classes.size(); ++i) {
+      if (classes[i].slot_size == options.extent_bytes) target = i;
+    }
+    ASSERT_LT(target, classes.size());
+    std::vector<BlockKey> evicted;
+    ASSERT_TRUE(allocator.Pin(key));
+    allow = true;
+    EXPECT_FALSE(allocator.StealFrom(0, target, &evicted));
+    ExpectMetadataMemory(allocator.MetadataMemoryUsage(), small);
+    ASSERT_TRUE(allocator.Unpin(key));
+    allow = false;
+    EXPECT_FALSE(allocator.StealFrom(0, target, &evicted));
+    EXPECT_TRUE(evicted.empty());
+    EXPECT_TRUE(allocator.Contains(key));
+    ExpectMetadataMemory(allocator.MetadataMemoryUsage(), small);
+    allow = true;
+    ASSERT_TRUE(allocator.StealFrom(0, target, &evicted));
+    ASSERT_EQ(evicted.size(), 1U);
+    EXPECT_EQ(evicted[0], key);
+    const SlabAllocator::MetadataMemory rebound =
+        allocator.MetadataMemoryUsage();
+    EXPECT_TRUE(
+        SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, rebound));
+    // The donor's four-slot vector is destroyed, not merely popped empty.
+    // Its rotation retains storage; the target gets its own one-slot vectors.
+    EXPECT_GT(rebound.class_free_slot_bytes, 0U);
+    EXPECT_LT(rebound.class_free_slot_bytes, small.class_free_slot_bytes);
+    EXPECT_GT(rebound.class_rotation_bytes, small.class_rotation_bytes);
+    SlabAllocator::SlotRef ref;
+    ASSERT_TRUE(allocator.Put({2, 0, 0}, options.extent_bytes, &ref, &evicted));
+    ExpectMetadataMemory(allocator.MetadataMemoryUsage(), rebound);
+  }
+}
+
+TEST(SlabLifetimeStorage, ClassVectorBackingReleasesReturnedExtentCapacity) {
+  SlabAllocator::Options options = LifetimeOptions();
+  options.num_extents = 9;
+  SlabAllocator allocator(options);
+  std::vector<SlabAllocator::RestoreEntry> entries;
+  for (uint32_t extent = 0; extent < options.num_extents; ++extent)
+    entries.push_back({{extent + 1, 0, 0}, 4096, extent, 0, 1});
+  ASSERT_TRUE(allocator.RestoreBulk(entries));
+  const SlabAllocator::MetadataMemory occupied =
+      allocator.MetadataMemoryUsage();
+  EXPECT_TRUE(
+      SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, occupied));
+  ASSERT_EQ(allocator.Remove({1, 0, 0}), SlabAllocator::RemoveResult::kRemoved);
+  ASSERT_EQ(allocator.ExtentReturns(), 1U);
+  const SlabAllocator::MetadataMemory returned =
+      allocator.MetadataMemoryUsage();
+  EXPECT_EQ(returned.class_rotation_bytes, occupied.class_rotation_bytes);
+  EXPECT_LT(returned.class_free_slot_bytes, occupied.class_free_slot_bytes);
+  EXPECT_TRUE(
+      SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, returned));
+  // Rebinding the returned extent with the same geometry restores the lost
+  // per-extent capacity without growing its retained rotation vector.
+  ASSERT_TRUE(allocator.RestoreBulk({{{10, 0, 0}, 4096, 0, 0, 1}}));
+  const SlabAllocator::MetadataMemory rebound = allocator.MetadataMemoryUsage();
+  EXPECT_EQ(rebound.class_rotation_bytes, occupied.class_rotation_bytes);
+  EXPECT_EQ(rebound.class_free_slot_bytes, occupied.class_free_slot_bytes);
+  EXPECT_TRUE(SlabAllocatorTestPeer::MetadataMemoryMatches(allocator, rebound));
 }
 
 TEST(SlabLifetimeStorage, DisabledStateStorageNeverAllocatesPerSlot) {

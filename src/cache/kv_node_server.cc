@@ -670,6 +670,11 @@ std::string KvNodeServer::MetricsText() const {
            "bytes");
     header("dfkv_slab_disk_metadata_key_index_bytes", "gauge",
            "Retained key index array backing bytes");
+    header("dfkv_slab_disk_metadata_class_rotation_bytes", "gauge",
+           "Retained class free extent rotation vector backing bytes");
+    header(
+        "dfkv_slab_disk_metadata_class_free_slot_bytes", "gauge",
+        "Retained class free slot vector backing bytes excluding map storage");
     header("dfkv_slab_disk_lifetime_identity_bytes", "gauge",
            "Retained resident identity vector backing bytes");
     header("dfkv_slab_disk_lifetime_state_bytes", "gauge",
@@ -863,6 +868,10 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_metadata_class_bytes", disk.metadata_class_bytes);
       sample("dfkv_slab_disk_metadata_key_index_bytes",
              disk.metadata_key_index_bytes);
+      sample("dfkv_slab_disk_metadata_class_rotation_bytes",
+             disk.metadata_class_rotation_bytes);
+      sample("dfkv_slab_disk_metadata_class_free_slot_bytes",
+             disk.metadata_class_free_slot_bytes);
       sample("dfkv_slab_disk_lifetime_identity_bytes",
              disk.lifetime_identity_bytes);
       sample("dfkv_slab_disk_lifetime_state_bytes", disk.lifetime_state_bytes);
@@ -1263,6 +1272,13 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_metadata_key_index_bytes", "gauge",
            "Retained key index array backing bytes",
            ss.metadata_key_index_bytes);
+    metric("dfkv_slab_metadata_class_rotation_bytes", "gauge",
+           "Retained class free extent rotation vector backing bytes",
+           ss.metadata_class_rotation_bytes);
+    metric(
+        "dfkv_slab_metadata_class_free_slot_bytes", "gauge",
+        "Retained class free slot vector backing bytes excluding map storage",
+        ss.metadata_class_free_slot_bytes);
     metric("dfkv_slab_lifetime_identity_bytes", "gauge",
            "Retained resident identity vector backing bytes",
            ss.lifetime_identity_bytes);

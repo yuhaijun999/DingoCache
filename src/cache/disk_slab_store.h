@@ -206,6 +206,9 @@ class DiskSlabStore : public StoreEngine {
     uint64_t metadata_extent_bytes = 0;
     uint64_t metadata_class_bytes = 0;
     uint64_t metadata_key_index_bytes = 0;
+    // Nested Class vector backing only; map nodes/buckets remain excluded.
+    uint64_t metadata_class_rotation_bytes = 0;
+    uint64_t metadata_class_free_slot_bytes = 0;
     // Allocator-retained residents with initialized recovered lifetime state.
     // Unread means no applied real reads; virtual recovery seeds do not count.
     uint64_t lifetime_recovered_objects = 0;

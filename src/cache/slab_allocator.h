@@ -217,11 +217,13 @@ class SlabAllocator {
     uint64_t extent_bytes = 0;     // ExtentMeta vector backing storage.
     uint64_t class_bytes = 0;      // Class vector backing storage.
     uint64_t key_index_bytes = 0;  // Flat key-index entry vector backing.
+    uint64_t class_rotation_bytes = 0;   // Class extent rotation vectors.
+    uint64_t class_free_slot_bytes = 0;  // Per-extent free-slot vectors.
   };
   // O(1) A-locked retained capacity snapshot, in every allocator mode. Includes
-  // element padding, but excludes nested Class allocations, lifetime arrays,
-  // fixed objects, heap bookkeeping and RSS; this is not total allocator
-  // memory.
+  // element padding and nested Class vector capacity, even when empty. Excludes
+  // Class map buckets/nodes, lifetime arrays, fixed objects, heap bookkeeping
+  // and RSS; this is not total allocator memory.
   MetadataMemory MetadataMemoryUsage() const;
   struct LifetimeBucketObservation {
     uint64_t protected_estimate =
@@ -599,6 +601,10 @@ class SlabAllocator {
   uint64_t evictions_ = 0;
   uint64_t steals_ = 0;
   uint64_t cold_steals_ = 0;
+  // A-locked backing totals: pop/Take retain vector storage; extent removal
+  // releases its free-slot vector but preserves the class rotation capacity.
+  uint64_t class_rotation_bytes_ = 0;
+  uint64_t class_free_slot_bytes_ = 0;
   LifetimeDonorStats lifetime_donor_stats_;
   uint64_t watermark_evictions_ = 0;
   uint64_t watermark_scan_steps_ = 0;

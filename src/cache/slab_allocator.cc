@@ -220,9 +220,17 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
 
 void SlabAllocator::PushFreeLocked(Class& cls, uint32_t extent,
                                    uint32_t slot) {
-  auto& slots = cls.free_by_ext[extent];
-  if (slots.empty()) cls.ext_rr.push_back(extent);
+  std::vector<uint32_t>& slots = cls.free_by_ext[extent];
+  if (slots.empty()) {
+    const size_t capacity = cls.ext_rr.capacity();
+    cls.ext_rr.push_back(extent);
+    // Account each completed growth before the next allocation can fail.
+    class_rotation_bytes_ +=
+        (cls.ext_rr.capacity() - capacity) * sizeof(uint32_t);
+  }
+  const size_t capacity = slots.capacity();
   slots.push_back(slot);
+  class_free_slot_bytes_ += (slots.capacity() - capacity) * sizeof(uint32_t);
   ++cls.free_count;
 }
 
@@ -273,9 +281,12 @@ bool SlabAllocator::TakeFreeSlotLocked(Class& cls, uint32_t extent,
 }
 
 void SlabAllocator::DropExtentFreeLocked(Class& cls, uint32_t extent) {
-  auto it = cls.free_by_ext.find(extent);
+  const std::unordered_map<uint32_t, std::vector<uint32_t>>::iterator it =
+      cls.free_by_ext.find(extent);
   if (it == cls.free_by_ext.end()) return;
   cls.free_count -= it->second.size();
+  // Even an empty free list retains capacity until its map entry is erased.
+  class_free_slot_bytes_ -= it->second.capacity() * sizeof(uint32_t);
   cls.free_by_ext.erase(it);
   DropFromRotationLocked(cls, extent);
 }
@@ -1911,7 +1922,10 @@ SlabAllocator::MetadataMemory SlabAllocator::MetadataMemoryUsage() const {
   const std::lock_guard<std::mutex> lock(mu_);
   return {slots_.capacity() * sizeof(SlotMeta),
           extents_.capacity() * sizeof(ExtentMeta),
-          classes_.capacity() * sizeof(Class), index_.BackingBytes()};
+          classes_.capacity() * sizeof(Class),
+          index_.BackingBytes(),
+          class_rotation_bytes_,
+          class_free_slot_bytes_};
 }
 
 SlabAllocator::LifetimeBucketObservation SlabAllocator::ObserveLifetimeBuckets(

@@ -2967,6 +2967,8 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
     st.metadata_extent_bytes = metadata.extent_bytes;
     st.metadata_class_bytes = metadata.class_bytes;
     st.metadata_key_index_bytes = metadata.key_index_bytes;
+    st.metadata_class_rotation_bytes = metadata.class_rotation_bytes;
+    st.metadata_class_free_slot_bytes = metadata.class_free_slot_bytes;
     const SlabAllocator::LifetimeMemory memory = alloc_->LifetimeMemoryUsage();
     st.lifetime_bucket_entries = memory.entries;
     st.lifetime_bucket_bytes = memory.bucket_bytes;

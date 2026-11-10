@@ -308,6 +308,8 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_metadata_extent_bytes` / `dfkv_slab_disk_metadata_extent_bytes` | gauge | Retained ExtentMeta array capacity × actual sizeof(ExtentMeta), including unused capacity. Base allocator storage in all slab modes, not lifetime-only incremental memory or RSS. |
 | `dfkv_slab_metadata_class_bytes` / `dfkv_slab_disk_metadata_class_bytes` | gauge | Retained Class array capacity × actual sizeof(Class), including unused capacity. Base allocator storage in all slab modes, not lifetime-only incremental memory or RSS. |
 | `dfkv_slab_metadata_key_index_bytes` / `dfkv_slab_disk_metadata_key_index_bytes` | gauge | Retained FlatKeyIndex::Entry array capacity × actual sizeof(FlatKeyIndex::Entry), including unused capacity. Base allocator storage in all slab modes, not lifetime-only incremental memory or RSS. |
+| `dfkv_slab_metadata_class_rotation_bytes` / `dfkv_slab_disk_metadata_class_rotation_bytes` | gauge | Sum of retained Class free-extent rotation vector capacity × sizeof(uint32_t). Includes unused/empty retained capacity, separately from the Class array. |
+| `dfkv_slab_metadata_class_free_slot_bytes` / `dfkv_slab_disk_metadata_class_free_slot_bytes` | gauge | Sum of retained per-extent free-slot vector capacity × sizeof(uint32_t), including exhausted vectors with zero size. Drops when the extent's vector is erased, not when its final free slot is consumed. Excludes unordered_map nodes/buckets and heap bookkeeping. |
 | `dfkv_slab_lifetime_identity_bytes` / `dfkv_slab_disk_lifetime_identity_bytes` | gauge | Resident generation vector capacity × sizeof(uint64_t). Reports actual enabled identity storage, including identity-only configurations; not an estimate of live keys. |
 | `dfkv_slab_lifetime_state_bytes` / `dfkv_slab_disk_lifetime_state_bytes` | gauge | Optional lifetime-state vector capacity × sizeof(optional<DiskLifetimeState>), including alignment and empty entries. |
 | `dfkv_slab_lifetime_link_bytes` / `dfkv_slab_disk_lifetime_link_bytes` | gauge | Dual-index link vector capacity × sizeof(LifetimeLinks); both global and class links belong to each element. |
@@ -687,13 +689,16 @@ these families. Global values sum disks through existing Stats aggregation;
 per-disk and global Stats are separate samples, not a cross-disk transaction.
 The four arrays are disjoint from the lifetime-vector backing above. However,
 `sizeof(Class)` covers the contained map/vector objects, not their allocations:
-free-slot map nodes/buckets, per-extent free-slot vectors and rotation vectors
-are excluded. Fixed allocator objects, heap overhead/fragmentation, temporary
+free-slot map nodes/buckets remain excluded, while per-extent free-slot and
+rotation vector backing is reported separately by the two nested-vector gauges. Fixed allocator objects, heap overhead/fragmentation, temporary
 reallocation copies, peak/recovery memory and RSS are also excluded. Even the
 combined gauges therefore do not prove complete allocator or incremental
-lifetime memory. This adds one O(1) A-lock acquisition per GetStats and 32 bytes
-to Store Stats, with no per-resident state or read/write-path accounting. These
-costs have not been declared within performance budgets. Existing alerts and
+lifetime memory. The original four-array snapshot added one O(1) A-lock
+acquisition per GetStats and 32 bytes to Store Stats. The two nested-vector
+gauges reuse that acquisition, add 16 bytes to Store Stats and the metadata
+snapshot, and maintain 16 fixed bytes per allocator at existing vector
+growth/erase sites. No per-resident state is added. These costs have not been
+declared within performance budgets. Existing alerts and
 dashboards do not depend on the new families and are not renamed.
 
 The original three-field `SlabAllocator::LifetimeBucketMemory` and
@@ -956,3 +961,24 @@ normal nonempty PULLs. There is no new clock or lock, but contention/cost is not
 zero and no latency/throughput budget acceptance is implied. Notification delay,
 lock time and non-PULL once-boundary coverage remain separate O5 work. Real
 RDMA/RXE acceptance is not established by CPU post-MR-boundary tests.
+
+
+### Nested class vector backing
+
+The two `metadata_class_*` vector gauges above apply to all slab policies. The
+allocator maintains capacity deltas under its existing lock when vectors grow
+or are erased, so the existing metadata snapshot remains O(1), without scanning
+slots/extents at scrape time. Ordinary pops/removes do not shrink vectors;
+extent rebinding can release free-slot backing while retaining rotation backing.
+Clean recovery recomputes capacities from reconstructed state, not persisted
+capacity values. Global values sum disk snapshots; compare separately collected
+snapshots only at quiescence. File mode omits the slab families. No key/request
+labels or new hot-path locks, atomics or clocks are added.
+
+The counters add two fixed uint64_t fields per allocator (including RAM) and two
+fields per metadata/Store snapshot, not per resident. Existing Class-array bytes
+already include vector/map objects, but not their allocations; the new gauges
+cover vector elements only, avoiding double counting those objects. Map nodes,
+buckets, heap overhead, other fixed objects, RSS and recovery peaks remain
+outside this partial accounting. This is not a full-memory/incremental lifetime
+budget or performance acceptance result.

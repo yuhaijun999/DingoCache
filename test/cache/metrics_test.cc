@@ -867,12 +867,16 @@ TEST(Metrics, MetadataArrayBytesTrackRetentionAndRecoveryAcrossDisks) {
   const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
   const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
   const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_metadata";
-  const std::array<const char*, 4> suffixes = {
-      "slot_bytes", "extent_bytes", "class_bytes", "key_index_bytes"};
+  const std::array<const char*, 6> suffixes = {
+      "slot_bytes",      "extent_bytes",         "class_bytes",
+      "key_index_bytes", "class_rotation_bytes", "class_free_slot_bytes"};
   const auto bytes = [](const DiskSlabStore::Stats& stats) {
-    return std::array<uint64_t, 4>{
-        stats.metadata_slot_bytes, stats.metadata_extent_bytes,
-        stats.metadata_class_bytes, stats.metadata_key_index_bytes};
+    return std::array<uint64_t, 6>{stats.metadata_slot_bytes,
+                                   stats.metadata_extent_bytes,
+                                   stats.metadata_class_bytes,
+                                   stats.metadata_key_index_bytes,
+                                   stats.metadata_class_rotation_bytes,
+                                   stats.metadata_class_free_slot_bytes};
   };
   for (const char* policy : {"legacy", "lifetime"}) {
     SCOPED_TRACE(policy);
@@ -902,9 +906,9 @@ TEST(Metrics, MetadataArrayBytesTrackRetentionAndRecoveryAcrossDisks) {
     const auto expect_metrics = [&] {
       const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
       const std::string text = server->MetricsText();
-      std::array<uint64_t, 4> totals{};
+      std::array<uint64_t, 6> totals{};
       for (size_t disk = 0; disk < 2; ++disk) {
-        const std::array<uint64_t, 4> current =
+        const std::array<uint64_t, 6> current =
             bytes(group.DiskSlabStats(disk));
         // Both base geometry arrays exist before the first resident, in
         // legacy as well as lifetime mode. Slot/index arrays grow on demand.
@@ -939,9 +943,17 @@ TEST(Metrics, MetadataArrayBytesTrackRetentionAndRecoveryAcrossDisks) {
                   .DiskSlabStats(0)
                   .metadata_slot_bytes,
               0U);
-    const std::string payload(31, 'm');
-    for (const std::vector<BlockKey>& disk_keys : keys) {
-      for (const BlockKey& key : disk_keys) {
+    for (size_t disk = 0; disk < 2; ++disk) {
+      const DiskSlabStore::Stats empty =
+          KvNodeServerTestPeer::Group(*server).DiskSlabStats(disk);
+      EXPECT_EQ(empty.metadata_class_rotation_bytes, 0U);
+      EXPECT_EQ(empty.metadata_class_free_slot_bytes, 0U);
+    }
+    const std::array<std::string, 2> payloads = {std::string(31, 'm'),
+                                                 std::string(65537, 'n')};
+    for (size_t disk = 0; disk < 2; ++disk) {
+      const std::string& payload = payloads[disk];
+      for (const BlockKey& key : keys[disk]) {
         ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Cache(
                       key, payload.data(), payload.size()),
                   Status::kOk);
@@ -949,14 +961,18 @@ TEST(Metrics, MetadataArrayBytesTrackRetentionAndRecoveryAcrossDisks) {
     }
     ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Count(), 18U);
     ASSERT_NO_FATAL_FAILURE(expect_metrics());
-    const std::array<uint64_t, 4> larger =
+    const std::array<uint64_t, 6> larger =
         bytes(KvNodeServerTestPeer::Group(*server).DiskSlabStats(0));
-    const std::array<uint64_t, 4> smaller =
+    const std::array<uint64_t, 6> smaller =
         bytes(KvNodeServerTestPeer::Group(*server).DiskSlabStats(1));
     EXPECT_GT(larger[0], smaller[0]);
     EXPECT_GT(smaller[0], 0U);
     EXPECT_GT(larger[3], smaller[3]);
     EXPECT_GT(smaller[3], 0U);
+    EXPECT_GT(larger[4], 0U);
+    EXPECT_GT(smaller[4], 0U);
+    EXPECT_GT(larger[5], smaller[5]);
+    EXPECT_GT(smaller[5], 0U);
     DiskSlabStore& removed =
         DiskCacheGroupTestPeer::Slab(KvNodeServerTestPeer::Group(*server), 0);
     for (const BlockKey& key : keys[0]) {
@@ -976,14 +992,20 @@ TEST(Metrics, MetadataArrayBytesTrackRetentionAndRecoveryAcrossDisks) {
                   .DiskSlabStats(0)
                   .metadata_slot_bytes,
               0U);
+    const DiskSlabStore::Stats rebuilt_empty =
+        KvNodeServerTestPeer::Group(*server).DiskSlabStats(0);
+    EXPECT_EQ(rebuilt_empty.metadata_class_rotation_bytes, 0U);
+    EXPECT_EQ(rebuilt_empty.metadata_class_free_slot_bytes, 0U);
     DiskSlabStore& survivor =
         DiskCacheGroupTestPeer::Slab(KvNodeServerTestPeer::Group(*server), 1);
-    const std::array<uint64_t, 4> recovered = bytes(survivor.GetStats());
+    const std::array<uint64_t, 6> recovered = bytes(survivor.GetStats());
     EXPECT_GT(recovered[0], 0U);
     EXPECT_GT(recovered[3], 0U);
+    EXPECT_GT(recovered[4], 0U);
+    EXPECT_GT(recovered[5], 0U);
     std::string value;
     ASSERT_EQ(survivor.Range(keys[1][0], 0, 0, &value), Status::kOk);
-    EXPECT_EQ(value, payload);
+    EXPECT_EQ(value, payloads[1]);
     ReadLease lease;
     ASSERT_EQ(survivor.RangeDirectPrep(keys[1][0], 0, 1, 4096, &lease),
               Status::kOk);
@@ -2547,10 +2569,14 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
         "dfkv_slab_metadata_extent_bytes",
         "dfkv_slab_metadata_class_bytes",
         "dfkv_slab_metadata_key_index_bytes",
+        "dfkv_slab_metadata_class_rotation_bytes",
+        "dfkv_slab_metadata_class_free_slot_bytes",
         "dfkv_slab_disk_metadata_slot_bytes",
         "dfkv_slab_disk_metadata_extent_bytes",
         "dfkv_slab_disk_metadata_class_bytes",
         "dfkv_slab_disk_metadata_key_index_bytes",
+        "dfkv_slab_disk_metadata_class_rotation_bytes",
+        "dfkv_slab_disk_metadata_class_free_slot_bytes",
         "dfkv_slab_lifetime_bucket_protected_estimate",
         "dfkv_slab_lifetime_bucket_estimate_available",
         "dfkv_slab_lifetime_bucket_summary_bytes",

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export retained class rotation and per-extent free-slot vector backing bytes
+  globally and per slab disk, including empty retained capacity. Preserve
+  allocation/eviction behavior and keep map/heap overhead outside these gauges.
+
 - Export PULL read-notification once-boundary outcomes: observer invocation,
   suppressed duplicate, empty payload and absent observer. Preserve existing
   authorization, notification timing and once-only behavior.
