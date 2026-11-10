@@ -7,11 +7,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "cache/disk_lifetime_clock.h"
@@ -108,6 +110,18 @@ uint64_t TokenForEnd(const DiskLifetimeConfig& config, uint64_t end) {
 void ExpectValid(const SlabAllocator& allocator) {
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeBucketsValid(allocator));
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
+void ExpectObservation(const SlabAllocator& allocator,
+                       const DiskLifetimeClock& clock, uint64_t expected) {
+  const SlabAllocator::LifetimeBucketObservation observation =
+      allocator.ObserveLifetimeBuckets(clock);
+  EXPECT_TRUE(observation.available);
+  EXPECT_EQ(observation.protected_estimate, expected);
+  EXPECT_EQ(observation.summary_bytes,
+            SlabAllocatorTestPeer::BucketSummaryCapacity(allocator) *
+                SlabAllocatorTestPeer::BucketPageBytes());
+  ExpectValid(allocator);
 }
 
 // The installed legacy return type must keep both size and field offsets;
@@ -331,6 +345,206 @@ TEST(SlabLifetimeBuckets, MemorySnapshotIsSafeDuringSlotMetadataGrowth) {
   EXPECT_GT(memory.link_bytes, 0U);
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeMemoryMatches(allocator, memory));
   ExpectValid(allocator);
+}
+
+TEST(SlabLifetimeBuckets, DisabledObservationDoesNotSampleOrAllocateSummary) {
+  const DiskLifetimeConfig config = Config();
+  for (const bool track_state : {false, true}) {
+    SlabAllocator::Options options = Options(config);
+    options.track_lifetime_state = track_state;
+    options.lifetime_bucket_count = 0;
+    options.lifetime_bucket_sec = 0;
+    const SlabAllocator allocator(options);
+    uint64_t source_calls = 0;
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&source_calls] {
+      ++source_calls;
+      return uint64_t{0};
+    });
+    const uint64_t before = source_calls;
+    const SlabAllocator::LifetimeBucketObservation observation =
+        allocator.ObserveLifetimeBuckets(clock);
+    EXPECT_FALSE(observation.available);
+    EXPECT_EQ(observation.protected_estimate, 0U);
+    EXPECT_EQ(observation.summary_bytes, 0U);
+    EXPECT_EQ(SlabAllocatorTestPeer::BucketSummaryCapacity(allocator), 0U);
+    EXPECT_EQ(source_calls, before);
+    ExpectValid(allocator);
+  }
+}
+
+TEST(SlabLifetimeBuckets, ObservationAggregatesExtentsAndSilentlyExpires) {
+  for (const uint64_t max_reads : {1U, 2U, 4U, 63U}) {
+    SCOPED_TRACE(max_reads);
+    DiskLifetimeConfig config = Config();
+    config.max_reads = max_reads;
+    config.bucket_count = max_reads == 63 ? 64 : 8;
+    std::string error;
+    ASSERT_TRUE(ValidateDiskLifetimeConfig(config, &error)) << error;
+    SlabAllocator allocator(Options(config, 8, 2));
+    uint64_t seconds = 0;
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                  [&seconds] { return seconds; });
+    ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 0));
+    const DiskLifetimeState written = NewDiskLifetimeState(0);
+    const DiskLifetimeState restored = RecoveredDiskLifetimeState(1);
+    ASSERT_NO_FATAL_FAILURE(Seed(allocator, 1, &written, config));
+    ASSERT_NO_FATAL_FAILURE(Seed(allocator, 2, &restored, config));
+    ASSERT_EQ(End(config, written), 16U);
+    ASSERT_EQ(End(config, restored), 20U);
+    // Two striped extent rows contribute to one bounded aggregate ring.
+    EXPECT_EQ(SlabAllocatorTestPeer::ProtectedEstimate(allocator, 0, 0), 1U);
+    EXPECT_EQ(SlabAllocatorTestPeer::ProtectedEstimate(allocator, 1, 0), 1U);
+    for (const std::pair<uint32_t, uint64_t>& sample :
+         {std::pair<uint32_t, uint64_t>{0, 2},
+          {15, 2},
+          {16, 1},
+          {20, 1},
+          {31, 1},
+          {32, 0},
+          {100000, 0}}) {
+      seconds = sample.first;
+      ASSERT_NO_FATAL_FAILURE(
+          ExpectObservation(allocator, clock, sample.second));
+      EXPECT_EQ(
+          sample.second,
+          SlabAllocatorTestPeer::ProtectedEstimate(allocator, 0, seconds) +
+              SlabAllocatorTestPeer::ProtectedEstimate(allocator, 1, seconds));
+    }
+    EXPECT_EQ(allocator.Count(), 2U);  // Expiry is not physical reclamation.
+    ASSERT_EQ(allocator.Remove(Key(1)), SlabAllocator::RemoveResult::kRemoved);
+    ASSERT_EQ(allocator.Remove(Key(2)), SlabAllocator::RemoveResult::kRemoved);
+    ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 0));
+  }
+}
+
+TEST(SlabLifetimeBuckets, SummaryKeepsNewerGenerationAfterDelayedRegistration) {
+  const DiskLifetimeConfig config = Config();
+  SlabAllocator allocator(Options(config, 8, 4));
+  std::vector<SlabAllocator::RestoreEntry> entries;
+  for (uint32_t extent = 0; extent < 4; ++extent)
+    entries.push_back({Key(extent + 1), 4096, extent, 0, 1});
+  ASSERT_TRUE(allocator.RestoreBulk(entries));
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&seconds] { return seconds; });
+  const DiskLifetimeState old = RecoveredDiskLifetimeState(1);
+  DiskLifetimeState current = RecoveredDiskLifetimeState(1);
+  current.anchor = 128;
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(1), 1, &old, &config,
+                                          0);
+  seconds = 128;
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(2), 2, &current,
+                                          &config, 128);
+  EXPECT_EQ(SlabAllocatorTestPeer::BucketToken(allocator, Key(1)), 2U);
+  EXPECT_EQ(SlabAllocatorTestPeer::BucketToken(allocator, Key(2)), 10U);
+  ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 1));
+  // Original registration work can be delayed, but cannot replace a later
+  // aggregate generation in another extent's same ring position.
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(3), 3, &old, &config,
+                                          0);
+  ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 1));
+  ASSERT_EQ(allocator.Remove(Key(1)), SlabAllocator::RemoveResult::kRemoved);
+  ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 1));
+  ASSERT_EQ(allocator.Remove(Key(2)), SlabAllocator::RemoveResult::kRemoved);
+  ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 0));
+  // Retain that newest generation even after its count reaches zero.
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(4), 4, &old, &config,
+                                          0);
+  ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 0));
+  ASSERT_EQ(allocator.Remove(Key(3)), SlabAllocator::RemoveResult::kRemoved);
+  ASSERT_EQ(allocator.Remove(Key(4)), SlabAllocator::RemoveResult::kRemoved);
+  ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 0));
+}
+
+TEST(SlabLifetimeBuckets, ObservationHonorsSoftHardAndRollbackClockBounds) {
+  const DiskLifetimeConfig config = Config();
+  SlabAllocator allocator(Options(config));
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&seconds] { return seconds; });
+  const DiskLifetimeState state = NewDiskLifetimeState(0);
+  ASSERT_NO_FATAL_FAILURE(Seed(allocator, 1, &state, config));
+  ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 1));
+  const uint64_t bytes = allocator.ObserveLifetimeBuckets(clock).summary_bytes;
+  ASSERT_GT(bytes, 0U);
+  seconds = UINT32_MAX - DiskLifetimeHorizon(config) + 1;
+  ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 0));
+  uint32_t offset = 7;
+  EXPECT_FALSE(clock.TryNow(&offset));
+  EXPECT_EQ(offset, 7U);  // Observation must not reopen admission.
+  seconds = UINT32_MAX;
+  ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 0));
+  seconds = static_cast<uint64_t>(UINT32_MAX) + 1;
+  const SlabAllocator::LifetimeBucketObservation hard =
+      allocator.ObserveLifetimeBuckets(clock);
+  EXPECT_FALSE(hard.available);
+  EXPECT_EQ(hard.protected_estimate, 0U);  // No cached former estimate.
+  EXPECT_EQ(hard.summary_bytes, bytes);
+  seconds = 0;
+  const SlabAllocator::LifetimeBucketObservation rollback =
+      allocator.ObserveLifetimeBuckets(clock);
+  EXPECT_FALSE(rollback.available);
+  EXPECT_EQ(rollback.summary_bytes, bytes);
+  EXPECT_FALSE(clock.TryNow(&offset));
+  const DiskLifetimeClock empty(DiskLifetimeHorizon(config),
+                                DiskLifetimeClock::NowFn{});
+  const SlabAllocator::LifetimeBucketObservation unavailable =
+      allocator.ObserveLifetimeBuckets(empty);
+  EXPECT_FALSE(unavailable.available);
+  EXPECT_EQ(unavailable.summary_bytes, bytes);
+  EXPECT_EQ(allocator.Count(), 1U);
+  ExpectValid(allocator);
+}
+
+TEST(SlabLifetimeBuckets,
+     ConcurrentObservationSeesPositiveResidentBeforeReuse) {
+  const DiskLifetimeConfig config = Config();
+  SlabAllocator allocator(Options(config));
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [] { return 0; });
+  const DiskLifetimeState state = NewDiskLifetimeState(0);
+  std::promise<void> first_seen;
+  const std::future<void> seen = first_seen.get_future();
+  std::atomic<bool> done{false};
+  bool writer_ok = true;
+  std::thread writer([&] {
+    for (uint64_t generation = 1; generation <= 200; ++generation) {
+      SlabAllocator::SlotRef ref;
+      std::vector<BlockKey> evicted;
+      if (!allocator.Put(Key(1), 1, &ref, &evicted) || !evicted.empty()) {
+        writer_ok = false;
+        break;
+      }
+      SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(1), generation,
+                                              &state, &config, 0);
+      if (generation == 1 &&
+          seen.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        writer_ok = false;
+        break;
+      }
+      if (!SlabAllocatorTestPeer::LifetimeBucketsValid(allocator) ||
+          allocator.Remove(Key(1)) != SlabAllocator::RemoveResult::kRemoved) {
+        writer_ok = false;
+        break;
+      }
+    }
+    done.store(true);
+  });
+  bool observed_positive = false;
+  do {
+    const SlabAllocator::LifetimeBucketObservation observation =
+        allocator.ObserveLifetimeBuckets(clock);
+    EXPECT_TRUE(observation.available);
+    EXPECT_LE(observation.protected_estimate, 1U);
+    EXPECT_GT(observation.summary_bytes, 0U);
+    if (!observed_positive && observation.protected_estimate == 1) {
+      observed_positive = true;
+      first_seen.set_value();
+    }
+  } while (!done.load());
+  writer.join();
+  EXPECT_TRUE(writer_ok);
+  EXPECT_TRUE(observed_positive);
+  ASSERT_NO_FATAL_FAILURE(ExpectObservation(allocator, clock, 0));
 }
 
 TEST(SlabLifetimeBuckets, UnknownAndUncommittedResidentsDoNotRegister) {
@@ -706,6 +920,10 @@ TEST_F(LifetimeBucketStoreTest,
   EXPECT_GT(memory.lifetime_queue_bytes, 0U);
   EXPECT_GT(memory.lifetime_version_bytes, 0U);
   EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 0), 1U);
+  const SlabAllocator::LifetimeBucketObservation before_observation =
+      store_->ObserveLifetimeBuckets();
+  EXPECT_TRUE(before_observation.available);
+  EXPECT_EQ(before_observation.protected_estimate, 1U);
   const uint64_t token = DiskSlabStoreTestPeer::Token(*store_, Key(1));
   DiskSlabStoreTestPeer::FailMetadata(*store_);
   EXPECT_EQ(store_->Remove(Key(1)), Status::kIOError);
@@ -724,6 +942,11 @@ TEST_F(LifetimeBucketStoreTest,
   EXPECT_EQ(DiskSlabStoreTestPeer::Token(*store_, Key(1)), token);
   EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 0), 1U);
   EXPECT_EQ(store_->TenantUsedBytes(7), 3U);
+  const SlabAllocator::LifetimeBucketObservation after_observation =
+      store_->ObserveLifetimeBuckets();
+  EXPECT_TRUE(after_observation.available);
+  EXPECT_EQ(after_observation.protected_estimate, 1U);
+  EXPECT_EQ(after_observation.summary_bytes, before_observation.summary_bytes);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(*store_));
 }
 
@@ -743,6 +966,7 @@ TEST_F(LifetimeBucketStoreTest,
   EXPECT_EQ(hidden.allocated_bytes, 4096U);
   EXPECT_EQ(hidden.allocator_payload_bytes, 3U);
   EXPECT_EQ(hidden.allocator_fragmentation_bytes, 4093U);
+  EXPECT_EQ(store_->ObserveLifetimeBuckets().protected_estimate, 1U);
   DiskSlabStoreTestPeer::FailMetadata(*store_);
   lease = ReadLease{};
   EXPECT_FALSE(store_->Healthy());
@@ -754,6 +978,10 @@ TEST_F(LifetimeBucketStoreTest,
   EXPECT_EQ(store_->TenantUsedBytes(7), 0U);
   EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 0), 1U);
   EXPECT_NE(DiskSlabStoreTestPeer::Token(*store_, Key(1)), 0U);
+  const SlabAllocator::LifetimeBucketObservation retained =
+      store_->ObserveLifetimeBuckets();
+  EXPECT_TRUE(retained.available);
+  EXPECT_EQ(retained.protected_estimate, 1U);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(*store_));
 }
 
@@ -834,6 +1062,10 @@ TEST_F(LifetimeBucketStoreTest, RecoveryUsesActualNowRatherThanAnchorZero) {
   EXPECT_TRUE(recovered.value_or(DiskLifetimeState{}).history_unknown);
   EXPECT_EQ(DiskSlabStoreTestPeer::Token(*store_, Key(1)), 0U);
   EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 21), 0U);
+  const SlabAllocator::LifetimeBucketObservation expired_recovery =
+      store_->ObserveLifetimeBuckets();
+  EXPECT_TRUE(expired_recovery.available);
+  EXPECT_EQ(expired_recovery.protected_estimate, 0U);
   std::string value;
   DiskResidentIdentity identity;
   ASSERT_EQ(store_->RangeWithIdentity(Key(1), 0, 0, &value, &identity),
@@ -841,6 +1073,7 @@ TEST_F(LifetimeBucketStoreTest, RecoveryUsesActualNowRatherThanAnchorZero) {
   ASSERT_EQ(value, "old");
   store_->NotifyLifetimeReadSuccess(Key(1), identity, value.size());
   EXPECT_EQ(DiskSlabStoreTestPeer::Estimate(*store_, 21), 1U);
+  EXPECT_EQ(store_->ObserveLifetimeBuckets().protected_estimate, 1U);
   EXPECT_NE(DiskSlabStoreTestPeer::Token(*store_, Key(1)), 0U);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(*store_));
 }

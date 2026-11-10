@@ -175,6 +175,7 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
     assert(opt_.num_extents <= SIZE_MAX / opt_.lifetime_bucket_count);
     lifetime_buckets_.resize(static_cast<size_t>(opt_.num_extents) *
                              opt_.lifetime_bucket_count);
+    lifetime_bucket_summary_.resize(opt_.lifetime_bucket_count);
   }
   unbound_ = opt_.num_extents;
 
@@ -431,10 +432,11 @@ void SlabAllocator::RegisterLifetimeBucketLocked(
   // Use the page containing the last protected second. An exact boundary
   // expires there, while other deadlines are conservatively rounded upward.
   const uint64_t generation = (end - 1) / opt_.lifetime_bucket_sec + 1;
+  const size_t page = (generation - 1) % opt_.lifetime_bucket_count;
   LifetimeBucket& bucket =
       lifetime_buckets_[static_cast<size_t>(slots_[index].ref.extent) *
                             opt_.lifetime_bucket_count +
-                        (generation - 1) % opt_.lifetime_bucket_count];
+                        page];
   if (bucket.generation != generation) {
     // Coverage B*G >= H excludes collisions between live pages. A lazy reset
     // may discard only an expired page, never another protected generation.
@@ -443,6 +445,15 @@ void SlabAllocator::RegisterLifetimeBucketLocked(
     bucket = {generation, 0};
   }
   ++bucket.count;
+  LifetimeBucket& summary = lifetime_bucket_summary_[page];
+  if (summary.generation < generation) {
+    assert(summary.count == 0 ||
+           summary.generation <= now / opt_.lifetime_bucket_sec);
+    summary = {generation, 0};
+  }
+  // A delayed older generation is already expired at the current owner time.
+  // Never replace the latest aggregate generation, even when its count is zero.
+  if (summary.generation == generation) ++summary.count;
   lifetime_bucket_tokens_[index] = generation;
 }
 
@@ -451,21 +462,34 @@ void SlabAllocator::UnregisterLifetimeBucketLocked(uint32_t index) {
   const uint64_t generation = lifetime_bucket_tokens_[index];
   if (generation == 0) return;  // Never infer registration from old heat state.
   lifetime_bucket_tokens_[index] = 0;
+  const size_t page = (generation - 1) % opt_.lifetime_bucket_count;
   LifetimeBucket& bucket =
       lifetime_buckets_[static_cast<size_t>(slots_[index].ref.extent) *
                             opt_.lifetime_bucket_count +
-                        (generation - 1) % opt_.lifetime_bucket_count];
+                        page];
   if (bucket.generation == generation) {
     assert(bucket.count != 0);
     --bucket.count;
+    LifetimeBucket& summary = lifetime_bucket_summary_[page];
+    if (summary.generation == generation) {
+      assert(summary.count != 0);
+      --summary.count;
+    }
   }  // An old token must not subtract a newer occupant of the ring position.
 }
 
 void SlabAllocator::ResetLifetimeBucketsLocked(uint32_t extent) {
   if (opt_.lifetime_bucket_count == 0) return;
   const size_t first = static_cast<size_t>(extent) * opt_.lifetime_bucket_count;
-  std::fill_n(lifetime_buckets_.begin() + first, opt_.lifetime_bucket_count,
-              LifetimeBucket{});
+  for (uint32_t page = 0; page < opt_.lifetime_bucket_count; ++page) {
+    LifetimeBucket& bucket = lifetime_buckets_[first + page];
+    LifetimeBucket& summary = lifetime_bucket_summary_[page];
+    if (bucket.generation == summary.generation) {
+      assert(summary.count >= bucket.count);
+      summary.count -= bucket.count;
+    }
+    bucket = LifetimeBucket{};
+  }
 }
 
 uint64_t SlabAllocator::LifetimeProtectedEstimateLocked(uint32_t extent,
@@ -1881,6 +1905,24 @@ SlabAllocator::LifetimeMemory SlabAllocator::LifetimeMemoryUsage() const {
   memory.queue_bytes = lifetime_queues_.capacity() * sizeof(LifetimeQueue);
   memory.version_bytes = lifetime_versions_.capacity() * sizeof(uint64_t);
   return memory;
+}
+
+SlabAllocator::LifetimeBucketObservation SlabAllocator::ObserveLifetimeBuckets(
+    const DiskLifetimeClock& clock) const {
+  if (opt_.lifetime_bucket_count == 0) return {};
+  const std::lock_guard<std::mutex> lock(mu_);
+  LifetimeBucketObservation observation;
+  observation.summary_bytes =
+      lifetime_bucket_summary_.capacity() * sizeof(LifetimeBucket);
+  uint32_t now = 0;
+  if (!clock.TryDrainNow(&now)) return observation;
+  observation.available = true;
+  const uint64_t current_page = now / opt_.lifetime_bucket_sec;
+  for (const LifetimeBucket& bucket : lifetime_bucket_summary_) {
+    if (bucket.generation > current_page)
+      observation.protected_estimate += bucket.count;
+  }
+  return observation;
 }
 
 std::vector<SlabAllocator::LifetimeQueueStat>

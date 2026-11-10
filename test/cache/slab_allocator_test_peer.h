@@ -149,6 +149,10 @@ class SlabAllocatorTestPeer {
     const std::lock_guard<std::mutex> lock(allocator.mu_);
     return allocator.lifetime_buckets_.size();
   }
+  static size_t BucketSummaryCapacity(const SlabAllocator& allocator) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    return allocator.lifetime_bucket_summary_.capacity();
+  }
   static size_t BucketTokenSize(const SlabAllocator& allocator) {
     const std::lock_guard<std::mutex> lock(allocator.mu_);
     return allocator.lifetime_bucket_tokens_.size();
@@ -194,9 +198,12 @@ class SlabAllocatorTestPeer {
     const size_t bands = allocator.opt_.lifetime_bucket_count;
     if (bands == 0)
       return allocator.lifetime_buckets_.empty() &&
-             allocator.lifetime_bucket_tokens_.empty();
+             allocator.lifetime_bucket_tokens_.empty() &&
+             allocator.lifetime_bucket_summary_.empty();
     if (allocator.lifetime_bucket_tokens_.size() != allocator.slots_.size() ||
-        allocator.lifetime_buckets_.size() != allocator.extents_.size() * bands)
+        allocator.lifetime_buckets_.size() !=
+            allocator.extents_.size() * bands ||
+        allocator.lifetime_bucket_summary_.size() != bands)
       return false;
     std::vector<uint64_t> counts(allocator.lifetime_buckets_.size(), 0);
     for (size_t index = 0; index < allocator.slots_.size(); ++index) {
@@ -210,8 +217,24 @@ class SlabAllocatorTestPeer {
                           static_cast<size_t>((token - 1) % bands);
       if (allocator.lifetime_buckets_[page].generation == token) ++counts[page];
     }
+    std::vector<uint64_t> summary_counts(bands, 0);
     for (size_t page = 0; page < counts.size(); ++page) {
-      if (allocator.lifetime_buckets_[page].count != counts[page]) return false;
+      const SlabAllocator::LifetimeBucket& bucket =
+          allocator.lifetime_buckets_[page];
+      if (bucket.count != counts[page]) return false;
+      const SlabAllocator::LifetimeBucket& summary =
+          allocator.lifetime_bucket_summary_[page % bands];
+      // Derive the aggregate from resident tokens, not its maintained ledger.
+      // Older ring generations may remain in other extent rows after expiry.
+      if (counts[page] != 0 && bucket.generation > summary.generation)
+        return false;
+      if (bucket.generation == summary.generation)
+        summary_counts[page % bands] += counts[page];
+    }
+    for (size_t page = 0; page < bands; ++page) {
+      if (allocator.lifetime_bucket_summary_[page].count !=
+          summary_counts[page])
+        return false;
     }
     return true;
   }

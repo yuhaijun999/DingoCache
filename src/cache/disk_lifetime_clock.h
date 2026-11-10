@@ -37,8 +37,10 @@ class DiskLifetimeClock {
   // uses TryDrainNow instead; neither API implements the full shutdown policy.
   bool TryNow(uint32_t* offset) const;
 
-  // For already-admitted work only; sample under the resident owner's lock
-  // when applying an update. Allows the remaining seconds through UINT32_MAX.
+  // For already-admitted work or non-admitting observations. Sample under the
+  // resident owner's lock when applying an update. Observations also advance
+  // the shared floor and can close future admission. Allows time through
+  // UINT32_MAX.
   // Does not admit a request or establish grant success. Crossing UINT32_MAX-H
   // advances the shared floor, closing subsequent TryNow admission even if
   // the server has not polled its restart signal yet. Deadlines stay uint64.

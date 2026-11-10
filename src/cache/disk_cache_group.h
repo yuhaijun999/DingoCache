@@ -222,6 +222,9 @@ class DiskCacheGroup {
   // Separate metrics-only snapshot; file/out-of-range views are empty.
   std::vector<SlabAllocator::LifetimeQueueStat> DiskLifetimeQueueStats(
       size_t i) const;
+  // Metrics-only bucket view; file/out-of-range views are unavailable.
+  SlabAllocator::LifetimeBucketObservation DiskLifetimeBucketObservation(
+      size_t i) const;
   uint64_t TenantUsedBytes(uint64_t tenant_hash) const;
   uint64_t TenantDefaultQuotaBytes() const { return tenant_default_quota_bytes_; }
   uint64_t TenantQuotaBytes(uint64_t tenant_hash) const {

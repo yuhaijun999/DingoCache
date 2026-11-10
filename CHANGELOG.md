@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export conservative protection-bucket resident estimates, availability and
+  retained summary-ring bytes globally and per disk. Preserve current-time
+  expiry semantics and omit unavailable estimates instead of reporting zero.
+
 - Export retained resident populations in global and class-local lifetime score
   queues, by disk and scoring band. Keep physical bands distinct from logical
   read classes, scores and protection; preserve counts until physical release.

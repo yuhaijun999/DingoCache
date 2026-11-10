@@ -212,6 +212,17 @@ class SlabAllocator {
   // allocators; these fields are not the full memory increment over a legacy
   // binary.
   LifetimeMemory LifetimeMemoryUsage() const;
+  struct LifetimeBucketObservation {
+    uint64_t protected_estimate =
+        0;                       // Coarse live-page count, not exact scores.
+    uint64_t summary_bytes = 0;  // Retained aggregate ring element backing.
+    bool available = false;  // False when disabled or the clock is exhausted.
+  };
+  // O(B) A-locked current-time observation, not a historical query. The clock
+  // must be the owner's shared monotonic clock; sampling advances its floor.
+  // Hard exhaustion keeps backing bytes but provides no usable estimate.
+  LifetimeBucketObservation ObserveLifetimeBuckets(
+      const DiskLifetimeClock& clock) const;
   struct LifetimeQueueStat {
     uint32_t slot_size = 0;  // Zero denotes the global index, not a size class.
     uint32_t band = 0;  // Effective scoring band, not a logical read class.
@@ -557,6 +568,9 @@ class SlabAllocator {
   // owner validation and every token transition share A with slot reuse.
   std::vector<uint64_t> lifetime_bucket_tokens_;
   std::vector<LifetimeBucket> lifetime_buckets_;
+  // One latest-generation aggregate per ring position across all extents.
+  // Older delayed registrations must never replace a newer generation.
+  std::vector<LifetimeBucket> lifetime_bucket_summary_;
   uint32_t lifetime_next_band_ =
       0;  // Global watermark turn, including quiet ticks.
   // Enabled-only class mutation versions, including pin eligibility changes.

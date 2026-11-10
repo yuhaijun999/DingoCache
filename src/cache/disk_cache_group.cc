@@ -1149,6 +1149,12 @@ DiskCacheGroup::DiskLifetimeQueueStats(size_t i) const {
   return slabs_[i]->LifetimeQueueStats();
 }
 
+SlabAllocator::LifetimeBucketObservation
+DiskCacheGroup::DiskLifetimeBucketObservation(size_t i) const {
+  if (i >= slabs_.size()) return {};
+  return slabs_[i]->ObserveLifetimeBuckets();
+}
+
 std::vector<SlabAllocator::ClassStat> DiskCacheGroup::SlabClasses() const {
   std::map<uint32_t, SlabAllocator::ClassStat> by_size;
   for (const auto* disk : slabs_) {

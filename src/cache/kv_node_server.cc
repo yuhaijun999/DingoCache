@@ -568,6 +568,15 @@ std::string KvNodeServer::MetricsText() const {
       s += "# HELP "; s += name; s += " "; s += help; s += "\n";
       s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
     };
+    uint64_t bucket_protected_estimate = 0;
+    uint64_t bucket_summary_bytes = 0;
+    bool bucket_estimate_available = group_.DiskCount() != 0;
+    header("dfkv_slab_disk_lifetime_bucket_protected_estimate", "gauge",
+           "Bucket-rounded estimate of retained protected residents");
+    header("dfkv_slab_disk_lifetime_bucket_estimate_available", "gauge",
+           "Whether a current lifetime bucket estimate is available");
+    header("dfkv_slab_disk_lifetime_bucket_summary_bytes", "gauge",
+           "Retained global expiry summary vector backing bytes");
     using LifetimeQueueKey = std::pair<uint32_t, uint32_t>;
     std::map<LifetimeQueueKey, uint64_t> queue_totals;
     const auto queue_labels = [](uint32_t slot_size, uint32_t band) {
@@ -691,6 +700,20 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_peak_high_bytes", st.watermark_peak_high_bytes);
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
+      const SlabAllocator::LifetimeBucketObservation buckets =
+          group_.DiskLifetimeBucketObservation(i);
+      sample("dfkv_slab_disk_lifetime_bucket_estimate_available",
+             buckets.available ? 1 : 0);
+      sample("dfkv_slab_disk_lifetime_bucket_summary_bytes",
+             buckets.summary_bytes);
+      if (buckets.available) {
+        sample("dfkv_slab_disk_lifetime_bucket_protected_estimate",
+               buckets.protected_estimate);
+        bucket_protected_estimate += buckets.protected_estimate;
+      }
+      bucket_summary_bytes += buckets.summary_bytes;
+      bucket_estimate_available =
+          bucket_estimate_available && buckets.available;
       // Aggregate these same per-disk snapshots, not a second observation.
       const std::vector<SlabAllocator::LifetimeQueueStat> queues =
           group_.DiskLifetimeQueueStats(i);
@@ -780,6 +803,18 @@ std::string KvNodeServer::MetricsText() const {
       s += "dfkv_slab_lifetime_queue_residents" +
            braces(queue_labels(entry.first.first, entry.first.second)) + " " +
            std::to_string(entry.second) + "\n";
+    }
+    metric("dfkv_slab_lifetime_bucket_estimate_available", "gauge",
+           "Whether all disk lifetime bucket estimates are available",
+           bucket_estimate_available ? 1 : 0);
+    metric("dfkv_slab_lifetime_bucket_summary_bytes", "gauge",
+           "Retained global expiry summary vector backing bytes",
+           bucket_summary_bytes);
+    header("dfkv_slab_lifetime_bucket_protected_estimate", "gauge",
+           "Bucket-rounded estimate of retained protected residents");
+    if (bucket_estimate_available) {
+      s += "dfkv_slab_lifetime_bucket_protected_estimate" + braces("") + " " +
+           std::to_string(bucket_protected_estimate) + "\n";
     }
     const auto ss = group_.SlabStats();
     metric("dfkv_slab_dio_write_fallback_total", "counter",

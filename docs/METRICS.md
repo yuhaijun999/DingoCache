@@ -287,6 +287,9 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_queue_bytes` / `dfkv_slab_disk_lifetime_queue_bytes` | gauge | Score-queue vector capacity × sizeof(LifetimeQueue). Logical queue count is (all canonical size classes + 1 global row) × (MAX_READS + 1), even before any resident is written. |
 | `dfkv_slab_lifetime_version_bytes` / `dfkv_slab_disk_lifetime_version_bytes` | gauge | Class mutation-version vector capacity × sizeof(uint64_t), covering all canonical size classes, not only bound classes. |
 | `dfkv_slab_lifetime_queue_residents` / `dfkv_slab_disk_lifetime_queue_residents` | gauge | Current retained residents in each physical lifetime scoring queue. Labels: `index="global"` with reserved `slot_size="0"`, or `index="class"` with actual slot size; `band="0"` through `MAX_READS`. Per-disk series also use existing `disk` / `disk_index`. Aggregate values sum the exact per-disk queue snapshots taken during that scrape, not a second sampling pass. |
+| `dfkv_slab_lifetime_bucket_protected_estimate` / `dfkv_slab_disk_lifetime_bucket_protected_estimate` | gauge | Current conservative bucket-based protected-resident estimate, not exact `score > KEEP`, unpinned candidates or bucket/token capacity. Numeric sample is omitted when unavailable. Aggregate sums the same per-disk observations only when all are available. |
+| `dfkv_slab_lifetime_bucket_estimate_available` / `dfkv_slab_disk_lifetime_bucket_estimate_available` | gauge | 1 when enabled bucket accounting has a usable bounded owner-clock observation, 0 for disabled buckets or hard clock exhaustion. 0 does not mean an empty cache. Aggregate is 1 only when all contributing disks are available. |
+| `dfkv_slab_lifetime_bucket_summary_bytes` / `dfkv_slab_disk_lifetime_bucket_summary_bytes` | gauge | Retained global expiry-summary ring capacity × sizeof(bucket), allocated once for B entries on enabled disks. Reported even when time is unavailable; separate from the existing per-extent bucket backing and token gauges. |
 | `dfkv_slab_lifetime_recovered_objects` / `dfkv_slab_disk_lifetime_recovered_objects` | gauge | Current allocator residents whose initialized lifetime state has `history_unknown=true`, globally / per disk with existing `disk` and `disk_index` labels. Reading them does not clear their recovered-history marker. Not the cumulative startup `table_rebuilt_objects`, reader-visible-only population, payload bytes or all records restored when scoring initialization was skipped. |
 | `dfkv_slab_lifetime_recovered_unread_objects` / `dfkv_slab_disk_lifetime_recovered_unread_objects` | gauge | The recovered population above whose in-memory `actual_reads` is zero. The first applied nonempty logical read removes one from this subset, but later reads cannot subtract it again. Virtual recovery scoring reads, payload preparation, physical storage reads alone, heat-rejected notifications and metric scrapes do not consume unread population. NEW unread residents are excluded. This state-based gauge is not proof that no logical GET succeeded if its metadata update was skipped. |
 | `dfkv_slab_allocator_objects` / `dfkv_slab_committed_objects` | gauge | allocator resident（含未提交写）/ reader-visible 已提交对象 |
@@ -688,3 +691,39 @@ slab has no queue samples; file omits the slab families. Internal shadow
 allocators return actual enabled index populations without claiming production
 policy activation. Internal C++ cache consumers still require matching headers
 and libraries; the C API, disk format and existing snapshot interfaces remain.
+
+### Current protection-bucket estimates
+
+An enabled disk keeps a B-entry summary across its per-extent expiry rings.
+Observations sum only generations strictly newer than `now / G`, matching the
+existing donor coarse estimator at current nondecreasing time; this is not a
+historical arbitrary-time query. Expiry rounding is conservative: a resident
+whose exact score has fallen to KEEP may remain estimated protected until its
+bucket boundary. Counts include pinned/hidden/isolated residents while their
+physical registrations remain; ordinary time expiry can still remove them from
+the current estimate without freeing their slots. Only exact resident checks
+can establish actual protected loss or victim eligibility.
+
+Registration, unregistration and extent reset update the summary under the
+existing A lock. Older delayed generations never replace newer summaries;
+stale tokens/rows subtract only matching generations. The estimate query is
+O(B), B<=64, not O(extents*B) or a resident scan. It acquires A and samples the
+owner's shared bounded clock once. Sampling advances that clock's sticky
+monotonic floor and can close future admission; it does not admit requests,
+heat residents, rotate expiry pages or change donor selection.
+
+The estimate remains available through the soft admission boundary, including
+valid already-admitted drain time. Beyond UINT32_MAX it becomes unavailable;
+clock rollback cannot restore availability or reopen admission. Summary backing
+bytes remain visible, but numeric estimates are omitted rather than emitted as
+zero or cached stale values. Disabled legacy/shadow buckets are unavailable;
+file omits slab metrics. Each aggregate uses the same per-disk observations,
+not a second sampling pass, but disks and other gauges are not simultaneous.
+
+The global summary adds an empty vector object even to disabled allocators and
+B actual bucket elements only to enabled ones, with fixed extra arithmetic at
+registration/removal/reset. This is not zero memory/latency cost. Existing
+bucket bytes still cover only per-extent backing; summary_bytes is separate.
+Neither includes allocator overhead or recovery/RSS peaks. Ordinary
+Classes/ClassStat/Stats and all previous snapshot return layouts are unchanged;
+internal C++ consumers still need matching headers/library builds.

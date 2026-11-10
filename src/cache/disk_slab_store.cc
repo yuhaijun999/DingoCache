@@ -2779,6 +2779,12 @@ DiskSlabStore::LifetimeQueueStats() const {
   return alloc_->LifetimeQueueStats();
 }
 
+SlabAllocator::LifetimeBucketObservation DiskSlabStore::ObserveLifetimeBuckets()
+    const {
+  if (!alloc_ || !opt_.lifetime_clock) return {};
+  return alloc_->ObserveLifetimeBuckets(*opt_.lifetime_clock);
+}
+
 void DiskSlabStore::NotifyLifetimeReadSuccess(
     const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
     LifetimeReadSource source) {
