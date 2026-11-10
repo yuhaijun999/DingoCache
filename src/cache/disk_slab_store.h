@@ -117,6 +117,12 @@ class DiskSlabStore : public StoreEngine {
     uint64_t applied = 0;
     uint64_t no_binding = 0;
     uint64_t race_lost = 0;
+    // Exclusive children of race_lost, not additional logical successes.
+    uint64_t race_identity_scope = 0;  // Unowned or foreign instance/epoch.
+    uint64_t race_not_visible = 0;     // Store no longer exposes this key.
+    uint64_t race_generation_mismatch = 0;  // Allocator generation differs.
+    uint64_t race_allocator_unavailable =
+        0;  // Missing/ineligible entry, not OOM.
     uint64_t clock_hard_exhausted = 0;
     uint64_t io_unhealthy = 0;
     uint64_t state_unavailable = 0;

@@ -671,7 +671,7 @@ TEST(SlabLifetimeBuckets, PhysicalReuseRejectsAnOldResidentRead) {
   seconds = 31;
   EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, Key(1), 11,
                                                      config, clock),
-            SlabAllocatorTestPeer::LifetimeReadResult::kResidentChanged);
+            SlabAllocatorTestPeer::LifetimeReadResult::kGenerationMismatch);
   EXPECT_EQ(SlabAllocatorTestPeer::BucketToken(allocator, Key(1)), token);
   EXPECT_EQ(SlabAllocatorTestPeer::ProtectedEstimate(allocator, 0, 31), 1U);
   ExpectValid(allocator);

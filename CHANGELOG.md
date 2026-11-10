@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Split rejected lifetime read notifications into identity scope, visibility,
+  resident generation and allocator-guard reasons. Preserve the existing
+  race-lost total, outcome partition and heat application rules.
+
 - Export retained class rotation and per-extent free-slot vector backing bytes
   globally and per slab disk, including empty retained capacity. Preserve
   allocation/eviction behavior and keep map/heap overhead outside these gauges.

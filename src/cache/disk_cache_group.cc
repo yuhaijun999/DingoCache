@@ -1118,6 +1118,13 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_reads.applied += st.lifetime_reads.applied;
     sum.lifetime_reads.no_binding += st.lifetime_reads.no_binding;
     sum.lifetime_reads.race_lost += st.lifetime_reads.race_lost;
+    sum.lifetime_reads.race_identity_scope +=
+        st.lifetime_reads.race_identity_scope;
+    sum.lifetime_reads.race_not_visible += st.lifetime_reads.race_not_visible;
+    sum.lifetime_reads.race_generation_mismatch +=
+        st.lifetime_reads.race_generation_mismatch;
+    sum.lifetime_reads.race_allocator_unavailable +=
+        st.lifetime_reads.race_allocator_unavailable;
     sum.lifetime_reads.clock_hard_exhausted +=
         st.lifetime_reads.clock_hard_exhausted;
     sum.lifetime_reads.io_unhealthy += st.lifetime_reads.io_unhealthy;

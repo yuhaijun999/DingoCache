@@ -51,6 +51,14 @@ class DiskSlabStoreTestPeer {
   static void FailReadInvalidation(DiskSlabStore& store) {
     store.record_write_hook_for_test_ = [] { return false; };
   }
+  static SlabAllocator::RemoveResult RemoveAllocatorResidentForTest(
+      DiskSlabStore& store, const BlockKey& key) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    // Deliberately corrupt only the in-memory ledger for the defensive
+    // diagnostic branch. This is not ordinary Remove or a production race:
+    // the Store payload and real persistent record intentionally remain.
+    return store.alloc_->Remove(key);
+  }
 };
 namespace {
 
@@ -110,6 +118,10 @@ class DiskLifetimeReadTest : public ::testing::Test {
               counters.applied + counters.no_binding + counters.race_lost +
                   counters.clock_hard_exhausted + counters.io_unhealthy +
                   counters.state_unavailable);
+    EXPECT_EQ(counters.race_lost, counters.race_identity_scope +
+                                      counters.race_not_visible +
+                                      counters.race_generation_mismatch +
+                                      counters.race_allocator_unavailable);
     EXPECT_EQ(counters.successful,
               counters.source_unclassified + counters.source_ram +
                   counters.source_disk + counters.source_copy_leader +
@@ -478,6 +490,8 @@ TEST_F(DiskLifetimeReadTest, RejectsForeignAndStaleCredentialsBeforeSampling) {
   EXPECT_EQ(State().actual_reads, 0U);
   const DiskSlabStore::LifetimeReadCounters counters = Counters();
   EXPECT_EQ(counters.race_lost, 3U);
+  EXPECT_EQ(counters.race_identity_scope, 2U);
+  EXPECT_EQ(counters.race_generation_mismatch, 1U);
   EXPECT_EQ(counters.no_binding, 1U);
   EXPECT_EQ(counters.successful, 4U);
 }
@@ -492,6 +506,7 @@ TEST_F(DiskLifetimeReadTest, SameKeyReplacementNeverInheritsOldOrRamHeat) {
   store_->NotifyLifetimeReadSuccess(key_, {}, 5);
   EXPECT_EQ(State().actual_reads, 0U);
   EXPECT_EQ(Counters().race_lost, 1U);
+  EXPECT_EQ(Counters().race_generation_mismatch, 1U);
   EXPECT_EQ(Counters().no_binding, 1U);
 }
 
@@ -509,6 +524,94 @@ TEST_F(DiskLifetimeReadTest, LastPinRemovePreservesSourceButRejectsHeat) {
   EXPECT_FALSE(store_->IsCached(key_));
   store_->NotifyLifetimeReadSuccess(key_, source, bytes.size());
   EXPECT_EQ(Counters().race_lost, 1U);
+  EXPECT_EQ(Counters().race_not_visible, 1U);
+}
+
+TEST_F(DiskLifetimeReadTest, RaceReasonsPartitionAtValidationBoundaries) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  DiskResidentIdentity wrong = identity;
+  ++wrong.store_instance;
+  store_->NotifyLifetimeReadSuccess(key_, wrong, 5);
+  wrong = identity;
+  ++wrong.generation;
+  for (unsigned i = 0; i < 3; ++i)
+    store_->NotifyLifetimeReadSuccess(key_, wrong, 5);
+  ASSERT_EQ(store_->Remove(key_), Status::kOk);
+  // Scope wins over hidden visibility, which wins over a wrong generation.
+  wrong = identity;
+  ++wrong.run_epoch;
+  store_->NotifyLifetimeReadSuccess(key_, wrong, 5);
+  wrong = identity;
+  ++wrong.generation;
+  for (unsigned i = 0; i < 5; ++i)
+    store_->NotifyLifetimeReadSuccess(key_, wrong, 5);
+  // An incomplete tuple wins over wrong scope and hidden visibility.
+  wrong.store_instance = identity.store_instance + 1;
+  wrong.generation = 0;
+  store_->NotifyLifetimeReadSuccess(key_, wrong, 5);
+  const DiskResidentIdentity replacement = Put();
+  ASSERT_EQ(
+      DiskSlabStoreTestPeer::RemoveAllocatorResidentForTest(*store_, key_),
+      SlabAllocator::RemoveResult::kRemoved);
+  ASSERT_TRUE(store_->IsCached(key_));
+  const uint64_t samples = samples_.load();
+  for (unsigned i = 0; i < 7; ++i)
+    store_->NotifyLifetimeReadSuccess(key_, replacement, 5);
+  const DiskSlabStore::LifetimeReadCounters counters = Counters();
+  EXPECT_EQ(counters.successful, 18U);
+  EXPECT_EQ(counters.race_lost, 17U);
+  EXPECT_EQ(counters.no_binding, 1U);
+  EXPECT_EQ(counters.applied, 0U);
+  EXPECT_EQ(counters.race_identity_scope, 2U);
+  EXPECT_EQ(counters.race_not_visible, 5U);
+  EXPECT_EQ(counters.race_generation_mismatch, 3U);
+  EXPECT_EQ(counters.race_allocator_unavailable, 7U);
+  EXPECT_EQ(samples_.load(), samples);
+  // The fixture removed only allocator metadata, not the real disk record.
+  // Restart reconstructs that record and begins fresh runtime counters.
+  store_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create());
+  std::string bytes;
+  EXPECT_EQ(store_->Range(key_, 0, 0, &bytes), Status::kOk);
+  EXPECT_EQ(bytes, "value");
+  EXPECT_EQ(Counters().successful, 0U);
+}
+
+TEST_F(DiskLifetimeReadTest, LifecycleWaitRejectsReplacementBeforeSampling) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity old = Put();
+  ASSERT_EQ(store_->Remove(key_), Status::kOk);
+  const DiskResidentIdentity replacement = Put();
+  ASSERT_NE(old.generation, replacement.generation);
+  std::unique_lock<std::mutex> lifecycle =
+      DiskSlabStoreTestPeer::HoldLifecycle(*store_);
+  const uint64_t samples = samples_.load();
+  std::promise<void> entered;
+  std::promise<void> finished;
+  const std::future<void> requested = entered.get_future();
+  const std::future<void> completion = finished.get_future();
+  std::thread notifier([&] {
+    entered.set_value();
+    store_->NotifyLifetimeReadSuccess(key_, old, 5);
+    finished.set_value();
+  });
+  requested.wait();
+  const std::future_status waiting =
+      completion.wait_for(std::chrono::milliseconds(30));
+  // A stale generation must be rejected before even sampling an exhausted
+  // clock. This wait is a functional handshake, not a performance threshold.
+  seconds_.store(uint64_t{std::numeric_limits<uint32_t>::max()} + 101);
+  lifecycle.unlock();
+  notifier.join();
+  EXPECT_EQ(waiting, std::future_status::timeout);
+  EXPECT_EQ(samples_.load(), samples);
+  EXPECT_EQ(State().actual_reads, 0U);
+  const DiskSlabStore::LifetimeReadCounters counters = Counters();
+  EXPECT_EQ(counters.successful, 1U);
+  EXPECT_EQ(counters.race_lost, 1U);
+  EXPECT_EQ(counters.race_generation_mismatch, 1U);
+  EXPECT_EQ(counters.clock_hard_exhausted, 0U);
 }
 
 TEST_F(DiskLifetimeReadTest,

@@ -1700,6 +1700,10 @@ TEST_F(SharedLifetimeClockTest, LogicalReadCountersAggregateAcrossBothDisks) {
   EXPECT_EQ(counters.applied, 2U);
   EXPECT_EQ(counters.no_binding, 1U);
   EXPECT_EQ(counters.race_lost, 1U);
+  EXPECT_EQ(counters.race_identity_scope, 0U);
+  EXPECT_EQ(counters.race_not_visible, 0U);
+  EXPECT_EQ(counters.race_generation_mismatch, 1U);
+  EXPECT_EQ(counters.race_allocator_unavailable, 0U);
   EXPECT_EQ(counters.clock_hard_exhausted, 2U);
   EXPECT_EQ(counters.io_unhealthy, 0U);
   EXPECT_EQ(counters.state_unavailable, 0U);

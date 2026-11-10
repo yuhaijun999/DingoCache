@@ -790,7 +790,7 @@ TEST(SlabLifetimeStorage, EarlyReadUsesEffectiveBandAndRejectedReadKeepsOrder) {
   seconds = 2;
   EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, key, 104,
                                                      config, clock),
-            SlabAllocatorTestPeer::LifetimeReadResult::kResidentChanged);
+            SlabAllocatorTestPeer::LifetimeReadResult::kGenerationMismatch);
   ExpectState(allocator, key, *read_state);
   const std::vector<SlabAllocator::LifetimeQueueStat> stats =
       allocator.LifetimeQueueStats();

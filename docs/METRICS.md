@@ -279,6 +279,10 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_read_io_unhealthy_total` / `dfkv_slab_lifetime_read_state_unavailable_total` | counter | 已成功的读在通知时遇盘I/O隔离 / 匹配住户的评分state缺失或时间不变量错误（正常应为0）；均不改原读状态。失败GET本身不发送通知 |
 | `dfkv_slab_disk_lifetime_read_success_total` / `dfkv_slab_disk_lifetime_read_applied_total` | counter | Per-disk successful nonempty logical read notifications / notifications applied to the original resident, using existing `disk` / `disk_index` and optional node identity labels. These reuse existing Store counters, not physical payload I/O counts, transport delivery/client-consumption proof, or proof of deduplication. |
 | `dfkv_slab_disk_lifetime_read_no_binding_total` / `dfkv_slab_disk_lifetime_read_race_lost_total` | counter | Per-disk notifications without a disk credential / with an obsolete or removed original resident. Attribution follows the key's configured disk route even for an unbound source; it does not prove that the bytes came from that disk. |
+| `dfkv_slab_lifetime_read_race_identity_scope_total` / `dfkv_slab_disk_lifetime_read_race_identity_scope_total` | counter | Receiving Store identity context is absent, or credential store instance/run epoch differs. Checked before payload visibility. |
+| `dfkv_slab_lifetime_read_race_not_visible_total` / `dfkv_slab_disk_lifetime_read_race_not_visible_total` | counter | Identity scope matches, but no reader-visible payload remains under the Store lifecycle lock. Does not prove the physical slot is already freed or distinguish Remove from eviction. |
+| `dfkv_slab_lifetime_read_race_generation_mismatch_total` / `dfkv_slab_disk_lifetime_read_race_generation_mismatch_total` | counter | Existing allocator lookup found a live, nonpending resident with a different current generation. The current generation may be reserved/uncommitted (zero); no replacement-commit claim. |
+| `dfkv_slab_lifetime_read_race_allocator_unavailable_total` / `dfkv_slab_disk_lifetime_read_race_allocator_unavailable_total` | counter | Remaining original allocator identity/resident guards rejected the notification (tracking disabled, missing/non-live/pending resident or zero supplied generation). Not allocation failure, I/O isolation or missing lifetime state. |
 | `dfkv_slab_lifetime_read_transport_unclassified_total` / `dfkv_slab_disk_lifetime_read_transport_unclassified_total` | counter | No preparation-route tag was supplied (including the legacy three-argument callback). A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
 | `dfkv_slab_lifetime_read_transport_ram_hit_total` / `dfkv_slab_disk_lifetime_read_transport_ram_hit_total` | counter | An already resident RAM value supplied the read, including pinned arena hits and copies into staging. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
 | `dfkv_slab_lifetime_read_transport_disk_staging_total` / `dfkv_slab_disk_lifetime_read_transport_disk_staging_total` | counter | The prepared storage request used staging, including an async coalescer owner. Not a physical-I/O counter. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
@@ -982,3 +986,35 @@ cover vector elements only, avoiding double counting those objects. Map nodes,
 buckets, heap overhead, other fixed objects, RSS and recovery peaks remain
 outside this partial accounting. This is not a full-memory/incremental lifetime
 budget or performance acceptance result.
+
+
+### Successful-read residency rejection reasons
+
+The four `read_race_*` children form a nested partition of the existing
+`read_race_lost_total`, not extra terms in the six-outcome success sum:
+
+```
+race_lost = race_identity_scope + race_not_visible
+          + race_generation_mismatch + race_allocator_unavailable
+```
+
+Rejection priority remains I/O isolation, missing/invalid binding, identity
+scope, visible payload, allocator identity/live/pending guards, generation,
+then clock/state and application. Disabled lifetime tracking and empty reads
+still add zero. Rejected credentials do not sample the application clock,
+change heat, move scoring queues or alter expiry buckets. Coarse/source counts
+and caller GET status are unchanged. These diagnostics do not establish that a
+concurrent race occurred: supplied foreign credentials also fail validation.
+They do not measure notification coverage, deduplication, latency or lock cost.
+
+All fields share the existing Store lifecycle lock and snapshot, with the
+existing single allocator lookup under its original lock. A rejection adds one
+plain integer increment; the applied path adds no new counter update. Four
+uint64_t fields add 32 fixed bytes per Store and read-counter/Stats snapshot,
+not per resident or request. Disk labels identify the receiving/validating
+configured key route, not proof of the physical source of returned bytes.
+Global values sum disk snapshots; compare separate samples only at quiescence.
+Counters reset on Store reconstruction; recovery virtual reads do not increment
+them. Legacy without lifetime scoring exports zero and file mode omits slab
+families. Existing alerts/dashboards keep the coarse family unchanged; do not
+sum its children with their parent or treat these as completed E2 acceptance.

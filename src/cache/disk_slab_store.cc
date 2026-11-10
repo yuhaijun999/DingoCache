@@ -2908,9 +2908,14 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
   }
   if (!resident_identity_ ||
       identity.store_instance != resident_identity_->store_instance ||
-      identity.run_epoch != run_epoch_ ||
-      payload_len_.count(key.Filename()) == 0) {
+      identity.run_epoch != run_epoch_) {
     ++lifetime_reads_.race_lost;
+    ++lifetime_reads_.race_identity_scope;
+    return;
+  }
+  if (payload_len_.count(key.Filename()) == 0) {
+    ++lifetime_reads_.race_lost;
+    ++lifetime_reads_.race_not_visible;
     return;
   }
   // D orders visibility/removal; A checks the same physical generation and
@@ -2924,6 +2929,11 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
       break;
     case SlabAllocator::LifetimeReadResult::kResidentChanged:
       ++lifetime_reads_.race_lost;
+      ++lifetime_reads_.race_allocator_unavailable;
+      break;
+    case SlabAllocator::LifetimeReadResult::kGenerationMismatch:
+      ++lifetime_reads_.race_lost;
+      ++lifetime_reads_.race_generation_mismatch;
       break;
     case SlabAllocator::LifetimeReadResult::kClockHardExhausted:
       ++lifetime_reads_.clock_hard_exhausted;

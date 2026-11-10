@@ -59,6 +59,13 @@ class DiskCacheGroupTestPeer {
 
 class DiskSlabStoreTestPeer {
  public:
+  static SlabAllocator::RemoveResult RemoveAllocatorResidentForTest(
+      DiskSlabStore& store, const BlockKey& key) {
+    // Deliberately leave the Store ledger/disk record intact to exercise the
+    // defensive allocator guard. This is NOT an ordinary Remove or GET race.
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    return store.alloc_->Remove(key);
+  }
   static std::pair<int, uint64_t> PayloadFile(DiskSlabStore& store,
                                               const BlockKey& key) {
     const std::lock_guard<std::mutex> lock(store.mu_);
@@ -335,6 +342,10 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
                              "applied",
                              "no_binding",
                              "race_lost",
+                             "race_identity_scope",
+                             "race_not_visible",
+                             "race_generation_mismatch",
+                             "race_allocator_unavailable",
                              "clock_hard_exhausted",
                              "io_unhealthy",
                              "state_unavailable",
@@ -2373,6 +2384,14 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
         {"applied", &DiskSlabStore::LifetimeReadCounters::applied},
         {"no_binding", &DiskSlabStore::LifetimeReadCounters::no_binding},
         {"race_lost", &DiskSlabStore::LifetimeReadCounters::race_lost},
+        {"race_identity_scope",
+         &DiskSlabStore::LifetimeReadCounters::race_identity_scope},
+        {"race_not_visible",
+         &DiskSlabStore::LifetimeReadCounters::race_not_visible},
+        {"race_generation_mismatch",
+         &DiskSlabStore::LifetimeReadCounters::race_generation_mismatch},
+        {"race_allocator_unavailable",
+         &DiskSlabStore::LifetimeReadCounters::race_allocator_unavailable},
         {"clock_hard_exhausted",
          &DiskSlabStore::LifetimeReadCounters::clock_hard_exhausted},
         {"io_unhealthy", &DiskSlabStore::LifetimeReadCounters::io_unhealthy},
@@ -2402,6 +2421,10 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
                   actual.applied + actual.no_binding + actual.race_lost +
                       actual.clock_hard_exhausted + actual.io_unhealthy +
                       actual.state_unavailable);
+        EXPECT_EQ(actual.race_lost, actual.race_identity_scope +
+                                        actual.race_not_visible +
+                                        actual.race_generation_mismatch +
+                                        actual.race_allocator_unavailable);
         EXPECT_EQ(actual.successful,
                   actual.source_unclassified + actual.source_ram +
                       actual.source_disk + actual.source_copy_leader +
@@ -2456,15 +2479,57 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
   ASSERT_EQ(read({10001, 0}, 0, &value), Status::kNotFound);
   ASSERT_NO_FATAL_FAILURE(expect_outcomes());
 
-  // Simulate a late successful transport notification with an actual old
-  // credential. This checks export attribution, not a live transport grant.
-  ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Remove(keys[0]), Status::kOk);
-  ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Cache(keys[0], "newer", 5),
-            Status::kOk);
-  server->NotifyLifetimeReadSuccessForKey(keys[0], original[0], 5);
-  ++expected[0].successful;
-  ++expected[0].race_lost;
-  ++expected[0].source_transport_grant;
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskResidentIdentity foreign = original[disk];
+    ++foreign.store_instance;
+    ++foreign.run_epoch;
+    ++foreign.generation;
+    for (size_t i = 0; i < disk + 1; ++i) {
+      server->NotifyLifetimeReadSuccessForKey(keys[disk], foreign, 5);
+      ++expected[disk].successful;
+      ++expected[disk].race_lost;
+      ++expected[disk].race_identity_scope;
+      ++expected[disk].source_transport_grant;
+    }
+    // Actual Store Remove hides the original payload before notification.
+    ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Remove(keys[disk]),
+              Status::kOk);
+    for (size_t i = 0; i < disk + 2; ++i) {
+      server->NotifyLifetimeReadSuccessForKey(keys[disk], original[disk], 5);
+      ++expected[disk].successful;
+      ++expected[disk].race_lost;
+      ++expected[disk].race_not_visible;
+      ++expected[disk].source_transport_grant;
+    }
+    const DiskWriteResult rewritten =
+        KvNodeServerTestPeer::Group(*server).CacheWithResult(keys[disk],
+                                                             "newer", 5);
+    ASSERT_EQ(rewritten.status, Status::kOk);
+    ASSERT_TRUE(rewritten.identity.valid());
+    ASSERT_NE(rewritten.identity.generation, original[disk].generation);
+    for (size_t i = 0; i < disk + 3; ++i) {
+      server->NotifyLifetimeReadSuccessForKey(keys[disk], original[disk], 5);
+      ++expected[disk].successful;
+      ++expected[disk].race_lost;
+      ++expected[disk].race_generation_mismatch;
+      ++expected[disk].source_transport_grant;
+    }
+    // Internal ledger-inconsistency fault seam, not a normal business race.
+    // The original disk record survives; restart below must recover its bytes.
+    ASSERT_EQ(DiskSlabStoreTestPeer::RemoveAllocatorResidentForTest(
+                  DiskCacheGroupTestPeer::Slab(
+                      KvNodeServerTestPeer::Group(*server), disk),
+                  keys[disk]),
+              SlabAllocator::RemoveResult::kRemoved);
+    for (size_t i = 0; i < disk + 4; ++i) {
+      server->NotifyLifetimeReadSuccessForKey(keys[disk], rewritten.identity,
+                                              5);
+      ++expected[disk].successful;
+      ++expected[disk].race_lost;
+      ++expected[disk].race_allocator_unavailable;
+      ++expected[disk].source_transport_grant;
+    }
+  }
   // An unbound notification is attributed by key route, not physical source.
   server->NotifyLifetimeReadSuccessForKey(keys[1], {}, 5);
   ++expected[1].successful;
@@ -2488,7 +2553,7 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
       1U);
   ASSERT_NO_FATAL_FAILURE(expect_outcomes());
   ASSERT_EQ(read(keys[1], 0, &value), Status::kOk);
-  EXPECT_EQ(value, "value");
+  EXPECT_EQ(value, "newer");
   ++expected[1].successful;
   ++expected[1].applied;
   ++expected[1].source_disk;
@@ -2565,7 +2630,15 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
                    .DiskLifetimeBucketObservation(0)
                    .available);
   for (const char* name :
-       {"dfkv_slab_metadata_slot_bytes",
+       {"dfkv_slab_lifetime_read_race_identity_scope_total",
+        "dfkv_slab_lifetime_read_race_not_visible_total",
+        "dfkv_slab_lifetime_read_race_generation_mismatch_total",
+        "dfkv_slab_lifetime_read_race_allocator_unavailable_total",
+        "dfkv_slab_disk_lifetime_read_race_identity_scope_total",
+        "dfkv_slab_disk_lifetime_read_race_not_visible_total",
+        "dfkv_slab_disk_lifetime_read_race_generation_mismatch_total",
+        "dfkv_slab_disk_lifetime_read_race_allocator_unavailable_total",
+        "dfkv_slab_metadata_slot_bytes",
         "dfkv_slab_metadata_extent_bytes",
         "dfkv_slab_metadata_class_bytes",
         "dfkv_slab_metadata_key_index_bytes",

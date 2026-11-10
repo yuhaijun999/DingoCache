@@ -364,9 +364,10 @@ SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
   const std::lock_guard<std::mutex> lock(mu_);
   const uint32_t* index = index_.Find(key);
   if (!opt_.track_resident_identity || index == nullptr || generation == 0 ||
-      !slots_[*index].live || slots_[*index].remove_pending ||
-      resident_generations_[*index] != generation)
+      !slots_[*index].live || slots_[*index].remove_pending)
     return LifetimeReadResult::kResidentChanged;
+  if (resident_generations_[*index] != generation)
+    return LifetimeReadResult::kGenerationMismatch;
   uint32_t applied_at = 0;
   // Hard exhaustion takes priority over a deliberately uninitialized state
   // left by an already-admitted NEW commit beyond the representable clock.

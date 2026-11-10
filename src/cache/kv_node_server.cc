@@ -733,6 +733,18 @@ std::string KvNodeServer::MetricsText() const {
            "Successful reads without a disk source binding");
     header("dfkv_slab_disk_lifetime_read_race_lost_total", "counter",
            "Successful reads whose original resident is no longer visible");
+    header(
+        "dfkv_slab_disk_lifetime_read_race_identity_scope_total", "counter",
+        "Read notifications with foreign or unavailable store identity scope");
+    header("dfkv_slab_disk_lifetime_read_race_not_visible_total", "counter",
+           "Read notifications whose source payload is no longer visible");
+    header("dfkv_slab_disk_lifetime_read_race_generation_mismatch_total",
+           "counter",
+           "Read notifications with a different current resident generation");
+    header(
+        "dfkv_slab_disk_lifetime_read_race_allocator_unavailable_total",
+        "counter",
+        "Read notifications rejected by remaining allocator resident guards");
     header("dfkv_slab_disk_lifetime_read_clock_hard_exhausted_total", "counter",
            "Successful reads left unheated at hard clock exhaustion");
     header("dfkv_slab_disk_lifetime_read_io_unhealthy_total", "counter",
@@ -850,6 +862,14 @@ std::string KvNodeServer::MetricsText() const {
              disk.lifetime_reads.no_binding);
       sample("dfkv_slab_disk_lifetime_read_race_lost_total",
              disk.lifetime_reads.race_lost);
+      sample("dfkv_slab_disk_lifetime_read_race_identity_scope_total",
+             disk.lifetime_reads.race_identity_scope);
+      sample("dfkv_slab_disk_lifetime_read_race_not_visible_total",
+             disk.lifetime_reads.race_not_visible);
+      sample("dfkv_slab_disk_lifetime_read_race_generation_mismatch_total",
+             disk.lifetime_reads.race_generation_mismatch);
+      sample("dfkv_slab_disk_lifetime_read_race_allocator_unavailable_total",
+             disk.lifetime_reads.race_allocator_unavailable);
       sample("dfkv_slab_disk_lifetime_read_clock_hard_exhausted_total",
              disk.lifetime_reads.clock_hard_exhausted);
       sample("dfkv_slab_disk_lifetime_read_io_unhealthy_total",
@@ -1186,6 +1206,20 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_read_race_lost_total", "counter",
            "Successful reads whose original resident is no longer visible",
            ss.lifetime_reads.race_lost);
+    metric(
+        "dfkv_slab_lifetime_read_race_identity_scope_total", "counter",
+        "Read notifications with foreign or unavailable store identity scope",
+        ss.lifetime_reads.race_identity_scope);
+    metric("dfkv_slab_lifetime_read_race_not_visible_total", "counter",
+           "Read notifications whose source payload is no longer visible",
+           ss.lifetime_reads.race_not_visible);
+    metric("dfkv_slab_lifetime_read_race_generation_mismatch_total", "counter",
+           "Read notifications with a different current resident generation",
+           ss.lifetime_reads.race_generation_mismatch);
+    metric("dfkv_slab_lifetime_read_race_allocator_unavailable_total",
+           "counter",
+           "Read notifications rejected by remaining allocator resident guards",
+           ss.lifetime_reads.race_allocator_unavailable);
     metric("dfkv_slab_lifetime_read_clock_hard_exhausted_total", "counter",
            "Successful reads left unheated at hard clock exhaustion",
            ss.lifetime_reads.clock_hard_exhausted);

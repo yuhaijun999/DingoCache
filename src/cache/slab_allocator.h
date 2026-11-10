@@ -287,9 +287,10 @@ class SlabAllocator {
       const DiskLifetimeConfig* config = nullptr, uint32_t now = 0);
   enum class LifetimeReadResult : unsigned char {
     kApplied = 0,             // Updated the matched resident.
-    kResidentChanged = 1,     // No matching live generation remains.
+    kResidentChanged = 1,     // No eligible allocator resident remains.
     kClockHardExhausted = 2,  // The shared clock cannot represent this event.
     kStateUnavailable = 3,    // Missing state or inconsistent event time.
+    kGenerationMismatch = 4,  // Eligible entry has a different generation.
   };
   // Caller holds the store lifecycle lock (D before A). Validate ownership,
   // sample the shared clock and update heat in one A critical section; a stale
