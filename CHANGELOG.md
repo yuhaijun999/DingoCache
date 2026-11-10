@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add owner-thread io_uring reader completion diagnostics, including residual
+  reads and discarded drain completions. Keep them separate from logical reads,
+  synchronous Store I/O and exported per-disk metrics.
+
 - Export Store-owned synchronous slab payload pread calls, returned bytes,
   negative results and short reads globally and per disk. Exclude metadata,
   recovery and externally executed prepared I/O; retain completed I/O accounting

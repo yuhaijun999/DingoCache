@@ -856,3 +856,29 @@ Global/per-disk series use only existing disk/disk_index labels and are sampled
 separately; compare sums at quiescence. Fixed counters, request-local work and
 additional metrics output have nonzero costs; this is not a memory/latency
 budget or full RSS/recovery-peak acceptance result.
+
+### io_uring reader-local completion diagnostics
+
+`UringReader::read_counters()` provides an owner-thread-only cumulative snapshot
+of consumed read CQEs: `completions`, positive returned `bytes`, negative-result
+`errors`, and nonnegative `short_reads` (including EOF). Shortness is compared
+with the current residual request, before advancing its completed byte count.
+One short CQE followed by EOF therefore counts two completions and two shorts;
+partial bytes remain counted if a later CQE fails. These fields are not a
+mutually exclusive outcome partition.
+
+Both normal `Reap` and shutdown/error `Drain` count consumed CQEs. Peeking,
+waiting, submission retries/errors, and dormant unsubmitted SQEs do not count.
+Partial Drain timeouts retain already consumed counts without counting them
+again on retry. Drain still discards results without retrying shorts. An unknown
+token contributes completions/bytes/errors, but cannot contribute short reads
+because its request length is unavailable. Such a token remains an existing
+infrastructure failure on the normal Reap path.
+
+These local diagnostics are **not exported Prometheus metrics**, per-disk Store
+counters, syscall counts, device I/O counts, or proof of RDMA/RXE hardware
+acceptance. They reset with each reader instance; destructor-only drain totals
+are not externally published. The existing `dfkv_uring_reads_total` and the
+Store-owned synchronous payload counters retain their previous meanings.
+Per-disk attribution, externally executed PreparedRead I/O and exported async
+I/O closure remain pending. No I/O is inferred from logical lease-release bytes.

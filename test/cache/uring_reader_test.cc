@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -244,6 +245,10 @@ TEST(UringReader, SubmitAndReapFillEveryDescAtItsOwnOffset) {
   std::vector<long> results;
   ASSERT_TRUE(ReadAll(&ring, descs.data(), kN, &results));
   EXPECT_FALSE(ring.poisoned());
+  EXPECT_EQ(ring.read_counters().completions, kN);
+  EXPECT_EQ(ring.read_counters().bytes, kN * 4096u);
+  EXPECT_EQ(ring.read_counters().errors, 0u);
+  EXPECT_EQ(ring.read_counters().short_reads, 0u);
   for (int i = 0; i < kN; ++i) {
     EXPECT_EQ(results[i], 4096) << "desc " << i;
     EXPECT_TRUE(PatternOk(bufs[i].data(), descs[i].off, 4096)) << "desc " << i;
@@ -270,6 +275,10 @@ TEST(UringReader, PerReadErrorIsRecordedNotInfraFailure) {
   EXPECT_FALSE(ring.poisoned());
   EXPECT_EQ(results[0], 4096);
   EXPECT_LT(results[1], 0);
+  EXPECT_EQ(ring.read_counters().completions, 2u);
+  EXPECT_EQ(ring.read_counters().bytes, 4096u);
+  EXPECT_EQ(ring.read_counters().errors, 1u);
+  EXPECT_EQ(ring.read_counters().short_reads, 0u);
   EXPECT_TRUE(ring.Drain());  // no-op: everything reaped
   ::close(fd);
   ::close(bad);
@@ -287,6 +296,10 @@ TEST(UringReader, EofYieldsBytesUpToEof) {
   ASSERT_TRUE(ReadAll(&ring, &d, 1, &results));
   EXPECT_EQ(results[0], 1000);
   EXPECT_TRUE(PatternOk(buf.data(), 0, 1000));
+  EXPECT_EQ(ring.read_counters().completions, 2u);
+  EXPECT_EQ(ring.read_counters().bytes, 1000u);
+  EXPECT_EQ(ring.read_counters().errors, 0u);
+  EXPECT_EQ(ring.read_counters().short_reads, 2u);
   ::close(fd);
   ::unlink(path.c_str());
 }
@@ -419,6 +432,11 @@ TEST(UringReader, ControlledBackendOutOfOrderErrorsAndResidualKeepToken) {
   EXPECT_EQ(first_completion.token, tokens[0]);
   EXPECT_EQ(first_completion.result, 4096);
   EXPECT_EQ(ring.inflight(), 0u);
+  const UringReader::ReadCounters counters = ring.read_counters();
+  EXPECT_EQ(counters.completions, 4u);
+  EXPECT_EQ(counters.bytes, 5120u);
+  EXPECT_EQ(counters.errors, 1u);
+  EXPECT_EQ(counters.short_reads, 1u);
 }
 
 TEST(UringReader, ControlledBackendSubmitFailureBeforeAdmissionPoisons) {
@@ -435,6 +453,8 @@ TEST(UringReader, ControlledBackendSubmitFailureBeforeAdmissionPoisons) {
   EXPECT_EQ(ring.inflight(), 0u);
   EXPECT_TRUE(ring.Drain(0));
   EXPECT_EQ(backend.seen, 0u);
+  EXPECT_EQ(ring.read_counters().completions, 0u);
+  EXPECT_EQ(ring.read_counters().errors, 0u);
   EXPECT_FALSE(ring.Submit(&desc, 1, &token));
 }
 
@@ -455,6 +475,10 @@ TEST(UringReader, ControlledBackendPartialAdmissionDrainsBeforeReuse) {
   ASSERT_TRUE(backend.Complete(tokens[1], 4096));
   EXPECT_TRUE(ring.Drain(0));
   EXPECT_EQ(backend.seen, 2u);
+  EXPECT_EQ(ring.read_counters().completions, 2u);
+  EXPECT_EQ(ring.read_counters().bytes, 8192u);
+  EXPECT_EQ(ring.read_counters().errors, 0u);
+  EXPECT_EQ(ring.read_counters().short_reads, 0u);
   EXPECT_EQ(backend.accepted(), 0u);
   EXPECT_EQ(ring.inflight(), 0u);
 }
@@ -473,14 +497,21 @@ TEST(UringReader, ControlledBackendPartialCqDrainRetainsAllOwners) {
   ASSERT_TRUE(backend.Complete(tokens[0], 4096));
   EXPECT_FALSE(ring.Drain(0));
   EXPECT_EQ(backend.seen, 2u);
+  EXPECT_EQ(ring.read_counters().completions, 2u);
+  EXPECT_EQ(ring.read_counters().bytes, 8192u);
   EXPECT_EQ(ring.inflight(), 4u)
       << "logical owners must remain retained until every kernel read drains";
 
-  ASSERT_TRUE(backend.Complete(tokens[3], 4096));
-  ASSERT_TRUE(backend.Complete(tokens[1], 4096));
+  ASSERT_TRUE(backend.Complete(tokens[3], 3));
+  ASSERT_TRUE(backend.Complete(tokens[1], -EIO));
   EXPECT_TRUE(ring.Drain(0));
   EXPECT_EQ(backend.seen, 4u);
   EXPECT_EQ(ring.inflight(), 0u);
+  EXPECT_TRUE(ring.Drain(0));
+  EXPECT_EQ(ring.read_counters().completions, 4u);
+  EXPECT_EQ(ring.read_counters().bytes, 8195u);
+  EXPECT_EQ(ring.read_counters().errors, 1u);
+  EXPECT_EQ(ring.read_counters().short_reads, 1u);
 }
 
 TEST(UringReader, ControlledBackendInitFailureIsExplicitSyncFallbackSignal) {
@@ -490,6 +521,125 @@ TEST(UringReader, ControlledBackendInitFailureIsExplicitSyncFallbackSignal) {
   EXPECT_FALSE(ring.ok());
   EXPECT_TRUE(ring.Drain(0));
   EXPECT_EQ(backend.initialized_depth, 32u);
+  EXPECT_EQ(ring.read_counters().completions, 0u);
+  EXPECT_EQ(ring.read_counters().bytes, 0u);
+  EXPECT_EQ(ring.read_counters().errors, 0u);
+  EXPECT_EQ(ring.read_counters().short_reads, 0u);
+}
+
+TEST(UringReader, CompletionCountersTrackRealPartialBytesBeforeEof) {
+  const std::pair<int, std::string> file = MakePatternFile(1000);
+  ASSERT_GE(file.first, 0);
+  ControlledBackend backend;
+  UringReader ring(2, &backend);
+  std::vector<char> buffer(4096);
+  const UringReader::ReadDesc desc{file.first, buffer.data(), 4096, 0};
+  UringReader::Token token = UringReader::kInvalidToken;
+  ASSERT_TRUE(ring.Submit(&desc, 1, &token));
+  EXPECT_EQ(ring.read_counters().completions, 0u);
+  ASSERT_TRUE(backend.CompleteRead(token));
+  UringReader::Event event;
+  ASSERT_EQ(ring.Peek(&event), 1);
+  EXPECT_EQ(ring.read_counters().completions, 0u);
+  UringReader::Completion completion;
+  ASSERT_EQ(ring.Reap(&event, &completion), 0);
+  EXPECT_EQ(ring.read_counters().completions, 1u);
+  EXPECT_EQ(ring.read_counters().bytes, 1000u);
+  EXPECT_EQ(ring.read_counters().short_reads, 1u);
+  ASSERT_TRUE(backend.CompleteRead(token));
+  ASSERT_EQ(ring.Wait(&event, 0), 1);
+  ASSERT_EQ(ring.Reap(&event, &completion), 1);
+  EXPECT_EQ(completion.result, 1000);
+  EXPECT_TRUE(PatternOk(buffer.data(), 0, 1000));
+  EXPECT_EQ(ring.read_counters().completions, 2u);
+  EXPECT_EQ(ring.read_counters().bytes, 1000u);
+  EXPECT_EQ(ring.read_counters().errors, 0u);
+  EXPECT_EQ(ring.read_counters().short_reads, 2u);
+  EXPECT_EQ(ring.Reap(&event, &completion), -1);
+  EXPECT_TRUE(ring.Drain(0));
+  EXPECT_EQ(ring.read_counters().completions, 2u);
+  EXPECT_EQ(::close(file.first), 0);
+  EXPECT_EQ(::unlink(file.second.c_str()), 0);
+}
+
+TEST(UringReader, CompletionCountersSeparateSubmitErrorsAndReadErrors) {
+  ControlledBackend backend;
+  backend.submit_results = {-EINTR, 1};
+  UringReader ring(2, &backend);
+  char buffer[16]{};
+  UringReader::ReadDesc desc{-1, buffer, 16, 0};
+  UringReader::Token token = UringReader::kInvalidToken;
+  ASSERT_TRUE(ring.Submit(&desc, 1, &token));
+  EXPECT_EQ(ring.read_counters().errors, 0u);
+  ASSERT_TRUE(backend.Complete(token, 5));
+  UringReader::Event event;
+  ASSERT_EQ(ring.Peek(&event), 1);
+  UringReader::Completion completion;
+  ASSERT_EQ(ring.Reap(&event, &completion), 0);
+  ASSERT_TRUE(backend.Complete(token, -EINTR));
+  ASSERT_EQ(ring.Peek(&event), 1);
+  ASSERT_EQ(ring.Reap(&event, &completion), 1);
+  EXPECT_EQ(completion.result, -EINTR);
+  EXPECT_EQ(ring.read_counters().completions, 2u);
+  EXPECT_EQ(ring.read_counters().bytes, 5u);
+  EXPECT_EQ(ring.read_counters().errors, 1u);
+  EXPECT_EQ(ring.read_counters().short_reads, 1u);
+  EXPECT_FALSE(ring.poisoned());
+
+  // A fresh instance does not inherit counters; a zero-length request's zero
+  // completion is not short. Drain counts data CQEs without retrying them.
+  ControlledBackend fresh_backend;
+  UringReader fresh(2, &fresh_backend);
+  desc.len = 0;
+  ASSERT_TRUE(fresh.Submit(&desc, 1, &token));
+  ASSERT_TRUE(fresh_backend.Complete(token, 0));
+  EXPECT_TRUE(fresh.Drain(0));
+  EXPECT_EQ(fresh.read_counters().completions, 1u);
+  EXPECT_EQ(fresh.read_counters().bytes, 0u);
+  EXPECT_EQ(fresh.read_counters().errors, 0u);
+  EXPECT_EQ(fresh.read_counters().short_reads, 0u);
+}
+
+TEST(UringReader, CompletionCountersRetainIoWhenResidualSubmitFails) {
+  ControlledBackend backend;
+  backend.submit_results = {1, -EIO};
+  UringReader ring(2, &backend);
+  char buffer[16]{};
+  const UringReader::ReadDesc desc{-1, buffer, 16, 0};
+  UringReader::Token token = UringReader::kInvalidToken;
+  ASSERT_TRUE(ring.Submit(&desc, 1, &token));
+  ASSERT_TRUE(backend.Complete(token, 3));
+  UringReader::Event event;
+  ASSERT_EQ(ring.Peek(&event), 1);
+  UringReader::Completion completion;
+  EXPECT_EQ(ring.Reap(&event, &completion), -1);
+  EXPECT_TRUE(ring.poisoned());
+  EXPECT_TRUE(ring.Drain(0));
+  EXPECT_EQ(ring.read_counters().completions, 1u);
+  EXPECT_EQ(ring.read_counters().bytes, 3u);
+  EXPECT_EQ(ring.read_counters().errors, 0u);
+  EXPECT_EQ(ring.read_counters().short_reads, 1u);
+}
+
+TEST(UringReader, CompletionCountersDrainComparesResidualLength) {
+  ControlledBackend backend;
+  UringReader ring(2, &backend);
+  char buffer[16]{};
+  const UringReader::ReadDesc desc{-1, buffer, 16, 0};
+  UringReader::Token token = UringReader::kInvalidToken;
+  ASSERT_TRUE(ring.Submit(&desc, 1, &token));
+  ASSERT_TRUE(backend.Complete(token, 5));
+  UringReader::Event event;
+  ASSERT_EQ(ring.Peek(&event), 1);
+  UringReader::Completion completion;
+  ASSERT_EQ(ring.Reap(&event, &completion), 0);
+  ASSERT_TRUE(backend.Complete(token, 11));
+  EXPECT_TRUE(ring.Drain(0));
+  EXPECT_EQ(ring.read_counters().completions, 2u);
+  EXPECT_EQ(ring.read_counters().bytes, 16u);
+  EXPECT_EQ(ring.read_counters().errors, 0u);
+  EXPECT_EQ(ring.read_counters().short_reads, 1u);
+  EXPECT_EQ(ring.inflight(), 0u);
 }
 
 #endif  // DFKV_WITH_URING

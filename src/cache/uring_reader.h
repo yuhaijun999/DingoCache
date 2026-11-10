@@ -37,6 +37,18 @@ class UringReader {
     long result = 0;
   };
 
+  // Actual read CQEs consumed by Reap or Drain, not logical reads, syscalls,
+  // submission attempts, or device I/O. A partial result followed by an error
+  // retains its returned bytes. Ring infrastructure errors are excluded.
+  struct ReadCounters {
+    uint64_t completions = 0;
+    uint64_t bytes = 0;
+    uint64_t errors = 0;
+    // Nonnegative results below the current residual request, including EOF.
+    // An unrecognized token has no known request length and is excluded here.
+    uint64_t short_reads = 0;
+  };
+
   // A CQE is borrowed from the ring until Reap.  It is intentionally opaque:
   // callers route completed descriptors by Completion::token, not CQE pointers.
   class Event {
@@ -91,6 +103,10 @@ class UringReader {
   bool ok() const { return ok_; }
   bool poisoned() const { return poisoned_; }
   unsigned depth() const { return depth_; }
+  // Like the ring itself, snapshots are accessed only by its owning thread.
+  // Peek/Wait do not count until their event is consumed. New readers start at
+  // zero; destructor-only drains are not externally published.
+  ReadCounters read_counters() const { return read_counters_; }
   size_t inflight() const { return logical_inflight_; }
   size_t capacity() const { return depth_ - logical_inflight_; }
 
@@ -196,6 +212,7 @@ class UringReader {
     --kernel_inflight_;
 
     Pending* pending = Find(token);
+    RecordCompletion(pending, result);
     if (!pending) {
       poisoned_ = true;
       return -1;
@@ -247,6 +264,9 @@ class UringReader {
         drained = false;
         break;
       }
+      const Token token = static_cast<Token>(
+          reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe)));
+      RecordCompletion(Find(token), cqe->res);
       backend_->Seen(&ring_, cqe);
       --kernel_inflight_;
     }
@@ -311,6 +331,23 @@ class UringReader {
     return nullptr;
   }
 
+  // Record before advancing done; callers capture CQE data before Seen.
+  // Drain leaves done unchanged: each accepted residual has at most one unread
+  // CQE, including when a previous Drain timed out.
+  void RecordCompletion(const Pending* pending, long result) {
+    ++read_counters_.completions;
+    if (result < 0) {
+      ++read_counters_.errors;
+      return;
+    }
+    read_counters_.bytes += static_cast<uint64_t>(result);
+    if (pending &&
+        static_cast<uint64_t>(result) <
+            static_cast<uint64_t>(pending->desc.len) - pending->done) {
+      ++read_counters_.short_reads;
+    }
+  }
+
   bool PrepResidual(Pending& pending) {
     struct io_uring_sqe* sqe = backend_->GetSqe(&ring_);
     if (!sqe) return false;
@@ -324,6 +361,7 @@ class UringReader {
     return true;
   }
 
+  ReadCounters read_counters_;
   struct io_uring ring_{};
   bool ok_ = false;
   bool poisoned_ = false;
