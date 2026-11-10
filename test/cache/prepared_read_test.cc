@@ -15,6 +15,8 @@
 #include <thread>
 #include <utility>
 
+#include "cache/disk_cache_group.h"
+#include "cache/disk_slab_store.h"
 #include "cache/kv_node_server.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
@@ -25,6 +27,10 @@
 namespace dfkv {
 class KvNodeServerTestPeer {
  public:
+  static DiskSlabStore::SyncPayloadReadCounters SyncPayloadReads(
+      const KvNodeServer& server) {
+    return server.group_.SlabStats().sync_payload_reads;
+  }
   static bool WaitForCopyFollower(KvNodeServer& server) {
     return ReadCoalescerTestPeer::WaitForCopyWaiter(server.read_coalescer_);
   }
@@ -144,7 +150,12 @@ TEST(PreparedRead, RangeDirectSourceResetsOnEmptyAndFailure) {
   const fs::path dir = fs::temp_directory_path() / "dfkv_direct_source_reset";
   fs::remove_all(dir);
   {
-    KvNodeServer server(dir.string(), 1ULL << 30);
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {dir.string()};
+    options.capacity_bytes = 1ULL << 30;
+    options.engine = "slab";
+    options.eviction_policy = "legacy";
+    KvNodeServer server(options);
     ASSERT_TRUE(server.Healthy());
     const std::string value(4096, 'd');
     ASSERT_EQ(Put(&server, Key(95), value), Status::kOk);
@@ -179,6 +190,12 @@ TEST(PreparedRead, RangeDirectSourceResetsOnEmptyAndFailure) {
                                        &bytes, &value_len, nullptr, &source),
               Status::kInvalid);
     EXPECT_EQ(source, PreparedRead::Source::kUnclassified);
+    const DiskSlabStore::SyncPayloadReadCounters io =
+        KvNodeServerTestPeer::SyncPayloadReads(server);
+    EXPECT_EQ(io.syscalls, 1U);
+    EXPECT_EQ(io.bytes, value.size());
+    EXPECT_EQ(io.errors, 0U);
+    EXPECT_EQ(io.short_reads, 0U);
   }
   fs::remove_all(dir);
   ::unsetenv("DFKV_READ_COALESCE");
@@ -191,7 +208,12 @@ TEST(PreparedRead, RangeDirectCoalescingReportsActualRole) {
   const fs::path dir = fs::temp_directory_path() / "dfkv_direct_source_roles";
   fs::remove_all(dir);
   {
-    KvNodeServer server(dir.string(), 1ULL << 30);
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {dir.string()};
+    options.capacity_bytes = 1ULL << 30;
+    options.engine = "slab";
+    options.eviction_policy = "legacy";
+    KvNodeServer server(options);
     ASSERT_TRUE(server.Healthy());
     const std::string value(4096, 'c');
     const BlockKey key = Key(97);
@@ -208,6 +230,9 @@ TEST(PreparedRead, RangeDirectCoalescingReportsActualRole) {
               Status::kOk);
     EXPECT_EQ(source, PreparedRead::Source::kSynchronousCopyLeader);
     EXPECT_EQ(std::string(data, bytes), value);
+    uint64_t expected_syscalls = 1;
+    EXPECT_EQ(KvNodeServerTestPeer::SyncPayloadReads(server).syscalls,
+              expected_syscalls);
     for (const bool fail_leader : {false, true}) {
       SCOPED_TRACE(fail_leader);
       PreparedRead leader = server.PrepareReadForKey(
@@ -222,6 +247,9 @@ TEST(PreparedRead, RangeDirectCoalescingReportsActualRole) {
                 Status::kOk);
       EXPECT_EQ(source, PreparedRead::Source::kSynchronousDisk);
       EXPECT_EQ(std::string(data, bytes), value);
+      ++expected_syscalls;  // The same-thread fallback really reads storage.
+      EXPECT_EQ(KvNodeServerTestPeer::SyncPayloadReads(server).syscalls,
+                expected_syscalls);
       const size_t copied_before =
           KvNodeServerTestPeer::CopiedFollowers(server);
       Status follower_status = Status::kInvalid;
@@ -254,6 +282,15 @@ TEST(PreparedRead, RangeDirectCoalescingReportsActualRole) {
                             : PreparedRead::Source::kSynchronousCopyFollower);
       EXPECT_EQ(KvNodeServerTestPeer::CopiedFollowers(server),
                 copied_before + (fail_leader ? 0 : 1));
+      // The external prepared pread is excluded. A shared copy adds no Store
+      // syscall; an aborted-flight fallback performs its own synchronous read.
+      if (fail_leader) ++expected_syscalls;
+      const DiskSlabStore::SyncPayloadReadCounters io =
+          KvNodeServerTestPeer::SyncPayloadReads(server);
+      EXPECT_EQ(io.syscalls, expected_syscalls);
+      EXPECT_EQ(io.bytes, expected_syscalls * value.size());
+      EXPECT_EQ(io.errors, 0U);
+      EXPECT_EQ(io.short_reads, 0U);
     }
   }
   fs::remove_all(dir);
@@ -316,53 +353,59 @@ TEST(PreparedRead, FallbackAbortAndDestructorReleaseFlight) {
   fs::remove_all(dir);
   fs::create_directories(dir);
   {
-  KvNodeServer server(dir.string(), 1ull << 30);
-  ASSERT_TRUE(server.Healthy());
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {dir.string()};
+    options.capacity_bytes = 1ULL << 30;
+    options.engine = "slab";
+    options.eviction_policy = "legacy";
+    KvNodeServer server(options);
+    ASSERT_TRUE(server.Healthy());
 
-  const std::string value(4096, 'a');
-  ASSERT_EQ(Put(&server, Key(2), value), Status::kOk);
-  AlignedBuffer first_staging(1 << 20);
-  AlignedBuffer second_staging(1 << 20);
+    const std::string value(4096, 'a');
+    ASSERT_EQ(Put(&server, Key(2), value), Status::kOk);
+    const AlignedBuffer first_staging(1 << 20);
+    AlignedBuffer second_staging(1 << 20);
 
-  PreparedRead leader =
-      server.PrepareReadForKey(Key(2), 0, value.size(), first_staging.data(),
-                               first_staging.size());
-  ASSERT_EQ(leader.status(), Status::kOk);
-  PreparedRead fallback =
-      server.PrepareReadForKey(Key(2), 0, value.size(), second_staging.data(),
-                               second_staging.size());
-  EXPECT_EQ(fallback.status(), Status::kInvalid);
-  EXPECT_FALSE(fallback.owns_cleanup());
+    PreparedRead leader = server.PrepareReadForKey(
+        Key(2), 0, value.size(), first_staging.data(), first_staging.size());
+    ASSERT_EQ(leader.status(), Status::kOk);
+    const PreparedRead fallback = server.PrepareReadForKey(
+        Key(2), 0, value.size(), second_staging.data(), second_staging.size());
+    EXPECT_EQ(fallback.status(), Status::kInvalid);
+    EXPECT_FALSE(fallback.owns_cleanup());
 
-  // A follower times out defensively while the RAII leader remains alive, then
-  // performs its own synchronous read without stealing cleanup ownership.
-  Status follower_status = Status::kIOError;
-  PreparedRead::Source follower_source = PreparedRead::Source::kUnclassified;
-  std::string follower_value;
-  std::thread follower([&] {
-    const char* data = nullptr;
-    size_t len = 0;
-    size_t value_len = 0;
-    follower_status = server.RangeDirectForKey(
-        Key(2), 0, value.size(), second_staging.data(), second_staging.size(),
-        &data, &len, &value_len, nullptr, &follower_source);
-    if (follower_status == Status::kOk && data != nullptr)
-      follower_value.assign(data, len);
-  });
-  follower.join();
-  EXPECT_EQ(follower_status, Status::kOk);
-  EXPECT_EQ(follower_source, PreparedRead::Source::kSynchronousDisk);
-  EXPECT_EQ(follower_value, value);
-  EXPECT_TRUE(leader.Abort());  // connection-abort path
-  EXPECT_FALSE(leader.Abort());
+    // A follower times out defensively while the RAII leader remains alive,
+    // then performs its own synchronous read without stealing cleanup
+    // ownership.
+    Status follower_status = Status::kIOError;
+    PreparedRead::Source follower_source = PreparedRead::Source::kUnclassified;
+    std::string follower_value;
+    std::thread follower([&] {
+      const char* data = nullptr;
+      size_t len = 0;
+      size_t value_len = 0;
+      follower_status = server.RangeDirectForKey(
+          Key(2), 0, value.size(), second_staging.data(), second_staging.size(),
+          &data, &len, &value_len, nullptr, &follower_source);
+      if (follower_status == Status::kOk && data != nullptr)
+        follower_value.assign(data, len);
+    });
+    follower.join();
+    EXPECT_EQ(follower_status, Status::kOk);
+    EXPECT_EQ(follower_source, PreparedRead::Source::kSynchronousDisk);
+    EXPECT_EQ(follower_value, value);
+    EXPECT_EQ(KvNodeServerTestPeer::SyncPayloadReads(server).syscalls, 1U);
+    EXPECT_EQ(KvNodeServerTestPeer::SyncPayloadReads(server).bytes,
+              value.size());
+    EXPECT_TRUE(leader.Abort());  // connection-abort path
+    EXPECT_FALSE(leader.Abort());
 
-  {
-    PreparedRead abandoned =
-        server.PrepareReadForKey(Key(2), 0, value.size(), first_staging.data(),
-                                 first_staging.size());
-    ASSERT_EQ(abandoned.status(), Status::kOk);
-    ASSERT_TRUE(abandoned.owns_cleanup());
-  }  // destructor-abort must remove the coalescer flight
+    {
+      const PreparedRead abandoned = server.PrepareReadForKey(
+          Key(2), 0, value.size(), first_staging.data(), first_staging.size());
+      ASSERT_EQ(abandoned.status(), Status::kOk);
+      ASSERT_TRUE(abandoned.owns_cleanup());
+    }  // destructor-abort must remove the coalescer flight
 
   PreparedRead retry =
       server.PrepareReadForKey(Key(2), 0, value.size(), second_staging.data(),
@@ -495,7 +538,12 @@ TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
   fs::remove_all(dir);
   fs::create_directories(dir);
   {
-    KvNodeServer server(dir.string(), 1ull << 30);
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {dir.string()};
+    options.capacity_bytes = 1ULL << 30;
+    options.engine = "slab";
+    options.eviction_policy = "legacy";
+    KvNodeServer server(options);
     ASSERT_TRUE(server.Healthy());
     ASSERT_TRUE(server.ram_enabled());
 
@@ -592,6 +640,12 @@ TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
               Status::kOk);
     EXPECT_EQ(direct_bytes, 0U);
     EXPECT_EQ(direct_source, PreparedRead::Source::kUnclassified);
+    const DiskSlabStore::SyncPayloadReadCounters io =
+        KvNodeServerTestPeer::SyncPayloadReads(server);
+    EXPECT_EQ(io.syscalls, 0U);
+    EXPECT_EQ(io.bytes, 0U);
+    EXPECT_EQ(io.errors, 0U);
+    EXPECT_EQ(io.short_reads, 0U);
   }
   fs::remove_all(dir);
   ::unsetenv("DFKV_READ_COALESCE");

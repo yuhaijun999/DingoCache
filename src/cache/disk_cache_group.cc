@@ -1007,6 +1007,10 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     const auto st = d->GetStats();
     sum.dio_write_fallbacks += st.dio_write_fallbacks;
     sum.dio_read_fallbacks += st.dio_read_fallbacks;
+    sum.sync_payload_reads.syscalls += st.sync_payload_reads.syscalls;
+    sum.sync_payload_reads.bytes += st.sync_payload_reads.bytes;
+    sum.sync_payload_reads.errors += st.sync_payload_reads.errors;
+    sum.sync_payload_reads.short_reads += st.sync_payload_reads.short_reads;
     sum.table_syncs += st.table_syncs;
     sum.bind_wipes += st.bind_wipes;
     sum.steals += st.steals;

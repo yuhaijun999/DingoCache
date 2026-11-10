@@ -4,6 +4,8 @@
 #include "utils/net_util.h"
 #include "transport/tcp_transport.h"
 
+#include <unistd.h>
+
 #include <gtest/gtest.h>
 
 #include <array>
@@ -11,9 +13,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <thread>
-#include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
@@ -55,6 +57,21 @@ class DiskCacheGroupTestPeer {
 
 class DiskSlabStoreTestPeer {
  public:
+  static std::pair<int, uint64_t> PayloadFile(DiskSlabStore& store,
+                                              const BlockKey& key) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    SlabAllocator::SlotRef ref;
+    if (!store.alloc_->Get(key, &ref)) return {-1, 0};
+    return {store.extent_fds_.at(ref.extent), ref.offset};
+  }
+  static int ExchangePayloadFd(DiskSlabStore& store, const BlockKey& key,
+                               int fd) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    SlabAllocator::SlotRef ref;
+    if (!store.alloc_->Get(key, &ref)) return -1;
+    return std::exchange(store.extent_fds_.at(ref.extent), fd);
+  }
+
   static void FailMetadata(DiskSlabStore& store) {
     const std::lock_guard<std::mutex> lock(store.mu_);
     if (store.table_fd_ >= 0) ::close(store.table_fd_);
@@ -1716,6 +1733,148 @@ TEST(Metrics, RecoveredGaugesTrackReadsRemovalAndRestarts) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, SyncPayloadReadCountersAggregateRealIoAndReset) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "4096");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_sync_payload";
+  const std::array<const char*, 4> suffixes = {"syscalls", "bytes", "errors",
+                                               "short_reads"};
+  const auto fields = [](const DiskSlabStore::Stats& stats) {
+    return std::array<uint64_t, 4>{
+        stats.sync_payload_reads.syscalls, stats.sync_payload_reads.bytes,
+        stats.sync_payload_reads.errors, stats.sync_payload_reads.short_reads};
+  };
+  // Each field has a distinct positive total, so swapped exports cannot pass.
+  const std::array<std::array<uint64_t, 4>, 2> expected = {
+      std::array<uint64_t, 4>{5, 13, 2, 2},
+      std::array<uint64_t, 4>{9, 40, 3, 4}};
+  for (const char* policy : {"legacy", "lifetime"}) {
+    SCOPED_TRACE(policy);
+    fs::remove_all(dir);
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+    options.capacity_bytes = 2ULL << 30;
+    options.engine = "slab";
+    options.eviction_policy = policy;
+    std::unique_ptr<KvNodeServer> server =
+        std::make_unique<KvNodeServer>(options);
+    ASSERT_TRUE(server->Healthy());
+    BlockKey keys[2]{};
+    bool found[2]{};
+    for (uint64_t id = 1; id < 10000 && !(found[0] && found[1]); ++id) {
+      const BlockKey key{id, 0};
+      const size_t disk = DiskCacheGroupTestPeer::RouteIndex(
+          KvNodeServerTestPeer::Group(*server), key);
+      ASSERT_LT(disk, 2U);
+      keys[disk] = key;
+      found[disk] = true;
+    }
+    ASSERT_TRUE(found[0] && found[1]);
+    const auto expect_counts = [&](bool empty) {
+      const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+      const std::string text = server->MetricsText();
+      const std::array<uint64_t, 4> total = fields(group.SlabStats());
+      for (size_t field = 0; field < suffixes.size(); ++field) {
+        uint64_t sum = 0;
+        const std::string name = std::string("dfkv_slab_sync_payload_read_") +
+                                 suffixes[field] + "_total";
+        const std::string disk_name =
+            std::string("dfkv_slab_disk_sync_payload_read_") + suffixes[field] +
+            "_total";
+        EXPECT_NE(text.find("# TYPE " + name + " counter\n"),
+                  std::string::npos);
+        EXPECT_NE(text.find("# TYPE " + disk_name + " counter\n"),
+                  std::string::npos);
+        for (size_t disk = 0; disk < 2; ++disk) {
+          const uint64_t value = empty ? 0 : expected[disk][field];
+          EXPECT_EQ(fields(group.DiskSlabStats(disk))[field], value);
+          const std::string labels = "{disk=\"" + options.cache_dirs[disk] +
+                                     "\",disk_index=\"" + std::to_string(disk) +
+                                     "\"} ";
+          EXPECT_NE(text.find("\n" + disk_name + labels +
+                              std::to_string(value) + "\n"),
+                    std::string::npos);
+          sum += value;
+        }
+        EXPECT_EQ(total[field], sum);
+        EXPECT_NE(text.find("\n" + name + " " + std::to_string(sum) + "\n"),
+                  std::string::npos);
+      }
+    };
+    ASSERT_NO_FATAL_FAILURE(expect_counts(true));
+    const std::string values[] = {std::string(11, 'a'), std::string(17, 'b')};
+    for (size_t disk = 0; disk < 2; ++disk) {
+      ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Cache(
+                    keys[disk], values[disk].data(), values[disk].size()),
+                Status::kOk);
+    }
+    // PUT and metadata activity do not count as payload reads.
+    ASSERT_NO_FATAL_FAILURE(expect_counts(true));
+    for (size_t disk = 0; disk < 2; ++disk) {
+      DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+      DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(group, disk);
+      std::string output;
+      for (size_t read = 0; read < disk + 1; ++read) {
+        ASSERT_EQ(group.Range(keys[disk], 0, 0, &output), Status::kOk);
+        EXPECT_EQ(output, values[disk]);
+      }
+      const std::pair<int, uint64_t> file =
+          DiskSlabStoreTestPeer::PayloadFile(store, keys[disk]);
+      ASSERT_GE(file.first, 0);
+      // Only file length is needed; all Store I/O uses positional offsets,
+      // so this test-only seek does not change any payload read/write offset.
+      const off_t file_size = ::lseek(file.first, 0, SEEK_END);
+      ASSERT_GE(file_size, 0);
+      const uint64_t retained = disk + 2;
+      ASSERT_EQ(
+          ::ftruncate(file.first, static_cast<off_t>(file.second + retained)),
+          0);
+      for (size_t read = 0; read < disk + 1; ++read) {
+        // An actual positive short pread is followed by an actual zero EOF.
+        EXPECT_EQ(store.Range(keys[disk], 0, 0, &output), Status::kIOError);
+        EXPECT_EQ(output.substr(0, retained), values[disk].substr(0, retained));
+      }
+      ASSERT_EQ(::ftruncate(file.first, file_size), 0);
+      ASSERT_EQ(::pwrite(file.first, values[disk].data(), values[disk].size(),
+                         static_cast<off_t>(file.second)),
+                static_cast<ssize_t>(values[disk].size()));
+      for (size_t read = 0; read < disk + 2; ++read) {
+        // Retain ownership of the live descriptor, but make Store's real
+        // pread use -1. Restore it before assertions or Store destruction.
+        const int fd =
+            DiskSlabStoreTestPeer::ExchangePayloadFd(store, keys[disk], -1);
+        const Status status = store.Range(keys[disk], 0, 0, &output);
+        const int replaced =
+            DiskSlabStoreTestPeer::ExchangePayloadFd(store, keys[disk], fd);
+        EXPECT_EQ(replaced, -1);
+        ASSERT_EQ(fd, file.first);
+        EXPECT_EQ(status, Status::kIOError);
+      }
+      EXPECT_TRUE(store.Healthy());
+    }
+    ASSERT_NO_FATAL_FAILURE(expect_counts(false));
+    server.reset();
+    server = std::make_unique<KvNodeServer>(options);
+    ASSERT_TRUE(server->Healthy());
+    EXPECT_EQ(KvNodeServerTestPeer::Group(*server).Count(), 2U);
+    // Read-only preflight and clean table recovery do not populate these
+    // counters. The restored extent bytes still serve the original content.
+    ASSERT_NO_FATAL_FAILURE(expect_counts(true));
+    std::string output;
+    ASSERT_EQ(
+        KvNodeServerTestPeer::Group(*server).Range(keys[0], 0, 0, &output),
+        Status::kOk);
+    EXPECT_EQ(output, values[0]);
+    EXPECT_EQ(fields(KvNodeServerTestPeer::Group(*server).SlabStats()),
+              (std::array<uint64_t, 4>{1, 11, 0, 0}));
+    server.reset();
+  }
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, TransportPreparationCountsAggregateAndReset) {
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
   const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
@@ -2180,6 +2339,15 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
   EXPECT_NE(text.find(",engine=\"file\",write_mode=\"n/a\""),
             std::string::npos) << text;
   EXPECT_EQ(text.find("dfkv_slab_capacity_bytes"), std::string::npos) << text;
+  for (const char* suffix : {"syscalls", "bytes", "errors", "short_reads"}) {
+    EXPECT_EQ(text.find(std::string("dfkv_slab_sync_payload_read_") + suffix +
+                        "_total"),
+              std::string::npos);
+    EXPECT_EQ(text.find(std::string("dfkv_slab_disk_sync_payload_read_") +
+                        suffix + "_total"),
+              std::string::npos);
+  }
+
   for (const char* suffix :
        {"unclassified", "ram_hit", "disk_staging", "disk_to_ram",
         "published_follower", "synchronous_fallback", "fallback_unclassified",

@@ -39,6 +39,7 @@
 #endif
 
 #include "cache/disk_resident_identity.h"
+#include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -109,6 +110,22 @@ class DiskSlabStoreTestPeer {
   static void SetReadAcquiredHook(DiskSlabStore* store,
                                   std::function<void()> hook) {
     store->read_acquired_hook_for_test_ = std::move(hook);
+  }
+  static bool TruncatePayload(DiskSlabStore* store, const BlockKey& key,
+                              size_t bytes) {
+    const std::lock_guard<std::mutex> lock(store->mu_);
+    SlabAllocator::SlotRef ref;
+    if (!store->alloc_->Get(key, &ref)) return false;
+    return ::ftruncate(store->extent_fds_[ref.extent],
+                       static_cast<off_t>(ref.offset + bytes)) == 0;
+  }
+  static bool BreakPayloadFd(DiskSlabStore* store, const BlockKey& key) {
+    const std::lock_guard<std::mutex> lock(store->mu_);
+    SlabAllocator::SlotRef ref;
+    if (!store->alloc_->Get(key, &ref)) return false;
+    // Remove ownership before close so teardown cannot close a reused fd.
+    const int fd = std::exchange(store->extent_fds_[ref.extent], -1);
+    return ::close(fd) == 0;
   }
   static void BreakTableFd(DiskSlabStore* store) {
     if (store->table_fd_ >= 0) ::close(store->table_fd_);
@@ -1753,6 +1770,189 @@ TEST_F(DiskSlabTest, BatchReputDuringDeferredRemoveWaitsOutWindowThenLands) {
   EXPECT_EQ(out, v2);
 }
 
+TEST_F(DiskSlabTest, SyncPayloadReadCountersTrackActualCallsAndReset) {
+  DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  const std::string value(3000, 'p');
+  {
+    DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy());
+    ASSERT_EQ(store.Cache(K(951), value.data(), value.size()), Status::kOk);
+    EXPECT_EQ(store.GetStats().sync_payload_reads.syscalls, 0U);
+    std::string output;
+    ASSERT_EQ(store.Range(K(951), 5, 100, &output), Status::kOk);
+    EXPECT_EQ(output, value.substr(5, 100));
+    char buffer[128] = {};
+    size_t length = 0;
+    ASSERT_EQ(store.RangeInto(K(951), 9, 17, buffer, sizeof(buffer), &length),
+              Status::kOk);
+    EXPECT_EQ(std::string(buffer, length), value.substr(9, 17));
+    const char* data = nullptr;
+    ASSERT_EQ(store.RangeDirect(K(951), 11, 13, buffer, sizeof(buffer), &data,
+                                &length),
+              Status::kOk);
+    EXPECT_EQ(std::string(data, length), value.substr(11, 13));
+    // None of these results issues a payload syscall.
+    EXPECT_EQ(store.Range(K(952), 0, 1, &output), Status::kNotFound);
+    EXPECT_EQ(store.Range(K(951), value.size() + 1, 1, &output),
+              Status::kInvalid);
+    ASSERT_EQ(store.Range(K(951), value.size(), 1, &output), Status::kOk);
+    EXPECT_TRUE(output.empty());
+    ASSERT_EQ(store.RangeInto(K(951), 0, 1, buffer, 0, &length), Status::kOk);
+    EXPECT_EQ(length, 0U);
+    const DiskSlabStore::SyncPayloadReadCounters io =
+        store.GetStats().sync_payload_reads;
+    EXPECT_EQ(io.syscalls, 3U);
+    EXPECT_EQ(io.bytes, 130U);
+    EXPECT_EQ(io.errors, 0U);
+    EXPECT_EQ(io.short_reads, 0U);
+  }
+  std::string error;
+  ASSERT_TRUE(DiskSlabStore::ValidateExistingMeta(options, &error)) << error;
+  DiskSlabStore reopened(options);
+  ASSERT_TRUE(reopened.Healthy());
+  // Header/table recovery reads are not synchronous payload traffic.
+  const DiskSlabStore::SyncPayloadReadCounters io =
+      reopened.GetStats().sync_payload_reads;
+  EXPECT_EQ(io.syscalls, 0U);
+  EXPECT_EQ(io.bytes, 0U);
+  EXPECT_EQ(io.errors, 0U);
+  EXPECT_EQ(io.short_reads, 0U);
+  std::string output;
+  ASSERT_EQ(reopened.Range(K(951), 0, 0, &output), Status::kOk);
+  EXPECT_EQ(output, value);
+  EXPECT_EQ(reopened.GetStats().sync_payload_reads.syscalls, 1U);
+  EXPECT_EQ(reopened.GetStats().sync_payload_reads.bytes, value.size());
+}
+
+TEST_F(DiskSlabTest, SyncPayloadReadCountersPreservePartialAndFailedIo) {
+  for (const bool invalid_fd : {false, true}) {
+    SCOPED_TRACE(invalid_fd);
+    fs::remove_all(dir_);
+    DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+    options.table_sync_ms = 0;
+    options.reclaim_interval_ms = 0;
+    DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy());
+    const std::string value(3000, 's');
+    ASSERT_EQ(store.Cache(K(953), value.data(), value.size()), Status::kOk);
+    if (invalid_fd) {
+      ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::BreakPayloadFd(&store, K(953)));
+    } else {
+      ASSERT_TRUE(
+          dfkv::DiskSlabStoreTestPeer::TruncatePayload(&store, K(953), 100));
+    }
+    std::string output;
+    ASSERT_EQ(store.Range(K(953), 0, 0, &output), Status::kIOError);
+    // A real regular-file short read returns 100 bytes, then a second pread
+    // reaches EOF. EBADF instead returns one negative syscall result.
+    const DiskSlabStore::SyncPayloadReadCounters io =
+        store.GetStats().sync_payload_reads;
+    EXPECT_EQ(io.syscalls, invalid_fd ? 1U : 2U);
+    EXPECT_EQ(io.bytes, invalid_fd ? 0U : 100U);
+    EXPECT_EQ(io.errors, invalid_fd ? 1U : 0U);
+    EXPECT_EQ(io.short_reads, invalid_fd ? 0U : 2U);
+    if (!invalid_fd) {
+      EXPECT_EQ(output.substr(0, 100), value.substr(0, 100));
+    }
+    EXPECT_EQ(store.GetStats().inflight, 0U);
+  }
+}
+
+TEST_F(DiskSlabTest, SyncPayloadReadCountersCountAlignedBytesAndFallbackOnce) {
+  DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  options.direct_writes = true;
+  DiskSlabStore store(options);
+  ASSERT_TRUE(store.Healthy());
+  if (!store.DirectWritesActive())
+    GTEST_SKIP() << "filesystem rejected O_DIRECT; aligned read not exercised";
+  const std::string value(3000, 'a');
+  ASSERT_EQ(store.Cache(K(954), value.data(), value.size()), Status::kOk);
+  alignas(4096) char buffer[8192] = {};
+  const char* data = nullptr;
+  size_t length = 0;
+  ASSERT_EQ(store.RangeDirect(K(954), 10, 100, buffer, sizeof(buffer), &data,
+                              &length),
+            Status::kOk);
+  EXPECT_EQ(std::string(data, length), value.substr(10, 100));
+  EXPECT_EQ(store.GetStats().sync_payload_reads.syscalls, 1U);
+  EXPECT_EQ(store.GetStats().sync_payload_reads.bytes, 4096U);
+  // A small destination selects one exact buffered read before issuing DIO.
+  ASSERT_EQ(store.RangeDirect(K(954), 10, 100, buffer, 8, &data, &length),
+            Status::kOk);
+  EXPECT_EQ(std::string(data, length), value.substr(10, 8));
+  EXPECT_EQ(store.GetStats().sync_payload_reads.syscalls, 2U);
+  EXPECT_EQ(store.GetStats().sync_payload_reads.bytes, 4104U);
+  // Unaligned RangeDirect delegates to RangeInto; do not count both layers.
+  ASSERT_EQ(store.RangeDirect(K(954), 20, 50, buffer + 1, 4096, &data, &length),
+            Status::kOk);
+  EXPECT_EQ(std::string(data, length), value.substr(20, 50));
+  const DiskSlabStore::SyncPayloadReadCounters io =
+      store.GetStats().sync_payload_reads;
+  EXPECT_EQ(io.syscalls, 3U);
+  EXPECT_EQ(io.bytes, 4154U);
+  EXPECT_EQ(io.errors, 0U);
+  EXPECT_EQ(io.short_reads, 0U);
+  EXPECT_EQ(store.GetStats().dio_read_fallbacks, 2U);
+}
+
+TEST_F(DiskSlabTest,
+       SyncPayloadReadCountersPublishCoherentConcurrentSnapshots) {
+  DiskSlabStore::Options options = Opts(4 * 4096, 4 * 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  DiskSlabStore store(options);
+  ASSERT_TRUE(store.Healthy());
+  const std::string value(3000, 'c');
+  ASSERT_EQ(store.Cache(K(955), value.data(), value.size()), Status::kOk);
+  std::atomic<unsigned> ready{0};
+  std::atomic<unsigned> done{0};
+  std::atomic<bool> start{false};
+  std::atomic<bool> valid{true};
+  std::vector<std::thread> readers;
+  for (unsigned worker = 0; worker < 4; ++worker) {
+    readers.emplace_back([&] {
+      for (unsigned i = 0; i < 32; ++i) {
+        std::string output;
+        if (store.Range(K(955), 0, 0, &output) != Status::kOk ||
+            output != value)
+          valid.store(false, std::memory_order_relaxed);
+        if (i == 0) {
+          ready.fetch_add(1, std::memory_order_release);
+          while (!start.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        }
+      }
+      done.fetch_add(1, std::memory_order_release);
+    });
+  }
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (ready.load(std::memory_order_acquire) != 4 &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  EXPECT_EQ(ready.load(std::memory_order_acquire), 4U);
+  EXPECT_EQ(store.GetStats().sync_payload_reads.syscalls, 4U);
+  start.store(true, std::memory_order_release);
+  size_t observations = 0;
+  do {
+    const DiskSlabStore::SyncPayloadReadCounters io =
+        store.GetStats().sync_payload_reads;
+    EXPECT_EQ(io.bytes, io.syscalls * value.size());
+    EXPECT_EQ(io.errors, 0U);
+    EXPECT_EQ(io.short_reads, 0U);
+    ++observations;
+  } while (done.load(std::memory_order_acquire) != 4);
+  for (std::thread& reader : readers) reader.join();
+  EXPECT_TRUE(valid.load(std::memory_order_relaxed));
+  EXPECT_GT(observations, 0U);
+  EXPECT_EQ(store.GetStats().sync_payload_reads.syscalls, 128U);
+  EXPECT_EQ(store.GetStats().sync_payload_reads.bytes, 128 * value.size());
+}
+
 // Direct-mode RangeDirect: O_DIRECT aligned-window read with head trim -- the
 // returned pointer must land exactly on the requested offset's bytes, including
 // a non-4KiB-aligned client offset (head != 0).
@@ -2097,6 +2297,14 @@ TEST_P(DeferredReadTest, FinalStatusIncludesDeferredInvalidation) {
     EXPECT_EQ(store.Count(), fail_invalidation ? 1U : 0U);
     EXPECT_EQ(store.UsedBytes(), fail_invalidation ? 4096U : 0U);
     EXPECT_EQ(store.GetStats().inflight, 0U);
+    const DiskSlabStore::SyncPayloadReadCounters io =
+        store.GetStats().sync_payload_reads;
+    EXPECT_EQ(io.syscalls, 1U);
+    EXPECT_EQ(io.bytes, GetParam() == DeferredReadPath::kRangeDirect
+                            ? 4096U
+                            : value.size());
+    EXPECT_EQ(io.errors, 0U);
+    EXPECT_EQ(io.short_reads, 0U);
     EXPECT_EQ(store.GetStats().payload_bytes, 0U);
     EXPECT_EQ(store.TenantUsedBytes(key.tenant_hash), 0U);
     EXPECT_EQ(value_length, fail_invalidation ? 99U : value.size());

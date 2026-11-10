@@ -105,13 +105,32 @@ bool PwriteAll(int fd, const void* buf, size_t n, uint64_t off) {
   return true;
 }
 
-bool PreadAll(int fd, void* buf, size_t n, uint64_t off) {
+bool PreadAll(int fd, void* buf, size_t n, uint64_t off,
+              DiskSlabStore::SyncPayloadReadCounters* counters = nullptr) {
   char* p = static_cast<char*>(buf);
   size_t done = 0;
   while (done < n) {
-    ssize_t r = ::pread(fd, p + done, n - done, static_cast<off_t>(off + done));
-    if (r < 0) { if (errno == EINTR) continue; return false; }
-    if (r == 0) { errno = EIO; return false; }  // short/EOF
+    const ssize_t r =
+        ::pread(fd, p + done, n - done, static_cast<off_t>(off + done));
+    // Only payload callers supply request-local accounting. Preserve actual
+    // progress before retry/EOF handling, independently of final GET success.
+    if (counters != nullptr) {
+      ++counters->syscalls;
+      if (r < 0) {
+        ++counters->errors;
+      } else {
+        counters->bytes += static_cast<uint64_t>(r);
+        if (static_cast<size_t>(r) < n - done) ++counters->short_reads;
+      }
+    }
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (r == 0) {
+      errno = EIO;  // EOF before all requested bytes arrived.
+      return false;
+    }
     done += static_cast<size_t>(r);
   }
   return true;
@@ -2111,6 +2130,7 @@ Status DiskSlabStore::RangeDirectImpl(const BlockKey& key, uint64_t offset,
     uint32_t plen = 0;
     if (!AcquireForRead(key, fn, &ref, &plen, identity))
       return Healthy() ? Status::kNotFound : Status::kIOError;
+    SyncPayloadReadCounters io;
     Status st = Status::kOk;
     size_t got = 0, head = 0;
     if (offset > plen) {
@@ -2124,7 +2144,7 @@ Status DiskSlabStore::RangeDirectImpl(const BlockKey& key, uint64_t offset,
       const size_t alen =
           (head + static_cast<size_t>(n) + 4095) & ~static_cast<size_t>(4095);
       if (alen <= io_cap) {
-        if (PreadAll(extent_dio_fds_[ref.extent], io_buf, alen, aoff))
+        if (PreadAll(extent_dio_fds_[ref.extent], io_buf, alen, aoff, &io))
           got = static_cast<size_t>(n);
         else
           st = Status::kIOError;
@@ -2132,14 +2152,14 @@ Status DiskSlabStore::RangeDirectImpl(const BlockKey& key, uint64_t offset,
         dio_read_fallbacks_.fetch_add(1, std::memory_order_relaxed);
         if (!PreadAll(extent_fds_[ref.extent], io_buf,
                       static_cast<size_t>(std::min<uint64_t>(n, io_cap)),
-                      ref.offset + offset))
+                      ref.offset + offset, &io))
           st = Status::kIOError;
         else { got = static_cast<size_t>(std::min<uint64_t>(n, io_cap)); head = 0; }
       }
     }
     {
       std::lock_guard<std::mutex> lk(mu_);
-      st = FinishReadLocked(key, fn, st, got, identity);
+      st = FinishReadLocked(key, fn, st, got, identity, &io);
     }
     if (st != Status::kOk) return st;
     if (value_len) *value_len = plen;
@@ -2288,7 +2308,16 @@ bool DiskSlabStore::ReleaseInflightLocked(const BlockKey& key,
 Status DiskSlabStore::FinishReadLocked(const BlockKey& key,
                                        const std::string& fn, Status status,
                                        size_t bytes,
-                                       DiskResidentIdentity* identity) {
+                                       DiskResidentIdentity* identity,
+                                       const SyncPayloadReadCounters* io) {
+  // Preserve actual I/O even if last-pin invalidation changes the GET result.
+  // The original read-finalization lock publishes this request's four fields.
+  if (io != nullptr) {
+    sync_payload_reads_.syscalls += io->syscalls;
+    sync_payload_reads_.bytes += io->bytes;
+    sync_payload_reads_.errors += io->errors;
+    sync_payload_reads_.short_reads += io->short_reads;
+  }
   if (!ReleaseInflightLocked(key, fn)) status = Status::kIOError;
   // Enabled lifetime reads preserve original byte provenance even if the last
   // pin just removed that resident. The logical-success owner revalidates the
@@ -2328,6 +2357,7 @@ Status DiskSlabStore::RangeImpl(const BlockKey& key, uint64_t offset,
   uint32_t plen = 0;
   if (!AcquireForRead(key, fn, &ref, &plen, identity))
     return Healthy() ? Status::kNotFound : Status::kIOError;
+  SyncPayloadReadCounters io;
   Status st = Status::kOk;
   if (offset > plen) {
     st = Status::kInvalid;
@@ -2338,12 +2368,12 @@ Status DiskSlabStore::RangeImpl(const BlockKey& key, uint64_t offset,
     const uint64_t avail = plen - offset;
     const uint64_t n = std::min(length ? length : avail, avail);
     out->resize(static_cast<size_t>(n));
-    if (n && !PreadAll(extent_fds_[ref.extent], &(*out)[0], static_cast<size_t>(n),
-                       ref.offset + offset))
+    if (n && !PreadAll(extent_fds_[ref.extent], out->data(),
+                       static_cast<size_t>(n), ref.offset + offset, &io))
       st = Status::kIOError;
   }
   std::lock_guard<std::mutex> lk(mu_);
-  st = FinishReadLocked(key, fn, st, out->size(), identity);
+  st = FinishReadLocked(key, fn, st, out->size(), identity, &io);
   if (st == Status::kOk && value_len) *value_len = plen;
   return st;
 }
@@ -2378,6 +2408,7 @@ Status DiskSlabStore::RangeIntoImpl(const BlockKey& key, uint64_t offset,
   uint32_t plen = 0;
   if (!AcquireForRead(key, fn, &ref, &plen, identity))
     return Healthy() ? Status::kNotFound : Status::kIOError;
+  SyncPayloadReadCounters io;
   Status st = Status::kOk;
   size_t got = 0;
   if (offset > plen) {
@@ -2385,13 +2416,14 @@ Status DiskSlabStore::RangeIntoImpl(const BlockKey& key, uint64_t offset,
   } else if (offset < plen) {
     uint64_t n = std::min(length ? length : (plen - offset), static_cast<uint64_t>(plen - offset));
     if (n > dst_cap) n = dst_cap;
-    if (n && !PreadAll(extent_fds_[ref.extent], dst, static_cast<size_t>(n), ref.offset + offset))
+    if (n && !PreadAll(extent_fds_[ref.extent], dst, static_cast<size_t>(n),
+                       ref.offset + offset, &io))
       st = Status::kIOError;
     else got = static_cast<size_t>(n);
   }
   {
     std::lock_guard<std::mutex> lk(mu_);
-    st = FinishReadLocked(key, fn, st, got, identity);
+    st = FinishReadLocked(key, fn, st, got, identity, &io);
   }
   if (st == Status::kOk && out_len) *out_len = got;
   if (st == Status::kOk && value_len) *value_len = plen;
@@ -3015,6 +3047,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
       lifetime_watermark_protected_victims_;
 
   st.lifetime_reads = lifetime_reads_;
+  st.sync_payload_reads = sync_payload_reads_;
   st.payload_bytes = committed_payload_bytes_;
   st.watermark_freed_payload_bytes = watermark_freed_payload_bytes_;
   st.lifetime_init_clock_hard_exhausted = lifetime_init_clock_hard_exhausted_;

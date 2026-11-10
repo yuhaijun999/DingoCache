@@ -572,6 +572,15 @@ std::string KvNodeServer::MetricsText() const {
     uint64_t bucket_protected_estimate = 0;
     uint64_t bucket_summary_bytes = 0;
     bool bucket_estimate_available = group_.DiskCount() != 0;
+    header("dfkv_slab_disk_sync_payload_read_syscalls_total", "counter",
+           "Completed synchronous payload pread attempts, including retries");
+    header("dfkv_slab_disk_sync_payload_read_bytes_total", "counter",
+           "Bytes returned by synchronous payload pread, including padding");
+    header("dfkv_slab_disk_sync_payload_read_errors_total", "counter",
+           "Negative synchronous payload pread returns, including EINTR");
+    header(
+        "dfkv_slab_disk_sync_payload_read_short_reads_total", "counter",
+        "Nonnegative short synchronous payload pread returns, including EOF");
     header("dfkv_slab_disk_lifetime_bucket_protected_estimate", "gauge",
            "Bucket-rounded estimate of retained protected residents");
     header("dfkv_slab_disk_lifetime_bucket_estimate_available", "gauge",
@@ -762,6 +771,14 @@ std::string KvNodeServer::MetricsText() const {
         queue_totals[{queue.slot_size, queue.band}] += queue.residents;
       }
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      sample("dfkv_slab_disk_sync_payload_read_syscalls_total",
+             disk.sync_payload_reads.syscalls);
+      sample("dfkv_slab_disk_sync_payload_read_bytes_total",
+             disk.sync_payload_reads.bytes);
+      sample("dfkv_slab_disk_sync_payload_read_errors_total",
+             disk.sync_payload_reads.errors);
+      sample("dfkv_slab_disk_sync_payload_read_short_reads_total",
+             disk.sync_payload_reads.short_reads);
       sample("dfkv_slab_disk_lifetime_recovered_objects",
              disk.lifetime_recovered_objects);
       sample("dfkv_slab_disk_lifetime_recovered_unread_objects",
@@ -887,6 +904,18 @@ std::string KvNodeServer::MetricsText() const {
            std::to_string(bucket_protected_estimate) + "\n";
     }
     const auto ss = group_.SlabStats();
+    metric("dfkv_slab_sync_payload_read_syscalls_total", "counter",
+           "Completed synchronous payload pread attempts, including retries",
+           ss.sync_payload_reads.syscalls);
+    metric("dfkv_slab_sync_payload_read_bytes_total", "counter",
+           "Bytes returned by synchronous payload pread, including padding",
+           ss.sync_payload_reads.bytes);
+    metric("dfkv_slab_sync_payload_read_errors_total", "counter",
+           "Negative synchronous payload pread returns, including EINTR",
+           ss.sync_payload_reads.errors);
+    metric("dfkv_slab_sync_payload_read_short_reads_total", "counter",
+           "Nonnegative short synchronous payload pread returns, including EOF",
+           ss.sync_payload_reads.short_reads);
     metric("dfkv_slab_dio_write_fallback_total", "counter",
            "Direct-mode PUTs that fell back to a buffered write", ss.dio_write_fallbacks);
     metric("dfkv_slab_dio_read_fallback_total", "counter",

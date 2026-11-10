@@ -141,9 +141,20 @@ class DiskSlabStore : public StoreEngine {
     uint64_t transport_fallback_copy_follower = 0;
   };
 
+  // Actual synchronous payload pread results, published at read finalization.
+  // Excludes metadata, recovery, async I/O and external ReadLease fd reads.
+  struct SyncPayloadReadCounters {
+    uint64_t syscalls = 0;  // Every pread attempt, including EINTR retries.
+    uint64_t bytes = 0;   // Positive kernel-returned bytes, including padding.
+    uint64_t errors = 0;  // Negative pread results, including EINTR.
+    uint64_t short_reads =
+        0;  // Nonnegative results smaller than requested; EOF too.
+  };
+
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
   struct Stats {
     LifetimeReadCounters lifetime_reads{};
+    SyncPayloadReadCounters sync_payload_reads{};
     uint64_t lifetime_class_scan_visits = 0;
     uint64_t lifetime_class_scan_slices = 0;
     uint64_t lifetime_scan_budget_exhausted = 0;
@@ -486,7 +497,8 @@ class DiskSlabStore : public StoreEngine {
   // originally captured source if it is still visible, never relabel by key.
   Status FinishReadLocked(const BlockKey& key, const std::string& fn,
                           Status status, size_t bytes,
-                          DiskResidentIdentity* identity);
+                          DiskResidentIdentity* identity,
+                          const SyncPayloadReadCounters* io = nullptr);
   // Returns with lock held. The caller retains its unique PutFlight across
   // all slices; this helper never re-enters owner/follower arbitration.
   DiskWriteResult AllocateForPutLocked(const BlockKey& key, size_t len,
@@ -592,6 +604,7 @@ class DiskSlabStore : public StoreEngine {
   // Invoked only between class slices, after releasing BOTH lifecycle locks.
   std::function<void()> lifetime_scan_yield_hook_for_test_{};
   LifetimeReadCounters lifetime_reads_{};  // under mu_
+  SyncPayloadReadCounters sync_payload_reads_{};  // under mu_
   uint64_t committed_payload_bytes_ = 0;  // under mu_
   uint64_t lifetime_init_clock_hard_exhausted_ = 0;  // under mu_
   bool ok_ = false;

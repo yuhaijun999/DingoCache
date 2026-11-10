@@ -227,6 +227,10 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_rebalanced_total` | counter | 回收线程从冷 class 搬给热 class 的 extent 数（类再平衡）——换模型/尺寸迁移期应看到增长，稳态应静止 |
 | `dfkv_slab_batched_writes_total` / `dfkv_slab_uring_write_batches_total` | counter | 进入 batched store visit 的 payload 写数 / io_uring 单次 submit 轮数 |
 | `dfkv_slab_bind_wipes_total` | counter | extent 绑定新 class 前完成的旧 slot-grid 清理 |
+| `dfkv_slab_sync_payload_read_syscalls_total` / `dfkv_slab_disk_sync_payload_read_syscalls_total` | counter | Every actual Store-owned synchronous payload pread call, including retries. Not logical GETs or device reads. |
+| `dfkv_slab_sync_payload_read_bytes_total` / `dfkv_slab_disk_sync_payload_read_bytes_total` | counter | Positive kernel-returned bytes for those calls, including aligned DIO excess and partial bytes before failure. Not logical payload bytes. |
+| `dfkv_slab_sync_payload_read_errors_total` / `dfkv_slab_disk_sync_payload_read_errors_total` | counter | Negative pread returns, including retried EINTR. Not final GET failures; EOF is a short read instead. |
+| `dfkv_slab_sync_payload_read_short_reads_total` / `dfkv_slab_disk_sync_payload_read_short_reads_total` | counter | Nonnegative returns smaller than that syscall request, including zero EOF; positive partial reads and a following EOF each count. |
 | `dfkv_slab_metadata_io_errors_total` / `dfkv_slab_unclean_resets_total` | counter | slots.tbl/epoch 持久化失败 / 冷升时丢弃 dirty epoch |
 | `dfkv_slab_lifetime_class_scan_visits_total` | counter | Resident visits in staged foreground lifetime class scans. |
 | `dfkv_slab_lifetime_class_scan_slices_total` | counter | Staged foreground lifetime class scan opportunities. |
@@ -814,3 +818,41 @@ per-request enum field with platform-dependent alignment cost, not a
 per-resident allocation. Twelve new fixed metric families add scrape/output
 cost. None of this establishes latency, RSS, recovery-peak or complete-memory
 budget compliance. Existing dashboards and alerts retain their names.
+
+
+### Store-owned synchronous payload pread accounting
+
+The four `sync_payload_read_*_total` counters describe syscall activity owned by
+Store Range/RangeInto/RangeDirect, in both legacy and lifetime slab modes.
+They reset when the Store is reconstructed and are absent for file engines.
+They are not an outcome partition: bytes has a different unit; a short positive
+return adds both bytes and short_reads, and a retried EINTR adds both a syscall
+and an error even if the read eventually succeeds. EOF adds a syscall and a
+short read, but not a negative-result error. Zero-length, missing or invalid
+ranges that issue no pread add nothing.
+
+A direct read reports the kernel's aligned-window return bytes, which can
+exceed the logical range. Capacity/alignment fallback chooses buffered I/O
+before a DIO syscall, not after a failed DIO read; count only calls actually
+made. Buffered and direct calls share these counters. A successful payload
+syscall still counts if final-pin deferred invalidation later turns the GET
+into IOError; such a metadata failure does not become a payload syscall error.
+
+Only the four payload callsites provide an accumulator. Startup preflight,
+meta/init-marker/epoch/table reads, recovery scans, writes, RAM hits and shared
+copy followers do not add payload syscalls. A synchronous coalescer leader or
+independent fallback does. RangeDirectPrep/PreparedRead preparation, release,
+external descriptor pread and io_uring CQ completions are excluded, even if an
+external descriptor owner executes pread synchronously. This is a deliberately
+bounded synchronous series, not complete asynchronous payload I/O, device I/O,
+page-cache misses or storage amplification. Async accounting remains pending.
+
+Each request accumulates locally and merges all four fields under its existing
+Store finalization lock before releasing the last pin. No new per-syscall lock,
+atomics, clock read or per-resident fields are added. Pending reads do not appear
+until finalization; the four new fields are copied together under the same
+Store lock, not a claim that every existing Stats field shares that snapshot.
+Global/per-disk series use only existing disk/disk_index labels and are sampled
+separately; compare sums at quiescence. Fixed counters, request-local work and
+additional metrics output have nonzero costs; this is not a memory/latency
+budget or full RSS/recovery-peak acceptance result.

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Export Store-owned synchronous slab payload pread calls, returned bytes,
+  negative results and short reads globally and per disk. Exclude metadata,
+  recovery and externally executed prepared I/O; retain completed I/O accounting
+  even when final-pin invalidation changes the GET result to an error.
+
 - Subdivide synchronous PULL fallback grants by actual RAM, independent disk,
   copy leader and copied-follower routes, retaining an unknown category for
   legacy handlers. Preserve the coarse fallback total and existing grant timing.
