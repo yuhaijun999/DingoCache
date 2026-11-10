@@ -1861,11 +1861,22 @@ SlabAllocator::LifetimeDonorStats SlabAllocator::DonorStats() const {
 }
 
 SlabAllocator::LifetimeBucketMemory SlabAllocator::BucketMemory() const {
+  const LifetimeMemory memory = LifetimeMemoryUsage();
+  return {memory.entries, memory.bucket_bytes, memory.token_bytes};
+}
+
+SlabAllocator::LifetimeMemory SlabAllocator::LifetimeMemoryUsage() const {
   const std::lock_guard<std::mutex> lock(mu_);
-  LifetimeBucketMemory memory;
+  LifetimeMemory memory;
   memory.entries = lifetime_buckets_.size();
   memory.bucket_bytes = lifetime_buckets_.capacity() * sizeof(LifetimeBucket);
   memory.token_bytes = lifetime_bucket_tokens_.capacity() * sizeof(uint64_t);
+  memory.identity_bytes = resident_generations_.capacity() * sizeof(uint64_t);
+  memory.state_bytes = resident_lifetime_states_.capacity() *
+                       sizeof(std::optional<DiskLifetimeState>);
+  memory.link_bytes = lifetime_links_.capacity() * sizeof(LifetimeLinks);
+  memory.queue_bytes = lifetime_queues_.capacity() * sizeof(LifetimeQueue);
+  memory.version_bytes = lifetime_versions_.capacity() * sizeof(uint64_t);
   return memory;
 }
 

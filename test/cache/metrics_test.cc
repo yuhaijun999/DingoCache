@@ -253,6 +253,8 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
   for (const char* name :
        {"dfkv_slab_lifetime_bucket_entries", "dfkv_slab_lifetime_bucket_bytes",
         "dfkv_slab_lifetime_bucket_token_bytes",
+        "dfkv_slab_lifetime_state_bytes", "dfkv_slab_lifetime_link_bytes",
+        "dfkv_slab_lifetime_queue_bytes", "dfkv_slab_lifetime_version_bytes",
         "dfkv_slab_lifetime_recovered_objects",
         "dfkv_slab_lifetime_recovered_unread_objects"}) {
     EXPECT_NE(text.find(std::string(name) + " 0\n"), std::string::npos);
@@ -279,6 +281,10 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
        {"dfkv_slab_disk_lifetime_bucket_entries",
         "dfkv_slab_disk_lifetime_bucket_bytes",
         "dfkv_slab_disk_lifetime_bucket_token_bytes",
+        "dfkv_slab_disk_lifetime_state_bytes",
+        "dfkv_slab_disk_lifetime_link_bytes",
+        "dfkv_slab_disk_lifetime_queue_bytes",
+        "dfkv_slab_disk_lifetime_version_bytes",
         "dfkv_slab_disk_lifetime_recovered_objects",
         "dfkv_slab_disk_lifetime_recovered_unread_objects"}) {
     EXPECT_NE(text.find(std::string(name) + labels), std::string::npos);
@@ -793,6 +799,18 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
     const std::string text = server->MetricsText();
     uint64_t bucket_bytes = 0;
     uint64_t token_bytes = 0;
+    DiskSlabStore::Stats index_totals;
+    const auto expect_index_memory = [&](const char* suffix, uint64_t bytes,
+                                         const std::string& labels) {
+      const std::string name =
+          std::string(labels.empty() ? "dfkv_slab_lifetime_"
+                                     : "dfkv_slab_disk_lifetime_") +
+          suffix;
+      EXPECT_NE(text.find("# TYPE " + name + " gauge\n"), std::string::npos);
+      EXPECT_NE(text.find(name + (labels.empty() ? " " : labels) +
+                          std::to_string(bytes) + "\n"),
+                std::string::npos);
+    };
     for (size_t disk = 0; disk < 2; ++disk) {
       const DiskSlabStore::Stats stats = group.DiskSlabStats(disk);
       // Two physical extents each reserve B=32 entries before any binding.
@@ -800,6 +818,13 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
       EXPECT_GT(stats.lifetime_bucket_bytes, 0U);
       EXPECT_EQ(stats.lifetime_bucket_token_bytes != 0,
                 disk == 0 ? tokens0 : tokens1);
+      const bool has_resident_capacity = disk == 0 ? tokens0 : tokens1;
+      EXPECT_EQ(stats.lifetime_identity_bytes != 0, has_resident_capacity);
+      EXPECT_EQ(stats.lifetime_state_bytes != 0, has_resident_capacity);
+      EXPECT_EQ(stats.lifetime_link_bytes != 0, has_resident_capacity);
+      // Queue heads and class versions exist even before the first resident.
+      EXPECT_GT(stats.lifetime_queue_bytes, 0U);
+      EXPECT_GT(stats.lifetime_version_bytes, 0U);
       const std::string labels = "{disk=\"" + options.cache_dirs[disk] +
                                  "\",disk_index=\"" + std::to_string(disk) +
                                  "\"} ";
@@ -817,9 +842,39 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
           text.find("dfkv_slab_disk_payload_bytes" + labels +
                     std::to_string(disk == 0 ? visible0 : visible1) + "\n"),
           std::string::npos);
+      expect_index_memory("identity_bytes", stats.lifetime_identity_bytes,
+                          labels);
+      expect_index_memory("state_bytes", stats.lifetime_state_bytes, labels);
+      expect_index_memory("link_bytes", stats.lifetime_link_bytes, labels);
+      expect_index_memory("queue_bytes", stats.lifetime_queue_bytes, labels);
+      expect_index_memory("version_bytes", stats.lifetime_version_bytes,
+                          labels);
+      index_totals.lifetime_identity_bytes += stats.lifetime_identity_bytes;
+      index_totals.lifetime_state_bytes += stats.lifetime_state_bytes;
+      index_totals.lifetime_link_bytes += stats.lifetime_link_bytes;
+      index_totals.lifetime_queue_bytes += stats.lifetime_queue_bytes;
+      index_totals.lifetime_version_bytes += stats.lifetime_version_bytes;
       bucket_bytes += stats.lifetime_bucket_bytes;
       token_bytes += stats.lifetime_bucket_token_bytes;
     }
+    const DiskSlabStore::Stats group_stats = group.SlabStats();
+    EXPECT_EQ(group_stats.lifetime_identity_bytes,
+              index_totals.lifetime_identity_bytes);
+    expect_index_memory("identity_bytes", index_totals.lifetime_identity_bytes,
+                        "");
+    EXPECT_EQ(group_stats.lifetime_state_bytes,
+              index_totals.lifetime_state_bytes);
+    expect_index_memory("state_bytes", index_totals.lifetime_state_bytes, "");
+    EXPECT_EQ(group_stats.lifetime_link_bytes,
+              index_totals.lifetime_link_bytes);
+    expect_index_memory("link_bytes", index_totals.lifetime_link_bytes, "");
+    EXPECT_EQ(group_stats.lifetime_queue_bytes,
+              index_totals.lifetime_queue_bytes);
+    expect_index_memory("queue_bytes", index_totals.lifetime_queue_bytes, "");
+    EXPECT_EQ(group_stats.lifetime_version_bytes,
+              index_totals.lifetime_version_bytes);
+    expect_index_memory("version_bytes", index_totals.lifetime_version_bytes,
+                        "");
     EXPECT_NE(text.find("dfkv_slab_lifetime_bucket_entries 128\n"),
               std::string::npos);
     EXPECT_NE(text.find("dfkv_slab_lifetime_bucket_bytes " +
@@ -857,6 +912,16 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
             before_remove.lifetime_bucket_bytes);
   EXPECT_EQ(after_remove.lifetime_bucket_token_bytes,
             before_remove.lifetime_bucket_token_bytes);
+  EXPECT_EQ(after_remove.lifetime_identity_bytes,
+            before_remove.lifetime_identity_bytes);
+  EXPECT_EQ(after_remove.lifetime_state_bytes,
+            before_remove.lifetime_state_bytes);
+  EXPECT_EQ(after_remove.lifetime_link_bytes,
+            before_remove.lifetime_link_bytes);
+  EXPECT_EQ(after_remove.lifetime_queue_bytes,
+            before_remove.lifetime_queue_bytes);
+  EXPECT_EQ(after_remove.lifetime_version_bytes,
+            before_remove.lifetime_version_bytes);
   server.reset();
   server = std::make_unique<KvNodeServer>(options);
   ASSERT_TRUE(server->Healthy());
@@ -879,6 +944,11 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
   EXPECT_EQ(empty.lifetime_bucket_bytes, rebuilt.lifetime_bucket_bytes);
   EXPECT_EQ(empty.lifetime_bucket_token_bytes,
             rebuilt.lifetime_bucket_token_bytes);
+  EXPECT_EQ(empty.lifetime_identity_bytes, rebuilt.lifetime_identity_bytes);
+  EXPECT_EQ(empty.lifetime_state_bytes, rebuilt.lifetime_state_bytes);
+  EXPECT_EQ(empty.lifetime_link_bytes, rebuilt.lifetime_link_bytes);
+  EXPECT_EQ(empty.lifetime_queue_bytes, rebuilt.lifetime_queue_bytes);
+  EXPECT_EQ(empty.lifetime_version_bytes, rebuilt.lifetime_version_bytes);
   server.reset();
   fs::remove_all(dir);
 }
@@ -1245,9 +1315,21 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
         "dfkv_slab_allocator_fragmentation_bytes",
         "dfkv_slab_disk_allocator_payload_bytes",
         "dfkv_slab_disk_allocator_fragmentation_bytes",
-        "dfkv_slab_disk_payload_bytes", "dfkv_slab_disk_allocated_bytes",
-        "dfkv_slab_lifetime_bucket_entries", "dfkv_slab_lifetime_bucket_bytes",
+        "dfkv_slab_disk_payload_bytes",
+        "dfkv_slab_disk_allocated_bytes",
+        "dfkv_slab_lifetime_bucket_entries",
+        "dfkv_slab_lifetime_bucket_bytes",
         "dfkv_slab_lifetime_bucket_token_bytes",
+        "dfkv_slab_lifetime_identity_bytes",
+        "dfkv_slab_lifetime_state_bytes",
+        "dfkv_slab_lifetime_link_bytes",
+        "dfkv_slab_lifetime_queue_bytes",
+        "dfkv_slab_lifetime_version_bytes",
+        "dfkv_slab_disk_lifetime_identity_bytes",
+        "dfkv_slab_disk_lifetime_state_bytes",
+        "dfkv_slab_disk_lifetime_link_bytes",
+        "dfkv_slab_disk_lifetime_queue_bytes",
+        "dfkv_slab_disk_lifetime_version_bytes",
         "dfkv_slab_disk_lifetime_bucket_entries",
         "dfkv_slab_disk_lifetime_bucket_bytes",
         "dfkv_slab_disk_lifetime_bucket_token_bytes",

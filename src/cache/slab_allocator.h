@@ -184,15 +184,34 @@ class SlabAllocator {
     uint64_t unscored_victims = 0;
   };
   LifetimeDonorStats DonorStats() const;
+  // Preserve the original installed return type and method ABI.
   struct LifetimeBucketMemory {
     uint64_t entries =
         0;  // Logical bucket positions, including unbound extents.
     uint64_t bucket_bytes = 0;  // Reserved bucket element backing storage.
     uint64_t token_bytes = 0;   // Reserved token element backing storage.
   };
+  LifetimeBucketMemory BucketMemory() const;
+  struct LifetimeMemory {
+    uint64_t entries =
+        0;  // Logical bucket positions, including unbound extents.
+    uint64_t bucket_bytes = 0;    // Reserved bucket element backing storage.
+    uint64_t token_bytes = 0;     // Reserved token element backing storage.
+    uint64_t identity_bytes = 0;  // Resident generation vector backing storage.
+    uint64_t state_bytes =
+        0;  // Optional lifetime state vector backing storage.
+    uint64_t link_bytes =
+        0;  // Dual-index resident link vector backing storage.
+    uint64_t queue_bytes = 0;  // Global and class-local queue vector backing.
+    uint64_t version_bytes =
+        0;  // Class mutation version vector backing storage.
+  };
   // O(1) locked capacity snapshot, not active/protected registration counts,
   // allocator overhead, vector object sizes or process/recovery peak memory.
-  LifetimeBucketMemory BucketMemory() const;
+  // Reports actual retained storage even for identity-only or shadow
+  // allocators; these fields are not the full memory increment over a legacy
+  // binary.
+  LifetimeMemory LifetimeMemoryUsage() const;
   uint64_t WatermarkEvictions() const;
   // Local candidate: reclaim slots in refreshed actual-read/new-write order
   // until allocated bytes reach target_bytes. A call removes at most max_victims

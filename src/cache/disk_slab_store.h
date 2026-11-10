@@ -166,6 +166,12 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_bucket_entries = 0;
     uint64_t lifetime_bucket_bytes = 0;
     uint64_t lifetime_bucket_token_bytes = 0;
+    // Retained lifetime/identity vector backing, not live entries or RSS.
+    uint64_t lifetime_identity_bytes = 0;
+    uint64_t lifetime_state_bytes = 0;
+    uint64_t lifetime_link_bytes = 0;
+    uint64_t lifetime_queue_bytes = 0;
+    uint64_t lifetime_version_bytes = 0;
     // Allocator-retained residents with initialized recovered lifetime state.
     // Unread means no applied real reads; virtual recovery seeds do not count.
     uint64_t lifetime_recovered_objects = 0;

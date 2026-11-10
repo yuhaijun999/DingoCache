@@ -157,6 +157,25 @@ class SlabAllocatorTestPeer {
     const std::lock_guard<std::mutex> lock(allocator.mu_);
     return allocator.lifetime_bucket_tokens_.capacity();
   }
+  static bool LifetimeMemoryMatches(
+      const SlabAllocator& allocator,
+      const SlabAllocator::LifetimeMemory& memory) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    return memory.identity_bytes ==
+               allocator.resident_generations_.capacity() * sizeof(uint64_t) &&
+           memory.state_bytes ==
+               allocator.resident_lifetime_states_.capacity() *
+                   sizeof(std::optional<DiskLifetimeState>) &&
+           memory.link_bytes == allocator.lifetime_links_.capacity() *
+                                    sizeof(SlabAllocator::LifetimeLinks) &&
+           memory.queue_bytes == allocator.lifetime_queues_.capacity() *
+                                     sizeof(SlabAllocator::LifetimeQueue) &&
+           memory.version_bytes ==
+               allocator.lifetime_versions_.capacity() * sizeof(uint64_t);
+  }
+  static size_t LifetimeQueueBytes() {
+    return sizeof(SlabAllocator::LifetimeQueue);
+  }
   static bool BucketRowEmpty(const SlabAllocator& allocator, uint32_t extent) {
     const std::lock_guard<std::mutex> lock(allocator.mu_);
     const size_t bands = allocator.opt_.lifetime_bucket_count;

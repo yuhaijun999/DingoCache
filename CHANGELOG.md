@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export retained resident-identity, lifetime-state, dual-link, score-queue and
+  class-version vector backing bytes, globally and per disk. Measure allocated
+  capacity across deletion and recovery, not live objects or total process RSS.
+
 - Export current recovered lifetime residents and their real-unread subset,
   globally and per disk. Rebuild the gauges on recovery and retain hidden pinned
   residents until allocator release; virtual reads do not consume the subset.

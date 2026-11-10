@@ -281,6 +281,11 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_bucket_entries` / `dfkv_slab_disk_lifetime_bucket_entries` | gauge | Logical protection-expiry bucket vector size, B × all physical extents including unbound/empty extents; these are entries, not OS memory pages or currently protected residents. Global / per-disk values, with existing `disk` / `disk_index` labels on the latter. |
 | `dfkv_slab_lifetime_bucket_bytes` / `dfkv_slab_disk_lifetime_bucket_bytes` | gauge | Retained expiry bucket vector backing: capacity × sizeof(entry), currently 16 bytes per entry, not vector size × entry size or an allocation/RSS peak. |
 | `dfkv_slab_lifetime_bucket_token_bytes` / `dfkv_slab_disk_lifetime_bucket_token_bytes` | gauge | Retained resident expiry-token vector backing: capacity × sizeof(uint64_t). Removing residents can clear registrations without releasing backing; clean recovery constructs fresh vectors whose capacity can differ, including zero for an empty rebuilt store. |
+| `dfkv_slab_lifetime_identity_bytes` / `dfkv_slab_disk_lifetime_identity_bytes` | gauge | Resident generation vector capacity × sizeof(uint64_t). Reports actual enabled identity storage, including identity-only configurations; not an estimate of live keys. |
+| `dfkv_slab_lifetime_state_bytes` / `dfkv_slab_disk_lifetime_state_bytes` | gauge | Optional lifetime-state vector capacity × sizeof(optional<DiskLifetimeState>), including alignment and empty entries. |
+| `dfkv_slab_lifetime_link_bytes` / `dfkv_slab_disk_lifetime_link_bytes` | gauge | Dual-index link vector capacity × sizeof(LifetimeLinks); both global and class links belong to each element. |
+| `dfkv_slab_lifetime_queue_bytes` / `dfkv_slab_disk_lifetime_queue_bytes` | gauge | Score-queue vector capacity × sizeof(LifetimeQueue). Logical queue count is (all canonical size classes + 1 global row) × (MAX_READS + 1), even before any resident is written. |
+| `dfkv_slab_lifetime_version_bytes` / `dfkv_slab_disk_lifetime_version_bytes` | gauge | Class mutation-version vector capacity × sizeof(uint64_t), covering all canonical size classes, not only bound classes. |
 | `dfkv_slab_lifetime_recovered_objects` / `dfkv_slab_disk_lifetime_recovered_objects` | gauge | Current allocator residents whose initialized lifetime state has `history_unknown=true`, globally / per disk with existing `disk` and `disk_index` labels. Reading them does not clear their recovered-history marker. Not the cumulative startup `table_rebuilt_objects`, reader-visible-only population, payload bytes or all records restored when scoring initialization was skipped. |
 | `dfkv_slab_lifetime_recovered_unread_objects` / `dfkv_slab_disk_lifetime_recovered_unread_objects` | gauge | The recovered population above whose in-memory `actual_reads` is zero. The first applied nonempty logical read removes one from this subset, but later reads cannot subtract it again. Virtual recovery scoring reads, payload preparation, physical storage reads alone, heat-rejected notifications and metric scrapes do not consume unread population. NEW unread residents are excluded. This state-based gauge is not proof that no logical GET succeeded if its metadata update was skipped. |
 | `dfkv_slab_allocator_objects` / `dfkv_slab_committed_objects` | gauge | allocator resident（含未提交写）/ reader-visible 已提交对象 |
@@ -626,3 +631,25 @@ JSON `issues[].code/message` 包含具体 endpoint/node 和处置方向。
 - 客户端计数搭在 `PeerHealth` 既有锁段上（无新增锁）；per-peer 仅错误路径（罕见）。
 - 插件轮询线程睡眠态、按间隔触发，不在 per-batch/per-page 路径。
 - 验证：每 PR 跑 RDMA Soft-RoCE loopback + ThreadSanitizer 全绿。
+
+Lifetime vector backing gauges use one O(1) allocator-locked snapshot shared
+with the existing bucket/token gauges. They include unused retained capacity:
+Remove/rebind clears ownership but does not promise to release vector backing.
+Clean/dirty recovery constructs fresh vectors; capacity is not persisted or
+promised equal across restarts. Identity-only and internal shadow configurations
+report their actual allocations rather than policy-based synthetic zeroes.
+Global values sum disks; independently sampled global/per-disk scrapes are not
+an atomic cross-disk snapshot. Existing bucket series retain their meanings.
+These gauges exclude vector objects, allocator metadata, fixed counters, base
+Class/ExtentMeta/SlotMeta/key-index storage, transient reallocation copies and
+recovery/process peaks. Their sum is not complete lifetime incremental memory
+or RSS, and does not satisfy the full layout/peak acceptance gate. No key or
+request labels are added; existing dashboards and alerts keep their series.
+
+The original three-field `SlabAllocator::LifetimeBucketMemory` and
+`BucketMemory()` remain available; the expanded `LifetimeMemoryUsage()` is a
+separate API. This does not promise binary compatibility for all internal C++
+cache types: `DiskSlabStore::Stats` grows with these metrics. C++ consumers of
+cache internals must rebuild with matching headers and libraries; do not mix old
+Stats-returning callers with a new library. The public C API and disk format do
+not change.

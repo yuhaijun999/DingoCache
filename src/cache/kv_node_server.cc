@@ -620,6 +620,16 @@ std::string KvNodeServer::MetricsText() const {
            "Retained protection expiry bucket vector backing bytes");
     header("dfkv_slab_disk_lifetime_bucket_token_bytes", "gauge",
            "Retained resident expiry token vector backing bytes");
+    header("dfkv_slab_disk_lifetime_identity_bytes", "gauge",
+           "Retained resident identity vector backing bytes");
+    header("dfkv_slab_disk_lifetime_state_bytes", "gauge",
+           "Retained optional lifetime state vector backing bytes");
+    header("dfkv_slab_disk_lifetime_link_bytes", "gauge",
+           "Retained dual lifetime index link vector backing bytes");
+    header("dfkv_slab_disk_lifetime_queue_bytes", "gauge",
+           "Retained global and class lifetime queue vector backing bytes");
+    header("dfkv_slab_disk_lifetime_version_bytes", "gauge",
+           "Retained class lifetime mutation version vector backing bytes");
     header("dfkv_slab_disk_lifetime_read_source_unclassified_total", "counter",
            "Successful notifications without a completion path");
     header("dfkv_slab_disk_lifetime_read_source_ram_total", "counter",
@@ -704,6 +714,13 @@ std::string KvNodeServer::MetricsText() const {
              disk.lifetime_bucket_bytes);
       sample("dfkv_slab_disk_lifetime_bucket_token_bytes",
              disk.lifetime_bucket_token_bytes);
+      sample("dfkv_slab_disk_lifetime_identity_bytes",
+             disk.lifetime_identity_bytes);
+      sample("dfkv_slab_disk_lifetime_state_bytes", disk.lifetime_state_bytes);
+      sample("dfkv_slab_disk_lifetime_link_bytes", disk.lifetime_link_bytes);
+      sample("dfkv_slab_disk_lifetime_queue_bytes", disk.lifetime_queue_bytes);
+      sample("dfkv_slab_disk_lifetime_version_bytes",
+             disk.lifetime_version_bytes);
       sample("dfkv_slab_disk_allocated_bytes", disk.allocated_bytes);
       sample("dfkv_slab_disk_payload_bytes", disk.payload_bytes);
       sample("dfkv_slab_disk_allocator_payload_bytes",
@@ -1007,6 +1024,21 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_bucket_token_bytes", "gauge",
            "Retained resident expiry token vector backing bytes",
            ss.lifetime_bucket_token_bytes);
+    metric("dfkv_slab_lifetime_identity_bytes", "gauge",
+           "Retained resident identity vector backing bytes",
+           ss.lifetime_identity_bytes);
+    metric("dfkv_slab_lifetime_state_bytes", "gauge",
+           "Retained optional lifetime state vector backing bytes",
+           ss.lifetime_state_bytes);
+    metric("dfkv_slab_lifetime_link_bytes", "gauge",
+           "Retained dual lifetime index link vector backing bytes",
+           ss.lifetime_link_bytes);
+    metric("dfkv_slab_lifetime_queue_bytes", "gauge",
+           "Retained global and class lifetime queue vector backing bytes",
+           ss.lifetime_queue_bytes);
+    metric("dfkv_slab_lifetime_version_bytes", "gauge",
+           "Retained class lifetime mutation version vector backing bytes",
+           ss.lifetime_version_bytes);
     metric("dfkv_slab_allocator_objects", "gauge",
            "Allocator residents including uncommitted writes",
            ss.allocator_objects);
