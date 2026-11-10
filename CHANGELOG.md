@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export sampled Store-lock acquisition wall time for lifetime read notifications,
+  using thread-local sampling without a shared atomic counter. Keep existing
+  processing-body timing and heat behavior unchanged.
+
 - Sample one in 64 lifetime read-notification processing bodies and export the
   sample count, elapsed nanoseconds and sampled maximum. Preserve heat rules;
   exclude Store lock wait and end-to-end notification latency.

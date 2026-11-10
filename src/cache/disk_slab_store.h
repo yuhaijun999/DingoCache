@@ -157,6 +157,15 @@ class DiskSlabStore : public StoreEngine {
     uint64_t max_ns = 0;    // Largest sampled duration, in nanoseconds.
   };
 
+  // Independent wait cohort: first and every 64th enabled nonempty notification
+  // per thread, across stores. Reconstruction resets these stats, not the
+  // surviving thread's phase. Zero samples means unobserved, not zero latency.
+  struct LifetimeReadLockWaitStats {
+    uint64_t samples = 0;   // Completed Store-lock acquisition observations.
+    uint64_t total_ns = 0;  // Sampled acquisition wall time, in nanoseconds.
+    uint64_t max_ns = 0;    // Largest sampled acquisition, in nanoseconds.
+  };
+
   // Actual synchronous payload pread results, published at read finalization.
   // Excludes metadata, recovery, async I/O and external ReadLease fd reads.
   struct SyncPayloadReadCounters {
@@ -171,6 +180,7 @@ class DiskSlabStore : public StoreEngine {
   struct Stats {
     LifetimeReadCounters lifetime_reads{};
     LifetimeReadProcessingStats lifetime_read_processing{};
+    LifetimeReadLockWaitStats lifetime_read_lock_wait{};
     SyncPayloadReadCounters sync_payload_reads{};
     // Explicitly attributed io_uring CQEs, published on storage-lease release.
     AsyncReadCounters uring_payload_reads{};
@@ -629,6 +639,7 @@ class DiskSlabStore : public StoreEngine {
   std::function<void()> lifetime_scan_yield_hook_for_test_{};
   LifetimeReadCounters lifetime_reads_{};  // under mu_
   LifetimeReadProcessingStats lifetime_read_processing_{};  // under mu_
+  LifetimeReadLockWaitStats lifetime_read_lock_wait_{};     // under mu_
   SyncPayloadReadCounters sync_payload_reads_{};  // under mu_
   AsyncReadCounters uring_payload_reads_{};       // under mu_
   uint64_t committed_payload_bytes_ = 0;  // under mu_

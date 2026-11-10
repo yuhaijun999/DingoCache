@@ -2861,7 +2861,26 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
     LifetimeReadSource source, PreparedRead::Source transport_source) {
   // Keep disabled and empty successes off the lifetime lock/clock path.
   if (!opt_.lifetime_config.has_value() || bytes == 0) return;
+  // Select before D without a shared atomic RMW. This phase belongs to the
+  // thread across all stores, independently of the per-store body cohort.
+  thread_local unsigned char lock_wait_phase = 0;
+  const bool sample_lock_wait = lock_wait_phase == 0;
+  lock_wait_phase = static_cast<unsigned char>((lock_wait_phase + 1U) & 63U);
+  std::chrono::steady_clock::time_point wait_started{};
+  if (sample_lock_wait) wait_started = std::chrono::steady_clock::now();
   const std::lock_guard<std::mutex> lock(mu_);
+  if (sample_lock_wait) {
+    // Acquisition wall time includes mutex overhead and descheduling, not
+    // processing or completed-to-applied lag. Publish only under existing D.
+    const uint64_t elapsed_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started)
+            .count());
+    ++lifetime_read_lock_wait_.samples;
+    lifetime_read_lock_wait_.total_ns += elapsed_ns;
+    lifetime_read_lock_wait_.max_ns =
+        std::max(lifetime_read_lock_wait_.max_ns, elapsed_ns);
+  }
   ++lifetime_reads_.successful;
   const ScopedLifetimeReadProcessingTimer processing_timer(
       (lifetime_reads_.successful & 63U) == 1U ? &lifetime_read_processing_
@@ -3101,6 +3120,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
 
   st.lifetime_reads = lifetime_reads_;
   st.lifetime_read_processing = lifetime_read_processing_;
+  st.lifetime_read_lock_wait = lifetime_read_lock_wait_;
   st.sync_payload_reads = sync_payload_reads_;
   st.uring_payload_reads = uring_payload_reads_;
   st.payload_bytes = committed_payload_bytes_;
