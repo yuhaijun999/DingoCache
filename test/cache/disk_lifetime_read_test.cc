@@ -112,8 +112,20 @@ class DiskLifetimeReadTest : public ::testing::Test {
     return *snapshot.second;
   }
   DiskSlabStore::LifetimeReadCounters Counters() const {
-    const DiskSlabStore::LifetimeReadCounters counters =
-        store_->GetStats().lifetime_reads;
+    const DiskSlabStore::Stats stats = store_->GetStats();
+    const DiskSlabStore::LifetimeReadCounters counters = stats.lifetime_reads;
+    const DiskSlabStore::LifetimeReadProcessingStats processing =
+        stats.lifetime_read_processing;
+    EXPECT_EQ(processing.samples, counters.successful / 64 +
+                                      (counters.successful % 64 != 0 ? 1 : 0));
+    EXPECT_GE(processing.total_ns, processing.max_ns);
+    if (processing.samples == 0) {
+      EXPECT_EQ(processing.total_ns, 0U);
+      EXPECT_EQ(processing.max_ns, 0U);
+    }
+    if (processing.samples == 1) {
+      EXPECT_EQ(processing.total_ns, processing.max_ns);
+    }
     EXPECT_EQ(counters.successful,
               counters.applied + counters.no_binding + counters.race_lost +
                   counters.clock_hard_exhausted + counters.io_unhealthy +
@@ -149,6 +161,115 @@ class DiskLifetimeReadTest : public ::testing::Test {
   std::unique_ptr<DiskSlabStore> store_;
   std::filesystem::path dir_;
 };
+
+TEST_F(DiskLifetimeReadTest, ProcessingSamplesEvery64EligibleNotifications) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  DiskSlabStore::LifetimeReadProcessingStats previous =
+      store_->GetStats().lifetime_read_processing;
+  EXPECT_EQ(previous.samples, 0U);
+  for (uint64_t notification = 1; notification <= 130; ++notification) {
+    store_->NotifyLifetimeReadSuccess(
+        key_, notification % 2 != 0 ? identity : DiskResidentIdentity{}, 5);
+    // Empty events neither consume the sampling phase nor alter processing.
+    store_->NotifyLifetimeReadSuccess(key_, identity, 0);
+    const DiskSlabStore::LifetimeReadProcessingStats processing =
+        store_->GetStats().lifetime_read_processing;
+    EXPECT_EQ(processing.samples, (notification + 63) / 64);
+    EXPECT_GE(processing.total_ns, previous.total_ns);
+    EXPECT_GE(processing.max_ns, previous.max_ns);
+    EXPECT_GE(processing.total_ns, processing.max_ns);
+    if ((notification & 63U) != 1U) {
+      EXPECT_EQ(processing.samples, previous.samples);
+      EXPECT_EQ(processing.total_ns, previous.total_ns);
+      EXPECT_EQ(processing.max_ns, previous.max_ns);
+    }
+    previous = processing;
+  }
+  const DiskSlabStore::LifetimeReadCounters counters = Counters();
+  EXPECT_EQ(counters.successful, 130U);
+  EXPECT_EQ(counters.applied, 65U);
+  EXPECT_EQ(counters.no_binding, 65U);
+  EXPECT_EQ(previous.samples, 3U);
+}
+
+TEST_F(DiskLifetimeReadTest, ProcessingSamplesRejectedEarlyReturns) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  store_->NotifyLifetimeReadSuccess(key_, {}, 5);
+  EXPECT_EQ(store_->GetStats().lifetime_read_processing.samples, 1U);
+  for (unsigned i = 0; i < 63; ++i)
+    store_->NotifyLifetimeReadSuccess(key_, identity, 5);
+  const DiskSlabStore::LifetimeReadProcessingStats previous =
+      store_->GetStats().lifetime_read_processing;
+  EXPECT_EQ(previous.samples, 1U);
+  ASSERT_EQ(
+      DiskSlabStoreTestPeer::RemoveAllocatorResidentForTest(*store_, key_),
+      SlabAllocator::RemoveResult::kRemoved);
+  store_->NotifyLifetimeReadSuccess(key_, identity, 5);
+  const DiskSlabStore::LifetimeReadProcessingStats processing =
+      store_->GetStats().lifetime_read_processing;
+  EXPECT_EQ(processing.samples, 2U);
+  EXPECT_GE(processing.total_ns, previous.total_ns);
+  EXPECT_GE(processing.max_ns, previous.max_ns);
+  const DiskSlabStore::LifetimeReadCounters counters = Counters();
+  EXPECT_EQ(counters.successful, 65U);
+  EXPECT_EQ(counters.no_binding, 1U);
+  EXPECT_EQ(counters.applied, 63U);
+  EXPECT_EQ(counters.race_allocator_unavailable, 1U);
+}
+
+TEST_F(DiskLifetimeReadTest,
+       ProcessingMeasuresControlledWorkInsideNotification) {
+  struct ClockGate {
+    std::atomic<bool> block{false};
+    std::promise<void> entered;
+    std::shared_future<void> release;
+  };
+  const std::shared_ptr<ClockGate> gate = std::make_shared<ClockGate>();
+  std::promise<void> release;
+  gate->release = release.get_future().share();
+  const std::future<void> entered = gate->entered.get_future();
+  // Shared ownership keeps this test clock's state valid even if setup fails
+  // before explicit teardown. No production timing hook is introduced.
+  clock_ = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config_), [this, gate] {
+        samples_.fetch_add(1, std::memory_order_relaxed);
+        if (gate->block.load()) {
+          gate->entered.set_value();
+          gate->release.wait();
+        }
+        return seconds_.load(std::memory_order_relaxed);
+      });
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  gate->block.store(true);
+  std::promise<void> finished;
+  const std::future<void> completion = finished.get_future();
+  std::thread notifier([&] {
+    store_->NotifyLifetimeReadSuccess(key_, identity, 5);
+    finished.set_value();
+  });
+  const std::future_status reached = entered.wait_for(std::chrono::seconds(5));
+  const std::future_status waiting =
+      completion.wait_for(std::chrono::milliseconds(30));
+  // Always release and join, including a failed handshake, before assertions.
+  // This controlled delay proves positive work, not a latency budget or p99.
+  release.set_value();
+  notifier.join();
+  gate->block.store(false);
+  EXPECT_EQ(reached, std::future_status::ready);
+  EXPECT_EQ(waiting, std::future_status::timeout);
+  const DiskSlabStore::LifetimeReadProcessingStats processing =
+      store_->GetStats().lifetime_read_processing;
+  EXPECT_EQ(processing.samples, 1U);
+  EXPECT_GT(processing.total_ns, 0U);
+  EXPECT_EQ(processing.max_ns, processing.total_ns);
+  EXPECT_EQ(Counters().applied, 1U);
+  EXPECT_EQ(State().actual_reads, 1U);
+  store_.reset();
+  clock_.reset();
+}
 
 TEST_F(DiskLifetimeReadTest,
        TransportPreparationPartitionPreservesCoarseTotal) {

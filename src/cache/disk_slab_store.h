@@ -148,6 +148,15 @@ class DiskSlabStore : public StoreEngine {
     uint64_t transport_fallback_copy_follower = 0;
   };
 
+  // Every 64th enabled nonempty notification, starting with the first, is
+  // timed after acquiring D through processing completion. This includes
+  // rejected heat events, but excludes D acquisition wait and delivery lag.
+  struct LifetimeReadProcessingStats {
+    uint64_t samples = 0;   // Completed processing-time observations.
+    uint64_t total_ns = 0;  // Sum of sampled durations, in nanoseconds.
+    uint64_t max_ns = 0;    // Largest sampled duration, in nanoseconds.
+  };
+
   // Actual synchronous payload pread results, published at read finalization.
   // Excludes metadata, recovery, async I/O and external ReadLease fd reads.
   struct SyncPayloadReadCounters {
@@ -161,6 +170,7 @@ class DiskSlabStore : public StoreEngine {
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
   struct Stats {
     LifetimeReadCounters lifetime_reads{};
+    LifetimeReadProcessingStats lifetime_read_processing{};
     SyncPayloadReadCounters sync_payload_reads{};
     // Explicitly attributed io_uring CQEs, published on storage-lease release.
     AsyncReadCounters uring_payload_reads{};
@@ -618,6 +628,7 @@ class DiskSlabStore : public StoreEngine {
   // Invoked only between class slices, after releasing BOTH lifecycle locks.
   std::function<void()> lifetime_scan_yield_hook_for_test_{};
   LifetimeReadCounters lifetime_reads_{};  // under mu_
+  LifetimeReadProcessingStats lifetime_read_processing_{};  // under mu_
   SyncPayloadReadCounters sync_payload_reads_{};  // under mu_
   AsyncReadCounters uring_payload_reads_{};       // under mu_
   uint64_t committed_payload_bytes_ = 0;  // under mu_

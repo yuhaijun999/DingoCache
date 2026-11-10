@@ -63,6 +63,35 @@ constexpr uint32_t kStateMagic = 0x53424C53u;  // "SLBS"
 constexpr uint32_t kStateClean = 1;
 constexpr uint32_t kStateDirty = 2;
 
+// Created after D is acquired and destroyed before D is released, including
+// rejected heat events. Unsampled notifications do not read the timing clock.
+class ScopedLifetimeReadProcessingTimer {
+ public:
+  explicit ScopedLifetimeReadProcessingTimer(
+      DiskSlabStore::LifetimeReadProcessingStats* stats)
+      : stats_(stats) {
+    if (stats_ != nullptr) started_ = std::chrono::steady_clock::now();
+  }
+  ScopedLifetimeReadProcessingTimer(const ScopedLifetimeReadProcessingTimer&) =
+      delete;
+  ScopedLifetimeReadProcessingTimer& operator=(
+      const ScopedLifetimeReadProcessingTimer&) = delete;
+  ~ScopedLifetimeReadProcessingTimer() {
+    if (stats_ == nullptr) return;
+    const uint64_t elapsed_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started_)
+            .count());
+    ++stats_->samples;
+    stats_->total_ns += elapsed_ns;
+    stats_->max_ns = std::max(stats_->max_ns, elapsed_ns);
+  }
+
+ private:
+  DiskSlabStore::LifetimeReadProcessingStats* stats_;
+  std::chrono::steady_clock::time_point started_{};
+};
+
 // Allocate only for opt-in stores. Saturate instead of wrapping, even when
 // old stores/credentials still exist; this is not a disk routing index.
 uint64_t NextResidentStoreInstance() {
@@ -2834,6 +2863,9 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
   if (!opt_.lifetime_config.has_value() || bytes == 0) return;
   const std::lock_guard<std::mutex> lock(mu_);
   ++lifetime_reads_.successful;
+  const ScopedLifetimeReadProcessingTimer processing_timer(
+      (lifetime_reads_.successful & 63U) == 1U ? &lifetime_read_processing_
+                                               : nullptr);
   // Source is an independent partition, including notifications left unheated.
   // The caller supplies one valid enumerator; do not infer it from identity.
   switch (source) {
@@ -3068,6 +3100,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
       lifetime_watermark_protected_victims_;
 
   st.lifetime_reads = lifetime_reads_;
+  st.lifetime_read_processing = lifetime_read_processing_;
   st.sync_payload_reads = sync_payload_reads_;
   st.uring_payload_reads = uring_payload_reads_;
   st.payload_bytes = committed_payload_bytes_;

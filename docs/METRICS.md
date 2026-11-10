@@ -279,6 +279,9 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_read_io_unhealthy_total` / `dfkv_slab_lifetime_read_state_unavailable_total` | counter | 已成功的读在通知时遇盘I/O隔离 / 匹配住户的评分state缺失或时间不变量错误（正常应为0）；均不改原读状态。失败GET本身不发送通知 |
 | `dfkv_slab_disk_lifetime_read_success_total` / `dfkv_slab_disk_lifetime_read_applied_total` | counter | Per-disk successful nonempty logical read notifications / notifications applied to the original resident, using existing `disk` / `disk_index` and optional node identity labels. These reuse existing Store counters, not physical payload I/O counts, transport delivery/client-consumption proof, or proof of deduplication. |
 | `dfkv_slab_disk_lifetime_read_no_binding_total` / `dfkv_slab_disk_lifetime_read_race_lost_total` | counter | Per-disk notifications without a disk credential / with an obsolete or removed original resident. Attribution follows the key's configured disk route even for an unbound source; it does not prove that the bytes came from that disk. |
+| `dfkv_slab_lifetime_read_processing_samples_total` / `dfkv_slab_disk_lifetime_read_processing_samples_total` | counter | Sampled processing bodies of enabled nonempty successful-read notifications, first/65th/129th... in Store lock acquisition order; includes notifications whose heat is rejected. |
+| `dfkv_slab_lifetime_read_processing_ns_total` / `dfkv_slab_disk_lifetime_read_processing_ns_total` | counter | Sum of sampled notification-body elapsed wall nanoseconds after obtaining the Store lock; includes allocator lock wait and descheduling, excludes Store lock wait and timing-ledger updates. Not all-notification elapsed time. |
+| `dfkv_slab_lifetime_read_processing_max_ns` / `dfkv_slab_disk_lifetime_read_processing_max_ns` | gauge | Maximum observed sampled body duration since Store reconstruction; aggregate is max across disks, NOT a sum, window maximum or percentile. Samples=0 means unobserved, not zero latency. |
 | `dfkv_slab_lifetime_read_race_identity_scope_total` / `dfkv_slab_disk_lifetime_read_race_identity_scope_total` | counter | Receiving Store identity context is absent, or credential store instance/run epoch differs. Checked before payload visibility. |
 | `dfkv_slab_lifetime_read_race_not_visible_total` / `dfkv_slab_disk_lifetime_read_race_not_visible_total` | counter | Identity scope matches, but no reader-visible payload remains under the Store lifecycle lock. Does not prove the physical slot is already freed or distinguish Remove from eviction. |
 | `dfkv_slab_lifetime_read_race_generation_mismatch_total` / `dfkv_slab_disk_lifetime_read_race_generation_mismatch_total` | counter | Existing allocator lookup found a live, nonpending resident with a different current generation. The current generation may be reserved/uncommitted (zero); no replacement-commit claim. |
@@ -1018,3 +1021,33 @@ Counters reset on Store reconstruction; recovery virtual reads do not increment
 them. Legacy without lifetime scoring exports zero and file mode omits slab
 families. Existing alerts/dashboards keep the coarse family unchanged; do not
 sum its children with their parent or treat these as completed E2 acceptance.
+
+
+### Sampled notification processing cost
+
+Sampling reuses the existing D-protected successful-notification count: first,
+65th, 129th, etc. Empty or disabled notifications do not advance it. A local
+noncopyable timer is constructed after the Store lock and successful increment;
+it records before that lock is released, including all normal early returns.
+Only selected notifications read `steady_clock` twice. No new shared sampler,
+atomic RMW, lock, request/resident field or scoring-clock read is introduced.
+Three plain counters share the existing D lock and Stats snapshot; reset on
+reconstruction, recovery virtual reads add zero. Legacy without lifetime
+tracking reports zero; file mode omits these slab families. Existing disk/node
+labels remain, with no key/request labels.
+
+The interval is processing-body elapsed wall time, not full D hold time, D
+acquisition wait, completed-to-applied delay, CPU time, READY/client consumption
+or GET latency. Fixed-period sampling can correlate with periodic workloads;
+it is not random/unbiased. Do not multiply the sampled sum by 64 as an exact
+total, divide it by all successes as a mean, or use sampled max as p99. A sampled
+mean is sum/samples (nanoseconds; divide by 1e9 for seconds), with zero samples
+undefined. Global samples/sum add across disks; max takes their maximum.
+Separate scrapes are not a cross-disk transaction.
+
+Store and Stats each gain 24 fixed bytes; sampled calls add two monotonic clock
+reads plus bookkeeping under D, and unsampled calls still have a branch/local
+timer. Its static size is not a complete stack-frame or RSS budget. This is
+not zero overhead or completed lock/latency acceptance: D wait and full
+completed-to-applied instrumentation remain separate work. No new alert/query
+migration is needed; existing metric names and heat rules are unchanged.

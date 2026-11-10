@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Sample one in 64 lifetime read-notification processing bodies and export the
+  sample count, elapsed nanoseconds and sampled maximum. Preserve heat rules;
+  exclude Store lock wait and end-to-end notification latency.
+
 - Split rejected lifetime read notifications into identity scope, visibility,
   resident generation and allocator-guard reasons. Preserve the existing
   race-lost total, outcome partition and heat application rules.
