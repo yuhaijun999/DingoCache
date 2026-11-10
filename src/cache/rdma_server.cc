@@ -202,13 +202,14 @@ bool RdmaServer::AdmitPullGrant(PreparedRead& read) {
 
 void RdmaServer::RecordPullGrant(const BlockKey& key,
                                  const DiskResidentIdentity& identity,
-                                 size_t bytes, bool& grant_recorded) {
+                                 size_t bytes, bool& grant_recorded,
+                                 PreparedRead::Source source) {
   if (grant_recorded) return;
   // Consume this generation's event before invoking the observer. READY send
   // failures and subsequent RELEASE/teardown must never replay or undo it.
   grant_recorded = true;
   if (bytes != 0 && pull_read_success_handler_)
-    pull_read_success_handler_(key, identity, bytes);
+    pull_read_success_handler_(key, identity, bytes, source);
 }
 
 RdmaServer::RdmaServer(Handler handler, size_t max_msg,
@@ -1250,13 +1251,19 @@ void RdmaServer::Serve(int boot_fd) {
     const DiskResidentIdentity identity = prepared.status() == Status::kOk
                                               ? prepared.source_identity()
                                               : fallback_identity;
+    // Preserve the preparation route before moving ownership. A synchronous
+    // fallback has no PreparedRead and must not be guessed to be a disk hit.
+    const PreparedRead::Source source =
+        prepared.status() == Status::kOk
+            ? prepared.source()
+            : PreparedRead::Source::kSynchronousFallback;
     state.arena_read = std::move(prepared);
     state.read_elapsed_sec = elapsed_sec;
     state.busy = true;
     state.data_len = output_len;
     state.value_len = value_len;
     RecordPullGrant(request.fields.Key(), identity, output_len,
-                    state.grant_recorded);
+                    state.grant_recorded, source);
     const rdma::DynamicPullReady ready{
         static_cast<uint32_t>(slot), state.generation, output_len, value_len,
         reinterpret_cast<uint64_t>(output), state.mr->rkey};
@@ -1302,7 +1309,8 @@ void RdmaServer::Serve(int boot_fd) {
     state.data_len = state.arena_read.payload_len();
     state.value_len = state.arena_read.value_len();
     RecordPullGrant(request.fields.Key(), state.arena_read.source_identity(),
-                    state.data_len, state.grant_recorded);
+                    state.data_len, state.grant_recorded,
+                    state.arena_read.source());
     const rdma::DynamicPullReady ready{
         static_cast<uint32_t>(slot), state.generation, state.data_len,
         state.value_len, reinterpret_cast<uint64_t>(state.arena_read.data()),

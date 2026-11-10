@@ -434,10 +434,11 @@ int main(int argc, char** argv) {
                char* staging, size_t cap) {
           return srv.PrepareReadForKey(key, off, len, staging, cap);
         });
-    rsrv->SetPullReadSuccessHandler(
+    rsrv->SetPullReadSuccessWithSourceHandler(
         [&srv](const dfkv::BlockKey& key,
-               const dfkv::DiskResidentIdentity& identity, size_t bytes) {
-          srv.NotifyLifetimeReadSuccessForKey(key, identity, bytes);
+               const dfkv::DiskResidentIdentity& identity, size_t bytes,
+               dfkv::PreparedRead::Source source) {
+          srv.NotifyLifetimeReadSuccessForKey(key, identity, bytes, source);
         });
     rsrv->SetRestartRequiredHandler(
         [&srv] { return srv.LifetimeRestartRequired(); });

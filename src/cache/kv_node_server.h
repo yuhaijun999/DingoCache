@@ -164,12 +164,12 @@ class KvNodeServer {
   // The caller notifies once; never call on preparation or resource release.
   // No admission recheck: an established grant remains successful when
   // unheated.
-  void NotifyLifetimeReadSuccessForKey(const BlockKey& key,
-                                       const DiskResidentIdentity& identity,
-                                       size_t bytes) {
+  void NotifyLifetimeReadSuccessForKey(
+      const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
+      PreparedRead::Source source = PreparedRead::Source::kUnclassified) {
     group_.NotifyLifetimeReadSuccess(
         key, identity, bytes,
-        DiskSlabStore::LifetimeReadSource::kTransportGrant);
+        DiskSlabStore::LifetimeReadSource::kTransportGrant, source);
   }
 
   bool ram_enabled() const { return ram_ != nullptr; }

@@ -15,6 +15,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -674,6 +675,20 @@ std::string KvNodeServer::MetricsText() const {
            "Successful reads copied from shared flight bytes");
     header("dfkv_slab_disk_lifetime_read_source_transport_grant_total",
            "counter", "Successful transport read grant notifications");
+    header("dfkv_slab_disk_lifetime_read_transport_unclassified_total",
+           "counter",
+           "Grant notifications without preparation-path provenance");
+    header("dfkv_slab_disk_lifetime_read_transport_ram_hit_total", "counter",
+           "Grant notifications prepared from RAM resident hits");
+    header("dfkv_slab_disk_lifetime_read_transport_disk_staging_total",
+           "counter", "Grant notifications prepared with staged disk I/O");
+    header("dfkv_slab_disk_lifetime_read_transport_disk_to_ram_total",
+           "counter", "Grant notifications prepared with disk I/O into RAM");
+    header("dfkv_slab_disk_lifetime_read_transport_published_follower_total",
+           "counter",
+           "Grant notifications from RAM preparation after a publication wait");
+    header("dfkv_slab_disk_lifetime_read_transport_synchronous_fallback_total",
+           "counter", "Grant notifications from synchronous range fallbacks");
     header("dfkv_slab_disk_lifetime_read_success_total", "counter",
            "Nonzero successful business reads notified to lifetime metadata");
     header("dfkv_slab_disk_lifetime_read_applied_total", "counter",
@@ -749,6 +764,19 @@ std::string KvNodeServer::MetricsText() const {
              disk.lifetime_reads.source_copy_follower);
       sample("dfkv_slab_disk_lifetime_read_source_transport_grant_total",
              disk.lifetime_reads.source_transport_grant);
+      sample("dfkv_slab_disk_lifetime_read_transport_unclassified_total",
+             disk.lifetime_reads.transport_unclassified);
+      sample("dfkv_slab_disk_lifetime_read_transport_ram_hit_total",
+             disk.lifetime_reads.transport_ram_hit);
+      sample("dfkv_slab_disk_lifetime_read_transport_disk_staging_total",
+             disk.lifetime_reads.transport_disk_staging);
+      sample("dfkv_slab_disk_lifetime_read_transport_disk_to_ram_total",
+             disk.lifetime_reads.transport_disk_to_ram);
+      sample("dfkv_slab_disk_lifetime_read_transport_published_follower_total",
+             disk.lifetime_reads.transport_published_follower);
+      sample(
+          "dfkv_slab_disk_lifetime_read_transport_synchronous_fallback_total",
+          disk.lifetime_reads.transport_synchronous_fallback);
       sample("dfkv_slab_disk_lifetime_read_success_total",
              disk.lifetime_reads.successful);
       sample("dfkv_slab_disk_lifetime_read_applied_total",
@@ -1018,6 +1046,25 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_read_source_transport_grant_total", "counter",
            "Successful transport read grant notifications",
            ss.lifetime_reads.source_transport_grant);
+    metric("dfkv_slab_lifetime_read_transport_unclassified_total", "counter",
+           "Grant notifications without preparation-path provenance",
+           ss.lifetime_reads.transport_unclassified);
+    metric("dfkv_slab_lifetime_read_transport_ram_hit_total", "counter",
+           "Grant notifications prepared from RAM resident hits",
+           ss.lifetime_reads.transport_ram_hit);
+    metric("dfkv_slab_lifetime_read_transport_disk_staging_total", "counter",
+           "Grant notifications prepared with staged disk I/O",
+           ss.lifetime_reads.transport_disk_staging);
+    metric("dfkv_slab_lifetime_read_transport_disk_to_ram_total", "counter",
+           "Grant notifications prepared with disk I/O into RAM",
+           ss.lifetime_reads.transport_disk_to_ram);
+    metric("dfkv_slab_lifetime_read_transport_published_follower_total",
+           "counter",
+           "Grant notifications from RAM preparation after a publication wait",
+           ss.lifetime_reads.transport_published_follower);
+    metric("dfkv_slab_lifetime_read_transport_synchronous_fallback_total",
+           "counter", "Grant notifications from synchronous range fallbacks",
+           ss.lifetime_reads.transport_synchronous_fallback);
     metric("dfkv_slab_lifetime_read_success_total", "counter",
            "Nonzero successful business reads notified to lifetime metadata",
            ss.lifetime_reads.successful);
@@ -1931,6 +1978,7 @@ PreparedRead KvNodeServer::PrepareReadForKey(
       if (waited == ReadCoalescer::PublishedWait::kReady) {
         resident = prepare_ram_hit();
         if (resident.status() == Status::kOk) {
+          resident.source_ = PreparedRead::Source::kPublishedFollower;
           read_coalescer_.RecordCoalesced();
           return resident;
         }
@@ -1993,15 +2041,19 @@ PreparedRead KvNodeServer::PrepareReadForKey(
   // SEND; completion publishes the durable entry, then SEND completion drops
   // the final pin. Partial, oversized, and arena-pressure reads retain staging.
   if (direct_reservation) {
-    auto promoted = std::make_shared<PromotedRead>();
+    const std::shared_ptr<PromotedRead> promoted =
+        std::make_shared<PromotedRead>();
     promoted->server = this;
     promoted->reservation = std::move(reservation);
     char* destination = promoted->reservation.data();
     const size_t destination_cap = promoted->reservation.capacity();
-    return PreparedRead::Storage(
-        std::move(lease), destination, destination_cap, promoted.get(),
-        flight, &FinishPromotedDiskRead,
+    PreparedRead read = PreparedRead::Storage(
+        std::move(lease), destination, destination_cap, promoted.get(), flight,
+        &FinishPromotedDiskRead,
         /*source_registered=*/true, staging, staging_cap, promoted);
+    // Registered RAM is the I/O destination, not an existing RAM hit.
+    read.source_ = PreparedRead::Source::kDiskToRam;
+    return read;
   }
 
   return PreparedRead::Storage(std::move(lease), staging, staging_cap, this,

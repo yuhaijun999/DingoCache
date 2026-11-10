@@ -118,6 +118,18 @@ class ReadLease {
 // destructor wins exactly once; subsequent terminal calls are harmless.
 class PreparedRead {
  public:
+  // Preparation path only, not physical I/O, buffer registration or grant
+  // delivery. A synchronous fallback is classified by its transport owner.
+  enum class Source : unsigned char {
+    kUnclassified = 0,  // No preparation-path provenance was supplied.
+    kRamHit = 1,        // This request pinned an existing RAM value.
+    kDiskStaging = 2,   // This request prepared disk I/O into staging.
+    kDiskToRam = 3,     // Disk I/O targets a hidden RAM reservation.
+    kPublishedFollower =
+        4,  // RAM prepared after a successful publication wait.
+    kSynchronousFallback = 5  // Transport used its synchronous range handler.
+  };
+
   PreparedRead() noexcept = default;
   ~PreparedRead() { Abort(); }
   PreparedRead(const PreparedRead&) = delete;
@@ -132,6 +144,7 @@ class PreparedRead {
   }
 
   Status status() const noexcept { return status_; }
+  Source source() const noexcept { return source_; }
   // Finalize completed I/O before registering a grant. This releases storage
   // without publishing RAM/coalescer success; Commit still owns that decision.
   // A failure is latched: a later Ok cannot override it.
@@ -245,6 +258,7 @@ class PreparedRead {
       std::shared_ptr<void> post_read_hold = {}) noexcept {
     PreparedRead read;
     read.status_ = Status::kOk;
+    read.source_ = Source::kDiskStaging;
     read.needs_io_ = lease.aligned_len != 0;
     read.source_registered_ = source_registered;
     read.aligned_off_ = lease.aligned_off;
@@ -272,6 +286,7 @@ class PreparedRead {
       const DiskResidentIdentity& identity = {}) noexcept {
     PreparedRead read;
     read.status_ = Status::kOk;
+    read.source_ = Source::kRamHit;
     read.lease_.identity_ = identity;
     read.payload_len_ = payload_len;
     read.value_len_ = value_len;
@@ -287,6 +302,7 @@ class PreparedRead {
   }
   void MoveFrom(PreparedRead&& other) noexcept {
     status_ = other.status_;
+    source_ = std::exchange(other.source_, Source::kUnclassified);
     active_ = std::exchange(other.active_, false);
     needs_io_ = other.needs_io_;
     storage_finished_ = std::exchange(other.storage_finished_, false);
@@ -309,6 +325,7 @@ class PreparedRead {
   }
 
   Status status_ = Status::kInvalid;
+  Source source_ = Source::kUnclassified;
   bool active_ = false;
   bool needs_io_ = false;
   bool storage_finished_ = false;

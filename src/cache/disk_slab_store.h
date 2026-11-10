@@ -125,6 +125,14 @@ class DiskSlabStore : public StoreEngine {
     uint64_t source_copy_leader = 0;
     uint64_t source_copy_follower = 0;
     uint64_t source_transport_grant = 0;
+    // A separate partition of transport grants by preparation path only.
+    // These do not add to the six-source partition above or prove payload I/O.
+    uint64_t transport_unclassified = 0;
+    uint64_t transport_ram_hit = 0;
+    uint64_t transport_disk_staging = 0;
+    uint64_t transport_disk_to_ram = 0;
+    uint64_t transport_published_follower = 0;
+    uint64_t transport_synchronous_fallback = 0;
   };
 
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
@@ -391,9 +399,12 @@ class DiskSlabStore : public StoreEngine {
   // captured identity proves byte provenance, not current residency: recheck
   // the same generation before heating, never reconstruct it from the key.
   bool TracksLifetimeState() const { return opt_.lifetime_config.has_value(); }
+  // transport_source is used only for kTransportGrant; other sources ignore it.
   void NotifyLifetimeReadSuccess(
       const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
-      LifetimeReadSource source = LifetimeReadSource::kUnclassified);
+      LifetimeReadSource source = LifetimeReadSource::kUnclassified,
+      PreparedRead::Source transport_source =
+          PreparedRead::Source::kUnclassified);
   Stats GetStats() const;
   std::vector<SlabAllocator::ClassStat> ClassStats() const;
   // Metrics-only retained queue populations; not scores or logical read

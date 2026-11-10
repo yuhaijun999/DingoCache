@@ -151,10 +151,11 @@ class RdmaServerTestPeer {
                                  identity);
   }
 
-  static void RecordPullGrant(RdmaServer& server, const BlockKey& key,
-                              const DiskResidentIdentity& identity,
-                              size_t bytes, bool& grant_recorded) {
-    server.RecordPullGrant(key, identity, bytes, grant_recorded);
+  static void RecordPullGrant(
+      RdmaServer& server, const BlockKey& key,
+      const DiskResidentIdentity& identity, size_t bytes, bool& grant_recorded,
+      PreparedRead::Source source = PreparedRead::Source::kUnclassified) {
+    server.RecordPullGrant(key, identity, bytes, grant_recorded, source);
   }
 
   static bool AdmitPullGrant(RdmaServer& server, PreparedRead& read) {
@@ -567,10 +568,10 @@ class RdmaPullHeatTest : public ::testing::Test {
     node_ = std::make_unique<KvNodeServer>(options);
     ASSERT_TRUE(node_->Healthy());
     KvNodeServerTestPeer::DisablePullCoalescing(*node_);
-    transport_.SetPullReadSuccessHandler(
+    transport_.SetPullReadSuccessWithSourceHandler(
         [this](const BlockKey& key, const DiskResidentIdentity& identity,
-               size_t bytes) {
-          node_->NotifyLifetimeReadSuccessForKey(key, identity, bytes);
+               size_t bytes, PreparedRead::Source source) {
+          node_->NotifyLifetimeReadSuccessForKey(key, identity, bytes, source);
         });
   }
   DiskResidentIdentity Seed() {
@@ -593,8 +594,11 @@ class RdmaPullHeatTest : public ::testing::Test {
     }
     return read.FinishStorage(Status::kOk, read.payload_len());
   }
-  void Grant(const DiskResidentIdentity& source, bool& recorded) {
-    RdmaServerTestPeer::RecordPullGrant(transport_, key_, source, 5, recorded);
+  void Grant(
+      const DiskResidentIdentity& identity, bool& recorded,
+      PreparedRead::Source source = PreparedRead::Source::kUnclassified) {
+    RdmaServerTestPeer::RecordPullGrant(transport_, key_, identity, 5, recorded,
+                                        source);
   }
   DiskSlabStore::LifetimeReadCounters Counters() const {
     const DiskSlabStore::LifetimeReadCounters counters =
@@ -603,6 +607,12 @@ class RdmaPullHeatTest : public ::testing::Test {
               counters.applied + counters.no_binding + counters.race_lost +
                   counters.clock_hard_exhausted + counters.io_unhealthy +
                   counters.state_unavailable);
+    EXPECT_EQ(counters.source_transport_grant,
+              counters.transport_unclassified + counters.transport_ram_hit +
+                  counters.transport_disk_staging +
+                  counters.transport_disk_to_ram +
+                  counters.transport_published_follower +
+                  counters.transport_synchronous_fallback);
     return counters;
   }
   const ScopedEnv slab_{"DFKV_STORE_ENGINE", "slab"};
@@ -664,6 +674,7 @@ TEST_F(RdmaPullHeatTest, StorageCompletionIsNotGrantAndGrantIsExactlyOnce) {
   const DiskResidentIdentity identity = Seed();
   PreparedRead read = Prepare();
   ASSERT_EQ(read.status(), Status::kOk);
+  EXPECT_EQ(read.source(), PreparedRead::Source::kDiskStaging);
   EXPECT_FALSE(read.source_identity().valid());
   EXPECT_EQ(Counters().successful, 0U);
   ASSERT_EQ(Finish(read), Status::kOk);
@@ -672,14 +683,107 @@ TEST_F(RdmaPullHeatTest, StorageCompletionIsNotGrantAndGrantIsExactlyOnce) {
   EXPECT_EQ(Counters().successful, 0U);
   // This independent once flag is not the async slot's I/O busy reservation.
   bool grant_recorded = false;
-  Grant(read.source_identity(), grant_recorded);
+  Grant(read.source_identity(), grant_recorded, read.source());
   EXPECT_TRUE(grant_recorded);
-  Grant(read.source_identity(), grant_recorded);
+  Grant(read.source_identity(), grant_recorded, read.source());
   EXPECT_EQ(Counters().applied, 1U);
+  EXPECT_EQ(Counters().transport_disk_staging, 1U);
   EXPECT_TRUE(read.Abort());
   EXPECT_FALSE(read.owns_cleanup());
   EXPECT_EQ(Counters().applied, 1U);
   EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 0U);
+}
+
+TEST_F(RdmaPullHeatTest, SourceAwareAndLegacyObserversReplaceAndClear) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  Seed();
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_EQ(Finish(read), Status::kOk);
+  const PreparedRead::Source expected = read.source();
+  ASSERT_EQ(expected, PreparedRead::Source::kDiskStaging);
+  unsigned source_calls = 0;
+  unsigned legacy_calls = 0;
+  transport_.SetPullReadSuccessWithSourceHandler(
+      [this, &source_calls, expected](
+          const BlockKey& key, const DiskResidentIdentity& identity,
+          size_t bytes, PreparedRead::Source source) {
+        ++source_calls;
+        EXPECT_EQ(source, expected);
+        node_->NotifyLifetimeReadSuccessForKey(key, identity, bytes, source);
+      });
+  bool source_recorded = false;
+  Grant(read.source_identity(), source_recorded, read.source());
+  Grant(read.source_identity(), source_recorded, read.source());
+  EXPECT_EQ(source_calls, 1U);
+  EXPECT_EQ(Counters().transport_disk_staging, 1U);
+  const auto legacy = [this, &legacy_calls](
+                          const BlockKey& key,
+                          const DiskResidentIdentity& identity, size_t bytes) {
+    ++legacy_calls;
+    node_->NotifyLifetimeReadSuccessForKey(key, identity, bytes);
+  };
+  transport_.SetPullReadSuccessHandler(legacy);
+  bool legacy_recorded = false;
+  Grant(read.source_identity(), legacy_recorded, read.source());
+  EXPECT_EQ(source_calls, 1U);
+  EXPECT_EQ(legacy_calls, 1U);
+  EXPECT_EQ(Counters().transport_unclassified, 1U);
+  transport_.SetPullReadSuccessWithSourceHandler({});
+  bool without_source_handler = false;
+  Grant(read.source_identity(), without_source_handler, read.source());
+  EXPECT_TRUE(without_source_handler);
+  transport_.SetPullReadSuccessHandler(legacy);
+  Grant(read.source_identity(), without_source_handler, read.source());
+  EXPECT_EQ(legacy_calls, 1U);  // Consumed events never replay after install.
+  transport_.SetPullReadSuccessHandler({});
+  bool without_legacy_handler = false;
+  Grant(read.source_identity(), without_legacy_handler, read.source());
+  EXPECT_TRUE(without_legacy_handler);
+  EXPECT_EQ(legacy_calls, 1U);
+  EXPECT_EQ(Counters().successful, 2U);
+  EXPECT_TRUE(read.Abort());
+}
+
+TEST_F(RdmaPullHeatTest, StagedMoveKeepsDiskToRamOriginUntilGrant) {
+  const ScopedEnv ram_on("DFKV_RAM_TIER", "1");
+  const ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
+  const ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
+  const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  PreparedRead prepared = Prepare();
+  ASSERT_EQ(prepared.status(), Status::kOk);
+  ASSERT_TRUE(prepared.needs_io());
+  ASSERT_TRUE(prepared.source_registered());
+  ASSERT_EQ(prepared.source(), PreparedRead::Source::kDiskToRam);
+  ASSERT_EQ(Finish(prepared), Status::kOk);
+  EXPECT_EQ(Counters().successful, 0U);
+  // This is the same copy used when MR resolution fails. Registration changes
+  // backing, not where the request obtained its bytes.
+  ASSERT_TRUE(prepared.Stage());
+  EXPECT_FALSE(prepared.source_registered());
+  EXPECT_EQ(prepared.source(), PreparedRead::Source::kDiskToRam);
+  EXPECT_EQ(std::string(prepared.data(), prepared.payload_len()), "value");
+  PreparedRead moved = std::move(prepared);
+  // MoveFrom resets source_; this const getter verifies that post-move
+  // contract.
+  // NOLINTNEXTLINE(bugprone-use-after-move,hicpp-invalid-access-moved,clang-analyzer-cplusplus.Move)
+  EXPECT_EQ(prepared.source(), PreparedRead::Source::kUnclassified);
+  EXPECT_EQ(moved.source(), PreparedRead::Source::kDiskToRam);
+  ASSERT_TRUE(moved.Commit(Status::kOk, 5, 0));
+  EXPECT_EQ(moved.source(), PreparedRead::Source::kDiskToRam);
+  EXPECT_TRUE(moved.source_identity() == identity);
+  EXPECT_EQ(Counters().successful, 0U);
+  bool recorded = false;
+  Grant(moved.source_identity(), recorded, moved.source());
+  Grant(moved.source_identity(), recorded, moved.source());
+  EXPECT_EQ(Counters().transport_disk_to_ram, 1U);
+  EXPECT_EQ(Counters().transport_ram_hit, 0U);
+  EXPECT_EQ(Counters().source_transport_grant, 1U);
+  EXPECT_FALSE(moved.Abort());
+  EXPECT_EQ(Counters().successful, 1U);
 }
 
 TEST_F(RdmaPullHeatTest, CommitBeforeGrantAndReleaseNeverDuplicatesHeat) {
@@ -805,20 +909,22 @@ TEST_F(RdmaPullHeatTest, BoundAndUnboundRamKeepPinUntilGrantTeardown) {
     PreparedRead read;
     ASSERT_TRUE(node_->RamPinnedHitForKey(key_, 0, 5, &read));
     ASSERT_EQ(Finish(read), Status::kOk);
+    EXPECT_EQ(read.source(), PreparedRead::Source::kRamHit);
     EXPECT_EQ(read.source_identity().valid(), bound);
     EXPECT_EQ(Counters().successful, bound ? 0U : 1U);
     ASSERT_TRUE(ram.Remove(key_));
     EXPECT_GT(ram.UsedBytes(), 0U);
     bool grant_recorded = false;
-    Grant(read.source_identity(), grant_recorded);
+    Grant(read.source_identity(), grant_recorded, read.source());
     EXPECT_GT(ram.UsedBytes(),
               0U);  // Notification does not release remote pins.
-    Grant(read.source_identity(), grant_recorded);
+    Grant(read.source_identity(), grant_recorded, read.source());
     EXPECT_TRUE(read.Abort());
     EXPECT_EQ(ram.UsedBytes(), 0U);
   }
   EXPECT_EQ(Counters().applied, 1U);
   EXPECT_EQ(Counters().no_binding, 1U);
+  EXPECT_EQ(Counters().transport_ram_hit, 2U);
 }
 
 TEST_F(RdmaPullHeatTest, PublishedFollowerHasItsOwnLogicalGrant) {
@@ -834,6 +940,7 @@ TEST_F(RdmaPullHeatTest, PublishedFollowerHasItsOwnLogicalGrant) {
   ASSERT_EQ(leader.status(), Status::kOk);
   ASSERT_TRUE(leader.needs_io());
   ASSERT_TRUE(leader.source_registered());
+  EXPECT_EQ(leader.source(), PreparedRead::Source::kDiskToRam);
   alignas(4096) char follower_staging[4096] = {};
   PreparedRead follower;
   std::thread waiter([&] {
@@ -849,7 +956,7 @@ TEST_F(RdmaPullHeatTest, PublishedFollowerHasItsOwnLogicalGrant) {
   const bool committed = leader.Commit(storage_status, 5, 0);
   bool leader_recorded = false;
   if (committed && storage_status == Status::kOk)
-    Grant(source, leader_recorded);
+    Grant(source, leader_recorded, leader.source());
   waiter.join();
   EXPECT_TRUE(observed_waiter);
   ASSERT_EQ(storage_status, Status::kOk);
@@ -858,13 +965,16 @@ TEST_F(RdmaPullHeatTest, PublishedFollowerHasItsOwnLogicalGrant) {
   ASSERT_EQ(follower.status(), Status::kOk);
   EXPECT_FALSE(follower.needs_io());  // One disk I/O, then a published RAM pin.
   EXPECT_TRUE(follower.source_registered());
+  EXPECT_EQ(follower.source(), PreparedRead::Source::kPublishedFollower);
   EXPECT_EQ(Counters().applied, 1U);
   ASSERT_EQ(Finish(follower), Status::kOk);
   EXPECT_TRUE(follower.source_identity() == identity);
   bool follower_recorded = false;
-  Grant(follower.source_identity(), follower_recorded);
-  Grant(source, leader_recorded);
+  Grant(follower.source_identity(), follower_recorded, follower.source());
+  Grant(source, leader_recorded, leader.source());
   EXPECT_EQ(Counters().applied, 2U);
+  EXPECT_EQ(Counters().transport_disk_to_ram, 1U);
+  EXPECT_EQ(Counters().transport_published_follower, 1U);
   EXPECT_TRUE(follower.Abort());
   EXPECT_FALSE(
       leader.Abort());  // Releases the leader's post-read physical pin.
@@ -954,10 +1064,11 @@ TEST_F(RdmaPullHeatTest, DirectFallbackExportsSourceWithoutHeatingStorageRead) {
     EXPECT_TRUE(source == identity);
     EXPECT_EQ(Counters().applied, request);
     bool grant_recorded = false;
-    Grant(source, grant_recorded);
-    Grant(source, grant_recorded);
+    Grant(source, grant_recorded, PreparedRead::Source::kSynchronousFallback);
+    Grant(source, grant_recorded, PreparedRead::Source::kSynchronousFallback);
   }
   EXPECT_EQ(Counters().applied, 2U);
+  EXPECT_EQ(Counters().transport_synchronous_fallback, 2U);
 }
 
 std::string SelfHdr() { return "test/model"; }

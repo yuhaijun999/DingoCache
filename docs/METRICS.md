@@ -267,13 +267,19 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_read_io_unhealthy_total` / `dfkv_slab_lifetime_read_state_unavailable_total` | counter | 已成功的读在通知时遇盘I/O隔离 / 匹配住户的评分state缺失或时间不变量错误（正常应为0）；均不改原读状态。失败GET本身不发送通知 |
 | `dfkv_slab_disk_lifetime_read_success_total` / `dfkv_slab_disk_lifetime_read_applied_total` | counter | Per-disk successful nonempty logical read notifications / notifications applied to the original resident, using existing `disk` / `disk_index` and optional node identity labels. These reuse existing Store counters, not physical payload I/O counts, transport delivery/client-consumption proof, or proof of deduplication. |
 | `dfkv_slab_disk_lifetime_read_no_binding_total` / `dfkv_slab_disk_lifetime_read_race_lost_total` | counter | Per-disk notifications without a disk credential / with an obsolete or removed original resident. Attribution follows the key's configured disk route even for an unbound source; it does not prove that the bytes came from that disk. |
+| `dfkv_slab_lifetime_read_transport_unclassified_total` / `dfkv_slab_disk_lifetime_read_transport_unclassified_total` | counter | No preparation-route tag was supplied (including the legacy three-argument callback). A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
+| `dfkv_slab_lifetime_read_transport_ram_hit_total` / `dfkv_slab_disk_lifetime_read_transport_ram_hit_total` | counter | An already resident RAM value supplied the read, including pinned arena hits and copies into staging. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
+| `dfkv_slab_lifetime_read_transport_disk_staging_total` / `dfkv_slab_disk_lifetime_read_transport_disk_staging_total` | counter | The prepared storage request used staging, including an async coalescer owner. Not a physical-I/O counter. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
+| `dfkv_slab_lifetime_read_transport_disk_to_ram_total` / `dfkv_slab_disk_lifetime_read_transport_disk_to_ram_total` | counter | The prepared storage request targeted a hidden RAM reservation. This is not a RAM hit or proof of successful RAM publication. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
+| `dfkv_slab_lifetime_read_transport_published_follower_total` / `dfkv_slab_disk_lifetime_read_transport_published_follower_total` | counter | RAM preparation after a successful publication wait. Not proof the returned generation still belongs to that exact leader after concurrent mutation. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
+| `dfkv_slab_lifetime_read_transport_synchronous_fallback_total` / `dfkv_slab_disk_lifetime_read_transport_synchronous_fallback_total` | counter | The transport used the synchronous range handler; its internal RAM/disk/copy leader/follower route is not inferred. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
 | `dfkv_slab_disk_lifetime_read_clock_hard_exhausted_total` / `dfkv_slab_disk_lifetime_read_io_unhealthy_total` / `dfkv_slab_disk_lifetime_read_state_unavailable_total` | counter | Per-disk hard-clock / isolated-disk / unavailable-state outcomes, with the same precedence as their aggregate counterparts. Within one Store snapshot, success equals applied plus these five skip outcomes. Per-disk and aggregate snapshots are separately sampled: compare exact sums only when activity is quiescent. All seven counters reset on Store reconstruction; recovery's virtual reads add zero, as do failed/empty reads and payload-free lookups. File engines omit these series; legacy without lifetime tracking exports zero. This export adds no read-path state or locks and does not complete origin/latency/physical-I/O coverage. |
 | `dfkv_slab_lifetime_read_source_unclassified_total` / `dfkv_slab_disk_lifetime_read_source_unclassified_total` | counter | Successful nonempty notifications from internal callers that do not supply a completion-path classification. Not an inference from credential validity; production Request/Into and transport-grant callbacks supply explicit paths. |
 | `dfkv_slab_lifetime_read_source_ram_total` / `dfkv_slab_disk_lifetime_read_source_ram_total` | counter | Successful nonempty synchronous Request/Into reads copied from RAM, including RAM without a disk credential. Does not count physical disk I/O. |
 | `dfkv_slab_lifetime_read_source_disk_total` / `dfkv_slab_disk_lifetime_read_source_disk_total` | counter | Successful nonempty independent synchronous storage reads, including coalescer timeout, failed-flight, missing-shared-buffer and self-thread fallbacks. A logical completion, not a syscall count or bytes read from hardware. |
 | `dfkv_slab_lifetime_read_source_copy_leader_total` / `dfkv_slab_disk_lifetime_read_source_copy_leader_total` | counter | Successful nonempty synchronous coalescer leaders, even when no follower joined. Failed or empty leaders contribute zero. |
 | `dfkv_slab_lifetime_read_source_copy_follower_total` / `dfkv_slab_disk_lifetime_read_source_copy_follower_total` | counter | Successful nonempty requests that actually copied shared flight bytes. Independent fallbacks are not followers; a source disk identity or a false leader flag alone cannot establish this role. |
-| `dfkv_slab_lifetime_read_source_transport_grant_total` / `dfkv_slab_disk_lifetime_read_source_transport_grant_total` | counter | Successful nonempty transport-grant notifications at the existing PULL authorization point, not preparation, READY delivery, client consumption or RELEASE. This category intentionally combines RAM/disk and transport coalescer origins; their finer provenance is not yet exported. |
+| `dfkv_slab_lifetime_read_source_transport_grant_total` / `dfkv_slab_disk_lifetime_read_source_transport_grant_total` | counter | Successful nonempty transport-grant notifications at the existing PULL authorization point, not preparation, READY delivery, client consumption or RELEASE. This category intentionally combines RAM/disk and transport coalescer origins. This remains the coarse total; transport_* children subdivide preparation routes, not physical I/O or exact shared-leader provenance. |
 | `dfkv_slab_eviction_record_clears_total` / `dfkv_slab_record_writes_total` | counter | allocator 复用前持久清除记录 / 已提交 slots.tbl record 写数 |
 | `dfkv_slab_capacity_bytes` / `dfkv_slab_allocated_bytes` / `dfkv_slab_payload_bytes` / `dfkv_slab_internal_fragmentation_bytes` | gauge | 物理 payload 容量 / 已占 slot / reader-visible 已提交逻辑 payload / 旧口径 allocated-visible 差额。保留旧公式不变；该差额可能包含隐藏、在途或等待最后一个 pin 释放的住户 payload，不能只解释为 slot 碎片 |
 | `dfkv_slab_allocator_payload_bytes` / `dfkv_slab_allocator_fragmentation_bytes` | gauge | All allocator residents' useful bytes (including hidden/in-flight residents) / resident slot slack. Computed by summing useful bytes and allocated-minus-useful bytes from one existing per-class allocator snapshot, not reader-visible payload, filesystem fragmentation or durable I/O byte counts. |
@@ -750,3 +756,44 @@ bucket bytes still cover only per-extent backing; summary_bytes is separate.
 Neither includes allocator overhead or recovery/RSS peaks. Ordinary
 Classes/ClassStat/Stats and all previous snapshot return layouts are unchanged;
 internal C++ consumers still need matching headers/library builds.
+
+
+### PULL grant preparation-path subpartition
+
+The six `lifetime_read_transport_*_total` counters subdivide the existing
+`lifetime_read_source_transport_grant_total`; within a Store snapshot their
+sum equals that coarse counter. The original six-source sum still equals
+successful logical notifications, and the independent heat-outcome partition
+is unchanged. Do not add transport children to the original source sum again.
+All six reset on Store reconstruction; virtual recovery reads add nothing.
+Legacy without lifetime tracking exports zero and file engines omit them.
+Per-disk series use only the existing disk/disk_index labels. Global/per-disk
+samples are separate; compare cross-disk sums at quiescence.
+
+`PreparedRead::Source` records the preparation route, not registered-memory
+state or physical byte provenance. A disk read directly targeting a RAM
+reservation stays disk_to_ram after MR fallback copies its bytes into staging.
+Ordinary RAM hits stay ram_hit when copied to a nonregistered buffer. A
+published_follower means the request waited for publication then acquired a
+RAM hit; a concurrent new PUT may have replaced the original leader resident,
+so this tag is not proof of exact shared-leader identity. Existing resident
+credentials remain authoritative. Synchronous fallback has its own category,
+not a guessed disk/RAM/copy route; finer fallback provenance is still pending.
+Move transfers the tag, while Stage and terminal operations preserve it.
+
+Only the established nonempty grant's existing once-only callback counts the
+event before READY encoding. Preparation, physical storage completion alone,
+empty or failed grants, repeated grant-recording attempts for the same grant, RELEASE
+and teardown do not add events. Grant establishment does not prove READY
+was delivered or data consumed remotely. The old three-argument success
+handler remains source-compatible through a small adapter that discards the
+tag; production uses the source-aware setter. Internal C++ cache types still
+require matching rebuilt headers/libraries; no C ABI or wire value changes.
+
+The new partition adds six uint64 counters (48 bytes per Store and its Stats
+snapshot) and fixed arithmetic inside the existing D lock, with no new
+resident field, read-path lock, clock or scan. PreparedRead adds one
+per-request enum field with platform-dependent alignment cost, not a
+per-resident allocation. Twelve new fixed metric families add scrape/output
+cost. None of this establishes latency, RSS, recovery-peak or complete-memory
+budget compliance. Existing dashboards and alerts retain their names.

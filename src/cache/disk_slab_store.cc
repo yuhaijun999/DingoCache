@@ -40,6 +40,7 @@
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_write_result.h"
 #include "cache/slab_allocator.h"
+#include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
 #include "utils/log.h"
@@ -2787,7 +2788,7 @@ SlabAllocator::LifetimeBucketObservation DiskSlabStore::ObserveLifetimeBuckets()
 
 void DiskSlabStore::NotifyLifetimeReadSuccess(
     const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
-    LifetimeReadSource source) {
+    LifetimeReadSource source, PreparedRead::Source transport_source) {
   // Keep disabled and empty successes off the lifetime lock/clock path.
   if (!opt_.lifetime_config.has_value() || bytes == 0) return;
   const std::lock_guard<std::mutex> lock(mu_);
@@ -2812,6 +2813,29 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
       break;
     case LifetimeReadSource::kTransportGrant:
       ++lifetime_reads_.source_transport_grant;
+      // Subdivide this source only. Do not add these again to successful or
+      // the independent six-source partition, including rejected heat events.
+      switch (transport_source) {
+        case PreparedRead::Source::kRamHit:
+          ++lifetime_reads_.transport_ram_hit;
+          break;
+        case PreparedRead::Source::kDiskStaging:
+          ++lifetime_reads_.transport_disk_staging;
+          break;
+        case PreparedRead::Source::kDiskToRam:
+          ++lifetime_reads_.transport_disk_to_ram;
+          break;
+        case PreparedRead::Source::kPublishedFollower:
+          ++lifetime_reads_.transport_published_follower;
+          break;
+        case PreparedRead::Source::kSynchronousFallback:
+          ++lifetime_reads_.transport_synchronous_fallback;
+          break;
+        case PreparedRead::Source::kUnclassified:
+        default:
+          ++lifetime_reads_.transport_unclassified;
+          break;
+      }
       break;
   }
   if (!Healthy()) {

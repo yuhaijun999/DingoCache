@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Subdivide PULL grant notifications by preparation path while preserving the
+  coarse transport total. Carry RAM, staged disk, disk-to-RAM and publication
+  wait provenance through moves and staging; keep synchronous fallback explicit
+  and preserve the legacy success observer API.
+
 - Export retained slot, extent, class and key-index array backing bytes,
   globally and per slab disk, including legacy mode. Keep base capacity distinct
   from lifetime-only storage, nested allocations, complete memory and RSS.

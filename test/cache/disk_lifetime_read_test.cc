@@ -23,6 +23,7 @@
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
 #include "cache/slab_allocator.h"
+#include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
 #include "slab_allocator_test_peer.h"
@@ -114,6 +115,12 @@ class DiskLifetimeReadTest : public ::testing::Test {
                   counters.source_disk + counters.source_copy_leader +
                   counters.source_copy_follower +
                   counters.source_transport_grant);
+    EXPECT_EQ(counters.source_transport_grant,
+              counters.transport_unclassified + counters.transport_ram_hit +
+                  counters.transport_disk_staging +
+                  counters.transport_disk_to_ram +
+                  counters.transport_published_follower +
+                  counters.transport_synchronous_fallback);
     return counters;
   }
   const BlockKey key_{1, 0};
@@ -124,6 +131,50 @@ class DiskLifetimeReadTest : public ::testing::Test {
   std::unique_ptr<DiskSlabStore> store_;
   std::filesystem::path dir_;
 };
+
+TEST_F(DiskLifetimeReadTest,
+       TransportPreparationPartitionPreservesCoarseTotal) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  const PreparedRead::Source sources[] = {
+      PreparedRead::Source::kUnclassified,
+      PreparedRead::Source::kRamHit,
+      PreparedRead::Source::kDiskStaging,
+      PreparedRead::Source::kDiskToRam,
+      PreparedRead::Source::kPublishedFollower,
+      PreparedRead::Source::kSynchronousFallback};
+  uint64_t repeats = 1;
+  for (const PreparedRead::Source source : sources) {
+    for (uint64_t i = 0; i < repeats; ++i) {
+      store_->NotifyLifetimeReadSuccess(
+          key_, identity, 5, DiskSlabStore::LifetimeReadSource::kTransportGrant,
+          source);
+    }
+    ++repeats;
+  }
+  DiskSlabStore::LifetimeReadCounters counters = Counters();
+  EXPECT_EQ(counters.successful, 21U);
+  EXPECT_EQ(counters.source_transport_grant, 21U);
+  EXPECT_EQ(counters.transport_unclassified, 1U);
+  EXPECT_EQ(counters.transport_ram_hit, 2U);
+  EXPECT_EQ(counters.transport_disk_staging, 3U);
+  EXPECT_EQ(counters.transport_disk_to_ram, 4U);
+  EXPECT_EQ(counters.transport_published_follower, 5U);
+  EXPECT_EQ(counters.transport_synchronous_fallback, 6U);
+  // Empty events stay outside both partitions. A non-transport read
+  // ignores the optional transport tag rather than counting a second source.
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 0, DiskSlabStore::LifetimeReadSource::kTransportGrant,
+      PreparedRead::Source::kRamHit);
+  store_->NotifyLifetimeReadSuccess(key_, identity, 5,
+                                    DiskSlabStore::LifetimeReadSource::kDisk,
+                                    PreparedRead::Source::kRamHit);
+  counters = Counters();
+  EXPECT_EQ(counters.successful, 22U);
+  EXPECT_EQ(counters.source_disk, 1U);
+  EXPECT_EQ(counters.source_transport_grant, 21U);
+  EXPECT_EQ(counters.transport_ram_hit, 2U);
+}
 
 TEST_F(DiskLifetimeReadTest, SourcesPartitionSuccessfulNotifications) {
   ASSERT_NO_FATAL_FAILURE(Create());
@@ -438,7 +489,10 @@ TEST_F(DiskLifetimeReadTest,
   EXPECT_FALSE(store_->Healthy());
   seconds_.store(uint64_t{std::numeric_limits<uint32_t>::max()} + 101);
   const uint64_t samples = samples_.load();
-  store_->NotifyLifetimeReadSuccess(key_, {}, 5);
+  store_->NotifyLifetimeReadSuccess(
+      key_, {}, 5, DiskSlabStore::LifetimeReadSource::kTransportGrant,
+      PreparedRead::Source::kDiskStaging);
+  EXPECT_EQ(Counters().transport_disk_staging, 1U);
   EXPECT_EQ(Counters().io_unhealthy, 1U);
   EXPECT_EQ(Counters().no_binding, 0U);
   EXPECT_EQ(samples_.load(), samples);
@@ -451,6 +505,11 @@ TEST_F(DiskLifetimeReadTest, DefaultOffAndZeroBytesNeverSampleOrCount) {
   const uint64_t samples = samples_.load();
   store_->NotifyLifetimeReadSuccess(key_, identity, 5,
                                     DiskSlabStore::LifetimeReadSource::kRam);
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 5, DiskSlabStore::LifetimeReadSource::kTransportGrant,
+      PreparedRead::Source::kRamHit);
+  EXPECT_EQ(Counters().source_transport_grant, 0U);
+  EXPECT_EQ(Counters().transport_ram_hit, 0U);
   EXPECT_EQ(samples_.load(), samples);
   EXPECT_EQ(Counters().successful, 0U);
   store_.reset();

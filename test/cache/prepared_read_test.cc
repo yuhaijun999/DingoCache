@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
+// POSIX setenv/unsetenv require their direct C header, not C++ std functions.
+// NOLINTNEXTLINE(hicpp-deprecated-headers,modernize-deprecated-headers)
+#include <stdlib.h>
+#include <sys/types.h>
 #include <unistd.h>
 
-#include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -11,11 +13,23 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "cache/kv_node_server.h"
 #include "cache/store_engine.h"
 #include "common/status.h"
+#include "read_coalescer_test_peer.h"
 #include "transport/wire.h"
+
+namespace dfkv {
+class KvNodeServerTestPeer {
+ public:
+  static bool WaitForPublishedFollower(KvNodeServer& server) {
+    return ReadCoalescerTestPeer::WaitForPublishedWaiter(
+        server.read_coalescer_);
+  }
+};
+}  // namespace dfkv
 
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
@@ -48,6 +62,73 @@ Status Put(KvNodeServer* server, const BlockKey& key,
   return server->ProcessRequestForKey(
       static_cast<uint8_t>(WireOp::kCache), key, 0, 0, value.data(),
       value.size(), &ignored);
+}
+
+TEST(PreparedRead, DiskSourceSurvivesMovesAndTerminalActions) {
+  ::setenv("DFKV_READ_COALESCE", "0", 1);
+  ::unsetenv("DFKV_RAM_TIER");
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_prepared_read_source_moves";
+  fs::remove_all(dir);
+  {
+    KvNodeServer server(dir.string(), 1ULL << 30);
+    ASSERT_TRUE(server.Healthy());
+    const std::string value(4096, 's');
+    ASSERT_EQ(Put(&server, Key(93), value), Status::kOk);
+    const AlignedBuffer staging(8192);
+    PreparedRead empty;
+    EXPECT_EQ(empty.source(), PreparedRead::Source::kUnclassified);
+    EXPECT_FALSE(empty.owns_cleanup());
+    const PreparedRead missing = server.PrepareReadForKey(
+        Key(94), 0, value.size(), staging.data(), staging.size());
+    EXPECT_EQ(missing.status(), Status::kNotFound);
+    EXPECT_EQ(missing.source(), PreparedRead::Source::kUnclassified);
+
+    PreparedRead original = server.PrepareReadForKey(
+        Key(93), 0, value.size(), staging.data(), staging.size());
+    ASSERT_EQ(original.status(), Status::kOk);
+    EXPECT_EQ(original.source(), PreparedRead::Source::kDiskStaging);
+    PreparedRead moved(std::move(original));
+    // MoveFrom resets source_; this const getter verifies that post-move
+    // contract.
+    // NOLINTNEXTLINE(bugprone-use-after-move,hicpp-invalid-access-moved,clang-analyzer-cplusplus.Move)
+    EXPECT_EQ(original.source(), PreparedRead::Source::kUnclassified);
+    EXPECT_FALSE(original.owns_cleanup());
+    EXPECT_EQ(moved.source(), PreparedRead::Source::kDiskStaging);
+    const ssize_t got =
+        ::pread(moved.fd(), moved.staging(), moved.aligned_len(),
+                static_cast<off_t>(moved.aligned_off()));
+    ASSERT_GE(got, 0);
+    ASSERT_GE(static_cast<size_t>(got), moved.head() + moved.payload_len());
+    ASSERT_EQ(moved.FinishStorage(Status::kOk, moved.payload_len()),
+              Status::kOk);
+    EXPECT_EQ(moved.source(), PreparedRead::Source::kDiskStaging);
+    empty = std::move(moved);
+    // MoveFrom resets source_; this const getter verifies that post-move
+    // contract.
+    // NOLINTNEXTLINE(bugprone-use-after-move,hicpp-invalid-access-moved,clang-analyzer-cplusplus.Move)
+    EXPECT_EQ(moved.source(), PreparedRead::Source::kUnclassified);
+    EXPECT_FALSE(moved.owns_cleanup());
+    EXPECT_EQ(empty.source(), PreparedRead::Source::kDiskStaging);
+    EXPECT_EQ(std::string(empty.data(), empty.payload_len()), value);
+    EXPECT_TRUE(empty.Commit(Status::kOk, empty.payload_len(), 0.0));
+    EXPECT_EQ(empty.source(), PreparedRead::Source::kDiskStaging);
+    EXPECT_FALSE(empty.Commit(Status::kOk, empty.payload_len(), 0.0));
+    empty = PreparedRead{};
+    EXPECT_EQ(empty.source(), PreparedRead::Source::kUnclassified);
+
+    PreparedRead failed = server.PrepareReadForKey(
+        Key(93), 0, value.size(), staging.data(), staging.size());
+    ASSERT_EQ(failed.status(), Status::kOk);
+    EXPECT_EQ(failed.FinishStorage(Status::kIOError, 0), Status::kIOError);
+    EXPECT_EQ(failed.source(), PreparedRead::Source::kDiskStaging);
+    EXPECT_FALSE(failed.source_identity().valid());
+    EXPECT_TRUE(failed.Abort());
+    // Preparation provenance remains diagnostic, not a successful grant.
+    EXPECT_EQ(failed.source(), PreparedRead::Source::kDiskStaging);
+  }
+  fs::remove_all(dir);
+  ::unsetenv("DFKV_READ_COALESCE");
 }
 
 TEST(PreparedRead, CompletionAndFailureAreSingleTerminalActions) {
@@ -272,6 +353,7 @@ TEST(PreparedRead, CoalescedRangeDirectHeadShiftByteExact) {
 
 TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
   ::setenv("DFKV_READ_COALESCE", "1", 1);
+  ::setenv("DFKV_READ_COALESCE_TIMEOUT_MS", "5000", 1);
   ::setenv("DFKV_RAM_TIER", "1", 1);
   ::setenv("DFKV_RAM_TIER_BYTES", "16777216", 1);
   ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
@@ -300,34 +382,42 @@ TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
                                  staging.size());
     ASSERT_EQ(read.status(), Status::kOk);
     ASSERT_TRUE(read.needs_io());
+    EXPECT_EQ(read.source(), PreparedRead::Source::kDiskToRam);
     EXPECT_TRUE(read.source_registered());
     EXPECT_NE(read.staging(), staging.data());
     AlignedBuffer follower_staging(1 << 20);
     PreparedRead follower;
-    std::atomic<bool> follower_entered{false};
     std::thread follower_thread([&] {
-      follower_entered.store(true, std::memory_order_release);
       follower = server.PrepareReadForKey(
           Key(92), 0, value.size(), follower_staging.data(),
           follower_staging.size());
     });
-    while (!follower_entered.load(std::memory_order_acquire))
-      std::this_thread::yield();
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool follower_waited =
+        KvNodeServerTestPeer::WaitForPublishedFollower(server);
     const ssize_t got = ::pread(read.fd(), read.staging(), read.aligned_len(),
                                 static_cast<off_t>(read.aligned_off()));
     const bool io_ok =
         got >= 0 &&
         static_cast<size_t>(got) >= read.head() + read.payload_len();
+    // MR fallback copies the bytes but must not turn this disk preparation
+    // into a RAM hit just because its original destination is registered.
+    if (io_ok) {
+      EXPECT_TRUE(read.Stage());
+      EXPECT_FALSE(read.source_registered());
+      EXPECT_EQ(read.source(), PreparedRead::Source::kDiskToRam);
+    }
     EXPECT_TRUE(read.Commit(io_ok ? Status::kOk : Status::kIOError,
                             io_ok ? read.payload_len() : 0, 0.001));
     follower_thread.join();
+    ASSERT_TRUE(follower_waited);
     ASSERT_TRUE(io_ok);
+    EXPECT_EQ(read.source(), PreparedRead::Source::kDiskToRam);
     EXPECT_EQ(std::memcmp(read.data(), value.data(), value.size()), 0);
     // The concurrent duplicate waited for disk completion, then acquired the
     // published arena entry directly: no follower payload copy or second IO.
     ASSERT_EQ(follower.status(), Status::kOk);
     EXPECT_FALSE(follower.needs_io());
+    EXPECT_EQ(follower.source(), PreparedRead::Source::kPublishedFollower);
     EXPECT_TRUE(follower.source_registered());
     EXPECT_NE(follower.data(), follower_staging.data());
     EXPECT_EQ(std::memcmp(follower.data(), value.data(), value.size()), 0);
@@ -337,9 +427,24 @@ TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
     EXPECT_FALSE(read.Commit(Status::kOk, read.payload_len(), 0.0));
     EXPECT_TRUE(
         follower.Commit(Status::kOk, follower.payload_len(), 0.0));
+    EXPECT_EQ(follower.source(), PreparedRead::Source::kPublishedFollower);
+
+    PreparedRead ram_hit = server.PrepareReadForKey(Key(92), 0, value.size(),
+                                                    follower_staging.data(),
+                                                    follower_staging.size());
+    ASSERT_EQ(ram_hit.status(), Status::kOk);
+    EXPECT_FALSE(ram_hit.needs_io());
+    EXPECT_EQ(ram_hit.source(), PreparedRead::Source::kRamHit);
+    EXPECT_TRUE(ram_hit.Stage());
+    EXPECT_FALSE(ram_hit.source_registered());
+    EXPECT_EQ(ram_hit.source(), PreparedRead::Source::kRamHit);
+    EXPECT_EQ(std::string(ram_hit.data(), ram_hit.payload_len()), value);
+    EXPECT_TRUE(ram_hit.Commit(Status::kOk, ram_hit.payload_len(), 0.0));
+    EXPECT_EQ(ram_hit.source(), PreparedRead::Source::kRamHit);
   }
   fs::remove_all(dir);
   ::unsetenv("DFKV_READ_COALESCE");
+  ::unsetenv("DFKV_READ_COALESCE_TIMEOUT_MS");
   ::unsetenv("DFKV_RAM_TIER");
   ::unsetenv("DFKV_RAM_TIER_BYTES");
   ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");

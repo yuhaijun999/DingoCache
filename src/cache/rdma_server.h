@@ -112,7 +112,25 @@ class RdmaServer {
   // It must be thread-safe, must not throw, and must not revoke a valid grant.
   using PullReadSuccessHandler =
       std::function<void(const BlockKey&, const DiskResidentIdentity&, size_t)>;
+  using PullReadSuccessWithSourceHandler =
+      std::function<void(const BlockKey&, const DiskResidentIdentity&, size_t,
+                         PreparedRead::Source)>;
   void SetPullReadSuccessHandler(PullReadSuccessHandler handler) {
+    if (!handler) {
+      pull_read_success_handler_ = {};
+      return;
+    }
+    pull_read_success_handler_ = [handler = std::move(handler)](
+                                     const BlockKey& key,
+                                     const DiskResidentIdentity& identity,
+                                     size_t bytes, PreparedRead::Source) {
+      handler(key, identity, bytes);
+    };
+  }
+  // Same callback lifetime and once-only contract as the legacy setter.
+  // Source describes preparation, not registered memory or physical I/O.
+  void SetPullReadSuccessWithSourceHandler(
+      PullReadSuccessWithSourceHandler handler) {
     pull_read_success_handler_ = std::move(handler);
   }
   // Pinned arena hit lookup (B5-3 zero-copy pull GET): returns true with a
@@ -209,9 +227,10 @@ class RdmaServer {
   // Called only after validation, successful MR registration and grant
   // ownership. Separate from busy: async I/O reserves a slot before any grant
   // exists.
-  void RecordPullGrant(const BlockKey& key,
-                       const DiskResidentIdentity& identity, size_t bytes,
-                       bool& grant_recorded);
+  void RecordPullGrant(
+      const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
+      bool& grant_recorded,
+      PreparedRead::Source source = PreparedRead::Source::kUnclassified);
   void AcceptLoop();
   void Serve(int boot_fd);
   void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
@@ -247,7 +266,7 @@ class RdmaServer {
 
   Handler handler_;
   RangeWithIdentityHandler range_handler_;
-  PullReadSuccessHandler pull_read_success_handler_;
+  PullReadSuccessWithSourceHandler pull_read_success_handler_;
   CacheDirectHandler cache_direct_handler_;
   CacheDirectBatchHandler cache_direct_batch_handler_;
   PrepareReadHandler prepare_read_handler_;

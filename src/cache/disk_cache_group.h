@@ -127,7 +127,9 @@ class DiskCacheGroup {
   void NotifyLifetimeReadSuccess(
       const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
       DiskSlabStore::LifetimeReadSource source =
-          DiskSlabStore::LifetimeReadSource::kUnclassified);
+          DiskSlabStore::LifetimeReadSource::kUnclassified,
+      PreparedRead::Source transport_source =
+          PreparedRead::Source::kUnclassified);
   // Actively sample the optional shared clock. Once exhausted, rollback cannot
   // clear the restart requirement. Does not mark storage unhealthy, stop new
   // requests, or drain accepted work; the future server gate must do those in
