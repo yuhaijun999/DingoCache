@@ -272,8 +272,13 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_read_transport_disk_staging_total` / `dfkv_slab_disk_lifetime_read_transport_disk_staging_total` | counter | The prepared storage request used staging, including an async coalescer owner. Not a physical-I/O counter. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
 | `dfkv_slab_lifetime_read_transport_disk_to_ram_total` / `dfkv_slab_disk_lifetime_read_transport_disk_to_ram_total` | counter | The prepared storage request targeted a hidden RAM reservation. This is not a RAM hit or proof of successful RAM publication. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
 | `dfkv_slab_lifetime_read_transport_published_follower_total` / `dfkv_slab_disk_lifetime_read_transport_published_follower_total` | counter | RAM preparation after a successful publication wait. Not proof the returned generation still belongs to that exact leader after concurrent mutation. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
-| `dfkv_slab_lifetime_read_transport_synchronous_fallback_total` / `dfkv_slab_disk_lifetime_read_transport_synchronous_fallback_total` | counter | The transport used the synchronous range handler; its internal RAM/disk/copy leader/follower route is not inferred. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
+| `dfkv_slab_lifetime_read_transport_synchronous_fallback_total` / `dfkv_slab_disk_lifetime_read_transport_synchronous_fallback_total` | counter | The transport used the synchronous range handler. Includes all five fallback_* children; old handlers remain unclassified. A subpartition of successful nonempty PULL grants, not an additional term in the original six-source sum. |
 | `dfkv_slab_disk_lifetime_read_clock_hard_exhausted_total` / `dfkv_slab_disk_lifetime_read_io_unhealthy_total` / `dfkv_slab_disk_lifetime_read_state_unavailable_total` | counter | Per-disk hard-clock / isolated-disk / unavailable-state outcomes, with the same precedence as their aggregate counterparts. Within one Store snapshot, success equals applied plus these five skip outcomes. Per-disk and aggregate snapshots are separately sampled: compare exact sums only when activity is quiescent. All seven counters reset on Store reconstruction; recovery's virtual reads add zero, as do failed/empty reads and payload-free lookups. File engines omit these series; legacy without lifetime tracking exports zero. This export adds no read-path state or locks and does not complete origin/latency/physical-I/O coverage. |
+| `dfkv_slab_lifetime_read_transport_fallback_unclassified_total` / `dfkv_slab_disk_lifetime_read_transport_fallback_unclassified_total` | counter | A legacy range handler provided no route. A nested subpartition of synchronous_fallback, not an additional transport/source term. |
+| `dfkv_slab_lifetime_read_transport_fallback_ram_hit_total` / `dfkv_slab_disk_lifetime_read_transport_fallback_ram_hit_total` | counter | The synchronous handler copied a RAM hit. A nested subpartition of synchronous_fallback, not an additional transport/source term. |
+| `dfkv_slab_lifetime_read_transport_fallback_disk_total` / `dfkv_slab_disk_lifetime_read_transport_fallback_disk_total` | counter | An independent synchronous storage read, including coalescer timeout/self/failure fallback. A nested subpartition of synchronous_fallback, not an additional transport/source term. |
+| `dfkv_slab_lifetime_read_transport_fallback_copy_leader_total` / `dfkv_slab_disk_lifetime_read_transport_fallback_copy_leader_total` | counter | The synchronous handler led a copy-coalesced storage read. A nested subpartition of synchronous_fallback, not an additional transport/source term. |
+| `dfkv_slab_lifetime_read_transport_fallback_copy_follower_total` / `dfkv_slab_disk_lifetime_read_transport_fallback_copy_follower_total` | counter | The synchronous handler actually copied successful shared-flight bytes; not inferred from merely being a nonleader. A nested subpartition of synchronous_fallback, not an additional transport/source term. |
 | `dfkv_slab_lifetime_read_source_unclassified_total` / `dfkv_slab_disk_lifetime_read_source_unclassified_total` | counter | Successful nonempty notifications from internal callers that do not supply a completion-path classification. Not an inference from credential validity; production Request/Into and transport-grant callbacks supply explicit paths. |
 | `dfkv_slab_lifetime_read_source_ram_total` / `dfkv_slab_disk_lifetime_read_source_ram_total` | counter | Successful nonempty synchronous Request/Into reads copied from RAM, including RAM without a disk credential. Does not count physical disk I/O. |
 | `dfkv_slab_lifetime_read_source_disk_total` / `dfkv_slab_disk_lifetime_read_source_disk_total` | counter | Successful nonempty independent synchronous storage reads, including coalescer timeout, failed-flight, missing-shared-buffer and self-thread fallbacks. A logical completion, not a syscall count or bytes read from hardware. |
@@ -760,12 +765,13 @@ internal C++ consumers still need matching headers/library builds.
 
 ### PULL grant preparation-path subpartition
 
-The six `lifetime_read_transport_*_total` counters subdivide the existing
+The original six `lifetime_read_transport_*_total` counters subdivide the existing
 `lifetime_read_source_transport_grant_total`; within a Store snapshot their
 sum equals that coarse counter. The original six-source sum still equals
 successful logical notifications, and the independent heat-outcome partition
 is unchanged. Do not add transport children to the original source sum again.
-All six reset on Store reconstruction; virtual recovery reads add nothing.
+All preparation counters, including nested fallback children, reset on Store
+reconstruction; virtual recovery reads add nothing.
 Legacy without lifetime tracking exports zero and file engines omit them.
 Per-disk series use only the existing disk/disk_index labels. Global/per-disk
 samples are separate; compare cross-disk sums at quiescence.
@@ -778,7 +784,18 @@ published_follower means the request waited for publication then acquired a
 RAM hit; a concurrent new PUT may have replaced the original leader resident,
 so this tag is not proof of exact shared-leader identity. Existing resident
 credentials remain authoritative. Synchronous fallback has its own category,
-not a guessed disk/RAM/copy route; finer fallback provenance is still pending.
+subdivided by five `lifetime_read_transport_fallback_*_total` counters. Their
+sum equals synchronous_fallback; never add these nested children to the
+six-way transport sum. RAM/disk/copy leader/copied-follower labels come from
+the actual synchronous handler result, not identity validity, promotion or
+registered-memory state. Timeout, self-recursion, failed-flight and no-shared-
+bytes fallbacks are independent disk reads, not copied followers. The Node's
+RangeDirectForKey resets its source output to Unclassified for empty or failed
+reads. Legacy adapters retain their unknown-route fallback tag regardless of
+status; neither failed nor empty grants count. Old eight/nine-argument range
+setters still work through adapters and use fallback_unclassified;
+production uses the source-aware range setter. The new fallback counters share
+the existing reset/disabled/empty/health-rejection semantics.
 Move transfers the tag, while Stage and terminal operations preserve it.
 
 Only the established nonempty grant's existing once-only callback counts the

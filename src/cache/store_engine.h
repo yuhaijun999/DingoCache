@@ -127,7 +127,13 @@ class PreparedRead {
     kDiskToRam = 3,     // Disk I/O targets a hidden RAM reservation.
     kPublishedFollower =
         4,  // RAM prepared after a successful publication wait.
-    kSynchronousFallback = 5  // Transport used its synchronous range handler.
+    kSynchronousFallback = 5,  // Synchronous handler supplied no finer source.
+    kSynchronousRamHit =
+        6,                 // Synchronous fallback copied an existing RAM value.
+    kSynchronousDisk = 7,  // Synchronous fallback issued its own storage read.
+    kSynchronousCopyLeader =
+        8,  // Synchronous coalescer leader filled the result.
+    kSynchronousCopyFollower = 9  // Synchronous follower copied shared bytes.
   };
 
   PreparedRead() noexcept = default;

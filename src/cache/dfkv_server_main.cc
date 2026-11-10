@@ -416,13 +416,14 @@ int main(int argc, char** argv) {
                                           value_len);
         },
         /*max_msg=*/max_msg, rdma_dev);
-    rsrv->set_range_with_identity_handler(  // disk -> registered dbuf -> RDMA
-                                            // scatter
+    rsrv->set_range_with_source_handler(  // disk -> registered dbuf -> RDMA
+                                          // scatter
         [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
                char* io_buf, size_t cap, const char** out_data, size_t* out_len,
-               size_t* value_len, dfkv::DiskResidentIdentity* identity) {
+               size_t* value_len, dfkv::DiskResidentIdentity* identity,
+               dfkv::PreparedRead::Source* source) {
           return srv.RangeDirectForKey(key, off, len, io_buf, cap, out_data,
-                                       out_len, value_len, identity);
+                                       out_len, value_len, identity, source);
         });
     rsrv->set_cache_direct_handler(  // server-side direct PUT: RDMA dbuf ->
                                      // O_DIRECT write

@@ -138,15 +138,18 @@ class KvNodeServer {
 
   // Preparation only: the current RDMA caller uses this before PULL MR/grant
   // establishment. It does not notify lifetime read success. Optional identity
-  // describes the returned bytes, not continued disk residency.
-  // RDMA direct GET: read an O_DIRECT-aligned superset into `io_buf`; *out_data
-  // points inside that same buffer at the exact requested range so the RDMA
-  // layer can scatter-send it without copying into sbuf.
+  // describes the returned bytes, not continued disk residency. Optional source
+  // reports the successful nonempty preparation route; failed/empty reads reset
+  // it to Unclassified. Neither output proves a transport grant or physical
+  // I/O. RDMA direct GET: read an O_DIRECT-aligned superset into `io_buf`;
+  // *out_data points inside that same buffer at the exact requested range so
+  // the RDMA layer can scatter-send it without copying into sbuf.
   Status RangeDirectForKey(const BlockKey& key, uint64_t offset,
                            uint64_t length, char* io_buf, size_t io_cap,
                            const char** out_data, size_t* out_len,
                            size_t* value_len = nullptr,
-                           DiskResidentIdentity* identity = nullptr);
+                           DiskResidentIdentity* identity = nullptr,
+                           PreparedRead::Source* source = nullptr);
   // Observe an arena hit without accounting. The prepared owner holds its pin
   // until the caller revokes remote access and commits, or fences and aborts.
   // Misses, dedicated values and registration fallbacks remain uncounted here.

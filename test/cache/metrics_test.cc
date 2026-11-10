@@ -312,14 +312,30 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
                       disk_labels + "1096\n"),
             std::string::npos);
   const std::string labels = disk_labels + "0\n";
-  for (const char* suffix :
-       {"success", "applied", "no_binding", "race_lost", "clock_hard_exhausted",
-        "io_unhealthy", "state_unavailable", "source_unclassified",
-        "source_ram", "source_disk", "source_copy_leader",
-        "source_copy_follower", "source_transport_grant",
-        "transport_unclassified", "transport_ram_hit", "transport_disk_staging",
-        "transport_disk_to_ram", "transport_published_follower",
-        "transport_synchronous_fallback"}) {
+  for (const char* suffix : {"success",
+                             "applied",
+                             "no_binding",
+                             "race_lost",
+                             "clock_hard_exhausted",
+                             "io_unhealthy",
+                             "state_unavailable",
+                             "source_unclassified",
+                             "source_ram",
+                             "source_disk",
+                             "source_copy_leader",
+                             "source_copy_follower",
+                             "source_transport_grant",
+                             "transport_unclassified",
+                             "transport_ram_hit",
+                             "transport_disk_staging",
+                             "transport_disk_to_ram",
+                             "transport_published_follower",
+                             "transport_synchronous_fallback",
+                             "transport_fallback_unclassified",
+                             "transport_fallback_ram_hit",
+                             "transport_fallback_disk",
+                             "transport_fallback_copy_leader",
+                             "transport_fallback_copy_follower"}) {
     EXPECT_NE(text.find(std::string("dfkv_slab_disk_lifetime_read_") + suffix +
                         "_total" + labels),
               std::string::npos);
@@ -1828,6 +1844,136 @@ TEST(Metrics, TransportPreparationCountsAggregateAndReset) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, SynchronousFallbackCountsAggregateAndReset) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_metrics_fallback_source";
+  fs::remove_all(dir);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 2ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  BlockKey keys[2]{};
+  bool found[2]{};
+  for (uint64_t id = 1; id < 10000 && !(found[0] && found[1]); ++id) {
+    const BlockKey key{id, 0};
+    const size_t disk = DiskCacheGroupTestPeer::RouteIndex(
+        KvNodeServerTestPeer::Group(*server), key);
+    ASSERT_LT(disk, 2U);
+    keys[disk] = key;
+    found[disk] = true;
+  }
+  ASSERT_TRUE(found[0] && found[1]);
+  struct TransportMetric {
+    PreparedRead::Source source;
+    const char* suffix;
+    uint64_t DiskSlabStore::LifetimeReadCounters::*field;
+  };
+  const TransportMetric metrics[] = {
+      {PreparedRead::Source::kSynchronousFallback, "fallback_unclassified",
+       &DiskSlabStore::LifetimeReadCounters::transport_fallback_unclassified},
+      {PreparedRead::Source::kSynchronousRamHit, "fallback_ram_hit",
+       &DiskSlabStore::LifetimeReadCounters::transport_fallback_ram_hit},
+      {PreparedRead::Source::kSynchronousDisk, "fallback_disk",
+       &DiskSlabStore::LifetimeReadCounters::transport_fallback_disk},
+      {PreparedRead::Source::kSynchronousCopyLeader, "fallback_copy_leader",
+       &DiskSlabStore::LifetimeReadCounters::transport_fallback_copy_leader},
+      {PreparedRead::Source::kSynchronousCopyFollower, "fallback_copy_follower",
+       &DiskSlabStore::LifetimeReadCounters::transport_fallback_copy_follower}};
+  const auto expect_counts = [&](uint64_t multiplier) {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+    const std::string text = server->MetricsText();
+    const DiskSlabStore::LifetimeReadCounters total =
+        group.SlabStats().lifetime_reads;
+    EXPECT_EQ(total.source_transport_grant, 45 * multiplier);
+    EXPECT_EQ(total.successful, total.source_transport_grant);
+    EXPECT_EQ(total.transport_synchronous_fallback,
+              total.source_transport_grant);
+    size_t index = 0;
+    for (const TransportMetric& metric : metrics) {
+      const std::string name =
+          std::string("dfkv_slab_lifetime_read_transport_") + metric.suffix +
+          "_total";
+      EXPECT_NE(text.find("# TYPE " + name + " counter\n"), std::string::npos);
+      EXPECT_EQ(total.*(metric.field), (index + 1) * 3 * multiplier);
+      EXPECT_NE(text.find("\n" + name + " " +
+                          std::to_string(total.*(metric.field)) + "\n"),
+                std::string::npos);
+      const std::string disk_name =
+          std::string("dfkv_slab_disk_lifetime_read_transport_") +
+          metric.suffix + "_total";
+      EXPECT_NE(text.find("# TYPE " + disk_name + " counter\n"),
+                std::string::npos);
+      for (size_t disk = 0; disk < 2; ++disk) {
+        const DiskSlabStore::LifetimeReadCounters actual =
+            group.DiskSlabStats(disk).lifetime_reads;
+        EXPECT_EQ(actual.*(metric.field),
+                  (index + 1) * (disk + 1) * multiplier);
+        EXPECT_EQ(actual.source_transport_grant, 15 * (disk + 1) * multiplier);
+        EXPECT_EQ(actual.source_transport_grant,
+                  actual.transport_unclassified + actual.transport_ram_hit +
+                      actual.transport_disk_staging +
+                      actual.transport_disk_to_ram +
+                      actual.transport_published_follower +
+                      actual.transport_synchronous_fallback);
+        EXPECT_EQ(actual.transport_synchronous_fallback,
+                  actual.transport_fallback_unclassified +
+                      actual.transport_fallback_ram_hit +
+                      actual.transport_fallback_disk +
+                      actual.transport_fallback_copy_leader +
+                      actual.transport_fallback_copy_follower);
+        const std::string labels = "{disk=\"" + options.cache_dirs[disk] +
+                                   "\",disk_index=\"" + std::to_string(disk) +
+                                   "\"} ";
+        EXPECT_NE(text.find("\n" + disk_name + labels +
+                            std::to_string(actual.*(metric.field)) + "\n"),
+                  std::string::npos);
+      }
+      ++index;
+    }
+  };
+  ASSERT_NO_FATAL_FAILURE(expect_counts(0));
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+    ASSERT_EQ(group.Cache(keys[disk], "value", 5), Status::kOk);
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(group, disk);
+    std::string value;
+    DiskResidentIdentity identity;
+    ASSERT_EQ(store.RangeWithIdentity(keys[disk], 0, 0, &value, &identity),
+              Status::kOk);
+    EXPECT_EQ(value, "value");
+    ASSERT_TRUE(identity.valid());
+    EXPECT_EQ(store.GetStats().lifetime_reads.successful, 0U);
+    // Exercise the observer boundary with explicit simulated grant events.
+    // CPU transport tests separately prove real preparation-path attribution.
+    size_t index = 0;
+    for (const TransportMetric& metric : metrics) {
+      for (size_t n = 0; n < (index + 1) * (disk + 1); ++n) {
+        server->NotifyLifetimeReadSuccessForKey(keys[disk], identity,
+                                                value.size(), metric.source);
+      }
+      server->NotifyLifetimeReadSuccessForKey(keys[disk], identity, 0,
+                                              metric.source);
+      ++index;
+    }
+  }
+  ASSERT_NO_FATAL_FAILURE(expect_counts(1));
+  server.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  EXPECT_EQ(KvNodeServerTestPeer::Group(*server).Count(), 2U);
+  ASSERT_NO_FATAL_FAILURE(expect_counts(0));
+  server.reset();
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
   const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
@@ -2036,7 +2182,9 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
   EXPECT_EQ(text.find("dfkv_slab_capacity_bytes"), std::string::npos) << text;
   for (const char* suffix :
        {"unclassified", "ram_hit", "disk_staging", "disk_to_ram",
-        "published_follower", "synchronous_fallback"}) {
+        "published_follower", "synchronous_fallback", "fallback_unclassified",
+        "fallback_ram_hit", "fallback_disk", "fallback_copy_leader",
+        "fallback_copy_follower"}) {
     EXPECT_EQ(text.find(std::string("dfkv_slab_lifetime_read_transport_") +
                         suffix + "_total"),
               std::string::npos);

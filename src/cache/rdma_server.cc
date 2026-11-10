@@ -1201,6 +1201,7 @@ void RdmaServer::Serve(int boot_fd) {
                           const char* output, size_t output_len,
                           size_t value_len, PreparedRead prepared,
                           const DiskResidentIdentity& fallback_identity,
+                          PreparedRead::Source fallback_source,
                           double elapsed_sec, Reply* reply) -> bool {
     PullSlotState& state = pull_slots[slot];
     auto error_reply = [&](Status status) {
@@ -1252,11 +1253,9 @@ void RdmaServer::Serve(int boot_fd) {
                                               ? prepared.source_identity()
                                               : fallback_identity;
     // Preserve the preparation route before moving ownership. A synchronous
-    // fallback has no PreparedRead and must not be guessed to be a disk hit.
+    // fallback has no PreparedRead; retain the handler's explicit route.
     const PreparedRead::Source source =
-        prepared.status() == Status::kOk
-            ? prepared.source()
-            : PreparedRead::Source::kSynchronousFallback;
+        prepared.status() == Status::kOk ? prepared.source() : fallback_source;
     state.arena_read = std::move(prepared);
     state.read_elapsed_sec = elapsed_sec;
     state.busy = true;
@@ -1396,9 +1395,10 @@ void RdmaServer::Serve(int boot_fd) {
       size_t output_len = 0;
       size_t value_len = 0;
       DiskResidentIdentity identity;
-      const Status status = range_handler_(key, fields.offset, fields.length,
-                                           target, target_capacity, &output,
-                                           &output_len, &value_len, &identity);
+      PreparedRead::Source source = PreparedRead::Source::kSynchronousFallback;
+      const Status status = range_handler_(
+          key, fields.offset, fields.length, target, target_capacity, &output,
+          &output_len, &value_len, &identity, &source);
       if (status != Status::kOk) {
         state.Reset();
         encode_status(status, 0, fields.length == 0 ? 0 : value_len);
@@ -1420,7 +1420,8 @@ void RdmaServer::Serve(int boot_fd) {
       if (output_len != 0 && output != target)
         std::memmove(target, output, output_len);
       return publish_pull(send_slot, slot, request, target, output_len,
-                          value_len, PreparedRead{}, identity, 0.0, reply);
+                          value_len, PreparedRead{}, identity, source, 0.0,
+                          reply);
     }
 
     if (fields.op == static_cast<uint8_t>(WireOp::kLeasePut)) {
@@ -1721,7 +1722,8 @@ void RdmaServer::Serve(int boot_fd) {
         const size_t bytes = qd.read.payload_len();
         const size_t value_len = qd.read.value_len();
         if (!publish_pull(qd.send_slot, control.slot_index, qd.request, data,
-                          bytes, value_len, std::move(qd.read), {}, elapsed_sec,
+                          bytes, value_len, std::move(qd.read), {},
+                          PreparedRead::Source::kUnclassified, elapsed_sec,
                           &qd.reply))
           return false;
       }
@@ -1828,6 +1830,7 @@ void RdmaServer::Serve(int boot_fd) {
               const size_t value_len = prepared.value_len();
               if (!publish_pull(qd.send_slot, control.slot_index, request, data,
                                 bytes, value_len, std::move(prepared), {},
+                                PreparedRead::Source::kUnclassified,
                                 NowSteadySec() - started_sec, &qd.reply))
                 return false;
               handled = true;

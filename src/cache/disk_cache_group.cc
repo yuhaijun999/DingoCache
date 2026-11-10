@@ -1133,6 +1133,16 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
         st.lifetime_reads.transport_published_follower;
     sum.lifetime_reads.transport_synchronous_fallback +=
         st.lifetime_reads.transport_synchronous_fallback;
+    sum.lifetime_reads.transport_fallback_unclassified +=
+        st.lifetime_reads.transport_fallback_unclassified;
+    sum.lifetime_reads.transport_fallback_ram_hit +=
+        st.lifetime_reads.transport_fallback_ram_hit;
+    sum.lifetime_reads.transport_fallback_disk +=
+        st.lifetime_reads.transport_fallback_disk;
+    sum.lifetime_reads.transport_fallback_copy_leader +=
+        st.lifetime_reads.transport_fallback_copy_leader;
+    sum.lifetime_reads.transport_fallback_copy_follower +=
+        st.lifetime_reads.transport_fallback_copy_follower;
     sum.unclean_resets += st.unclean_resets;
     sum.eviction_record_clears += st.eviction_record_clears;
     sum.record_writes += st.record_writes;

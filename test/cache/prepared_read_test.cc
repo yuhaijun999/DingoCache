@@ -17,6 +17,7 @@
 
 #include "cache/kv_node_server.h"
 #include "cache/store_engine.h"
+#include "common/kv_types.h"
 #include "common/status.h"
 #include "read_coalescer_test_peer.h"
 #include "transport/wire.h"
@@ -24,6 +25,12 @@
 namespace dfkv {
 class KvNodeServerTestPeer {
  public:
+  static bool WaitForCopyFollower(KvNodeServer& server) {
+    return ReadCoalescerTestPeer::WaitForCopyWaiter(server.read_coalescer_);
+  }
+  static size_t CopiedFollowers(const KvNodeServer& server) {
+    return server.read_coalescer_.coalesced();
+  }
   static bool WaitForPublishedFollower(KvNodeServer& server) {
     return ReadCoalescerTestPeer::WaitForPublishedWaiter(
         server.read_coalescer_);
@@ -131,6 +138,129 @@ TEST(PreparedRead, DiskSourceSurvivesMovesAndTerminalActions) {
   ::unsetenv("DFKV_READ_COALESCE");
 }
 
+TEST(PreparedRead, RangeDirectSourceResetsOnEmptyAndFailure) {
+  ::setenv("DFKV_READ_COALESCE", "0", 1);
+  ::unsetenv("DFKV_RAM_TIER");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_direct_source_reset";
+  fs::remove_all(dir);
+  {
+    KvNodeServer server(dir.string(), 1ULL << 30);
+    ASSERT_TRUE(server.Healthy());
+    const std::string value(4096, 'd');
+    ASSERT_EQ(Put(&server, Key(95), value), Status::kOk);
+    const AlignedBuffer buffer(8192);
+    const char* data = nullptr;
+    size_t bytes = 0;
+    size_t value_len = 0;
+    PreparedRead::Source source = PreparedRead::Source::kRamHit;
+    ASSERT_EQ(server.RangeDirectForKey(Key(95), 0, value.size(), buffer.data(),
+                                       buffer.size(), &data, &bytes, &value_len,
+                                       nullptr, &source),
+              Status::kOk);
+    EXPECT_EQ(source, PreparedRead::Source::kSynchronousDisk);
+    EXPECT_EQ(std::string(data, bytes), value);
+    EXPECT_EQ(value_len, value.size());
+    // A reused output must not retain the prior nonempty source.
+    ASSERT_EQ(server.RangeDirectForKey(Key(95), value.size(), 1, buffer.data(),
+                                       buffer.size(), &data, &bytes, &value_len,
+                                       nullptr, &source),
+              Status::kOk);
+    EXPECT_EQ(bytes, 0U);
+    EXPECT_EQ(source, PreparedRead::Source::kUnclassified);
+    source = PreparedRead::Source::kSynchronousRamHit;
+    EXPECT_EQ(
+        server.RangeDirectForKey(Key(96), 0, 1, buffer.data(), buffer.size(),
+                                 &data, &bytes, &value_len, nullptr, &source),
+        Status::kNotFound);
+    EXPECT_EQ(source, PreparedRead::Source::kUnclassified);
+    source = PreparedRead::Source::kSynchronousCopyFollower;
+    EXPECT_EQ(server.RangeDirectForKey(Key(95), value.size() + 1, 1,
+                                       buffer.data(), buffer.size(), &data,
+                                       &bytes, &value_len, nullptr, &source),
+              Status::kInvalid);
+    EXPECT_EQ(source, PreparedRead::Source::kUnclassified);
+  }
+  fs::remove_all(dir);
+  ::unsetenv("DFKV_READ_COALESCE");
+}
+
+TEST(PreparedRead, RangeDirectCoalescingReportsActualRole) {
+  ::setenv("DFKV_READ_COALESCE", "1", 1);
+  ::setenv("DFKV_READ_COALESCE_TIMEOUT_MS", "500", 1);
+  ::unsetenv("DFKV_RAM_TIER");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_direct_source_roles";
+  fs::remove_all(dir);
+  {
+    KvNodeServer server(dir.string(), 1ULL << 30);
+    ASSERT_TRUE(server.Healthy());
+    const std::string value(4096, 'c');
+    const BlockKey key = Key(97);
+    ASSERT_EQ(Put(&server, key, value), Status::kOk);
+    const AlignedBuffer leader_buffer(8192);
+    const AlignedBuffer buffer(8192);
+    const char* data = nullptr;
+    size_t bytes = 0;
+    size_t value_len = 0;
+    PreparedRead::Source source = PreparedRead::Source::kUnclassified;
+    ASSERT_EQ(server.RangeDirectForKey(key, 0, value.size(), buffer.data(),
+                                       buffer.size(), &data, &bytes, &value_len,
+                                       nullptr, &source),
+              Status::kOk);
+    EXPECT_EQ(source, PreparedRead::Source::kSynchronousCopyLeader);
+    EXPECT_EQ(std::string(data, bytes), value);
+    for (const bool fail_leader : {false, true}) {
+      SCOPED_TRACE(fail_leader);
+      PreparedRead leader = server.PrepareReadForKey(
+          key, 0, value.size(), leader_buffer.data(), leader_buffer.size());
+      ASSERT_EQ(leader.status(), Status::kOk);
+      ASSERT_TRUE(leader.needs_io());
+      // Same-thread recursion must independently read rather than deadlock or
+      // report a follower merely because this request did not become leader.
+      ASSERT_EQ(server.RangeDirectForKey(key, 0, value.size(), buffer.data(),
+                                         buffer.size(), &data, &bytes,
+                                         &value_len, nullptr, &source),
+                Status::kOk);
+      EXPECT_EQ(source, PreparedRead::Source::kSynchronousDisk);
+      EXPECT_EQ(std::string(data, bytes), value);
+      const size_t copied_before =
+          KvNodeServerTestPeer::CopiedFollowers(server);
+      Status follower_status = Status::kInvalid;
+      std::thread follower([&] {
+        follower_status = server.RangeDirectForKey(
+            key, 0, value.size(), buffer.data(), buffer.size(), &data, &bytes,
+            &value_len, nullptr, &source);
+      });
+      const bool waited = KvNodeServerTestPeer::WaitForCopyFollower(server);
+      if (fail_leader) {
+        EXPECT_TRUE(leader.Abort());
+      } else {
+        const ssize_t got =
+            ::pread(leader.fd(), leader.staging(), leader.aligned_len(),
+                    static_cast<off_t>(leader.aligned_off()));
+        const bool io_ok = got >= 0 && static_cast<size_t>(got) >=
+                                           leader.head() + leader.payload_len();
+        EXPECT_TRUE(io_ok);
+        EXPECT_TRUE(leader.Commit(io_ok ? Status::kOk : Status::kIOError,
+                                  io_ok ? leader.payload_len() : 0, 0.0));
+      }
+      // Join before fatal assertions so failed handshakes cannot terminate
+      // the test process with a live std::thread.
+      follower.join();
+      ASSERT_TRUE(waited);
+      ASSERT_EQ(follower_status, Status::kOk);
+      EXPECT_EQ(std::string(data, bytes), value);
+      EXPECT_EQ(source, fail_leader
+                            ? PreparedRead::Source::kSynchronousDisk
+                            : PreparedRead::Source::kSynchronousCopyFollower);
+      EXPECT_EQ(KvNodeServerTestPeer::CopiedFollowers(server),
+                copied_before + (fail_leader ? 0 : 1));
+    }
+  }
+  fs::remove_all(dir);
+  ::unsetenv("DFKV_READ_COALESCE");
+  ::unsetenv("DFKV_READ_COALESCE_TIMEOUT_MS");
+}
+
 TEST(PreparedRead, CompletionAndFailureAreSingleTerminalActions) {
   ::setenv("DFKV_READ_COALESCE", "1", 1);
   ::setenv("DFKV_READ_COALESCE_TIMEOUT_MS", "25", 1);
@@ -207,19 +337,21 @@ TEST(PreparedRead, FallbackAbortAndDestructorReleaseFlight) {
   // A follower times out defensively while the RAII leader remains alive, then
   // performs its own synchronous read without stealing cleanup ownership.
   Status follower_status = Status::kIOError;
+  PreparedRead::Source follower_source = PreparedRead::Source::kUnclassified;
   std::string follower_value;
   std::thread follower([&] {
     const char* data = nullptr;
     size_t len = 0;
     size_t value_len = 0;
     follower_status = server.RangeDirectForKey(
-        Key(2), 0, value.size(), second_staging.data(),
-        second_staging.size(), &data, &len, &value_len);
+        Key(2), 0, value.size(), second_staging.data(), second_staging.size(),
+        &data, &len, &value_len, nullptr, &follower_source);
     if (follower_status == Status::kOk && data != nullptr)
       follower_value.assign(data, len);
   });
   follower.join();
   EXPECT_EQ(follower_status, Status::kOk);
+  EXPECT_EQ(follower_source, PreparedRead::Source::kSynchronousDisk);
   EXPECT_EQ(follower_value, value);
   EXPECT_TRUE(leader.Abort());  // connection-abort path
   EXPECT_FALSE(leader.Abort());
@@ -441,6 +573,25 @@ TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
     EXPECT_EQ(std::string(ram_hit.data(), ram_hit.payload_len()), value);
     EXPECT_TRUE(ram_hit.Commit(Status::kOk, ram_hit.payload_len(), 0.0));
     EXPECT_EQ(ram_hit.source(), PreparedRead::Source::kRamHit);
+
+    const char* direct_data = nullptr;
+    size_t direct_bytes = 0;
+    size_t direct_value_len = 0;
+    PreparedRead::Source direct_source = PreparedRead::Source::kDiskStaging;
+    ASSERT_EQ(server.RangeDirectForKey(
+                  Key(92), 0, value.size(), follower_staging.data(),
+                  follower_staging.size(), &direct_data, &direct_bytes,
+                  &direct_value_len, nullptr, &direct_source),
+              Status::kOk);
+    EXPECT_EQ(direct_source, PreparedRead::Source::kSynchronousRamHit);
+    EXPECT_EQ(std::string(direct_data, direct_bytes), value);
+    ASSERT_EQ(server.RangeDirectForKey(
+                  Key(92), value.size(), 1, follower_staging.data(),
+                  follower_staging.size(), &direct_data, &direct_bytes,
+                  &direct_value_len, nullptr, &direct_source),
+              Status::kOk);
+    EXPECT_EQ(direct_bytes, 0U);
+    EXPECT_EQ(direct_source, PreparedRead::Source::kUnclassified);
   }
   fs::remove_all(dir);
   ::unsetenv("DFKV_READ_COALESCE");

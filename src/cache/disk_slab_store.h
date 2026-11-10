@@ -133,6 +133,12 @@ class DiskSlabStore : public StoreEngine {
     uint64_t transport_disk_to_ram = 0;
     uint64_t transport_published_follower = 0;
     uint64_t transport_synchronous_fallback = 0;
+    // Nested partition of synchronous fallbacks, not additional grants.
+    uint64_t transport_fallback_unclassified = 0;
+    uint64_t transport_fallback_ram_hit = 0;
+    uint64_t transport_fallback_disk = 0;
+    uint64_t transport_fallback_copy_leader = 0;
+    uint64_t transport_fallback_copy_follower = 0;
   };
 
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).

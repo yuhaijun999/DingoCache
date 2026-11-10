@@ -2828,8 +2828,27 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
         case PreparedRead::Source::kPublishedFollower:
           ++lifetime_reads_.transport_published_follower;
           break;
+        // These nested children retain the original fallback total. A legacy
+        // handler explicitly supplies the unknown-route fallback enumerator.
         case PreparedRead::Source::kSynchronousFallback:
           ++lifetime_reads_.transport_synchronous_fallback;
+          ++lifetime_reads_.transport_fallback_unclassified;
+          break;
+        case PreparedRead::Source::kSynchronousRamHit:
+          ++lifetime_reads_.transport_synchronous_fallback;
+          ++lifetime_reads_.transport_fallback_ram_hit;
+          break;
+        case PreparedRead::Source::kSynchronousDisk:
+          ++lifetime_reads_.transport_synchronous_fallback;
+          ++lifetime_reads_.transport_fallback_disk;
+          break;
+        case PreparedRead::Source::kSynchronousCopyLeader:
+          ++lifetime_reads_.transport_synchronous_fallback;
+          ++lifetime_reads_.transport_fallback_copy_leader;
+          break;
+        case PreparedRead::Source::kSynchronousCopyFollower:
+          ++lifetime_reads_.transport_synchronous_fallback;
+          ++lifetime_reads_.transport_fallback_copy_follower;
           break;
         case PreparedRead::Source::kUnclassified:
         default:

@@ -56,6 +56,12 @@ class RdmaServer {
       const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
       size_t io_cap, const char** out_data, size_t* out_len, size_t* value_len,
       DiskResidentIdentity* identity)>;
+  // Source-aware synchronous preparation. The source describes returned bytes,
+  // not a grant; legacy adapters leave the fallback's internal route unknown.
+  using RangeWithSourceHandler = std::function<Status(
+      const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
+      size_t io_cap, const char** out_data, size_t* out_len, size_t* value_len,
+      DiskResidentIdentity* identity, PreparedRead::Source* source)>;
   // Optional direct PUT handler: `data` points at an aligned registered buffer
   // containing exactly the raw stored value bytes.
   using CacheDirectHandler = std::function<Status(
@@ -84,12 +90,31 @@ class RdmaServer {
                          const BlockKey& key, uint64_t offset, uint64_t length,
                          char* buffer, size_t cap, const char** data,
                          size_t* bytes, size_t* value_len,
-                         DiskResidentIdentity* identity) {
+                         DiskResidentIdentity* identity,
+                         PreparedRead::Source* source) {
       if (identity != nullptr) *identity = {};
+      if (source != nullptr)
+        *source = PreparedRead::Source::kSynchronousFallback;
       return handler(key, offset, length, buffer, cap, data, bytes, value_len);
     };
   }
   void set_range_with_identity_handler(RangeWithIdentityHandler handler) {
+    if (!handler) {
+      range_handler_ = {};
+      return;
+    }
+    range_handler_ =
+        [handler = std::move(handler)](
+            const BlockKey& key, uint64_t offset, uint64_t length, char* buffer,
+            size_t cap, const char** data, size_t* bytes, size_t* value_len,
+            DiskResidentIdentity* identity, PreparedRead::Source* source) {
+          if (source != nullptr)
+            *source = PreparedRead::Source::kSynchronousFallback;
+          return handler(key, offset, length, buffer, cap, data, bytes,
+                         value_len, identity);
+        };
+  }
+  void set_range_with_source_handler(RangeWithSourceHandler handler) {
     range_handler_ = std::move(handler);
   }
   void set_cache_direct_handler(CacheDirectHandler h) {
@@ -265,7 +290,7 @@ class RdmaServer {
   };
 
   Handler handler_;
-  RangeWithIdentityHandler range_handler_;
+  RangeWithSourceHandler range_handler_;
   PullReadSuccessWithSourceHandler pull_read_success_handler_;
   CacheDirectHandler cache_direct_handler_;
   CacheDirectBatchHandler cache_direct_batch_handler_;

@@ -121,6 +121,12 @@ class DiskLifetimeReadTest : public ::testing::Test {
                   counters.transport_disk_to_ram +
                   counters.transport_published_follower +
                   counters.transport_synchronous_fallback);
+    EXPECT_EQ(counters.transport_synchronous_fallback,
+              counters.transport_fallback_unclassified +
+                  counters.transport_fallback_ram_hit +
+                  counters.transport_fallback_disk +
+                  counters.transport_fallback_copy_leader +
+                  counters.transport_fallback_copy_follower);
     return counters;
   }
   const BlockKey key_{1, 0};
@@ -174,6 +180,65 @@ TEST_F(DiskLifetimeReadTest,
   EXPECT_EQ(counters.source_disk, 1U);
   EXPECT_EQ(counters.source_transport_grant, 21U);
   EXPECT_EQ(counters.transport_ram_hit, 2U);
+}
+
+TEST_F(DiskLifetimeReadTest, SynchronousFallbackPartitionPreservesBothTotals) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  const PreparedRead::Source sources[] = {
+      PreparedRead::Source::kSynchronousFallback,
+      PreparedRead::Source::kSynchronousRamHit,
+      PreparedRead::Source::kSynchronousDisk,
+      PreparedRead::Source::kSynchronousCopyLeader,
+      PreparedRead::Source::kSynchronousCopyFollower};
+  uint64_t repeats = 1;
+  for (const PreparedRead::Source source : sources) {
+    for (uint64_t i = 0; i < repeats; ++i) {
+      store_->NotifyLifetimeReadSuccess(
+          key_, identity, 5, DiskSlabStore::LifetimeReadSource::kTransportGrant,
+          source);
+    }
+    // Neither an empty grant nor a non-transport source adds a fallback event.
+    store_->NotifyLifetimeReadSuccess(
+        key_, identity, 0, DiskSlabStore::LifetimeReadSource::kTransportGrant,
+        source);
+    store_->NotifyLifetimeReadSuccess(
+        key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk, source);
+    ++repeats;
+  }
+  DiskSlabStore::LifetimeReadCounters counters = Counters();
+  EXPECT_EQ(counters.successful, 20U);
+  EXPECT_EQ(counters.source_disk, 5U);
+  EXPECT_EQ(counters.source_transport_grant, 15U);
+  EXPECT_EQ(counters.transport_synchronous_fallback, 15U);
+  EXPECT_EQ(counters.transport_fallback_unclassified, 1U);
+  EXPECT_EQ(counters.transport_fallback_ram_hit, 2U);
+  EXPECT_EQ(counters.transport_fallback_disk, 3U);
+  EXPECT_EQ(counters.transport_fallback_copy_leader, 4U);
+  EXPECT_EQ(counters.transport_fallback_copy_follower, 5U);
+  // Provenance is independent of whether the successful grant can be heated.
+  store_->NotifyLifetimeReadSuccess(
+      key_, {}, 5, DiskSlabStore::LifetimeReadSource::kTransportGrant,
+      PreparedRead::Source::kSynchronousDisk);
+  counters = Counters();
+  EXPECT_EQ(counters.no_binding, 1U);
+  EXPECT_EQ(counters.transport_synchronous_fallback, 16U);
+  EXPECT_EQ(counters.transport_fallback_disk, 4U);
+  ASSERT_EQ(store_->Remove(key_), Status::kOk);
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 5, DiskSlabStore::LifetimeReadSource::kTransportGrant,
+      PreparedRead::Source::kSynchronousCopyFollower);
+  counters = Counters();
+  EXPECT_EQ(counters.race_lost, 1U);
+  EXPECT_EQ(counters.transport_fallback_copy_follower, 6U);
+  store_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create(false));
+  const uint64_t samples = samples_.load(std::memory_order_relaxed);
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 5, DiskSlabStore::LifetimeReadSource::kTransportGrant,
+      PreparedRead::Source::kSynchronousRamHit);
+  EXPECT_EQ(Counters().successful, 0U);
+  EXPECT_EQ(samples_.load(std::memory_order_relaxed), samples);
 }
 
 TEST_F(DiskLifetimeReadTest, SourcesPartitionSuccessfulNotifications) {

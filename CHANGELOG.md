@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Subdivide synchronous PULL fallback grants by actual RAM, independent disk,
+  copy leader and copied-follower routes, retaining an unknown category for
+  legacy handlers. Preserve the coarse fallback total and existing grant timing.
+
 - Subdivide PULL grant notifications by preparation path while preserving the
   coarse transport total. Carry RAM, staged disk, disk-to-RAM and publication
   wait provenance through moves and staging; keep synchronous fallback explicit

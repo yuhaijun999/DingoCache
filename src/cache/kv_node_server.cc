@@ -689,6 +689,20 @@ std::string KvNodeServer::MetricsText() const {
            "Grant notifications from RAM preparation after a publication wait");
     header("dfkv_slab_disk_lifetime_read_transport_synchronous_fallback_total",
            "counter", "Grant notifications from synchronous range fallbacks");
+    header("dfkv_slab_disk_lifetime_read_transport_fallback_unclassified_total",
+           "counter",
+           "Fallback grants with unknown synchronous preparation provenance");
+    header("dfkv_slab_disk_lifetime_read_transport_fallback_ram_hit_total",
+           "counter", "Fallback grants with synchronous RAM hits");
+    header("dfkv_slab_disk_lifetime_read_transport_fallback_disk_total",
+           "counter",
+           "Fallback grants with independent synchronous storage reads");
+    header("dfkv_slab_disk_lifetime_read_transport_fallback_copy_leader_total",
+           "counter",
+           "Fallback grants with synchronous copy coalescer leaders");
+    header(
+        "dfkv_slab_disk_lifetime_read_transport_fallback_copy_follower_total",
+        "counter", "Fallback grants with synchronous shared-result copies");
     header("dfkv_slab_disk_lifetime_read_success_total", "counter",
            "Nonzero successful business reads notified to lifetime metadata");
     header("dfkv_slab_disk_lifetime_read_applied_total", "counter",
@@ -777,6 +791,19 @@ std::string KvNodeServer::MetricsText() const {
       sample(
           "dfkv_slab_disk_lifetime_read_transport_synchronous_fallback_total",
           disk.lifetime_reads.transport_synchronous_fallback);
+      sample(
+          "dfkv_slab_disk_lifetime_read_transport_fallback_unclassified_total",
+          disk.lifetime_reads.transport_fallback_unclassified);
+      sample("dfkv_slab_disk_lifetime_read_transport_fallback_ram_hit_total",
+             disk.lifetime_reads.transport_fallback_ram_hit);
+      sample("dfkv_slab_disk_lifetime_read_transport_fallback_disk_total",
+             disk.lifetime_reads.transport_fallback_disk);
+      sample(
+          "dfkv_slab_disk_lifetime_read_transport_fallback_copy_leader_total",
+          disk.lifetime_reads.transport_fallback_copy_leader);
+      sample(
+          "dfkv_slab_disk_lifetime_read_transport_fallback_copy_follower_total",
+          disk.lifetime_reads.transport_fallback_copy_follower);
       sample("dfkv_slab_disk_lifetime_read_success_total",
              disk.lifetime_reads.successful);
       sample("dfkv_slab_disk_lifetime_read_applied_total",
@@ -1065,6 +1092,22 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_read_transport_synchronous_fallback_total",
            "counter", "Grant notifications from synchronous range fallbacks",
            ss.lifetime_reads.transport_synchronous_fallback);
+    metric("dfkv_slab_lifetime_read_transport_fallback_unclassified_total",
+           "counter",
+           "Fallback grants with unknown synchronous preparation provenance",
+           ss.lifetime_reads.transport_fallback_unclassified);
+    metric("dfkv_slab_lifetime_read_transport_fallback_ram_hit_total",
+           "counter", "Fallback grants with synchronous RAM hits",
+           ss.lifetime_reads.transport_fallback_ram_hit);
+    metric("dfkv_slab_lifetime_read_transport_fallback_disk_total", "counter",
+           "Fallback grants with independent synchronous storage reads",
+           ss.lifetime_reads.transport_fallback_disk);
+    metric("dfkv_slab_lifetime_read_transport_fallback_copy_leader_total",
+           "counter", "Fallback grants with synchronous copy coalescer leaders",
+           ss.lifetime_reads.transport_fallback_copy_leader);
+    metric("dfkv_slab_lifetime_read_transport_fallback_copy_follower_total",
+           "counter", "Fallback grants with synchronous shared-result copies",
+           ss.lifetime_reads.transport_fallback_copy_follower);
     metric("dfkv_slab_lifetime_read_success_total", "counter",
            "Nonzero successful business reads notified to lifetime metadata",
            ss.lifetime_reads.successful);
@@ -1850,8 +1893,10 @@ Status KvNodeServer::RangeDirectForKey(const BlockKey& key, uint64_t offset,
                                        uint64_t length, char* io_buf,
                                        size_t io_cap, const char** out_data,
                                        size_t* out_len, size_t* value_len,
-                                       DiskResidentIdentity* identity) {
+                                       DiskResidentIdentity* identity,
+                                       PreparedRead::Source* source) {
   if (identity != nullptr) *identity = {};
+  if (source != nullptr) *source = PreparedRead::Source::kUnclassified;
   if (LifetimeRestartRequired()) {
     if (out_data != nullptr) *out_data = nullptr;
     if (out_len != nullptr) *out_len = 0;
@@ -1872,6 +1917,8 @@ Status KvNodeServer::RangeDirectForKey(const BlockKey& key, uint64_t offset,
       if (out_len) *out_len = n;
       if (value_len) *value_len = h.value_len;
       if (identity != nullptr && n != 0) *identity = h.identity;
+      if (source != nullptr && n != 0)
+        *source = PreparedRead::Source::kSynchronousRamHit;
       cache_hit_.fetch_add(1, std::memory_order_relaxed);
       bytes_read_.fetch_add(n, std::memory_order_relaxed);
       if (samp) get_lat_.Observe(NowSec() - t0);
@@ -1883,6 +1930,7 @@ Status KvNodeServer::RangeDirectForKey(const BlockKey& key, uint64_t offset,
   if (value_len == nullptr) value_len = &stored_len;
   const uint64_t read_epoch = CaptureReadEpoch(key);
   DiskResidentIdentity read_identity;
+  ReadCoalescer::Outcome outcome;
   Status st;
   if (coalesce_enabled_ && (read_epoch & 1) == 0) {
     // Leader reads into the shared scratch, every rank's convoy copy lands in
@@ -1902,7 +1950,7 @@ Status KvNodeServer::RangeDirectForKey(const BlockKey& key, uint64_t offset,
             std::memmove(buf, p, *n < cap ? *n : cap);
           return s;
         },
-        nullptr, read_epoch);
+        source != nullptr ? &outcome : nullptr, read_epoch);
     if (st == Status::kOk && out_data) *out_data = io_buf;
   } else if (ram_ || identity != nullptr) {
     st = group_.RangeDirectWithIdentity(key, offset, length, io_buf, io_cap,
@@ -1914,6 +1962,16 @@ Status KvNodeServer::RangeDirectForKey(const BlockKey& key, uint64_t offset,
   }
   if (st == Status::kOk) {
     if (identity != nullptr && *out_len != 0) *identity = read_identity;
+    if (source != nullptr && *out_len != 0) {
+      // Only an actual shared copy is a follower. Timeout, failed-flight and
+      // same-thread fallbacks do their own read with neither role set.
+      if (outcome.leader)
+        *source = PreparedRead::Source::kSynchronousCopyLeader;
+      else if (outcome.copied_follower)
+        *source = PreparedRead::Source::kSynchronousCopyFollower;
+      else
+        *source = PreparedRead::Source::kSynchronousDisk;
+    }
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
     // Only a complete value may become a durable RAM resident. A slice must

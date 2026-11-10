@@ -146,9 +146,10 @@ class RdmaServerTestPeer {
   static Status InvokeRange(RdmaServer& server, const BlockKey& key,
                             char* buffer, size_t cap, const char** data,
                             size_t* bytes, size_t* value_len,
-                            DiskResidentIdentity* identity) {
+                            DiskResidentIdentity* identity,
+                            PreparedRead::Source* source = nullptr) {
     return server.range_handler_(key, 0, 5, buffer, cap, data, bytes, value_len,
-                                 identity);
+                                 identity, source);
   }
 
   static void RecordPullGrant(
@@ -613,6 +614,12 @@ class RdmaPullHeatTest : public ::testing::Test {
                   counters.transport_disk_to_ram +
                   counters.transport_published_follower +
                   counters.transport_synchronous_fallback);
+    EXPECT_EQ(counters.transport_synchronous_fallback,
+              counters.transport_fallback_unclassified +
+                  counters.transport_fallback_ram_hit +
+                  counters.transport_fallback_disk +
+                  counters.transport_fallback_copy_leader +
+                  counters.transport_fallback_copy_follower);
     return counters;
   }
   const ScopedEnv slab_{"DFKV_STORE_ENGINE", "slab"};
@@ -818,12 +825,14 @@ TEST_F(RdmaPullHeatTest, LegacyRangeClearsSourceAndTypedRangePreservesIt) {
   size_t bytes = 0;
   size_t value_len = 0;
   DiskResidentIdentity source = identity;
+  PreparedRead::Source route = PreparedRead::Source::kSynchronousRamHit;
   ASSERT_EQ(RdmaServerTestPeer::InvokeRange(transport_, key_, staging_,
                                             sizeof(staging_), &data, &bytes,
-                                            &value_len, &source),
+                                            &value_len, &source, &route),
             Status::kOk);
   EXPECT_EQ(std::string(data, bytes), "value");
   EXPECT_FALSE(source.valid());
+  EXPECT_EQ(route, PreparedRead::Source::kSynchronousFallback);
   transport_.set_range_handler({});
   EXPECT_FALSE(RdmaServerTestPeer::HasRangeHandler(transport_));
   transport_.set_range_with_identity_handler(
@@ -835,14 +844,117 @@ TEST_F(RdmaPullHeatTest, LegacyRangeClearsSourceAndTypedRangePreservesIt) {
                                         output, output_bytes, stored_bytes,
                                         output_identity);
       });
+  route = PreparedRead::Source::kSynchronousDisk;
   ASSERT_EQ(RdmaServerTestPeer::InvokeRange(transport_, key_, staging_,
                                             sizeof(staging_), &data, &bytes,
-                                            &value_len, &source),
+                                            &value_len, &source, &route),
             Status::kOk);
+  EXPECT_EQ(route, PreparedRead::Source::kSynchronousFallback);
   EXPECT_TRUE(source == identity);
   EXPECT_EQ(std::string(data, bytes), "value");
   EXPECT_EQ(Counters().successful, 0U);
+  bool recorded = false;
+  Grant(source, recorded, route);
+  Grant(source, recorded, route);
+  EXPECT_EQ(Counters().successful, 1U);
+  EXPECT_EQ(Counters().transport_synchronous_fallback, 1U);
+  EXPECT_EQ(Counters().transport_fallback_unclassified, 1U);
   transport_.set_range_with_identity_handler({});
+  EXPECT_FALSE(RdmaServerTestPeer::HasRangeHandler(transport_));
+}
+
+TEST_F(RdmaPullHeatTest, SynchronousSourceHandlerCarriesDiskThenRamToGrant) {
+  const ScopedEnv ram_on("DFKV_RAM_TIER", "1");
+  const ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
+  const ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
+  const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+  ASSERT_NO_FATAL_FAILURE(Create());
+  ASSERT_TRUE(node_->ram_enabled());
+  const DiskResidentIdentity expected_identity = Seed();
+  unsigned calls = 0;
+  transport_.set_range_with_source_handler(
+      [this, &calls](const BlockKey& key, uint64_t offset, uint64_t length,
+                     char* buffer, size_t cap, const char** output,
+                     size_t* output_bytes, size_t* stored_bytes,
+                     DiskResidentIdentity* identity,
+                     PreparedRead::Source* source) {
+        ++calls;
+        return node_->RangeDirectForKey(key, offset, length, buffer, cap,
+                                        output, output_bytes, stored_bytes,
+                                        identity, source);
+      });
+  const PreparedRead::Source expected_sources[] = {
+      PreparedRead::Source::kSynchronousDisk,
+      PreparedRead::Source::kSynchronousRamHit};
+  for (unsigned request = 0; request < 2; ++request) {
+    const char* data = nullptr;
+    size_t bytes = 0;
+    size_t value_len = 0;
+    DiskResidentIdentity identity;
+    PreparedRead::Source source = PreparedRead::Source::kUnclassified;
+    ASSERT_EQ(RdmaServerTestPeer::InvokeRange(transport_, key_, staging_,
+                                              sizeof(staging_), &data, &bytes,
+                                              &value_len, &identity, &source),
+              Status::kOk);
+    ASSERT_EQ(bytes, 5U);
+    EXPECT_EQ(std::string(data, bytes), "value");
+    EXPECT_TRUE(identity == expected_identity);
+    EXPECT_EQ(source, expected_sources[request]);
+    EXPECT_EQ(Counters().successful, request);  // Preparation is not a grant.
+    bool recorded = false;
+    Grant(identity, recorded, source);
+    Grant(identity, recorded, source);
+    EXPECT_TRUE(recorded);
+  }
+  EXPECT_EQ(calls, 2U);
+  EXPECT_EQ(Counters().transport_fallback_disk, 1U);
+  EXPECT_EQ(Counters().transport_fallback_ram_hit, 1U);
+  EXPECT_EQ(Counters().transport_synchronous_fallback, 2U);
+  EXPECT_EQ(Counters().successful, 2U);
+
+  const char* data = nullptr;
+  size_t bytes = 0;
+  size_t value_len = 0;
+  DiskResidentIdentity identity = expected_identity;
+  PreparedRead::Source source = PreparedRead::Source::kSynchronousDisk;
+  const BlockKey missing{key_.digest_hi + 1, key_.digest_lo};
+  EXPECT_EQ(RdmaServerTestPeer::InvokeRange(transport_, missing, staging_,
+                                            sizeof(staging_), &data, &bytes,
+                                            &value_len, &identity, &source),
+            Status::kNotFound);
+  EXPECT_EQ(source, PreparedRead::Source::kUnclassified);
+  EXPECT_FALSE(identity.valid());
+  EXPECT_EQ(Counters().successful, 2U);  // Failed reads never reach grant.
+
+  // The RAM range is truncated to zero by capacity; the sentinel grant must
+  // not become a nonempty logical success or retain stale provenance.
+  source = PreparedRead::Source::kSynchronousDisk;
+  ASSERT_EQ(
+      RdmaServerTestPeer::InvokeRange(transport_, key_, staging_, 0, &data,
+                                      &bytes, &value_len, &identity, &source),
+      Status::kOk);
+  EXPECT_EQ(bytes, 0U);
+  EXPECT_EQ(source, PreparedRead::Source::kUnclassified);
+  bool empty_recorded = false;
+  RdmaServerTestPeer::RecordPullGrant(transport_, key_, identity, bytes,
+                                      empty_recorded, source);
+  EXPECT_TRUE(empty_recorded);
+  EXPECT_EQ(Counters().successful, 2U);
+  EXPECT_EQ(calls, 4U);
+
+  // An old setter replaces the source-aware handler instead of layering one.
+  transport_.set_range_handler([](const BlockKey&, uint64_t, uint64_t, char*,
+                                  size_t, const char**, size_t*,
+                                  size_t*) { return Status::kNotFound; });
+  source = PreparedRead::Source::kSynchronousRamHit;
+  EXPECT_EQ(RdmaServerTestPeer::InvokeRange(transport_, key_, staging_,
+                                            sizeof(staging_), &data, &bytes,
+                                            &value_len, &identity, &source),
+            Status::kNotFound);
+  EXPECT_EQ(source, PreparedRead::Source::kSynchronousFallback);
+  EXPECT_EQ(calls, 4U);
+  transport_.set_range_with_source_handler({});
   EXPECT_FALSE(RdmaServerTestPeer::HasRangeHandler(transport_));
 }
 
@@ -1055,20 +1167,24 @@ TEST_F(RdmaPullHeatTest, DirectFallbackExportsSourceWithoutHeatingStorageRead) {
     size_t bytes = 0;
     size_t value_len = 0;
     DiskResidentIdentity source;
-    ASSERT_EQ(node_->RangeDirectForKey(key_, 0, 5, staging_, sizeof(staging_),
-                                       &data, &bytes, &value_len, &source),
-              Status::kOk);
+    PreparedRead::Source route = PreparedRead::Source::kUnclassified;
+    ASSERT_EQ(
+        node_->RangeDirectForKey(key_, 0, 5, staging_, sizeof(staging_), &data,
+                                 &bytes, &value_len, &source, &route),
+        Status::kOk);
     ASSERT_EQ(bytes, 5U);
     ASSERT_NE(data, nullptr);
     EXPECT_EQ(std::string(data, bytes), "value");
     EXPECT_TRUE(source == identity);
     EXPECT_EQ(Counters().applied, request);
     bool grant_recorded = false;
-    Grant(source, grant_recorded, PreparedRead::Source::kSynchronousFallback);
-    Grant(source, grant_recorded, PreparedRead::Source::kSynchronousFallback);
+    EXPECT_EQ(route, PreparedRead::Source::kSynchronousDisk);
+    Grant(source, grant_recorded, route);
+    Grant(source, grant_recorded, route);
   }
   EXPECT_EQ(Counters().applied, 2U);
   EXPECT_EQ(Counters().transport_synchronous_fallback, 2U);
+  EXPECT_EQ(Counters().transport_fallback_disk, 2U);
 }
 
 std::string SelfHdr() { return "test/model"; }
