@@ -340,7 +340,8 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
             std::string::npos);
   for (const char* suffix :
        {"processing_samples_total", "processing_ns_total", "processing_max_ns",
-        "lock_wait_samples_total", "lock_wait_ns_total", "lock_wait_max_ns"}) {
+        "lock_wait_samples_total", "lock_wait_ns_total", "lock_wait_max_ns",
+        "lock_held_samples_total", "lock_held_ns_total", "lock_held_max_ns"}) {
     const std::string name = std::string("dfkv_slab_lifetime_read_") + suffix;
     EXPECT_NE(text.find("\n" + name + " 0\n"), std::string::npos);
     const std::string disk_name =
@@ -2545,6 +2546,52 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
                           std::to_string(wait_totals[field]) + "\n"),
                 std::string::npos);
     }
+    const std::array<const char*, 3> held_suffixes = {
+        "lock_held_samples_total", "lock_held_ns_total", "lock_held_max_ns"};
+    std::array<uint64_t, 3> held_totals{};
+    for (size_t disk = 0; disk < 2; ++disk) {
+      const DiskSlabStore::LifetimeReadLockHeldStats held =
+          group.DiskSlabStats(disk).lifetime_read_lock_held;
+      EXPECT_EQ(held.samples,
+                group.DiskSlabStats(disk).lifetime_read_lock_wait.samples);
+      EXPECT_GE(held.total_ns, held.max_ns);
+      if (expected[disk].successful == 0) {
+        EXPECT_EQ(held.samples, 0U);
+        EXPECT_EQ(held.total_ns, 0U);
+        EXPECT_EQ(held.max_ns, 0U);
+      }
+      const std::array<uint64_t, 3> values = {held.samples, held.total_ns,
+                                              held.max_ns};
+      held_totals[0] += held.samples;
+      held_totals[1] += held.total_ns;
+      held_totals[2] = std::max(held_totals[2], held.max_ns);
+      const std::string labels = R"({disk=")" + options.cache_dirs[disk] +
+                                 R"(",disk_index=")" + std::to_string(disk) +
+                                 R"(",node="reads",group="test"} )";
+      for (size_t field = 0; field < held_suffixes.size(); ++field) {
+        const std::string name =
+            std::string("dfkv_slab_disk_lifetime_read_") + held_suffixes[field];
+        EXPECT_NE(text.find("# TYPE " + name + " " + types[field] + "\n"),
+                  std::string::npos);
+        EXPECT_NE(text.find("\n" + name + labels +
+                            std::to_string(values[field]) + "\n"),
+                  std::string::npos);
+      }
+    }
+    const DiskSlabStore::LifetimeReadLockHeldStats held_total =
+        group.SlabStats().lifetime_read_lock_held;
+    EXPECT_EQ(held_total.samples, held_totals[0]);
+    EXPECT_EQ(held_total.total_ns, held_totals[1]);
+    EXPECT_EQ(held_total.max_ns, held_totals[2]);
+    for (size_t field = 0; field < held_suffixes.size(); ++field) {
+      const std::string name =
+          std::string("dfkv_slab_lifetime_read_") + held_suffixes[field];
+      EXPECT_NE(text.find("# TYPE " + name + " " + types[field] + "\n"),
+                std::string::npos);
+      EXPECT_NE(text.find("\n" + name + R"({node="reads",group="test"} )" +
+                          std::to_string(held_totals[field]) + "\n"),
+                std::string::npos);
+    }
 
   };
   ASSERT_NO_FATAL_FAILURE(expect_outcomes());
@@ -2613,6 +2660,12 @@ TEST(Metrics, LifetimeReadOutcomesArePerDiskAndResetOnRecovery) {
             .lifetime_read_lock_wait;
     EXPECT_EQ(wait.samples, before + 1);
     EXPECT_GT(wait.max_ns, 0U);
+    const DiskSlabStore::LifetimeReadLockHeldStats held =
+        KvNodeServerTestPeer::Group(*server)
+            .DiskSlabStats(disk)
+            .lifetime_read_lock_held;
+    EXPECT_EQ(held.samples, wait.samples);
+    EXPECT_GT(held.max_ns, 0U);
   }
   ASSERT_NO_FATAL_FAILURE(expect_outcomes());
   const DiskSlabStore::LifetimeReadProcessingStats first =
@@ -2781,7 +2834,13 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
                    .DiskLifetimeBucketObservation(0)
                    .available);
   for (const char* name :
-       {"dfkv_slab_lifetime_read_lock_wait_samples_total",
+       {"dfkv_slab_lifetime_read_lock_held_samples_total",
+        "dfkv_slab_lifetime_read_lock_held_ns_total",
+        "dfkv_slab_lifetime_read_lock_held_max_ns",
+        "dfkv_slab_disk_lifetime_read_lock_held_samples_total",
+        "dfkv_slab_disk_lifetime_read_lock_held_ns_total",
+        "dfkv_slab_disk_lifetime_read_lock_held_max_ns",
+        "dfkv_slab_lifetime_read_lock_wait_samples_total",
         "dfkv_slab_lifetime_read_lock_wait_ns_total",
         "dfkv_slab_lifetime_read_lock_wait_max_ns",
         "dfkv_slab_disk_lifetime_read_lock_wait_samples_total",

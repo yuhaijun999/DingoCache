@@ -725,14 +725,22 @@ std::string KvNodeServer::MetricsText() const {
     header(
         "dfkv_slab_disk_lifetime_read_transport_fallback_copy_follower_total",
         "counter", "Fallback grants with synchronous shared-result copies");
+    header("dfkv_slab_disk_lifetime_read_lock_held_samples_total", "counter",
+           "Thread-local sampled read notification Store lock-held intervals");
     header("dfkv_slab_disk_lifetime_read_lock_wait_samples_total", "counter",
            "Thread-local sampled read notification Store lock acquisitions");
     header("dfkv_slab_disk_lifetime_read_processing_samples_total", "counter",
            "Sampled read notification processing bodies, one in 64");
+    header(
+        "dfkv_slab_disk_lifetime_read_lock_held_ns_total", "counter",
+        "Sampled read notification Store lock-held interval wall nanoseconds");
     header("dfkv_slab_disk_lifetime_read_lock_wait_ns_total", "counter",
            "Sampled read notification Store lock acquisition wall nanoseconds");
     header("dfkv_slab_disk_lifetime_read_processing_ns_total", "counter",
            "Sampled read notification processing body wall nanoseconds");
+    header("dfkv_slab_disk_lifetime_read_lock_held_max_ns", "gauge",
+           "Maximum sampled read notification Store lock-held interval "
+           "nanoseconds");
     header(
         "dfkv_slab_disk_lifetime_read_lock_wait_max_ns", "gauge",
         "Maximum sampled read notification Store lock acquisition nanoseconds");
@@ -867,14 +875,20 @@ std::string KvNodeServer::MetricsText() const {
       sample(
           "dfkv_slab_disk_lifetime_read_transport_fallback_copy_follower_total",
           disk.lifetime_reads.transport_fallback_copy_follower);
+      sample("dfkv_slab_disk_lifetime_read_lock_held_samples_total",
+             disk.lifetime_read_lock_held.samples);
       sample("dfkv_slab_disk_lifetime_read_lock_wait_samples_total",
              disk.lifetime_read_lock_wait.samples);
       sample("dfkv_slab_disk_lifetime_read_processing_samples_total",
              disk.lifetime_read_processing.samples);
+      sample("dfkv_slab_disk_lifetime_read_lock_held_ns_total",
+             disk.lifetime_read_lock_held.total_ns);
       sample("dfkv_slab_disk_lifetime_read_lock_wait_ns_total",
              disk.lifetime_read_lock_wait.total_ns);
       sample("dfkv_slab_disk_lifetime_read_processing_ns_total",
              disk.lifetime_read_processing.total_ns);
+      sample("dfkv_slab_disk_lifetime_read_lock_held_max_ns",
+             disk.lifetime_read_lock_held.max_ns);
       sample("dfkv_slab_disk_lifetime_read_lock_wait_max_ns",
              disk.lifetime_read_lock_wait.max_ns);
       sample("dfkv_slab_disk_lifetime_read_processing_max_ns",
@@ -1219,18 +1233,29 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_read_transport_fallback_copy_follower_total",
            "counter", "Fallback grants with synchronous shared-result copies",
            ss.lifetime_reads.transport_fallback_copy_follower);
+    metric("dfkv_slab_lifetime_read_lock_held_samples_total", "counter",
+           "Thread-local sampled read notification Store lock-held intervals",
+           ss.lifetime_read_lock_held.samples);
     metric("dfkv_slab_lifetime_read_lock_wait_samples_total", "counter",
            "Thread-local sampled read notification Store lock acquisitions",
            ss.lifetime_read_lock_wait.samples);
     metric("dfkv_slab_lifetime_read_processing_samples_total", "counter",
            "Sampled read notification processing bodies, one in 64",
            ss.lifetime_read_processing.samples);
+    metric(
+        "dfkv_slab_lifetime_read_lock_held_ns_total", "counter",
+        "Sampled read notification Store lock-held interval wall nanoseconds",
+        ss.lifetime_read_lock_held.total_ns);
     metric("dfkv_slab_lifetime_read_lock_wait_ns_total", "counter",
            "Sampled read notification Store lock acquisition wall nanoseconds",
            ss.lifetime_read_lock_wait.total_ns);
     metric("dfkv_slab_lifetime_read_processing_ns_total", "counter",
            "Sampled read notification processing body wall nanoseconds",
            ss.lifetime_read_processing.total_ns);
+    metric("dfkv_slab_lifetime_read_lock_held_max_ns", "gauge",
+           "Maximum sampled read notification Store lock-held interval "
+           "nanoseconds",
+           ss.lifetime_read_lock_held.max_ns);
     metric(
         "dfkv_slab_lifetime_read_lock_wait_max_ns", "gauge",
         "Maximum sampled read notification Store lock acquisition nanoseconds",

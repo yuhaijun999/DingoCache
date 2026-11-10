@@ -114,6 +114,18 @@ class DiskLifetimeReadTest : public ::testing::Test {
   DiskSlabStore::LifetimeReadCounters Counters() const {
     const DiskSlabStore::Stats stats = store_->GetStats();
     const DiskSlabStore::LifetimeReadCounters counters = stats.lifetime_reads;
+    const DiskSlabStore::LifetimeReadLockHeldStats held =
+        stats.lifetime_read_lock_held;
+    EXPECT_EQ(held.samples, stats.lifetime_read_lock_wait.samples);
+    EXPECT_LE(held.samples, counters.successful);
+    EXPECT_GE(held.total_ns, held.max_ns);
+    if (held.samples == 0) {
+      EXPECT_EQ(held.total_ns, 0U);
+      EXPECT_EQ(held.max_ns, 0U);
+    }
+    if (held.samples == 1) {
+      EXPECT_EQ(held.total_ns, held.max_ns);
+    }
     const DiskSlabStore::LifetimeReadProcessingStats processing =
         stats.lifetime_read_processing;
     EXPECT_EQ(processing.samples, counters.successful / 64 +
@@ -175,7 +187,7 @@ TEST_F(DiskLifetimeReadTest, LockWaitSamplesPerThreadAndSkipsDisabledOrEmpty) {
   options.direct_writes = false;
   DiskSlabStore legacy(options);
   ASSERT_TRUE(legacy.Healthy()) << legacy.StartupError();
-  std::vector<DiskSlabStore::LifetimeReadLockWaitStats> observations;
+  std::vector<DiskSlabStore::Stats> observations;
   observations.reserve(130);
   // A fresh thread gives an independent phase, unaffected by other test cases.
   std::thread notifier([&] {
@@ -184,14 +196,21 @@ TEST_F(DiskLifetimeReadTest, LockWaitSamplesPerThreadAndSkipsDisabledOrEmpty) {
       store_->NotifyLifetimeReadSuccess(key_, identity, 0);
       store_->NotifyLifetimeReadSuccess(
           key_, notification % 2 != 0 ? identity : DiskResidentIdentity{}, 5);
-      observations.push_back(store_->GetStats().lifetime_read_lock_wait);
+      observations.push_back(store_->GetStats());
     }
   });
   notifier.join();
   DiskSlabStore::LifetimeReadLockWaitStats previous;
+  DiskSlabStore::LifetimeReadLockHeldStats previous_held;
   for (size_t index = 0; index < observations.size(); ++index) {
     const DiskSlabStore::LifetimeReadLockWaitStats& current =
-        observations[index];
+        observations[index].lifetime_read_lock_wait;
+    const DiskSlabStore::LifetimeReadLockHeldStats& held =
+        observations[index].lifetime_read_lock_held;
+    EXPECT_EQ(held.samples, current.samples);
+    EXPECT_GE(held.total_ns, held.max_ns);
+    EXPECT_GE(held.total_ns, previous_held.total_ns);
+    EXPECT_GE(held.max_ns, previous_held.max_ns);
     EXPECT_EQ(current.samples, index / 64 + 1);
     EXPECT_GE(current.total_ns, current.max_ns);
     EXPECT_GE(current.total_ns, previous.total_ns);
@@ -199,12 +218,18 @@ TEST_F(DiskLifetimeReadTest, LockWaitSamplesPerThreadAndSkipsDisabledOrEmpty) {
     if (index % 64 != 0) {
       EXPECT_EQ(current.total_ns, previous.total_ns);
       EXPECT_EQ(current.max_ns, previous.max_ns);
+      EXPECT_EQ(held.total_ns, previous_held.total_ns);
+      EXPECT_EQ(held.max_ns, previous_held.max_ns);
     }
     previous = current;
+    previous_held = held;
   }
   EXPECT_EQ(legacy.GetStats().lifetime_read_lock_wait.samples, 0U);
   EXPECT_EQ(legacy.GetStats().lifetime_read_lock_wait.total_ns, 0U);
   EXPECT_EQ(legacy.GetStats().lifetime_read_lock_wait.max_ns, 0U);
+  EXPECT_EQ(legacy.GetStats().lifetime_read_lock_held.samples, 0U);
+  EXPECT_EQ(legacy.GetStats().lifetime_read_lock_held.total_ns, 0U);
+  EXPECT_EQ(legacy.GetStats().lifetime_read_lock_held.max_ns, 0U);
   const DiskSlabStore::LifetimeReadCounters counters = Counters();
   EXPECT_EQ(counters.successful, 130U);
   EXPECT_EQ(counters.applied, 65U);
@@ -233,27 +258,47 @@ TEST_F(DiskLifetimeReadTest,
   DiskSlabStore::LifetimeReadLockWaitStats reset;
   DiskSlabStore::LifetimeReadLockWaitStats rebuilt_first;
   DiskSlabStore::LifetimeReadLockWaitStats rebuilt_sample;
+  std::vector<DiskSlabStore::Stats> snapshots;
+  snapshots.reserve(6);
   std::thread notifier([&] {
     store_->NotifyLifetimeReadSuccess(key_, identity, 5);  // Thread event 1.
-    first = store_->GetStats().lifetime_read_lock_wait;
+    snapshots.push_back(store_->GetStats());
+    first = snapshots.back().lifetime_read_lock_wait;
     for (unsigned index = 0; index < 63; ++index) {
       second.NotifyLifetimeReadSuccess(key_, {}, 5);  // Events 2 through 64.
     }
-    second_before_sample = second.GetStats().lifetime_read_lock_wait;
+    snapshots.push_back(second.GetStats());
+    second_before_sample = snapshots.back().lifetime_read_lock_wait;
     second.NotifyLifetimeReadSuccess(key_, {}, 5);  // Event 65.
-    second_after_sample = second.GetStats().lifetime_read_lock_wait;
+    snapshots.push_back(second.GetStats());
+    second_after_sample = snapshots.back().lifetime_read_lock_wait;
     // Rebuilding the Store clears its ledger, not this still-running thread.
     store_.reset();
     Create();
-    reset = store_->GetStats().lifetime_read_lock_wait;
+    snapshots.push_back(store_->GetStats());
+    reset = snapshots.back().lifetime_read_lock_wait;
     store_->NotifyLifetimeReadSuccess(key_, {}, 5);  // Event 66, not sampled.
-    rebuilt_first = store_->GetStats().lifetime_read_lock_wait;
+    snapshots.push_back(store_->GetStats());
+    rebuilt_first = snapshots.back().lifetime_read_lock_wait;
     for (unsigned index = 0; index < 63; ++index) {
       store_->NotifyLifetimeReadSuccess(key_, {}, 5);  // Through event 129.
     }
-    rebuilt_sample = store_->GetStats().lifetime_read_lock_wait;
+    snapshots.push_back(store_->GetStats());
+    rebuilt_sample = snapshots.back().lifetime_read_lock_wait;
   });
   notifier.join();
+  const uint64_t expected_samples[] = {1, 0, 1, 0, 0, 1};
+  for (size_t index = 0; index < snapshots.size(); ++index) {
+    const DiskSlabStore::LifetimeReadLockHeldStats& held =
+        snapshots[index].lifetime_read_lock_held;
+    EXPECT_EQ(held.samples, expected_samples[index]);
+    EXPECT_EQ(held.samples, snapshots[index].lifetime_read_lock_wait.samples);
+    EXPECT_EQ(held.total_ns, held.max_ns);
+    if (held.samples == 0) {
+      EXPECT_EQ(held.total_ns, 0U);
+      EXPECT_EQ(held.max_ns, 0U);
+    }
+  }
   EXPECT_EQ(first.samples, 1U);
   EXPECT_EQ(second_before_sample.samples, 0U);
   EXPECT_EQ(second_before_sample.total_ns, 0U);
@@ -291,8 +336,13 @@ TEST_F(DiskLifetimeReadTest, LockWaitAggregatesIndependentConcurrentThreads) {
   while (entered.load() != 4) std::this_thread::yield();
   start.set_value();
   for (std::thread& notifier : notifiers) notifier.join();
+  const DiskSlabStore::Stats snapshot = store_->GetStats();
   const DiskSlabStore::LifetimeReadLockWaitStats wait =
-      store_->GetStats().lifetime_read_lock_wait;
+      snapshot.lifetime_read_lock_wait;
+  const DiskSlabStore::LifetimeReadLockHeldStats held =
+      snapshot.lifetime_read_lock_held;
+  EXPECT_EQ(held.samples, wait.samples);
+  EXPECT_GE(held.total_ns, held.max_ns);
   EXPECT_EQ(wait.samples, 8U);
   EXPECT_GE(wait.total_ns, wait.max_ns);
   EXPECT_EQ(Counters().successful, 260U);
@@ -326,11 +376,17 @@ TEST_F(DiskLifetimeReadTest, LockWaitObservesContendedLifecycleAcquisition) {
   EXPECT_EQ(reached, std::future_status::ready);
   EXPECT_EQ(waiting, std::future_status::timeout);
   EXPECT_EQ(samples_while_locked, clock_samples);
+  const DiskSlabStore::Stats snapshot = store_->GetStats();
   const DiskSlabStore::LifetimeReadLockWaitStats wait =
-      store_->GetStats().lifetime_read_lock_wait;
+      snapshot.lifetime_read_lock_wait;
+  const DiskSlabStore::LifetimeReadLockHeldStats held =
+      snapshot.lifetime_read_lock_held;
+  EXPECT_EQ(held.samples, wait.samples);
+  EXPECT_GE(held.total_ns, held.max_ns);
   EXPECT_EQ(wait.samples, 1U);
   EXPECT_GT(wait.total_ns, 0U);
   EXPECT_EQ(wait.total_ns, wait.max_ns);
+  EXPECT_EQ(held.total_ns, held.max_ns);
   EXPECT_EQ(Counters().applied, 1U);
   EXPECT_EQ(State().actual_reads, 1U);
 }
@@ -390,6 +446,62 @@ TEST_F(DiskLifetimeReadTest, ProcessingSamplesRejectedEarlyReturns) {
   EXPECT_EQ(counters.no_binding, 1U);
   EXPECT_EQ(counters.applied, 63U);
   EXPECT_EQ(counters.race_allocator_unavailable, 1U);
+}
+
+TEST_F(DiskLifetimeReadTest, LockHeldMeasuresControlledWorkInsideNotification) {
+  struct ClockGate {
+    std::atomic<bool> block{false};
+    std::promise<void> entered;
+    std::shared_future<void> release;
+  };
+  const std::shared_ptr<ClockGate> gate = std::make_shared<ClockGate>();
+  std::promise<void> release;
+  gate->release = release.get_future().share();
+  const std::future<void> entered = gate->entered.get_future();
+  // Shared ownership keeps this test clock's state valid even if setup fails
+  // before explicit teardown. No production timing hook is introduced.
+  clock_ = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config_), [this, gate] {
+        samples_.fetch_add(1, std::memory_order_relaxed);
+        if (gate->block.load()) {
+          gate->entered.set_value();
+          gate->release.wait();
+        }
+        return seconds_.load(std::memory_order_relaxed);
+      });
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  gate->block.store(true);
+  std::promise<void> finished;
+  const std::future<void> completion = finished.get_future();
+  std::thread notifier([&] {
+    store_->NotifyLifetimeReadSuccess(key_, identity, 5);
+    finished.set_value();
+  });
+  const std::future_status reached = entered.wait_for(std::chrono::seconds(5));
+  const std::future_status waiting =
+      completion.wait_for(std::chrono::milliseconds(30));
+  // Always release and join, including a failed handshake, before assertions.
+  // This controlled delay proves positive work, not a latency budget or p99.
+  release.set_value();
+  notifier.join();
+  gate->block.store(false);
+  EXPECT_EQ(reached, std::future_status::ready);
+  EXPECT_EQ(waiting, std::future_status::timeout);
+  const DiskSlabStore::Stats snapshot = store_->GetStats();
+  const DiskSlabStore::LifetimeReadLockHeldStats held =
+      snapshot.lifetime_read_lock_held;
+  EXPECT_EQ(held.samples, 1U);
+  EXPECT_EQ(held.samples, snapshot.lifetime_read_lock_wait.samples);
+  EXPECT_GT(held.total_ns, 0U);
+  EXPECT_EQ(held.max_ns, held.total_ns);
+  EXPECT_EQ(snapshot.lifetime_read_processing.samples, 1U);
+  EXPECT_GT(snapshot.lifetime_read_processing.total_ns, 0U);
+  EXPECT_GE(held.total_ns, snapshot.lifetime_read_processing.total_ns);
+  EXPECT_EQ(Counters().applied, 1U);
+  EXPECT_EQ(State().actual_reads, 1U);
+  store_.reset();
+  clock_.reset();
 }
 
 TEST_F(DiskLifetimeReadTest,

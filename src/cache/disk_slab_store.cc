@@ -63,20 +63,21 @@ constexpr uint32_t kStateMagic = 0x53424C53u;  // "SLBS"
 constexpr uint32_t kStateClean = 1;
 constexpr uint32_t kStateDirty = 2;
 
-// Created after D is acquired and destroyed before D is released, including
-// rejected heat events. Unsampled notifications do not read the timing clock.
-class ScopedLifetimeReadProcessingTimer {
+// Both intervals are inside D, including rejected heat events. A supplied
+// start reuses the acquisition endpoint; unsampled timers never read a clock.
+class ScopedLifetimeReadTimer {
  public:
-  explicit ScopedLifetimeReadProcessingTimer(
-      DiskSlabStore::LifetimeReadProcessingStats* stats)
+  explicit ScopedLifetimeReadTimer(
+      DiskSlabStore::LifetimeReadTimingStats* stats)
       : stats_(stats) {
     if (stats_ != nullptr) started_ = std::chrono::steady_clock::now();
   }
-  ScopedLifetimeReadProcessingTimer(const ScopedLifetimeReadProcessingTimer&) =
-      delete;
-  ScopedLifetimeReadProcessingTimer& operator=(
-      const ScopedLifetimeReadProcessingTimer&) = delete;
-  ~ScopedLifetimeReadProcessingTimer() {
+  ScopedLifetimeReadTimer(DiskSlabStore::LifetimeReadTimingStats* stats,
+                          std::chrono::steady_clock::time_point started)
+      : stats_(stats), started_(started) {}
+  ScopedLifetimeReadTimer(const ScopedLifetimeReadTimer&) = delete;
+  ScopedLifetimeReadTimer& operator=(const ScopedLifetimeReadTimer&) = delete;
+  ~ScopedLifetimeReadTimer() {
     if (stats_ == nullptr) return;
     const uint64_t elapsed_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -88,7 +89,7 @@ class ScopedLifetimeReadProcessingTimer {
   }
 
  private:
-  DiskSlabStore::LifetimeReadProcessingStats* stats_;
+  DiskSlabStore::LifetimeReadTimingStats* stats_;
   std::chrono::steady_clock::time_point started_{};
 };
 
@@ -2869,12 +2870,18 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
   std::chrono::steady_clock::time_point wait_started{};
   if (sample_lock_wait) wait_started = std::chrono::steady_clock::now();
   const std::lock_guard<std::mutex> lock(mu_);
+  std::chrono::steady_clock::time_point acquired{};
+  if (sample_lock_wait) acquired = std::chrono::steady_clock::now();
+  // Declared before wait bookkeeping and the body timer: destruction includes
+  // both ledgers below, but excludes this timer's own ledger and D unlocking.
+  const ScopedLifetimeReadTimer held_timer(
+      sample_lock_wait ? &lifetime_read_lock_held_ : nullptr, acquired);
   if (sample_lock_wait) {
     // Acquisition wall time includes mutex overhead and descheduling, not
     // processing or completed-to-applied lag. Publish only under existing D.
     const uint64_t elapsed_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - wait_started)
+        std::chrono::duration_cast<std::chrono::nanoseconds>(acquired -
+                                                             wait_started)
             .count());
     ++lifetime_read_lock_wait_.samples;
     lifetime_read_lock_wait_.total_ns += elapsed_ns;
@@ -2882,7 +2889,7 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
         std::max(lifetime_read_lock_wait_.max_ns, elapsed_ns);
   }
   ++lifetime_reads_.successful;
-  const ScopedLifetimeReadProcessingTimer processing_timer(
+  const ScopedLifetimeReadTimer processing_timer(
       (lifetime_reads_.successful & 63U) == 1U ? &lifetime_read_processing_
                                                : nullptr);
   // Source is an independent partition, including notifications left unheated.
@@ -3121,6 +3128,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.lifetime_reads = lifetime_reads_;
   st.lifetime_read_processing = lifetime_read_processing_;
   st.lifetime_read_lock_wait = lifetime_read_lock_wait_;
+  st.lifetime_read_lock_held = lifetime_read_lock_held_;
   st.sync_payload_reads = sync_payload_reads_;
   st.uring_payload_reads = uring_payload_reads_;
   st.payload_bytes = committed_payload_bytes_;

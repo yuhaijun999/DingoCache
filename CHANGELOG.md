@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export sampled read-notification lock-held intervals paired with acquisition
+  samples. Reuse timing state without changing heat rules; exclude the new
+  ledger update and actual mutex unlock from the measured interval.
+
 - Export sampled Store-lock acquisition wall time for lifetime read notifications,
   using thread-local sampling without a shared atomic counter. Keep existing
   processing-body timing and heat behavior unchanged.

@@ -1114,6 +1114,11 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_recovered_unread_objects +=
         st.lifetime_recovered_unread_objects;
 
+    sum.lifetime_read_lock_held.samples += st.lifetime_read_lock_held.samples;
+    sum.lifetime_read_lock_held.total_ns += st.lifetime_read_lock_held.total_ns;
+    sum.lifetime_read_lock_held.max_ns = std::max(
+        sum.lifetime_read_lock_held.max_ns, st.lifetime_read_lock_held.max_ns);
+
     sum.lifetime_read_lock_wait.samples += st.lifetime_read_lock_wait.samples;
     sum.lifetime_read_lock_wait.total_ns += st.lifetime_read_lock_wait.total_ns;
     sum.lifetime_read_lock_wait.max_ns = std::max(
