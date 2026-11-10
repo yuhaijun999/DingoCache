@@ -155,6 +155,10 @@ RDMA-listener scrape inventory。
 | `dfkv_server_rdma_rails_configured` / `dfkv_rdma_rails_initialized` / `dfkv_server_rdma_rails_active` | gauge | health monitor 固定 resolved 数 / 成功 anchor 初始化数 / 当前健康数；auto 模式均包含选出的 rail，无 `device` label |
 | `dfkv_server_ib_device_healthy{device}` | gauge | 每个固定 initialized device 当前是否 `query_ok && ACTIVE && LinkUp`；部分为 0 不再等价于整节点退环 |
 | `dfkv_rdma_completions_total` / `dfkv_rdma_completion_errors_total` | counter | RDMA 请求完成 / 错误完成 |
+| `dfkv_rdma_pull_read_notification_notified_total` | counter | PULL once-boundary observer invocations, before callback entry; not applied heat, READY delivery or remote consumption. |
+| `dfkv_rdma_pull_read_notification_duplicate_total` | counter | Repeated once-boundary calls suppressed before invoking the observer. |
+| `dfkv_rdma_pull_read_notification_empty_total` | counter | First calls consumed with zero payload bytes, even if no observer exists. |
+| `dfkv_rdma_pull_read_notification_no_observer_total` | counter | First nonempty calls consumed without an installed observer. |
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接 |
 | `dfkv_rdma_v2_conns_opened_total` | counter | server 累计打开的 v2 连接 |
 | `dfkv_rdma_v2_put_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT |
@@ -921,3 +925,34 @@ moving or releasing their PreparedRead. The owner must remain stable until all
 kernel operations drain. This is not a cross-thread mutable metrics API. Internal
 C++ lease/descriptor layouts grow; matching headers and libraries must be rebuilt.
 No wire/disk format or policy default changes are implied.
+
+### PULL read-notification once-boundary outcomes
+
+The four `dfkv_rdma_pull_read_notification_*_total` counters classify calls to the
+existing post-validation/MR/grant `RecordPullGrant` boundary. Each call contributes
+exactly once: an already-consumed generation is `duplicate`; a fresh generation
+is consumed at the original point and classified as `empty` before checking
+`no_observer`, otherwise `notified` before invoking the callback. Empty/missing
+observer generations cannot later be replayed when an observer is installed.
+Canceled or failed preparation that never reaches this boundary contributes zero.
+The callback's existing thread-safe/nonthrowing and before-Start setup contract
+is unchanged; these metrics do not add live handler reconfiguration support.
+
+In a quiescent server, the sum of all four is the number of helper calls, and
+`notified + empty + no_observer` counts fresh generations consumed there. The
+fields are sampled by independent relaxed loads, not a coherent cross-counter
+snapshot. They are scoped to each RdmaServer instance, start at zero on new
+construction, and have no key/request/disk labels. They are not all GETs, unique
+keys, all transport attempts, cross-protocol dedup coverage or per-disk heat.
+
+`notified` records an observer invocation, not successful application or callback
+completion. Legacy/no-binding/changed-resident/clock/IO conditions can leave the
+Store unheated; READY send failure never retracts an invocation. The once bool
+is still connection-owner state: atomic metrics do not make concurrent sharing
+of that bool legal. Each thread/request must retain its original ownership.
+
+Instrumentation adds one shared relaxed atomic RMW per helper call, including
+normal nonempty PULLs. There is no new clock or lock, but contention/cost is not
+zero and no latency/throughput budget acceptance is implied. Notification delay,
+lock time and non-PULL once-boundary coverage remain separate O5 work. Real
+RDMA/RXE acceptance is not established by CPU post-MR-boundary tests.

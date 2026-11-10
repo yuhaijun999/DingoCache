@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export PULL read-notification once-boundary outcomes: observer invocation,
+  suppressed duplicate, empty payload and absent observer. Preserve existing
+  authorization, notification timing and once-only behavior.
+
 - Attribute participating io_uring payload completions to their owning slab
   disk, including partial/error and drain results. Export global and per-disk
   counters separately from synchronous reads, publishing at lease release.

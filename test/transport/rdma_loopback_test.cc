@@ -536,6 +536,23 @@ TEST_F(RdmaPullAdmissionTest,
   EXPECT_TRUE(node_->Healthy());
 }
 
+void ExpectPullNotificationMetrics(const RdmaServer& server, uint64_t notified,
+                                   uint64_t duplicate, uint64_t empty,
+                                   uint64_t no_observer) {
+  const std::array<const char*, 4> suffixes = {"notified", "duplicate", "empty",
+                                               "no_observer"};
+  const std::array<uint64_t, 4> expected = {notified, duplicate, empty,
+                                            no_observer};
+  const std::string text = server.MetricsText();
+  for (size_t i = 0; i < suffixes.size(); ++i) {
+    const std::string name = std::string("dfkv_rdma_pull_read_notification_") +
+                             suffixes[i] + "_total";
+    EXPECT_NE(text.find("# TYPE " + name + " counter\n"), std::string::npos);
+    EXPECT_NE(text.find("\n" + name + " " + std::to_string(expected[i]) + "\n"),
+              std::string::npos);
+  }
+}
+
 // These CPU tests explicitly simulate the post-MR-success boundary. They do
 // not register memory, publish a real grant, or require an RDMA device.
 class RdmaPullHeatTest : public ::testing::Test {
@@ -674,6 +691,7 @@ TEST_F(RdmaPullHeatTest, ClockOnlyLegacyGrantNeverSamplesCompletionTime) {
             Status::kOk);
   EXPECT_EQ(std::string(output, bytes), "value");
   EXPECT_EQ(Counters().successful, 0U);
+  ExpectPullNotificationMetrics(transport_, 1, 0, 0, 0);
 }
 
 TEST_F(RdmaPullHeatTest, StorageCompletionIsNotGrantAndGrantIsExactlyOnce) {
@@ -987,6 +1005,111 @@ TEST_F(RdmaPullHeatTest, OptionalHandlerAndEmptyGrantsStayUncounted) {
   transport_.SetPullReadSuccessHandler({});
 }
 
+TEST_F(RdmaPullHeatTest, NotificationOutcomesPartitionOnceBoundaryCalls) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  ExpectPullNotificationMetrics(transport_, 0, 0, 0, 0);
+  for (unsigned i = 0; i < 6; ++i) {
+    bool recorded = false;
+    Grant(identity, recorded);
+    EXPECT_TRUE(recorded);
+    if (i < 3) Grant(identity, recorded);
+  }
+  transport_.SetPullReadSuccessHandler({});
+  bool without_observer = false;
+  Grant(identity, without_observer);
+  bool empty_without_observer = false;
+  RdmaServerTestPeer::RecordPullGrant(transport_, key_, identity, 0,
+                                      empty_without_observer);
+  EXPECT_TRUE(without_observer);
+  EXPECT_TRUE(empty_without_observer);
+  // Installing an observer cannot replay generations already consumed while
+  // absent or empty. Zero bytes take precedence over an absent observer.
+  transport_.SetPullReadSuccessWithSourceHandler(
+      [this](const BlockKey& key, const DiskResidentIdentity& source,
+             size_t bytes, PreparedRead::Source route) {
+        node_->NotifyLifetimeReadSuccessForKey(key, source, bytes, route);
+      });
+  Grant(identity, without_observer);
+  Grant(identity, empty_without_observer);
+  bool empty = false;
+  RdmaServerTestPeer::RecordPullGrant(transport_, key_, identity, 0, empty);
+  EXPECT_TRUE(empty);
+  ExpectPullNotificationMetrics(transport_, 6, 5, 2, 1);
+  EXPECT_EQ(Counters().successful, 6u);
+  EXPECT_EQ(Counters().applied, 6u);
+  // Counts are per server instance, not process-global or persisted state.
+  const RdmaServer fresh(RdmaServer::Handler{}, kMaxMsg);
+  ExpectPullNotificationMetrics(fresh, 0, 0, 0, 0);
+}
+
+TEST_F(RdmaPullHeatTest, NotificationReentryConsumesBeforeObserver) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  bool recorded = false;
+  unsigned callbacks = 0;
+  transport_.SetPullReadSuccessHandler(
+      [this, &recorded, &callbacks](const BlockKey& key,
+                                    const DiskResidentIdentity& source,
+                                    size_t bytes) {
+        ++callbacks;
+        EXPECT_TRUE(recorded);
+        ExpectPullNotificationMetrics(transport_, 1, 0, 0, 0);
+        Grant(source, recorded);
+        node_->NotifyLifetimeReadSuccessForKey(key, source, bytes);
+      });
+  Grant(identity, recorded);
+  EXPECT_EQ(callbacks, 1u);
+  ExpectPullNotificationMetrics(transport_, 1, 1, 0, 0);
+  EXPECT_EQ(Counters().applied, 1u);
+  transport_.SetPullReadSuccessHandler({});
+}
+
+TEST_F(RdmaPullHeatTest, NotificationCountsConcurrentIndependentGenerations) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  std::atomic<unsigned> callbacks{0};
+  // Setters do not race active callbacks. Each thread owns its request bool;
+  // the counters do not make sharing that non-atomic bool across threads safe.
+  transport_.SetPullReadSuccessHandler(
+      [this, &callbacks](const BlockKey& key,
+                         const DiskResidentIdentity& source, size_t bytes) {
+        callbacks.fetch_add(1, std::memory_order_relaxed);
+        node_->NotifyLifetimeReadSuccessForKey(key, source, bytes);
+      });
+  std::mutex gate_mu;
+  std::condition_variable gate_cv;
+  unsigned ready = 0;
+  bool run = false;
+  std::vector<std::thread> threads;
+  for (unsigned worker = 0; worker < 4; ++worker) {
+    threads.emplace_back([this, &identity, &gate_mu, &gate_cv, &ready, &run] {
+      {
+        std::unique_lock<std::mutex> lock(gate_mu);
+        ++ready;
+        gate_cv.notify_all();
+        gate_cv.wait(lock, [&run] { return run; });
+      }
+      for (unsigned i = 0; i < 32; ++i) {
+        bool recorded = false;
+        Grant(identity, recorded);
+        Grant(identity, recorded);
+      }
+    });
+  }
+  {
+    std::unique_lock<std::mutex> lock(gate_mu);
+    gate_cv.wait(lock, [&ready] { return ready == 4; });
+    run = true;
+    gate_cv.notify_all();
+  }
+  for (std::thread& thread : threads) thread.join();
+  EXPECT_EQ(callbacks.load(std::memory_order_relaxed), 128u);
+  ExpectPullNotificationMetrics(transport_, 128, 128, 0, 0);
+  EXPECT_EQ(Counters().applied, 128u);
+  transport_.SetPullReadSuccessHandler({});
+}
+
 TEST_F(RdmaPullHeatTest, CanceledOrFailedPreparationDoesNotGrant) {
   ASSERT_NO_FATAL_FAILURE(Create());
   Seed();
@@ -1001,6 +1124,7 @@ TEST_F(RdmaPullHeatTest, CanceledOrFailedPreparationDoesNotGrant) {
   EXPECT_TRUE(failed.Abort());
   EXPECT_EQ(Counters().successful, 0U);
   EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 0U);
+  ExpectPullNotificationMetrics(transport_, 0, 0, 0, 0);
 }
 
 TEST_F(RdmaPullHeatTest, BoundAndUnboundRamKeepPinUntilGrantTeardown) {
@@ -1111,6 +1235,7 @@ TEST_F(RdmaPullHeatTest, DeferredRemoveKeepsOriginalBytesButLosesHeatRace) {
   Grant(read.source_identity(), grant_recorded);
   EXPECT_EQ(Counters().race_lost, 1U);
   EXPECT_EQ(Counters().applied, 0U);
+  ExpectPullNotificationMetrics(transport_, 1, 0, 0, 0);
   EXPECT_TRUE(read.Abort());
   EXPECT_TRUE(node_->Healthy());
 }

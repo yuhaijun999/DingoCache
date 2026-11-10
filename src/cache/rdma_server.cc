@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -204,12 +205,24 @@ void RdmaServer::RecordPullGrant(const BlockKey& key,
                                  const DiskResidentIdentity& identity,
                                  size_t bytes, bool& grant_recorded,
                                  PreparedRead::Source source) {
-  if (grant_recorded) return;
+  if (grant_recorded) {
+    pull_read_notification_duplicate_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   // Consume this generation's event before invoking the observer. READY send
   // failures and subsequent RELEASE/teardown must never replay or undo it.
   grant_recorded = true;
-  if (bytes != 0 && pull_read_success_handler_)
-    pull_read_success_handler_(key, identity, bytes, source);
+  if (bytes == 0) {
+    pull_read_notification_empty_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (!pull_read_success_handler_) {
+    pull_read_notification_no_observer_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  // Invocation is observed before callback reentry, not proof of applied heat.
+  pull_read_notification_notified_.fetch_add(1, std::memory_order_relaxed);
+  pull_read_success_handler_(key, identity, bytes, source);
 }
 
 RdmaServer::RdmaServer(Handler handler, size_t max_msg,
@@ -2241,6 +2254,19 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_pull_zerocopy_served_total", "counter",
     "Dynamic-pull GETs served directly from the pinned RAM arena without a staging copy",
     pull_zerocopy_served_);
+  m(s, "dfkv_rdma_pull_read_notification_notified_total", "counter",
+    "PULL once-boundary observer invocations, not applied heat or READY "
+    "delivery",
+    pull_read_notification_notified_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_pull_read_notification_duplicate_total", "counter",
+    "Repeated PULL once-boundary calls suppressed before observer invocation",
+    pull_read_notification_duplicate_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_pull_read_notification_empty_total", "counter",
+    "First PULL once-boundary calls consumed with zero payload bytes",
+    pull_read_notification_empty_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_pull_read_notification_no_observer_total", "counter",
+    "First nonempty PULL once-boundary calls consumed without an observer",
+    pull_read_notification_no_observer_.load(std::memory_order_relaxed));
   m(s, "dfkv_rdma_dynamic_get_active", "gauge",
     "In-flight dynamic GET staging operations currently held",
     dynamic_get_active_);

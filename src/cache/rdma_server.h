@@ -349,6 +349,11 @@ class RdmaServer {
   std::atomic<uint64_t> dynamic_get_active_{0};
   std::atomic<uint64_t> dynamic_get_bytes_active_{0};
   std::atomic<uint64_t> pull_zerocopy_served_{0};
+  // Mutually exclusive outcomes of RecordPullGrant calls, not heat results.
+  std::atomic<uint64_t> pull_read_notification_notified_{0};
+  std::atomic<uint64_t> pull_read_notification_duplicate_{0};
+  std::atomic<uint64_t> pull_read_notification_empty_{0};
+  std::atomic<uint64_t> pull_read_notification_no_observer_{0};
   // One anchor per resolved rail holds a lifetime shared device reference and
   // registers the initial receive chunk and caller pools on that rail's PD.
   // Later chunks register lazily on the rail of the connection that leases
