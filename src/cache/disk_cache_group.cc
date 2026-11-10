@@ -1143,6 +1143,12 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
   return sum;
 }
 
+std::vector<SlabAllocator::LifetimeQueueStat>
+DiskCacheGroup::DiskLifetimeQueueStats(size_t i) const {
+  if (i >= slabs_.size()) return {};
+  return slabs_[i]->LifetimeQueueStats();
+}
+
 std::vector<SlabAllocator::ClassStat> DiskCacheGroup::SlabClasses() const {
   std::map<uint32_t, SlabAllocator::ClassStat> by_size;
   for (const auto* disk : slabs_) {

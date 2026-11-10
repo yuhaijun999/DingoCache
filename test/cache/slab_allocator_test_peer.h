@@ -283,6 +283,7 @@ class SlabAllocatorTestPeer {
         uint32_t current = queue.head;
         uint32_t anchor = 0;
         bool cursor_seen = false;
+        uint64_t residents = 0;
         while (current != SlabAllocator::kNoSlot) {
           if (current >= size || seen[current][scope]) return false;
           const SlabAllocator::SlotMeta& meta = allocator.slots_[current];
@@ -301,15 +302,17 @@ class SlabAllocatorTestPeer {
                                      state->first_early_read(),
                                  allocator.opt_.lifetime_max_reads);
           if (expected_band != band) return false;
+          ++residents;
           seen[current][scope] = true;
           cursor_seen = cursor_seen || current == queue.cursor;
           anchor = state->anchor;
           prev = current;
           current = links.indexes[scope].next;
         }
-        if (prev != queue.tail || (queue.head == SlabAllocator::kNoSlot
-                                       ? queue.cursor != SlabAllocator::kNoSlot
-                                       : !cursor_seen)) {
+        if (residents != queue.residents || prev != queue.tail ||
+            (queue.head == SlabAllocator::kNoSlot
+                 ? queue.cursor != SlabAllocator::kNoSlot
+                 : !cursor_seen)) {
           return false;
         }
       }

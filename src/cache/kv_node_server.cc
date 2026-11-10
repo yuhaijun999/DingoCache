@@ -14,14 +14,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/ram_tier.h"
 #include "cache/read_coalescer.h"
+#include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
@@ -565,6 +568,17 @@ std::string KvNodeServer::MetricsText() const {
       s += "# HELP "; s += name; s += " "; s += help; s += "\n";
       s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
     };
+    using LifetimeQueueKey = std::pair<uint32_t, uint32_t>;
+    std::map<LifetimeQueueKey, uint64_t> queue_totals;
+    const auto queue_labels = [](uint32_t slot_size, uint32_t band) {
+      return std::string("index=\"") + (slot_size == 0 ? "global" : "class") +
+             "\",slot_size=\"" + std::to_string(slot_size) + "\",band=\"" +
+             std::to_string(band) + "\"";
+    };
+    header("dfkv_slab_lifetime_queue_residents", "gauge",
+           "Retained residents by lifetime scoring index and band");
+    header("dfkv_slab_disk_lifetime_queue_residents", "gauge",
+           "Retained residents by disk lifetime scoring index and band");
     header("dfkv_slab_disk_run_epoch", "gauge", "Dirty run epoch for this store instance");
     header("dfkv_slab_disk_capacity_bytes", "gauge", "Physical capacity for this store");
     header("dfkv_slab_disk_watermark_high_bytes", "gauge", "Resolved strict high threshold");
@@ -677,6 +691,15 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_peak_high_bytes", st.watermark_peak_high_bytes);
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
+      // Aggregate these same per-disk snapshots, not a second observation.
+      const std::vector<SlabAllocator::LifetimeQueueStat> queues =
+          group_.DiskLifetimeQueueStats(i);
+      for (const SlabAllocator::LifetimeQueueStat& queue : queues) {
+        s += "dfkv_slab_disk_lifetime_queue_residents" +
+             braces(labels + "," + queue_labels(queue.slot_size, queue.band)) +
+             " " + std::to_string(queue.residents) + "\n";
+        queue_totals[{queue.slot_size, queue.band}] += queue.residents;
+      }
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
       sample("dfkv_slab_disk_lifetime_recovered_objects",
              disk.lifetime_recovered_objects);
@@ -751,6 +774,12 @@ std::string KvNodeServer::MetricsText() const {
              disk.lifetime_background_freed_slot_bytes);
       sample("dfkv_slab_disk_lifetime_background_freed_payload_bytes_total",
              disk.lifetime_background_freed_payload_bytes);
+    }
+    for (const std::map<LifetimeQueueKey, uint64_t>::value_type& entry :
+         queue_totals) {
+      s += "dfkv_slab_lifetime_queue_residents" +
+           braces(queue_labels(entry.first.first, entry.first.second)) + " " +
+           std::to_string(entry.second) + "\n";
     }
     const auto ss = group_.SlabStats();
     metric("dfkv_slab_dio_write_fallback_total", "counter",

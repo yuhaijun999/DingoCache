@@ -2773,6 +2773,12 @@ std::vector<SlabAllocator::ClassStat> DiskSlabStore::ClassStats() const {
                 : std::vector<SlabAllocator::ClassStat>{};
 }
 
+std::vector<SlabAllocator::LifetimeQueueStat>
+DiskSlabStore::LifetimeQueueStats() const {
+  if (!alloc_) return {};
+  return alloc_->LifetimeQueueStats();
+}
+
 void DiskSlabStore::NotifyLifetimeReadSuccess(
     const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
     LifetimeReadSource source) {

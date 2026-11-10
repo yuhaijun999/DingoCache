@@ -520,6 +520,7 @@ void SlabAllocator::LinkLifetimeLocked(uint32_t meta_index) {
     else
       lifetime_links_[next].indexes[index].prev = meta_index;
     if (queue.cursor == kNoSlot) queue.cursor = meta_index;
+    ++queue.residents;
   }
 }
 
@@ -541,6 +542,8 @@ void SlabAllocator::UnlinkLifetimeLocked(uint32_t meta_index) {
     // A continuation points to a surviving successor, wrapping only at tail.
     if (queue.cursor == meta_index)
       queue.cursor = link.next == kNoSlot ? queue.head : link.next;
+    assert(queue.residents != 0);
+    --queue.residents;
   }
   links = LifetimeLinks{};
 }
@@ -1878,6 +1881,28 @@ SlabAllocator::LifetimeMemory SlabAllocator::LifetimeMemoryUsage() const {
   memory.queue_bytes = lifetime_queues_.capacity() * sizeof(LifetimeQueue);
   memory.version_bytes = lifetime_versions_.capacity() * sizeof(uint64_t);
   return memory;
+}
+
+std::vector<SlabAllocator::LifetimeQueueStat>
+SlabAllocator::LifetimeQueueStats() const {
+  if (!opt_.track_lifetime_state) return {};
+  const std::lock_guard<std::mutex> lock(mu_);
+  const size_t bands = opt_.lifetime_max_reads + 1;
+  size_t active_rows = 1;  // Global rows remain visible even without residents.
+  for (const Class& cls : classes_) {
+    if (cls.resident_count != 0) ++active_rows;
+  }
+  std::vector<LifetimeQueueStat> stats;
+  stats.reserve(active_rows * bands);
+  for (size_t row = 0; row <= classes_.size(); ++row) {
+    if (row != 0 && classes_[row - 1].resident_count == 0) continue;
+    const uint32_t slot_size = row == 0 ? 0 : classes_[row - 1].slot_size;
+    for (uint32_t band = 0; band < bands; ++band) {
+      stats.push_back(
+          {slot_size, band, lifetime_queues_[row * bands + band].residents});
+    }
+  }
+  return stats;
 }
 
 uint64_t SlabAllocator::WatermarkEvictions() const {

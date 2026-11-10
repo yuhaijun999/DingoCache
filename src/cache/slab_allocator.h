@@ -212,6 +212,16 @@ class SlabAllocator {
   // allocators; these fields are not the full memory increment over a legacy
   // binary.
   LifetimeMemory LifetimeMemoryUsage() const;
+  struct LifetimeQueueStat {
+    uint32_t slot_size = 0;  // Zero denotes the global index, not a size class.
+    uint32_t band = 0;  // Effective scoring band, not a logical read class.
+    uint64_t residents = 0;  // Indexed residents, including hidden pinned data.
+  };
+  // One A-locked snapshot of both indexes; no resident walk or clock read.
+  // Enabled stores include all global bands and all bands of resident classes.
+  // Disabled storage returns empty. Cost is O(classes + active classes *
+  // bands).
+  std::vector<LifetimeQueueStat> LifetimeQueueStats() const;
   uint64_t WatermarkEvictions() const;
   // Local candidate: reclaim slots in refreshed actual-read/new-write order
   // until allocated bytes reach target_bytes. A call removes at most max_victims
@@ -392,6 +402,7 @@ class SlabAllocator {
     uint32_t head = kNoSlot;
     uint32_t tail = kNoSlot;
     uint32_t cursor = kNoSlot;
+    uint64_t residents = 0;  // Maintained by the same A-locked link mutations.
   };
 
   struct Class {

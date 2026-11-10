@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export retained resident populations in global and class-local lifetime score
+  queues, by disk and scoring band. Keep physical bands distinct from logical
+  read classes, scores and protection; preserve counts until physical release.
+
 - Export retained resident-identity, lifetime-state, dual-link, score-queue and
   class-version vector backing bytes, globally and per disk. Measure allocated
   capacity across deletion and recovery, not live objects or total process RSS.

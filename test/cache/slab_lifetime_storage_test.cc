@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -44,6 +45,36 @@ void ExpectState(const SlabAllocator& allocator, const BlockKey& key,
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
 }
 
+std::optional<uint64_t> QueuePopulation(
+    const std::vector<SlabAllocator::LifetimeQueueStat>& stats,
+    uint32_t slot_size, uint32_t band) {
+  for (const SlabAllocator::LifetimeQueueStat& stat : stats) {
+    if (stat.slot_size == slot_size && stat.band == band) return stat.residents;
+  }
+  return std::nullopt;
+}
+
+bool QueueSnapshotConservesResidents(
+    const std::vector<SlabAllocator::LifetimeQueueStat>& stats,
+    uint32_t max_reads) {
+  std::array<uint64_t, 64> global{};
+  std::array<uint64_t, 64> classes{};
+  std::array<bool, 64> seen{};
+  size_t global_bands = 0;
+  for (const SlabAllocator::LifetimeQueueStat& stat : stats) {
+    if (stat.band > max_reads) return false;
+    if (stat.slot_size == 0) {
+      if (seen[stat.band]) return false;
+      seen[stat.band] = true;
+      ++global_bands;
+      global[stat.band] = stat.residents;
+    } else {
+      classes[stat.band] += stat.residents;
+    }
+  }
+  return global_bands == max_reads + 1 && global == classes;
+}
+
 TEST(SlabLifetimeStorage, DisabledStateStorageNeverAllocatesPerSlot) {
   for (const bool track_identity : {false, true}) {
     SlabAllocator::Options options = LifetimeOptions();
@@ -56,6 +87,7 @@ TEST(SlabLifetimeStorage, DisabledStateStorageNeverAllocatesPerSlot) {
       ASSERT_TRUE(allocator.Put({i, 0, 0}, 4096, &ref, &evicted));
     EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
     EXPECT_EQ(SlabAllocatorTestPeer::LifetimeQueueCount(allocator), 0U);
+    EXPECT_TRUE(allocator.LifetimeQueueStats().empty());
     EXPECT_EQ(SlabAllocatorTestPeer::LifetimeStateSize(allocator), 0U);
     EXPECT_EQ(SlabAllocatorTestPeer::LifetimeStateCapacity(allocator), 0U);
     EXPECT_FALSE(SlabAllocatorTestPeer::LifetimeState(allocator, {31, 0, 0})
@@ -305,6 +337,9 @@ TEST(SlabLifetimeStorage, ConcurrentObserverSeesCoherentSameKeyReuse) {
     while (!done.load()) {
       if (!SlabAllocatorTestPeer::LifetimeIndexesValid(allocator))
         valid.store(false);
+      const std::vector<SlabAllocator::LifetimeQueueStat> queue_stats =
+          allocator.LifetimeQueueStats();
+      if (!QueueSnapshotConservesResidents(queue_stats, 2)) valid.store(false);
       const SlabAllocatorTestPeer::LifetimeSnapshot snapshot =
           SlabAllocatorTestPeer::LifetimeSnapshotFor(allocator, key);
       if (snapshot.first == 0) {
@@ -324,7 +359,8 @@ TEST(SlabLifetimeStorage, ConcurrentObserverSeesCoherentSameKeyReuse) {
                             state.actual_reads == expected.actual_reads &&
                             state.history_unknown == expected.history_unknown;
       if (!coherent) valid.store(false);
-      if (coherent && !published) {
+      if (coherent && !published &&
+          QueuePopulation(queue_stats, 0, 0) == std::optional<uint64_t>(1)) {
         first_live_seen.set_value();
         published = true;
       }
@@ -360,6 +396,77 @@ TEST(SlabLifetimeStorage, ConcurrentObserverSeesCoherentSameKeyReuse) {
   EXPECT_TRUE(valid.load());
   EXPECT_EQ(allocator.Count(), 0U);
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
+TEST(SlabLifetimeStorage, QueuePopulationSnapshotTracksPhysicalMembership) {
+  for (const uint32_t max_reads : {1U, 2U, 4U, 63U}) {
+    SCOPED_TRACE(max_reads);
+    SlabAllocator::Options options = LifetimeOptions();
+    options.num_extents = 2;
+    options.lifetime_max_reads = max_reads;
+    SlabAllocator allocator(options);
+    std::vector<SlabAllocator::LifetimeQueueStat> stats =
+        allocator.LifetimeQueueStats();
+    ASSERT_EQ(stats.size(), max_reads + 1);
+    EXPECT_TRUE(QueueSnapshotConservesResidents(stats, max_reads));
+    const BlockKey fresh{201, 0, 0};
+    const BlockKey recovered{202, 0, 0};
+    const BlockKey uninitialized{203, 0, 0};
+    SlabAllocator::SlotRef ref;
+    std::vector<BlockKey> evicted;
+    ASSERT_TRUE(allocator.Put(fresh, 4096, &ref, &evicted));
+    const DiskLifetimeState fresh_state = NewDiskLifetimeState(0);
+    SlabAllocatorTestPeer::CommitGeneration(&allocator, fresh, 201,
+                                            &fresh_state);
+    ASSERT_TRUE(allocator.Put(recovered, 8192, &ref, &evicted));
+    const DiskLifetimeState recovered_state = RecoveredDiskLifetimeState(2);
+    SlabAllocatorTestPeer::CommitGeneration(&allocator, recovered, 202,
+                                            &recovered_state);
+    ASSERT_TRUE(allocator.Put(uninitialized, 4096, &ref, &evicted));
+    ASSERT_TRUE(evicted.empty());
+    const uint32_t recovered_band = max_reads < 2 ? max_reads : 2;
+    stats = allocator.LifetimeQueueStats();
+    EXPECT_EQ(stats.size(), 3 * (max_reads + 1));
+    EXPECT_EQ(QueuePopulation(stats, 0, 0), std::optional<uint64_t>(1));
+    EXPECT_EQ(QueuePopulation(stats, 4096, 0), std::optional<uint64_t>(1));
+    EXPECT_EQ(QueuePopulation(stats, 0, recovered_band),
+              std::optional<uint64_t>(1));
+    EXPECT_EQ(QueuePopulation(stats, 8192, recovered_band),
+              std::optional<uint64_t>(1));
+    EXPECT_TRUE(QueueSnapshotConservesResidents(stats, max_reads));
+    EXPECT_EQ(allocator.Count(), 3U);  // One resident has no scoring state.
+    EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+    ASSERT_TRUE(allocator.Pin(fresh));
+    ASSERT_EQ(allocator.Remove(fresh), SlabAllocator::RemoveResult::kDeferred);
+    stats = allocator.LifetimeQueueStats();
+    EXPECT_EQ(QueuePopulation(stats, 0, 0), std::optional<uint64_t>(1));
+    EXPECT_EQ(QueuePopulation(stats, 4096, 0), std::optional<uint64_t>(1));
+    ASSERT_TRUE(allocator.Unpin(fresh));
+    stats = allocator.LifetimeQueueStats();
+    EXPECT_EQ(QueuePopulation(stats, 0, 0), std::optional<uint64_t>(0));
+    // The raw resident keeps this class visible, but adds no indexed member.
+    EXPECT_EQ(QueuePopulation(stats, 4096, 0), std::optional<uint64_t>(0));
+    ASSERT_EQ(allocator.Remove(uninitialized),
+              SlabAllocator::RemoveResult::kRemoved);
+    stats = allocator.LifetimeQueueStats();
+    EXPECT_FALSE(QueuePopulation(stats, 4096, 0).has_value());
+    ASSERT_EQ(allocator.Remove(recovered),
+              SlabAllocator::RemoveResult::kRemoved);
+    stats = allocator.LifetimeQueueStats();
+    EXPECT_EQ(stats.size(), max_reads + 1);
+    EXPECT_EQ(QueuePopulation(stats, 0, recovered_band),
+              std::optional<uint64_t>(0));
+    EXPECT_TRUE(QueueSnapshotConservesResidents(stats, max_reads));
+    // Reuse starts in the new write's band, not the previous resident's band.
+    ASSERT_TRUE(allocator.Put(fresh, 4096, &ref, &evicted));
+    SlabAllocatorTestPeer::CommitGeneration(&allocator, fresh, 204,
+                                            &fresh_state);
+    stats = allocator.LifetimeQueueStats();
+    EXPECT_EQ(QueuePopulation(stats, 0, 0), std::optional<uint64_t>(1));
+    EXPECT_EQ(QueuePopulation(stats, 4096, 0), std::optional<uint64_t>(1));
+    EXPECT_TRUE(QueueSnapshotConservesResidents(stats, max_reads));
+    EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+  }
 }
 
 TEST(SlabLifetimeStorage, ConfiguredBandCountsCoverBothIndexesAndClasses) {
@@ -436,6 +543,11 @@ TEST(SlabLifetimeStorage, EarlyReadUsesEffectiveBandAndRejectedReadKeepsOrder) {
                                                      config, clock),
             SlabAllocatorTestPeer::LifetimeReadResult::kResidentChanged);
   ExpectState(allocator, key, *read_state);
+  const std::vector<SlabAllocator::LifetimeQueueStat> stats =
+      allocator.LifetimeQueueStats();
+  EXPECT_EQ(QueuePopulation(stats, 0, 2), std::optional<uint64_t>(1));
+  EXPECT_EQ(QueuePopulation(stats, 4096, 2), std::optional<uint64_t>(1));
+  EXPECT_TRUE(QueueSnapshotConservesResidents(stats, 4));
 }
 
 TEST(SlabLifetimeStorage, SaturatedReadsMoveBothQueuesAndRepairCursors) {
@@ -489,6 +601,11 @@ TEST(SlabLifetimeStorage, SaturatedReadsMoveBothQueuesAndRepairCursors) {
     EXPECT_EQ(SlabAllocatorTestPeer::LifetimeCursorKey(allocator, row, 1),
               std::optional<BlockKey>(second));
   }
+  const std::vector<SlabAllocator::LifetimeQueueStat> stats =
+      allocator.LifetimeQueueStats();
+  EXPECT_EQ(QueuePopulation(stats, 0, 1), std::optional<uint64_t>(2));
+  EXPECT_EQ(QueuePopulation(stats, 4096, 1), std::optional<uint64_t>(2));
+  EXPECT_TRUE(QueueSnapshotConservesResidents(stats, 1));
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
 }
 

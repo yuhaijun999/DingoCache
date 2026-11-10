@@ -286,6 +286,7 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_link_bytes` / `dfkv_slab_disk_lifetime_link_bytes` | gauge | Dual-index link vector capacity × sizeof(LifetimeLinks); both global and class links belong to each element. |
 | `dfkv_slab_lifetime_queue_bytes` / `dfkv_slab_disk_lifetime_queue_bytes` | gauge | Score-queue vector capacity × sizeof(LifetimeQueue). Logical queue count is (all canonical size classes + 1 global row) × (MAX_READS + 1), even before any resident is written. |
 | `dfkv_slab_lifetime_version_bytes` / `dfkv_slab_disk_lifetime_version_bytes` | gauge | Class mutation-version vector capacity × sizeof(uint64_t), covering all canonical size classes, not only bound classes. |
+| `dfkv_slab_lifetime_queue_residents` / `dfkv_slab_disk_lifetime_queue_residents` | gauge | Current retained residents in each physical lifetime scoring queue. Labels: `index="global"` with reserved `slot_size="0"`, or `index="class"` with actual slot size; `band="0"` through `MAX_READS`. Per-disk series also use existing `disk` / `disk_index`. Aggregate values sum the exact per-disk queue snapshots taken during that scrape, not a second sampling pass. |
 | `dfkv_slab_lifetime_recovered_objects` / `dfkv_slab_disk_lifetime_recovered_objects` | gauge | Current allocator residents whose initialized lifetime state has `history_unknown=true`, globally / per disk with existing `disk` and `disk_index` labels. Reading them does not clear their recovered-history marker. Not the cumulative startup `table_rebuilt_objects`, reader-visible-only population, payload bytes or all records restored when scoring initialization was skipped. |
 | `dfkv_slab_lifetime_recovered_unread_objects` / `dfkv_slab_disk_lifetime_recovered_unread_objects` | gauge | The recovered population above whose in-memory `actual_reads` is zero. The first applied nonempty logical read removes one from this subset, but later reads cannot subtract it again. Virtual recovery scoring reads, payload preparation, physical storage reads alone, heat-rejected notifications and metric scrapes do not consume unread population. NEW unread residents are excluded. This state-based gauge is not proof that no logical GET succeeded if its metadata update was skipped. |
 | `dfkv_slab_allocator_objects` / `dfkv_slab_committed_objects` | gauge | allocator resident（含未提交写）/ reader-visible 已提交对象 |
@@ -653,3 +654,37 @@ cache types: `DiskSlabStore::Stats` grows with these metrics. C++ consumers of
 cache internals must rebuild with matching headers and libraries; do not mix old
 Stats-returning callers with a new library. The public C API and disk format do
 not change.
+
+### Lifetime queue populations
+
+These are physical index memberships: `band = min(scoring_reads + fw,
+MAX_READS)`, not W/R/O logical classes, actual read counts, current scores or
+protected populations. Time passing alone does not move a resident's physical
+band. Clean-recovered virtual-two-read residents are still logically unread
+but occupy band `min(2, MAX_READS)` until a real event changes membership.
+
+Each enabled disk emits all `MAX_READS + 1` global bands including zeros, plus
+all bands for classes with allocator residents. Class rows disappear when that
+class has no residents; no fixed five-band assumption is made. Uncommitted or
+uninitialized/null-state residents are not indexed, so indexed totals can be
+less than allocator resident count. Hidden pinned or isolated residents retain
+membership until physical release, including failed metadata invalidation.
+At one disk snapshot, each global band equals the sum of that band's class
+rows; do not add both indexes together as if they represented different keys.
+The disk snapshots are coherent under A, but not simultaneous across disks or
+atomic with separately sampled payload/population metrics.
+
+Counters are maintained only at existing link/unlink sites under A. Metrics
+use a separate A-locked queue snapshot, costing O(canonical classes + emitted
+queues), with up to `(active resident classes + 1) * (MAX_READS + 1)` rows per
+disk. No resident traversal, clock read or deadline processing is introduced.
+This is not O(1) or zero overhead: each queue gains a uint64 count (including
+alignment effects in actual sizeof), link/unlink does extra fixed arithmetic,
+and a scrape adds an A-lock acquisition, temporary rows/aggregation and output.
+The existing queue-backing byte gauge uses actual sizeof and reflects this
+allocation change. Shared ClassStat/Stats, ordinary Classes(), RAM reclaim and
+business snapshot paths are not expanded to carry band arrays. Disabled legacy
+slab has no queue samples; file omits the slab families. Internal shadow
+allocators return actual enabled index populations without claiming production
+policy activation. Internal C++ cache consumers still require matching headers
+and libraries; the C API, disk format and existing snapshot interfaces remain.

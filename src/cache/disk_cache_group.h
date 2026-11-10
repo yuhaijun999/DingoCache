@@ -27,6 +27,7 @@
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
 #include "cache/kv_store.h"
+#include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -218,6 +219,9 @@ class DiskCacheGroup {
   DiskSlabStore::Stats DiskSlabStats(size_t i) const {
     return slabs_[i]->GetStats();
   }
+  // Separate metrics-only snapshot; file/out-of-range views are empty.
+  std::vector<SlabAllocator::LifetimeQueueStat> DiskLifetimeQueueStats(
+      size_t i) const;
   uint64_t TenantUsedBytes(uint64_t tenant_hash) const;
   uint64_t TenantDefaultQuotaBytes() const { return tenant_default_quota_bytes_; }
   uint64_t TenantQuotaBytes(uint64_t tenant_hash) const {

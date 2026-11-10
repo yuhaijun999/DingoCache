@@ -390,6 +390,9 @@ class DiskSlabStore : public StoreEngine {
       LifetimeReadSource source = LifetimeReadSource::kUnclassified);
   Stats GetStats() const;
   std::vector<SlabAllocator::ClassStat> ClassStats() const;
+  // Metrics-only retained queue populations; not scores or logical read
+  // classes.
+  std::vector<SlabAllocator::LifetimeQueueStat> LifetimeQueueStats() const;
   bool Healthy() const override {
     return ok_ && !metadata_failed_.load(std::memory_order_acquire);
   }

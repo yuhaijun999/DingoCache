@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -15,8 +16,11 @@
 
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/disk_cache_group.h"
@@ -47,6 +51,11 @@ class DiskCacheGroupTestPeer {
 
 class DiskSlabStoreTestPeer {
  public:
+  static void FailMetadata(DiskSlabStore& store) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    if (store.table_fd_ >= 0) ::close(store.table_fd_);
+    store.table_fd_ = -1;
+  }
   static void TickBackground(DiskSlabStore& store) {
     store.ReclaimLifetimeTick(1);
   }
@@ -172,6 +181,14 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
             Status::kOk);
 
   const std::string text = s->MetricsText();
+  EXPECT_TRUE(
+      KvNodeServerTestPeer::Group(*s).DiskLifetimeQueueStats(0).empty());
+  EXPECT_TRUE(
+      KvNodeServerTestPeer::Group(*s).DiskLifetimeQueueStats(1).empty());
+  EXPECT_EQ(text.find("dfkv_slab_lifetime_queue_residents{"),
+            std::string::npos);
+  EXPECT_EQ(text.find("dfkv_slab_disk_lifetime_queue_residents{"),
+            std::string::npos);
   EXPECT_NE(text.find("dfkv_slab_capacity_bytes 1073741824"),
             std::string::npos)
       << text;
@@ -953,6 +970,169 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, LifetimeQueueGaugesTrackBothIndexesAcrossReadsAndRecovery) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "4096");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const ScopedEnv max_reads("DFKV_SLAB_LIFE_MAX_READS", "4");
+  const ScopedEnv buckets("DFKV_SLAB_BUCKET_COUNT", "64");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_queues";
+  fs::remove_all(dir);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 4ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  std::vector<BlockKey> keys[2];
+  for (uint64_t id = 1; id < 10000 && (keys[0].size() < 2 || keys[1].empty());
+       ++id) {
+    const BlockKey key{id, 0};
+    const size_t disk = DiskCacheGroupTestPeer::RouteIndex(
+        KvNodeServerTestPeer::Group(*server), key);
+    ASSERT_LT(disk, 2U);
+    if ((disk == 0 && keys[0].size() < 2) || (disk == 1 && keys[1].empty()))
+      keys[disk].push_back(key);
+  }
+  ASSERT_EQ(keys[0].size(), 2U);
+  ASSERT_EQ(keys[1].size(), 1U);
+  using QueueKey = std::pair<uint32_t, uint32_t>;
+  using QueueCounts = std::map<QueueKey, uint64_t>;
+  const auto labels = [](uint32_t slot_size, uint32_t band) {
+    return std::string("index=\"") + (slot_size == 0 ? "global" : "class") +
+           "\",slot_size=\"" + std::to_string(slot_size) + "\",band=\"" +
+           std::to_string(band) + "\"";
+  };
+  const auto expect_queues = [&](const std::array<uint64_t, 5>& small0,
+                                 const std::array<uint64_t, 5>& large0,
+                                 const std::array<uint64_t, 5>& small1) {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+    const std::string text = server->MetricsText();
+    QueueCounts totals;
+    for (size_t disk = 0; disk < 2; ++disk) {
+      const std::array<uint64_t, 5>& small = disk == 0 ? small0 : small1;
+      uint64_t small_total = 0;
+      uint64_t large_total = 0;
+      for (uint32_t band = 0; band <= 4; ++band) {
+        small_total += small[band];
+        if (disk == 0) large_total += large0[band];
+      }
+      QueueCounts expected;
+      for (uint32_t band = 0; band <= 4; ++band) {
+        expected[{0, band}] = small[band] + (disk == 0 ? large0[band] : 0);
+        if (small_total != 0) expected[{4096, band}] = small[band];
+        if (large_total != 0) expected[{8192, band}] = large0[band];
+      }
+      const std::vector<SlabAllocator::LifetimeQueueStat> queues =
+          group.DiskLifetimeQueueStats(disk);
+      QueueCounts actual;
+      for (const SlabAllocator::LifetimeQueueStat& queue : queues) {
+        EXPECT_TRUE(
+            actual
+                .emplace(QueueKey{queue.slot_size, queue.band}, queue.residents)
+                .second);
+        const std::string disk_labels =
+            "{disk=\"" + options.cache_dirs[disk] + "\",disk_index=\"" +
+            std::to_string(disk) + "\"," + labels(queue.slot_size, queue.band) +
+            "} ";
+        EXPECT_NE(
+            text.find("dfkv_slab_disk_lifetime_queue_residents" + disk_labels +
+                      std::to_string(queue.residents) + "\n"),
+            std::string::npos);
+        totals[{queue.slot_size, queue.band}] += queue.residents;
+      }
+      EXPECT_EQ(actual, expected);
+      for (uint32_t band = 0; band <= 4; ++band) {
+        EXPECT_EQ(actual.at({0, band}),
+                  (small_total == 0 ? 0 : actual.at({4096, band})) +
+                      (large_total == 0 ? 0 : actual.at({8192, band})));
+      }
+    }
+    for (const QueueCounts::value_type& entry : totals) {
+      EXPECT_NE(text.find("dfkv_slab_lifetime_queue_residents{" +
+                          labels(entry.first.first, entry.first.second) + "} " +
+                          std::to_string(entry.second) + "\n"),
+                std::string::npos);
+    }
+    for (const char* name : {"dfkv_slab_lifetime_queue_residents",
+                             "dfkv_slab_disk_lifetime_queue_residents"}) {
+      EXPECT_NE(text.find(std::string("# TYPE ") + name + " gauge\n"),
+                std::string::npos);
+    }
+    EXPECT_EQ(text.find("band=\"5\""), std::string::npos);
+  };
+  const std::string small("small");
+  const std::string large(5000, 'l');
+  ASSERT_NO_FATAL_FAILURE(expect_queues({}, {}, {}));
+  DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+  ASSERT_EQ(group.Cache(keys[0][0], small.data(), small.size()), Status::kOk);
+  ASSERT_EQ(group.Cache(keys[0][1], large.data(), large.size()), Status::kOk);
+  ASSERT_EQ(group.Cache(keys[1][0], small.data(), small.size()), Status::kOk);
+  ASSERT_EQ(group.Count(), 3U);
+  ASSERT_NO_FATAL_FAILURE(
+      expect_queues({1, 0, 0, 0, 0}, {1, 0, 0, 0, 0}, {1, 0, 0, 0, 0}));
+  const auto read_small = [&](const BlockKey& key) {
+    std::string value;
+    ASSERT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                           key, 0, 0, nullptr, 0, &value),
+              Status::kOk);
+    EXPECT_EQ(value, small);
+  };
+  ASSERT_NO_FATAL_FAILURE(read_small(keys[0][0]));
+  // NEW's early-read bonus skips physical band 1; this is not logical O2.
+  ASSERT_NO_FATAL_FAILURE(
+      expect_queues({0, 0, 1, 0, 0}, {1, 0, 0, 0, 0}, {1, 0, 0, 0, 0}));
+  ASSERT_NO_FATAL_FAILURE(read_small(keys[0][0]));
+  ASSERT_NO_FATAL_FAILURE(
+      expect_queues({0, 0, 0, 1, 0}, {1, 0, 0, 0, 0}, {1, 0, 0, 0, 0}));
+  ASSERT_NO_FATAL_FAILURE(read_small(keys[0][0]));
+  ASSERT_NO_FATAL_FAILURE(read_small(keys[0][0]));
+  ASSERT_NO_FATAL_FAILURE(read_small(keys[1][0]));
+  ASSERT_NO_FATAL_FAILURE(
+      expect_queues({0, 0, 0, 0, 1}, {1, 0, 0, 0, 0}, {0, 0, 1, 0, 0}));
+  DiskSlabStore& disk0 = DiskCacheGroupTestPeer::Slab(group, 0);
+  ReadLease lease;
+  ASSERT_EQ(disk0.RangeDirectPrep(keys[0][1], 0, 1, 4096, &lease), Status::kOk);
+  ASSERT_EQ(disk0.Remove(keys[0][1]), Status::kOk);
+  EXPECT_FALSE(disk0.IsCached(keys[0][1]));
+  // Hidden pinned residents still belong to both physical indexes.
+  ASSERT_NO_FATAL_FAILURE(
+      expect_queues({0, 0, 0, 0, 1}, {1, 0, 0, 0, 0}, {0, 0, 1, 0, 0}));
+  lease = ReadLease{};
+  ASSERT_TRUE(disk0.Healthy());
+  ASSERT_NO_FATAL_FAILURE(expect_queues({0, 0, 0, 0, 1}, {}, {0, 0, 1, 0, 0}));
+  server.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  // Clean recovery's virtual n=2 is band 2 but still zero real reads.
+  ASSERT_NO_FATAL_FAILURE(expect_queues({0, 0, 1, 0, 0}, {}, {0, 0, 1, 0, 0}));
+  EXPECT_EQ(KvNodeServerTestPeer::Group(*server)
+                .SlabStats()
+                .lifetime_reads.successful,
+            0U);
+  ASSERT_NO_FATAL_FAILURE(read_small(keys[0][0]));
+  ASSERT_NO_FATAL_FAILURE(read_small(keys[1][0]));
+  ASSERT_NO_FATAL_FAILURE(read_small(keys[1][0]));
+  ASSERT_NO_FATAL_FAILURE(expect_queues({0, 0, 0, 1, 0}, {}, {0, 0, 0, 0, 1}));
+  DiskSlabStore& disk1 =
+      DiskCacheGroupTestPeer::Slab(KvNodeServerTestPeer::Group(*server), 1);
+  ASSERT_EQ(disk1.RangeDirectPrep(keys[1][0], 0, 1, 4096, &lease), Status::kOk);
+  ASSERT_EQ(disk1.Remove(keys[1][0]), Status::kOk);
+  EXPECT_FALSE(disk1.IsCached(keys[1][0]));
+  DiskSlabStoreTestPeer::FailMetadata(disk1);
+  lease = ReadLease{};
+  EXPECT_FALSE(disk1.Healthy());
+  // Failed invalidation cannot debit the still-retained physical queues.
+  ASSERT_NO_FATAL_FAILURE(expect_queues({0, 0, 0, 1, 0}, {}, {0, 0, 0, 0, 1}));
+  server.reset();
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, RecoveredGaugesTrackReadsRemovalAndRestarts) {
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
   const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
@@ -1310,8 +1490,12 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
   EXPECT_NE(text.find(",engine=\"file\",write_mode=\"n/a\""),
             std::string::npos) << text;
   EXPECT_EQ(text.find("dfkv_slab_capacity_bytes"), std::string::npos) << text;
+  EXPECT_TRUE(
+      KvNodeServerTestPeer::Group(*server).DiskLifetimeQueueStats(0).empty());
   for (const char* name :
-       {"dfkv_slab_allocator_payload_bytes",
+       {"dfkv_slab_lifetime_queue_residents",
+        "dfkv_slab_disk_lifetime_queue_residents",
+        "dfkv_slab_allocator_payload_bytes",
         "dfkv_slab_allocator_fragmentation_bytes",
         "dfkv_slab_disk_allocator_payload_bytes",
         "dfkv_slab_disk_allocator_fragmentation_bytes",
