@@ -92,6 +92,7 @@ TEST(PreparedRead, DiskSourceSurvivesMovesAndTerminalActions) {
     PreparedRead empty;
     EXPECT_EQ(empty.source(), PreparedRead::Source::kUnclassified);
     EXPECT_FALSE(empty.owns_cleanup());
+    EXPECT_EQ(empty.async_read_counters(), nullptr);
     const PreparedRead missing = server.PrepareReadForKey(
         Key(94), 0, value.size(), staging.data(), staging.size());
     EXPECT_EQ(missing.status(), Status::kNotFound);
@@ -102,6 +103,7 @@ TEST(PreparedRead, DiskSourceSurvivesMovesAndTerminalActions) {
     ASSERT_EQ(original.status(), Status::kOk);
     EXPECT_EQ(original.source(), PreparedRead::Source::kDiskStaging);
     PreparedRead moved(std::move(original));
+    EXPECT_NE(moved.async_read_counters(), nullptr);
     // MoveFrom resets source_; this const getter verifies that post-move
     // contract.
     // NOLINTNEXTLINE(bugprone-use-after-move,hicpp-invalid-access-moved,clang-analyzer-cplusplus.Move)
@@ -115,6 +117,7 @@ TEST(PreparedRead, DiskSourceSurvivesMovesAndTerminalActions) {
     ASSERT_GE(static_cast<size_t>(got), moved.head() + moved.payload_len());
     ASSERT_EQ(moved.FinishStorage(Status::kOk, moved.payload_len()),
               Status::kOk);
+    EXPECT_EQ(moved.async_read_counters(), nullptr);
     EXPECT_EQ(moved.source(), PreparedRead::Source::kDiskStaging);
     empty = std::move(moved);
     // MoveFrom resets source_; this const getter verifies that post-move
@@ -615,6 +618,7 @@ TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
     ASSERT_EQ(ram_hit.status(), Status::kOk);
     EXPECT_FALSE(ram_hit.needs_io());
     EXPECT_EQ(ram_hit.source(), PreparedRead::Source::kRamHit);
+    EXPECT_EQ(ram_hit.async_read_counters(), nullptr);
     EXPECT_TRUE(ram_hit.Stage());
     EXPECT_FALSE(ram_hit.source_registered());
     EXPECT_EQ(ram_hit.source(), PreparedRead::Source::kRamHit);

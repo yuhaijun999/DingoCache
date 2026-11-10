@@ -581,6 +581,14 @@ std::string KvNodeServer::MetricsText() const {
     header(
         "dfkv_slab_disk_sync_payload_read_short_reads_total", "counter",
         "Nonnegative short synchronous payload pread returns, including EOF");
+    header("dfkv_slab_disk_uring_payload_read_completions_total", "counter",
+           "Attributed io_uring payload CQEs, not syscalls or logical reads");
+    header("dfkv_slab_disk_uring_payload_read_bytes_total", "counter",
+           "Positive bytes returned in attributed io_uring payload CQEs");
+    header("dfkv_slab_disk_uring_payload_read_errors_total", "counter",
+           "Negative attributed io_uring payload CQE results");
+    header("dfkv_slab_disk_uring_payload_read_short_reads_total", "counter",
+           "Nonnegative attributed payload CQEs below residual length");
     header("dfkv_slab_disk_lifetime_bucket_protected_estimate", "gauge",
            "Bucket-rounded estimate of retained protected residents");
     header("dfkv_slab_disk_lifetime_bucket_estimate_available", "gauge",
@@ -779,6 +787,14 @@ std::string KvNodeServer::MetricsText() const {
              disk.sync_payload_reads.errors);
       sample("dfkv_slab_disk_sync_payload_read_short_reads_total",
              disk.sync_payload_reads.short_reads);
+      sample("dfkv_slab_disk_uring_payload_read_completions_total",
+             disk.uring_payload_reads.completions);
+      sample("dfkv_slab_disk_uring_payload_read_bytes_total",
+             disk.uring_payload_reads.bytes);
+      sample("dfkv_slab_disk_uring_payload_read_errors_total",
+             disk.uring_payload_reads.errors);
+      sample("dfkv_slab_disk_uring_payload_read_short_reads_total",
+             disk.uring_payload_reads.short_reads);
       sample("dfkv_slab_disk_lifetime_recovered_objects",
              disk.lifetime_recovered_objects);
       sample("dfkv_slab_disk_lifetime_recovered_unread_objects",
@@ -916,6 +932,18 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_sync_payload_read_short_reads_total", "counter",
            "Nonnegative short synchronous payload pread returns, including EOF",
            ss.sync_payload_reads.short_reads);
+    metric("dfkv_slab_uring_payload_read_completions_total", "counter",
+           "Attributed io_uring payload CQEs, not syscalls or logical reads",
+           ss.uring_payload_reads.completions);
+    metric("dfkv_slab_uring_payload_read_bytes_total", "counter",
+           "Positive bytes returned in attributed io_uring payload CQEs",
+           ss.uring_payload_reads.bytes);
+    metric("dfkv_slab_uring_payload_read_errors_total", "counter",
+           "Negative attributed io_uring payload CQE results",
+           ss.uring_payload_reads.errors);
+    metric("dfkv_slab_uring_payload_read_short_reads_total", "counter",
+           "Nonnegative attributed payload CQEs below residual length",
+           ss.uring_payload_reads.short_reads);
     metric("dfkv_slab_dio_write_fallback_total", "counter",
            "Direct-mode PUTs that fell back to a buffered write", ss.dio_write_fallbacks);
     metric("dfkv_slab_dio_read_fallback_total", "counter",

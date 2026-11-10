@@ -30,6 +30,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cache/async_read_counters.h"
 #include "cache/disk_lifetime_math.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_write_result.h"
@@ -155,6 +156,8 @@ class DiskSlabStore : public StoreEngine {
   struct Stats {
     LifetimeReadCounters lifetime_reads{};
     SyncPayloadReadCounters sync_payload_reads{};
+    // Explicitly attributed io_uring CQEs, published on storage-lease release.
+    AsyncReadCounters uring_payload_reads{};
     uint64_t lifetime_class_scan_visits = 0;
     uint64_t lifetime_class_scan_slices = 0;
     uint64_t lifetime_scan_budget_exhausted = 0;
@@ -526,9 +529,11 @@ class DiskSlabStore : public StoreEngine {
   // Call with mu_ held.
   bool ReleaseInflightLocked(const BlockKey& key, const std::string& fn);
   static Status ReleaseReadLeaseThunk(void* owner, uint64_t token, size_t bytes,
-                                      DiskResidentIdentity* identity) noexcept;
+                                      DiskResidentIdentity* identity,
+                                      const AsyncReadCounters& io) noexcept;
   Status ReleaseReadLease(uint64_t token, size_t bytes,
-                          DiskResidentIdentity* identity) noexcept;
+                          DiskResidentIdentity* identity,
+                          const AsyncReadCounters& io) noexcept;
   uint64_t TableOffset(uint32_t extent, uint32_t slot) const {
     return static_cast<uint64_t>(extent) * max_slots_per_extent_ * kRecBytes +
            static_cast<uint64_t>(slot) * kRecBytes;
@@ -605,6 +610,7 @@ class DiskSlabStore : public StoreEngine {
   std::function<void()> lifetime_scan_yield_hook_for_test_{};
   LifetimeReadCounters lifetime_reads_{};  // under mu_
   SyncPayloadReadCounters sync_payload_reads_{};  // under mu_
+  AsyncReadCounters uring_payload_reads_{};       // under mu_
   uint64_t committed_payload_bytes_ = 0;  // under mu_
   uint64_t lifetime_init_clock_hard_exhausted_ = 0;  // under mu_
   bool ok_ = false;

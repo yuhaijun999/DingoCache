@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/async_read_counters.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_write_result.h"
 #include "common/kv_types.h"
@@ -65,7 +66,8 @@ class ReadLease {
   friend class PreparedRead;
   friend class KVStore;
   using ReleaseFn = Status (*)(void* owner, uint64_t token, size_t bytes,
-                               DiskResidentIdentity* identity) noexcept;
+                               DiskResidentIdentity* identity,
+                               const AsyncReadCounters& counters) noexcept;
   static ReadLease Adopt(int fd, void* owner = nullptr, uint64_t token = 0,
                          ReleaseFn release = nullptr,
                          const DiskResidentIdentity& identity = {}) noexcept {
@@ -83,9 +85,12 @@ class ReadLease {
     ReleaseFn release = std::exchange(release_, nullptr);
     void* owner = std::exchange(owner_, nullptr);
     const uint64_t token = std::exchange(token_, 0);
+    const AsyncReadCounters counters =
+        std::exchange(async_reads_, AsyncReadCounters{});
     if (fd >= 0) ::close(fd);
-    return release != nullptr ? release(owner, token, payload_len, &identity_)
-                              : Status::kOk;
+    return release != nullptr
+               ? release(owner, token, payload_len, &identity_, counters)
+               : Status::kOk;
   }
   void MoveFrom(ReadLease&& other) noexcept {
     fd_ = std::exchange(other.fd_, -1);
@@ -93,6 +98,7 @@ class ReadLease {
     token_ = std::exchange(other.token_, 0);
     release_ = std::exchange(other.release_, nullptr);
     identity_ = std::exchange(other.identity_, DiskResidentIdentity{});
+    async_reads_ = std::exchange(other.async_reads_, AsyncReadCounters{});
     aligned_off = other.aligned_off;
     aligned_len = other.aligned_len;
     head = other.head;
@@ -110,6 +116,7 @@ class ReadLease {
   uint64_t token_ = 0;
   ReleaseFn release_ = nullptr;
   DiskResidentIdentity identity_{};
+  AsyncReadCounters async_reads_{};
 };
 
 // One prepared transport read and its complete terminal lifecycle. The owner is
@@ -173,6 +180,14 @@ class PreparedRead {
 
   bool owns_cleanup() const noexcept { return active_; }
   bool needs_io() const noexcept { return needs_io_; }
+  // Optional completion sink for a disk executor. Bind only after this owner
+  // reaches its stable address; the pointer must not cross a move or terminal
+  // call. Drain all kernel ownership before FinishStorage/Commit/Abort or
+  // destruction. The lease publishes recorded results once at storage release.
+  AsyncReadCounters* async_read_counters() noexcept {
+    return active_ && !storage_finished_ && needs_io_ ? &lease_.async_reads_
+                                                      : nullptr;
+  }
   int fd() const noexcept { return lease_.fd(); }
   uint64_t aligned_off() const noexcept { return aligned_off_; }
   size_t aligned_len() const noexcept { return aligned_len_; }

@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/async_read_counters.h"
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_state.h"
@@ -2235,14 +2236,15 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
 }
 
 Status DiskSlabStore::ReleaseReadLeaseThunk(
-    void* owner, uint64_t token, size_t bytes,
-    DiskResidentIdentity* identity) noexcept {
+    void* owner, uint64_t token, size_t bytes, DiskResidentIdentity* identity,
+    const AsyncReadCounters& io) noexcept {
   return static_cast<DiskSlabStore*>(owner)->ReleaseReadLease(token, bytes,
-                                                              identity);
+                                                              identity, io);
 }
 
-Status DiskSlabStore::ReleaseReadLease(
-    uint64_t token, size_t bytes, DiskResidentIdentity* identity) noexcept {
+Status DiskSlabStore::ReleaseReadLease(uint64_t token, size_t bytes,
+                                       DiskResidentIdentity* identity,
+                                       const AsyncReadCounters& io) noexcept {
   std::lock_guard<std::mutex> lk(mu_);
   const std::unordered_map<uint64_t, PrepHold>::iterator it =
       prep_holds_.find(token);
@@ -2250,6 +2252,13 @@ Status DiskSlabStore::ReleaseReadLease(
     if (identity != nullptr) *identity = {};
     return Status::kIOError;
   }
+  // Publish actual CQEs even if final-pin invalidation changes the GET result.
+  // Request-local recording needs no per-CQE lock; reuse this finalization
+  // lock.
+  uring_payload_reads_.completions += io.completions;
+  uring_payload_reads_.bytes += io.bytes;
+  uring_payload_reads_.errors += io.errors;
+  uring_payload_reads_.short_reads += io.short_reads;
   const Status status = FinishReadLocked(it->second.key, it->second.fn,
                                          Status::kOk, bytes, identity);
   prep_holds_.erase(it);
@@ -3048,6 +3057,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
 
   st.lifetime_reads = lifetime_reads_;
   st.sync_payload_reads = sync_payload_reads_;
+  st.uring_payload_reads = uring_payload_reads_;
   st.payload_bytes = committed_payload_bytes_;
   st.watermark_freed_payload_bytes = watermark_freed_payload_bytes_;
   st.lifetime_init_clock_hard_exhausted = lifetime_init_clock_hard_exhausted_;

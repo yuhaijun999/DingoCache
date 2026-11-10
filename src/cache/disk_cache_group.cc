@@ -1011,6 +1011,10 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.sync_payload_reads.bytes += st.sync_payload_reads.bytes;
     sum.sync_payload_reads.errors += st.sync_payload_reads.errors;
     sum.sync_payload_reads.short_reads += st.sync_payload_reads.short_reads;
+    sum.uring_payload_reads.completions += st.uring_payload_reads.completions;
+    sum.uring_payload_reads.bytes += st.uring_payload_reads.bytes;
+    sum.uring_payload_reads.errors += st.uring_payload_reads.errors;
+    sum.uring_payload_reads.short_reads += st.uring_payload_reads.short_reads;
     sum.table_syncs += st.table_syncs;
     sum.bind_wipes += st.bind_wipes;
     sum.steals += st.steals;

@@ -227,6 +227,10 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_rebalanced_total` | counter | 回收线程从冷 class 搬给热 class 的 extent 数（类再平衡）——换模型/尺寸迁移期应看到增长，稳态应静止 |
 | `dfkv_slab_batched_writes_total` / `dfkv_slab_uring_write_batches_total` | counter | 进入 batched store visit 的 payload 写数 / io_uring 单次 submit 轮数 |
 | `dfkv_slab_bind_wipes_total` | counter | extent 绑定新 class 前完成的旧 slot-grid 清理 |
+| `dfkv_slab_uring_payload_read_completions_total` / `dfkv_slab_disk_uring_payload_read_completions_total` | counter | Consumed CQEs from participating prepared payload reads, including residual and drained completions. Not syscalls or logical GETs. |
+| `dfkv_slab_uring_payload_read_bytes_total` / `dfkv_slab_disk_uring_payload_read_bytes_total` | counter | Positive CQE-returned bytes, including DIO padding and partial bytes before later failure. |
+| `dfkv_slab_uring_payload_read_errors_total` / `dfkv_slab_disk_uring_payload_read_errors_total` | counter | Negative read CQE results, not submission/wait errors or final GET failures. |
+| `dfkv_slab_uring_payload_read_short_reads_total` / `dfkv_slab_disk_uring_payload_read_short_reads_total` | counter | Nonnegative CQEs below the current residual request length, including EOF. |
 | `dfkv_slab_sync_payload_read_syscalls_total` / `dfkv_slab_disk_sync_payload_read_syscalls_total` | counter | Every actual Store-owned synchronous payload pread call, including retries. Not logical GETs or device reads. |
 | `dfkv_slab_sync_payload_read_bytes_total` / `dfkv_slab_disk_sync_payload_read_bytes_total` | counter | Positive kernel-returned bytes for those calls, including aligned DIO excess and partial bytes before failure. Not logical payload bytes. |
 | `dfkv_slab_sync_payload_read_errors_total` / `dfkv_slab_disk_sync_payload_read_errors_total` | counter | Negative pread returns, including retried EINTR. Not final GET failures; EOF is a short read instead. |
@@ -880,5 +884,40 @@ counters, syscall counts, device I/O counts, or proof of RDMA/RXE hardware
 acceptance. They reset with each reader instance; destructor-only drain totals
 are not externally published. The existing `dfkv_uring_reads_total` and the
 Store-owned synchronous payload counters retain their previous meanings.
-Per-disk attribution, externally executed PreparedRead I/O and exported async
-I/O closure remain pending. No I/O is inferred from logical lease-release bytes.
+Per-disk attribution for participating readers is described below. Arbitrary
+externally executed PreparedRead I/O remains outside that accounting. No I/O is
+inferred from logical lease-release bytes.
+
+### Prepared io_uring payload attribution
+
+The eight `dfkv_slab[_disk]_uring_payload_read_*_total` families attribute explicit
+read CQEs to the original owning slab through its storage lease. Normal Reap and
+Drain update request-local counters at each consumed CQE. The lease publishes
+all four fields under the Store's existing finalization lock before releasing
+the final disk pin. Reads still in flight or completed but not yet released are
+not yet visible in these Store metrics. Partial Drain timeouts retain ownership;
+later Drain/destructor completion precedes lease release. Even if deferred Remove
+invalidation changes the final GET result to an error, completed I/O is retained.
+Moves and repeated terminal calls do not duplicate publication.
+
+Only descriptors explicitly attached to the prepared lease's counter sink are
+covered. The RDMA io_uring pipeline binds that sink after stable queue insertion
+and before submission, including batches that are only partly admitted. Dormant
+unsubmitted SQEs contribute zero. Unknown CQE tokens cannot be guessed into a
+disk. Ordinary external fd pread and independently implemented io_uring executors
+remain excluded unless they explicitly participate; logical lease bytes never
+substitute for actual I/O. These metrics are not total device I/O, grants, logical
+read success, or proof of hardware acceptance.
+
+Both legacy and lifetime slabs report actual participation; file engines do not
+export these slab families. Store reconstruction starts them at zero, including
+clean recovery. Global and per-disk series are sampled separately, so equality
+of sums is guaranteed only when quiescent. They use existing disk/disk_index
+labels, not per-request or per-key labels. Existing synchronous payload,
+`dfkv_uring_reads_total`, heat and grant counters retain their meanings.
+
+Internal counter pointers are borrowed, owner-thread-only, and invalidated by
+moving or releasing their PreparedRead. The owner must remain stable until all
+kernel operations drain. This is not a cross-thread mutable metrics API. Internal
+C++ lease/descriptor layouts grow; matching headers and libraries must be rebuilt.
+No wire/disk format or policy default changes are implied.

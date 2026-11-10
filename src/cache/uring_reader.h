@@ -18,6 +18,8 @@
 #include <limits>
 #include <vector>
 
+#include "cache/async_read_counters.h"
+
 namespace dfkv {
 
 class UringReader {
@@ -30,6 +32,9 @@ class UringReader {
     void* buf = nullptr;
     unsigned len = 0;
     uint64_t off = 0;
+    // Borrowed until all accepted CQEs drain. The sink must remain at the same
+    // address, including after Submit failure and during reader destruction.
+    AsyncReadCounters* counters = nullptr;
   };
 
   struct Completion {
@@ -40,14 +45,7 @@ class UringReader {
   // Actual read CQEs consumed by Reap or Drain, not logical reads, syscalls,
   // submission attempts, or device I/O. A partial result followed by an error
   // retains its returned bytes. Ring infrastructure errors are excluded.
-  struct ReadCounters {
-    uint64_t completions = 0;
-    uint64_t bytes = 0;
-    uint64_t errors = 0;
-    // Nonnegative results below the current residual request, including EOF.
-    // An unrecognized token has no known request length and is excluded here.
-    uint64_t short_reads = 0;
-  };
+  using ReadCounters = AsyncReadCounters;
 
   // A CQE is borrowed from the ring until Reap.  It is intentionally opaque:
   // callers route completed descriptors by Completion::token, not CQE pointers.
@@ -335,16 +333,11 @@ class UringReader {
   // Drain leaves done unchanged: each accepted residual has at most one unread
   // CQE, including when a previous Drain timed out.
   void RecordCompletion(const Pending* pending, long result) {
-    ++read_counters_.completions;
-    if (result < 0) {
-      ++read_counters_.errors;
-      return;
-    }
-    read_counters_.bytes += static_cast<uint64_t>(result);
-    if (pending &&
-        static_cast<uint64_t>(result) <
-            static_cast<uint64_t>(pending->desc.len) - pending->done) {
-      ++read_counters_.short_reads;
+    const uint64_t requested =
+        pending ? static_cast<uint64_t>(pending->desc.len) - pending->done : 0;
+    read_counters_.Record(result, requested);
+    if (pending && pending->desc.counters != nullptr) {
+      pending->desc.counters->Record(result, requested);
     }
   }
 

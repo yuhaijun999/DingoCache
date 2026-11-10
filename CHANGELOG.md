@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Attribute participating io_uring payload completions to their owning slab
+  disk, including partial/error and drain results. Export global and per-disk
+  counters separately from synchronous reads, publishing at lease release.
+
 - Add owner-thread io_uring reader completion diagnostics, including residual
   reads and discarded drain completions. Keep them separate from logical reads,
   synchronous Store I/O and exported per-disk metrics.

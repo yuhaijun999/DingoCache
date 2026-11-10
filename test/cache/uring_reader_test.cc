@@ -5,22 +5,61 @@
 
 #include "cache/uring_reader.h"
 
-#include <gtest/gtest.h>
 #include <fcntl.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <gtest/gtest.h>
+#include <liburing/io_uring.h>
+
+#include "cache/async_read_counters.h"
+#include "cache/disk_cache_group.h"
+#include "cache/disk_slab_store.h"
+#include "cache/kv_node_server.h"
+#include "cache/store_engine.h"
+#include "common/kv_types.h"
+#include "common/status.h"
+
+namespace dfkv {
+class KvNodeServerTestPeer {
+ public:
+  static DiskCacheGroup& Group(KvNodeServer& server) { return server.group_; }
+};
+class DiskCacheGroupTestPeer {
+ public:
+  static size_t RouteIndex(const DiskCacheGroup& group, const BlockKey& key) {
+    return group.RouteIndex(key);
+  }
+  static DiskSlabStore& Slab(DiskCacheGroup& group, size_t disk) {
+    return *group.slabs_.at(disk);
+  }
+};
+class DiskSlabStoreTestPeer {
+ public:
+  static void FailRecordWrites(DiskSlabStore& store) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    store.record_write_hook_for_test_ = [] { return false; };
+  }
+};
+}  // namespace dfkv
 
 using namespace dfkv;  // NOLINT
 
@@ -176,7 +215,22 @@ class ControlledBackend final : public UringReader::Backend {
     const ssize_t result =
         ::pread(request.fd, request.buf, request.len,
                 static_cast<off_t>(request.off));
-    return Complete(token, result);
+    return Complete(token, result < 0 ? -errno : result);
+  }
+
+  // Failure cleanup for controlled tests: no real kernel owns these buffers.
+  // Queue terminal CQEs before the ring's destructor can block on its drain.
+  void CompleteOutstanding() {
+    const std::lock_guard<std::mutex> lock(mu_);
+    for (const std::pair<const UringReader::Token, Request>& entry :
+         accepted_) {
+      io_uring_cqe cqe{};
+      cqe.user_data = entry.first;
+      cqe.res = -ECANCELED;
+      ready_.push_back(cqe);
+    }
+    accepted_.clear();
+    cv_.notify_all();
   }
 
   size_t accepted() const {
@@ -204,6 +258,81 @@ class ControlledBackend final : public UringReader::Backend {
   std::map<UringReader::Token, Request> accepted_;
   std::list<io_uring_cqe> ready_;
 };
+
+// Declared after a controlled ring so assertion failures cannot leave its
+// destructor waiting forever for a completion that the test did not produce.
+class ControlledDrainGuard {
+ public:
+  explicit ControlledDrainGuard(ControlledBackend& backend)
+      : backend_(backend) {}
+  ~ControlledDrainGuard() { backend_.CompleteOutstanding(); }
+
+ private:
+  ControlledBackend& backend_;
+};
+
+struct PreparedSlabs {
+  explicit PreparedSlabs(const char* name)
+      : dir(std::filesystem::temp_directory_path() / name) {
+    std::filesystem::remove_all(dir);
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+    options.capacity_bytes = 2ULL << 30;
+    options.engine = "slab";
+    options.eviction_policy = "legacy";
+    server = std::make_unique<KvNodeServer>(options);
+    EXPECT_TRUE(server->Healthy());
+    DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+    std::array<bool, 2> found{};
+    for (uint64_t id = 1; id < 10000 && !(found[0] && found[1]); ++id) {
+      const BlockKey key{id, 0};
+      const size_t disk = DiskCacheGroupTestPeer::RouteIndex(group, key);
+      keys[disk] = key;
+      found[disk] = true;
+    }
+    EXPECT_TRUE(found[0] && found[1]);
+    for (size_t disk = 0; disk < keys.size(); ++disk) {
+      EXPECT_EQ(
+          group.Cache(keys[disk], values[disk].data(), values[disk].size()),
+          Status::kOk);
+    }
+  }
+  ~PreparedSlabs() {
+    server.reset();
+    std::filesystem::remove_all(dir);
+  }
+  PreparedRead Prepare(size_t disk) {
+    return server->PrepareReadForKey(keys[disk], 0, values[disk].size(),
+                                     buffers[disk].data,
+                                     sizeof(buffers[disk].data));
+  }
+  DiskSlabStore::Stats Stats(size_t disk) const {
+    return KvNodeServerTestPeer::Group(*server).DiskSlabStats(disk);
+  }
+
+  struct Buffer {
+    alignas(4096) char data[16384]{};
+  };
+  std::filesystem::path dir;
+  std::unique_ptr<KvNodeServer> server;
+  std::array<BlockKey, 2> keys{};
+  std::array<std::string, 2> values{std::string(4096, 'a'),
+                                    std::string(8192, 'b')};
+  std::array<Buffer, 2> buffers{};
+};
+
+UringReader::ReadDesc PreparedDesc(PreparedRead& read) {
+  return {read.fd(), read.staging(), static_cast<unsigned>(read.aligned_len()),
+          read.aligned_off(), read.async_read_counters()};
+}
+
+void ExpectIo(const AsyncReadCounters& counters, uint64_t completions,
+              uint64_t bytes, uint64_t errors, uint64_t shorts) {
+  EXPECT_EQ(counters.completions, completions);
+  EXPECT_EQ(counters.bytes, bytes);
+  EXPECT_EQ(counters.errors, errors);
+  EXPECT_EQ(counters.short_reads, shorts);
+}
 
 bool ReadAll(UringReader* ring, UringReader::ReadDesc* descs, size_t count,
              std::vector<long>* results) {
@@ -640,6 +769,177 @@ TEST(UringReader, CompletionCountersDrainComparesResidualLength) {
   EXPECT_EQ(ring.read_counters().errors, 0u);
   EXPECT_EQ(ring.read_counters().short_reads, 1u);
   EXPECT_EQ(ring.inflight(), 0u);
+}
+
+TEST(UringReader, PreparedReadsAttributeMovesAndDeferredInvalidation) {
+  PreparedSlabs slabs("dfkv_uring_prepared_moves");
+  ASSERT_TRUE(slabs.server->Healthy());
+  PreparedRead original = slabs.Prepare(0);
+  ASSERT_EQ(original.status(), Status::kOk);
+  PreparedRead first(std::move(original));
+  PreparedRead second = slabs.Prepare(1);
+  ASSERT_EQ(second.status(), Status::kOk);
+  ASSERT_NE(first.async_read_counters(), nullptr);
+  ASSERT_NE(second.async_read_counters(), nullptr);
+  ControlledBackend backend;
+  UringReader ring(4, &backend);
+  const ControlledDrainGuard cleanup(backend);
+  const UringReader::ReadDesc descs[] = {PreparedDesc(first),
+                                         PreparedDesc(second)};
+  UringReader::Token tokens[2]{};
+  ASSERT_TRUE(ring.Submit(descs, 2, tokens));
+  ASSERT_TRUE(backend.CompleteRead(tokens[1]));
+  UringReader::Event event;
+  ASSERT_EQ(ring.Peek(&event), 1);
+  UringReader::Completion completion;
+  ASSERT_EQ(ring.Reap(&event, &completion), 1);
+  ASSERT_TRUE(backend.CompleteRead(tokens[0]));
+  ASSERT_EQ(ring.Peek(&event), 1);
+  ASSERT_EQ(ring.Reap(&event, &completion), 1);
+  EXPECT_EQ(std::string(first.data(), first.payload_len()), slabs.values[0]);
+  EXPECT_EQ(std::string(second.data(), second.payload_len()), slabs.values[1]);
+  ExpectIo(slabs.Stats(0).uring_payload_reads, 0, 0, 0, 0);
+  ExpectIo(slabs.Stats(1).uring_payload_reads, 0, 0, 0, 0);
+
+  // There is no outstanding kernel ownership now, so moving the completed
+  // request is legal and must transfer its unreported counters exactly once.
+  PreparedRead completed(std::move(first));
+  DiskCacheGroup& group = KvNodeServerTestPeer::Group(*slabs.server);
+  ASSERT_EQ(group.Remove(slabs.keys[0]), Status::kOk);
+  ASSERT_EQ(group.Remove(slabs.keys[1]), Status::kOk);
+  DiskSlabStoreTestPeer::FailRecordWrites(
+      DiskCacheGroupTestPeer::Slab(group, 1));
+  EXPECT_EQ(completed.FinishStorage(Status::kOk, completed.payload_len()),
+            Status::kOk);
+  EXPECT_EQ(second.FinishStorage(Status::kOk, second.payload_len()),
+            Status::kIOError);
+  EXPECT_EQ(completed.async_read_counters(), nullptr);
+  EXPECT_EQ(second.async_read_counters(), nullptr);
+  EXPECT_TRUE(completed.Commit(Status::kOk, completed.payload_len(), 0.0));
+  EXPECT_TRUE(second.Abort());
+  EXPECT_FALSE(completed.Abort());
+  EXPECT_FALSE(second.Commit(Status::kOk, second.payload_len(), 0.0));
+  ExpectIo(slabs.Stats(0).uring_payload_reads, 1, 4096, 0, 0);
+  ExpectIo(slabs.Stats(1).uring_payload_reads, 1, 8192, 0, 0);
+  ExpectIo(group.SlabStats().uring_payload_reads, 2, 12288, 0, 0);
+  EXPECT_EQ(group.SlabStats().sync_payload_reads.syscalls, 0u);
+}
+
+TEST(UringReader, PreparedReadsKeepPartialBytesBeforeErrorAndEof) {
+  PreparedSlabs slabs("dfkv_uring_prepared_partial");
+  ASSERT_TRUE(slabs.server->Healthy());
+  PreparedRead first = slabs.Prepare(0);
+  PreparedRead second = slabs.Prepare(1);
+  ASSERT_EQ(first.status(), Status::kOk);
+  ASSERT_EQ(second.status(), Status::kOk);
+  // Real truncation makes pread-backed controlled CQEs report positive short
+  // reads and EOF. This is not a claim of kernel io_uring fault injection.
+  ASSERT_EQ(::fcntl(first.fd(), F_GETFL) & O_DIRECT, 0);
+  ASSERT_EQ(::fcntl(second.fd(), F_GETFL) & O_DIRECT, 0);
+  ASSERT_EQ(
+      ::ftruncate(first.fd(), static_cast<off_t>(first.aligned_off() + 1000)),
+      0);
+  ASSERT_EQ(
+      ::ftruncate(second.fd(), static_cast<off_t>(second.aligned_off() + 2000)),
+      0);
+  ControlledBackend backend;
+  UringReader ring(4, &backend);
+  const ControlledDrainGuard cleanup(backend);
+  const UringReader::ReadDesc descs[] = {PreparedDesc(first),
+                                         PreparedDesc(second)};
+  UringReader::Token tokens[2]{};
+  ASSERT_TRUE(ring.Submit(descs, 2, tokens));
+  ASSERT_TRUE(backend.CompleteRead(tokens[0]));
+  UringReader::Event event;
+  ASSERT_EQ(ring.Peek(&event), 1);
+  UringReader::Completion completion;
+  ASSERT_EQ(ring.Reap(&event, &completion), 0);
+  ASSERT_TRUE(
+      backend.Complete(tokens[0], -EIO));  // Explicit synthetic CQE error.
+  ASSERT_EQ(ring.Peek(&event), 1);
+  ASSERT_EQ(ring.Reap(&event, &completion), 1);
+  EXPECT_EQ(completion.result, -EIO);
+  ASSERT_TRUE(backend.CompleteRead(tokens[1]));
+  ASSERT_EQ(ring.Peek(&event), 1);
+  ASSERT_EQ(ring.Reap(&event, &completion), 0);
+  ASSERT_TRUE(backend.CompleteRead(tokens[1]));
+  ASSERT_EQ(ring.Peek(&event), 1);
+  ASSERT_EQ(ring.Reap(&event, &completion), 1);
+  EXPECT_EQ(completion.result, 2000);
+  EXPECT_EQ(std::string(first.data(), 1000), slabs.values[0].substr(0, 1000));
+  EXPECT_EQ(std::string(second.data(), 2000), slabs.values[1].substr(0, 2000));
+  ExpectIo(slabs.Stats(0).uring_payload_reads, 0, 0, 0, 0);
+  EXPECT_TRUE(first.Commit(Status::kIOError, 0, 0.0));
+  EXPECT_TRUE(second.Commit(Status::kIOError, 0, 0.0));
+  ExpectIo(slabs.Stats(0).uring_payload_reads, 2, 1000, 1, 1);
+  ExpectIo(slabs.Stats(1).uring_payload_reads, 2, 2000, 0, 2);
+  EXPECT_EQ(KvNodeServerTestPeer::Group(*slabs.server)
+                .SlabStats()
+                .sync_payload_reads.syscalls,
+            0u);
+}
+
+TEST(UringReader, PreparedReadsPartialAdmissionAttributesOnlyAcceptedIo) {
+  PreparedSlabs slabs("dfkv_uring_prepared_admission");
+  ASSERT_TRUE(slabs.server->Healthy());
+  PreparedRead first = slabs.Prepare(0);
+  PreparedRead second = slabs.Prepare(1);
+  ASSERT_EQ(first.status(), Status::kOk);
+  ASSERT_EQ(second.status(), Status::kOk);
+  ControlledBackend backend;
+  backend.submit_results = {1, -EIO};
+  UringReader ring(4, &backend);
+  const ControlledDrainGuard cleanup(backend);
+  const UringReader::ReadDesc descs[] = {PreparedDesc(first),
+                                         PreparedDesc(second)};
+  UringReader::Token tokens[2]{};
+  ASSERT_FALSE(ring.Submit(descs, 2, tokens));
+  ASSERT_EQ(backend.accepted(), 1u);
+  ASSERT_TRUE(backend.CompleteRead(tokens[0]));
+  ASSERT_TRUE(ring.Drain(0));
+  ExpectIo(ring.read_counters(), 1, 4096, 0, 0);
+  ExpectIo(slabs.Stats(0).uring_payload_reads, 0, 0, 0, 0);
+  EXPECT_TRUE(first.Abort());
+  EXPECT_TRUE(second.Abort());
+  EXPECT_FALSE(first.Abort());
+  ExpectIo(slabs.Stats(0).uring_payload_reads, 1, 4096, 0, 0);
+  ExpectIo(slabs.Stats(1).uring_payload_reads, 0, 0, 0, 0);
+}
+
+TEST(UringReader, PreparedReadsDestructorDrainPublishesAfterOwnersRelease) {
+  PreparedSlabs slabs("dfkv_uring_prepared_destructor");
+  ASSERT_TRUE(slabs.server->Healthy());
+  {
+    // Mirror production destruction order: the ring drains before prepared
+    // owners release their descriptors, storage pins and completion counters.
+    PreparedRead first = slabs.Prepare(0);
+    PreparedRead second = slabs.Prepare(1);
+    ASSERT_EQ(first.status(), Status::kOk);
+    ASSERT_EQ(second.status(), Status::kOk);
+    {
+      ControlledBackend backend;
+      UringReader ring(4, &backend);
+      const ControlledDrainGuard cleanup(backend);
+      const UringReader::ReadDesc descs[] = {PreparedDesc(first),
+                                             PreparedDesc(second)};
+      UringReader::Token tokens[2]{};
+      ASSERT_TRUE(ring.Submit(descs, 2, tokens));
+      ASSERT_TRUE(backend.CompleteRead(tokens[0]));
+      EXPECT_FALSE(ring.Drain(0));
+      ExpectIo(ring.read_counters(), 1, 4096, 0, 0);
+      ExpectIo(slabs.Stats(0).uring_payload_reads, 0, 0, 0, 0);
+      ASSERT_TRUE(backend.CompleteRead(tokens[1]));
+      // The second ready CQE is intentionally consumed by the destructor.
+    }
+    ExpectIo(slabs.Stats(0).uring_payload_reads, 0, 0, 0, 0);
+    ExpectIo(slabs.Stats(1).uring_payload_reads, 0, 0, 0, 0);
+  }
+  ExpectIo(slabs.Stats(0).uring_payload_reads, 1, 4096, 0, 0);
+  ExpectIo(slabs.Stats(1).uring_payload_reads, 1, 8192, 0, 0);
+  EXPECT_EQ(KvNodeServerTestPeer::Group(*slabs.server)
+                .SlabStats()
+                .sync_payload_reads.syscalls,
+            0u);
 }
 
 #endif  // DFKV_WITH_URING

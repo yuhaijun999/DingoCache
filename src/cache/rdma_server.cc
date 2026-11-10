@@ -1879,6 +1879,10 @@ void RdmaServer::Serve(int boot_fd) {
       submit_owners.clear();
       for (Queued& qd : queue) {
         if (qd.disk_state != DiskState::kWaiting) continue;
+        // Bind only after deque insertion: moving a PreparedRead invalidates
+        // its counter address. Ring drain precedes queue destruction, even
+        // when Submit partially accepts a batch and then fails.
+        qd.desc.counters = qd.read.async_read_counters();
         submit_descs.push_back(qd.desc);
         submit_owners.push_back(&qd);
         if (submit_descs.size() == count_limit) break;
