@@ -1827,6 +1827,8 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
     }
     if (!ReclaimAllowed() || !clock.TryDrainNow(&now)) break;
     bool protected_victim = false;
+    bool history_unknown = false;
+    uint32_t victim_age_sec = 0;
     if (stats != nullptr) {
       // Selection's score can expire before this final pre-wipe time. A has
       // stayed locked, so the selected state is still present and unchanged.
@@ -1834,6 +1836,8 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
           resident_lifetime_states_[best];
       assert(selected.has_value());
       const DiskLifetimeState& state = *selected;
+      history_unknown = state.history_unknown;
+      victim_age_sec = now >= state.anchor ? now - state.anchor : 0;
       protected_victim =
           DiskLifetimeScore(config, state.anchor, state.scoring_reads(),
                             state.first_early_read(), state.write_armed(),
@@ -1847,6 +1851,21 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
       break;  // A whole-extent callback cannot safely invalidate one slot.
     }
     const BlockKey victim = slots_[best].key;
+    if (stats != nullptr) {
+      // Publish only a successful invalidation, using the pre-I/O age. Reads
+      // cannot make a recovered resident's earlier history become known.
+      LifetimeDonorAgeStats& age = stats->age;
+      if (history_unknown) {
+        ++age.history_unknown;
+      } else {
+        const std::array<uint32_t, 7>& bounds = kLifetimeDonorAgeBoundsSec;
+        const size_t bucket = static_cast<size_t>(
+            std::lower_bound(bounds.begin(), bounds.end(), victim_age_sec) -
+            bounds.begin());
+        ++age.buckets[bucket];
+        age.total_sec += victim_age_sec;
+      }
+    }
     FreeSlotLocked(best);
     if (evicted != nullptr) evicted->push_back(victim);
     ++evictions_;

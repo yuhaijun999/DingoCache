@@ -1078,6 +1078,14 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_watermark_pin_skips += st.lifetime_watermark_pin_skips;
     sum.lifetime_watermark_protected_victims +=
         st.lifetime_watermark_protected_victims;
+    for (size_t bucket = 0; bucket < sum.lifetime_watermark_age.buckets.size();
+         ++bucket) {
+      sum.lifetime_watermark_age.buckets[bucket] +=
+          st.lifetime_watermark_age.buckets[bucket];
+    }
+    sum.lifetime_watermark_age.total_sec += st.lifetime_watermark_age.total_sec;
+    sum.lifetime_watermark_age.history_unknown +=
+        st.lifetime_watermark_age.history_unknown;
     sum.lifetime_donor_coarse_extents += st.lifetime_donor_coarse_extents;
     sum.lifetime_donor_precise_extents += st.lifetime_donor_precise_extents;
     sum.lifetime_donor_precise_residents += st.lifetime_donor_precise_residents;

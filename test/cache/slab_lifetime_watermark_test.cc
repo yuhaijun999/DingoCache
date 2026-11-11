@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -104,6 +105,143 @@ size_t Evict(SlabAllocator& allocator, uint64_t target, size_t victims,
              SlabAllocatorTestPeer::LifetimeWatermarkStats* stats = nullptr) {
   return SlabAllocatorTestPeer::EvictLifetimeToTarget(
       allocator, target, victims, config, clock, evicted, stats);
+}
+
+void SeedState(SlabAllocator& allocator, uint64_t id,
+               const DiskLifetimeState& state) {
+  SlabAllocator::SlotRef ref;
+  std::vector<BlockKey> evicted;
+  ASSERT_TRUE(allocator.Put(Key(id), 1, &ref, &evicted));
+  ASSERT_TRUE(evicted.empty());
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(id), id, &state);
+}
+
+TEST(SlabLifetimeWatermark, AgeUsesFixedDisplayBoundaries) {
+  struct Case {
+    uint32_t seconds;
+    size_t bucket;
+  };
+  const std::array<Case, 14> cases = {{{0, 0},
+                                       {1, 1},
+                                       {2, 2},
+                                       {60, 2},
+                                       {61, 3},
+                                       {3600, 3},
+                                       {3601, 4},
+                                       {86400, 4},
+                                       {86401, 5},
+                                       {604800, 5},
+                                       {604801, 6},
+                                       {2592000, 6},
+                                       {2592001, 7},
+                                       {UINT32_MAX, 7}}};
+  for (const Case& test : cases) {
+    SCOPED_TRACE(test.seconds);
+    uint64_t seconds = 0;
+    const DiskLifetimeConfig config;
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                  [&] { return seconds; });
+    SlabAllocator allocator(Options(2));
+    ASSERT_NO_FATAL_FAILURE(SeedState(allocator, 1, NewDiskLifetimeState(0)));
+    seconds = test.seconds;
+    std::vector<BlockKey> evicted;
+    SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
+    ASSERT_EQ(Evict(allocator, 0, 1, config, clock, &evicted, &stats), 1U);
+    EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+    for (size_t bucket = 0; bucket < stats.age.buckets.size(); ++bucket) {
+      EXPECT_EQ(stats.age.buckets[bucket], bucket == test.bucket ? 1U : 0U);
+    }
+    EXPECT_EQ(stats.age.total_sec, test.seconds);
+    EXPECT_EQ(stats.age.history_unknown, 0U);
+    EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+  }
+}
+
+TEST(SlabLifetimeWatermark, AgeUsesFinalPreWipeTimeAndNullableStats) {
+  for (const bool with_stats : {false, true}) {
+    SCOPED_TRACE(with_stats);
+    uint64_t seconds = 0;
+    bool armed = false;
+    unsigned samples = 0;
+    const DiskLifetimeConfig config;
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&] {
+      const uint64_t sampled = seconds;
+      if (armed) {
+        ++samples;
+        seconds = 20;
+      }
+      return sampled;
+    });
+    SlabAllocator::Options options = Options(2);
+    unsigned writes = 0;
+    options.on_slot_evict = [&](const SlabAllocator::SlotRef&) {
+      ++writes;
+      seconds = 1000;
+      return true;
+    };
+    SlabAllocator allocator(options);
+    ASSERT_NO_FATAL_FAILURE(SeedState(allocator, 1, NewDiskLifetimeState(0)));
+    seconds = 19;
+    armed = true;
+    SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
+    stats.age.buckets[0] = 99;
+    stats.age.total_sec = 99;
+    stats.age.history_unknown = 99;
+    std::vector<BlockKey> evicted;
+    ASSERT_EQ(Evict(allocator, 0, 1, config, clock, &evicted,
+                    with_stats ? &stats : nullptr),
+              1U);
+    EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+    EXPECT_EQ(writes, 1U);
+    EXPECT_EQ(samples, 2U);
+    EXPECT_EQ(allocator.WatermarkScanVisits(), 1U);
+    EXPECT_EQ(stats.age.buckets[0], with_stats ? 0U : 99U);
+    EXPECT_EQ(stats.age.buckets[2], with_stats ? 1U : 0U);
+    EXPECT_EQ(stats.age.total_sec, with_stats ? 20U : 99U);
+    EXPECT_EQ(stats.age.history_unknown, with_stats ? 0U : 99U);
+  }
+}
+
+TEST(SlabLifetimeWatermark, AgeExcludesRecoveredHistoryEvenAfterRealRead) {
+  uint64_t seconds = 0;
+  const DiskLifetimeConfig config;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&] { return seconds; });
+  SlabAllocator allocator(Options(4));
+  ASSERT_NO_FATAL_FAILURE(
+      SeedState(allocator, 1, RecoveredDiskLifetimeState(2)));
+  ASSERT_NO_FATAL_FAILURE(
+      SeedState(allocator, 2, RecoveredDiskLifetimeState(2)));
+  seconds = 10;
+  ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, Key(2), 2,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  seconds = 20;
+  std::vector<BlockKey> evicted;
+  SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
+  ASSERT_EQ(Evict(allocator, 0, 2, config, clock, &evicted, &stats), 2U);
+  EXPECT_EQ(evicted.size(), 2U);
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 2U);
+  EXPECT_EQ(allocator.Count(), 0U);
+}
+
+TEST(SlabLifetimeWatermark, AgeSaturatesFutureAnchorAtZero) {
+  uint64_t seconds = 0;
+  const DiskLifetimeConfig config;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&] { return seconds; });
+  SlabAllocator allocator(Options(2));
+  // Defensive synthetic state: valid production anchors never lead the clock.
+  ASSERT_NO_FATAL_FAILURE(SeedState(allocator, 1, NewDiskLifetimeState(30)));
+  seconds = 20;
+  std::vector<BlockKey> evicted;
+  SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
+  ASSERT_EQ(Evict(allocator, 0, 1, config, clock, &evicted, &stats), 1U);
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{1}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 0U);
 }
 
 TEST(SlabLifetimeWatermark, ProtectedCountUsesFinalPreWipeTime) {
@@ -393,7 +531,14 @@ TEST(SlabLifetimeWatermark, CountByteAndZeroLimitsStopImmediately) {
   const DiskLifetimeConfig config;
   const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [] { return 0; });
   std::vector<BlockKey> evicted;
-  EXPECT_EQ(Evict(allocator, 0, 0, config, clock, &evicted), 0U);
+  SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
+  stats.age.buckets[0] = 99;
+  stats.age.total_sec = 99;
+  stats.age.history_unknown = 99;
+  EXPECT_EQ(Evict(allocator, 0, 0, config, clock, &evicted, &stats), 0U);
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 0U);
   EXPECT_EQ(allocator.WatermarkScanVisits(), 0U);
   EXPECT_EQ(Evict(allocator, 0, 1, config, clock, &evicted), 1U);
   EXPECT_EQ(allocator.Count(), 3U);
@@ -427,7 +572,11 @@ TEST(SlabLifetimeWatermark, FullPinnedTraversalStopsWithoutRevisiting) {
   const DiskLifetimeConfig config;
   const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [] { return 0; });
   std::vector<BlockKey> evicted;
-  EXPECT_EQ(Evict(allocator, 0, 256, config, clock, &evicted), 0U);
+  SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
+  EXPECT_EQ(Evict(allocator, 0, 256, config, clock, &evicted, &stats), 0U);
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 0U);
   EXPECT_EQ(allocator.WatermarkScanVisits(), 12U);
   EXPECT_TRUE(evicted.empty());
   EXPECT_EQ(allocator.Count(), 12U);
@@ -499,8 +648,14 @@ TEST(SlabLifetimeWatermark, PersistenceFailureDoesNotFreeOrRetry) {
   std::vector<BlockKey> evicted;
   SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
   stats.protected_victims = 99;
+  stats.age.buckets[0] = 99;
+  stats.age.total_sec = 99;
+  stats.age.history_unknown = 99;
   EXPECT_EQ(Evict(allocator, 0, 256, config, clock, &evicted, &stats), 0U);
   EXPECT_EQ(stats.protected_victims, 0U);
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 0U);
   EXPECT_EQ(attempts, 1U);
   EXPECT_EQ(observed, 1U);
   EXPECT_TRUE(evicted.empty());
@@ -525,6 +680,9 @@ TEST(SlabLifetimeWatermark,
   SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
   EXPECT_EQ(Evict(allocator, 0, 256, config, clock, &evicted, &stats), 1U);
   EXPECT_EQ(stats.protected_victims, 1U);
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 1U);
   EXPECT_EQ(attempts, 2U);
   EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
   EXPECT_EQ(allocator.Count(), 2U);
@@ -608,12 +766,18 @@ TEST(SlabLifetimeWatermark, HardClockStopsAfterCompletedInvalidation) {
   SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
   EXPECT_EQ(Evict(allocator, 0, 256, config, clock, &evicted, &stats), 1U);
   EXPECT_EQ(stats.protected_victims, 1U);
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 1U);
   EXPECT_EQ(attempts, 1U);
   EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
   EXPECT_EQ(allocator.Count(), 2U);
   seconds = 0;
   EXPECT_EQ(Evict(allocator, 0, 256, config, clock, &evicted, &stats), 0U);
   EXPECT_EQ(stats.protected_victims, 0U);
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 0U);
   EXPECT_EQ(attempts, 1U);
 }
 
@@ -831,6 +995,11 @@ TEST_F(LifetimeWatermarkStoreTest, ConcurrentReadsKeepPinnedSurvivorByteExact) {
   EXPECT_TRUE(store_->IsCached(Key(64)));
   EXPECT_EQ(store_->GetStats().watermark_evictions, 63U);
   EXPECT_EQ(store_->GetStats().lifetime_watermark_protected_victims, 63U);
+  const SlabAllocator::LifetimeDonorAgeStats age =
+      store_->GetStats().lifetime_watermark_age;
+  EXPECT_EQ(age.buckets, (std::array<uint64_t, 8>{63}));
+  EXPECT_EQ(age.total_sec, 0U);
+  EXPECT_EQ(age.history_unknown, 0U);
   EXPECT_EQ(store_->GetStats().lifetime_reads.successful, 256U);
   EXPECT_EQ(store_->GetStats().lifetime_reads.applied, 256U);
   EXPECT_EQ(store_->TenantUsedBytes(7), 10U);

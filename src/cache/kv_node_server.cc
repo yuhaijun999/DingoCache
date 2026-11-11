@@ -637,6 +637,15 @@ std::string KvNodeServer::MetricsText() const {
     header("dfkv_slab_lifetime_donor_score_negative_magnitude_seconds",
            "histogram",
            "Absolute negative scores of successful donor releases");
+    header(
+        "dfkv_slab_disk_lifetime_watermark_age_seconds", "histogram",
+        "Successful watermark pre-wipe ages since anchor with known history");
+    header(
+        "dfkv_slab_lifetime_watermark_age_seconds", "histogram",
+        "Successful watermark pre-wipe ages since anchor with known history");
+    header("dfkv_slab_disk_lifetime_watermark_age_history_unknown_total",
+           "counter",
+           "Successful watermark victims with unknown recovered history");
     header("dfkv_slab_disk_lifetime_donor_age_seconds", "histogram",
            "Successful donor pre-wipe ages since anchor with known history");
     header("dfkv_slab_lifetime_donor_age_seconds", "histogram",
@@ -1000,6 +1009,12 @@ std::string KvNodeServer::MetricsText() const {
              disk.lifetime_donor_protected_payload_bytes);
       sample("dfkv_slab_disk_lifetime_donor_unscored_victims_total",
              disk.lifetime_donor_unscored_victims);
+      donor_histogram("dfkv_slab_disk_lifetime_watermark_age_seconds",
+                      disk.lifetime_watermark_age.buckets,
+                      std::to_string(disk.lifetime_watermark_age.total_sec),
+                      SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
+      sample("dfkv_slab_disk_lifetime_watermark_age_history_unknown_total",
+             disk.lifetime_watermark_age.history_unknown);
       donor_histogram("dfkv_slab_disk_lifetime_donor_age_seconds",
                       disk.lifetime_donor_age.buckets,
                       std::to_string(disk.lifetime_donor_age.total_sec),
@@ -1244,6 +1259,13 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_donor_unscored_victims_total", "counter",
            "Released donor residents without valid lifetime scoring state",
            ss.lifetime_donor_unscored_victims);
+    donor_histogram("dfkv_slab_lifetime_watermark_age_seconds",
+                    ss.lifetime_watermark_age.buckets,
+                    std::to_string(ss.lifetime_watermark_age.total_sec),
+                    SlabAllocator::kLifetimeDonorAgeBoundsSec, "");
+    metric("dfkv_slab_lifetime_watermark_age_history_unknown_total", "counter",
+           "Successful watermark victims with unknown recovered history",
+           ss.lifetime_watermark_age.history_unknown);
     donor_histogram("dfkv_slab_lifetime_donor_age_seconds",
                     ss.lifetime_donor_age.buckets,
                     std::to_string(ss.lifetime_donor_age.total_sec),

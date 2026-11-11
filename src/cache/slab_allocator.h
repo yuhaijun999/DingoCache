@@ -371,6 +371,7 @@ class SlabAllocator {
                                              LifetimeScan& scan,
                                              std::vector<BlockKey>* evicted);
   struct LifetimeWatermarkStats {
+    LifetimeDonorAgeStats age{};
     uint64_t budget_exhausted = 0;
     uint64_t no_candidate = 0;
     uint64_t pin_skips = 0;

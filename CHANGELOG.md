@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export successful lifetime watermark eviction ages using the existing final
+  pre-wipe timestamp. Separate unknown recovered history, including after reads,
+  without changing victim selection, scan budgets or invalidation rules.
+
 - Correct lifetime watermark protected-victim counts to use the final pre-wipe
   timestamp rather than earlier selection scores. Preserve victim selection,
   scan budgets and success-only accounting; expose the existing per-disk counts.
