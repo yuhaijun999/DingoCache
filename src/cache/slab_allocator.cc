@@ -1065,6 +1065,9 @@ bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
     const bool history_unknown = selected->history_unknown;
     const uint32_t age_sec =
         now >= selected->anchor ? now - selected->anchor : 0;
+    const int64_t score = DiskLifetimeScore(
+        scan.config, selected->anchor, selected->scoring_reads(),
+        selected->first_early_read(), selected->write_armed(), now);
     // No lock boundary since scoring: pin, generation and membership cannot
     // have changed. Persist exactly one invalidation before freeing anything.
     if (opt_.on_slot_evict && !opt_.on_slot_evict(slots_[best].ref)) {
@@ -1085,6 +1088,23 @@ bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
           bounds.begin());
       ++scan.age.buckets[bucket];
       scan.age.total_sec += age_sec;
+    }
+    // Unknown recovery ages still have valid scores. Preserve integer sign
+    // and binning; unsigned subtraction also avoids negating INT64_MIN.
+    const bool nonnegative = score >= 0;
+    const uint64_t magnitude = nonnegative
+                                   ? static_cast<uint64_t>(score)
+                                   : uint64_t{0} - static_cast<uint64_t>(score);
+    const std::array<uint32_t, 7>& bounds = kLifetimeDonorScoreBoundsSec;
+    const size_t bucket = static_cast<size_t>(
+        std::lower_bound(bounds.begin(), bounds.end(), magnitude) -
+        bounds.begin());
+    if (nonnegative) {
+      ++scan.score.nonnegative_buckets[bucket];
+      scan.score.nonnegative_total_sec += static_cast<double>(magnitude);
+    } else {
+      ++scan.score.negative_magnitude_buckets[bucket];
+      scan.score.negative_magnitude_total_sec += static_cast<double>(magnitude);
     }
     FreeSlotLocked(best);
     if (evicted != nullptr) evicted->push_back(victim);
@@ -1482,7 +1502,10 @@ bool SlabAllocator::PutImpl(const BlockKey& key, size_t len, SlotRef* out,
   *reclaim_denied = false;
   bool class_pending =
       scan != nullptr && scan->result == LifetimeScanResult::kRetry;
-  if (scan != nullptr) scan->result = LifetimeScanResult::kIdle;
+  if (scan != nullptr) {
+    scan->result = LifetimeScanResult::kIdle;
+    scan->score = LifetimeDonorScoreStats{};
+  }
   if (out_handle) *out_handle = SlotHandle{};
   ++activity_seq_;
   if (uint32_t* existing = index_.Find(key)) {
@@ -1727,6 +1750,7 @@ SlabAllocator::LifetimeReclaimResult SlabAllocator::ReclaimLifetimeClass(
     LifetimeScan& scan, std::vector<BlockKey>* evicted) {
   const std::lock_guard<std::mutex> lock(mu_);
   LifetimeReclaimResult result;
+  scan.score = LifetimeDonorScoreStats{};
   if (cls_index >= classes_.size() || max_victims == 0) return result;
   assert(scan.initialized);  // Caller installed one shared background tick cap.
   const Class& cls = classes_[cls_index];

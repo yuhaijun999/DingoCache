@@ -4,10 +4,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -91,6 +93,79 @@ void Seed(SlabAllocator& allocator, uint64_t id, bool pin = false) {
   }
 }
 
+TEST(SlabLifetimeBackground, ScoreCallsKeepLargeSumThenSmallPieceIndependent) {
+  const uint64_t maximum = std::numeric_limits<int64_t>::max();
+  DiskLifetimeConfig config;
+  config.base_sec = 100;
+  config.read_bonus_sec = 0;
+  config.max_reads = 1;
+  config.boost_sec = maximum - config.base_sec;
+  config.keep_score_sec = 99;
+  config.protect_sec = config.slowdown = config.bucket_sec = 1;
+  config.bucket_count = 2;
+  config.high_pct = 0;
+  std::string error;
+  ASSERT_TRUE(ValidateDiskLifetimeConfig(config, &error)) << error;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&] { return seconds; });
+  SlabAllocator allocator(Options(8));
+  for (uint64_t id = 1; id <= 8; ++id) {
+    SlabAllocator::SlotRef ref;
+    std::vector<BlockKey> evicted;
+    ASSERT_TRUE(allocator.Put(Key(id), 1, &ref, &evicted));
+    ASSERT_TRUE(evicted.empty());
+    const DiskLifetimeState state = NewDiskLifetimeState(0);
+    SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(id), id, &state);
+  }
+  Scan scan(config, clock);
+  SetTickBudget(scan, 8);
+  std::vector<BlockKey> evicted;
+  const ReclaimResult first = SlabAllocatorTestPeer::ReclaimLifetimeClass(
+      allocator, 0, 4, 3, scan, &evicted);
+  ASSERT_EQ(first.victims, 3U);
+  EXPECT_TRUE(first.more);
+  EXPECT_EQ(scan.score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 0, 3}));
+  EXPECT_TRUE(std::isfinite(scan.score.nonnegative_total_sec));
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec,
+                   3.0 * static_cast<double>(maximum));
+  EXPECT_GT(scan.score.nonnegative_total_sec,
+            static_cast<double>(std::numeric_limits<uint64_t>::max()));
+  seconds = 1;  // Same valid config, but huge new-write BOOST has expired.
+  const ReclaimResult second = SlabAllocatorTestPeer::ReclaimLifetimeClass(
+      allocator, 0, 4, 3, scan, &evicted);
+  ASSERT_EQ(second.victims, 1U);
+  EXPECT_FALSE(second.more);
+  EXPECT_EQ(scan.score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 1}));
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec, 99);
+  EXPECT_EQ(scan.score.negative_magnitude_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(scan.score.negative_magnitude_total_sec, 0);
+  EXPECT_EQ(scan.victims, 4U);
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{3, 1}));
+  // A no-work call and invalid/zero-limit calls clear only their piece scores.
+  const ReclaimResult done = SlabAllocatorTestPeer::ReclaimLifetimeClass(
+      allocator, 0, 4, 3, scan, &evicted);
+  EXPECT_EQ(done.victims, 0U);
+  EXPECT_EQ(scan.score.nonnegative_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec, 0);
+  scan.score.nonnegative_total_sec = 99;
+  EXPECT_EQ(SlabAllocatorTestPeer::ReclaimLifetimeClass(
+                allocator, allocator.ClassCount(), 4, 3, scan, &evicted)
+                .victims,
+            0U);
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec, 0);
+  scan.score.nonnegative_total_sec = 99;
+  EXPECT_EQ(SlabAllocatorTestPeer::ReclaimLifetimeClass(allocator, 0, 4, 0,
+                                                        scan, &evicted)
+                .victims,
+            0U);
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec, 0);
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{3, 1}));
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
 TEST(SlabLifetimeBackground, VictimAndHeadroomLimitsAreIndependent) {
   SlabAllocator allocator(Options(8));
   for (uint64_t id = 1; id <= 8; ++id)
@@ -106,6 +181,9 @@ TEST(SlabLifetimeBackground, VictimAndHeadroomLimitsAreIndependent) {
   EXPECT_EQ(first.freed_slot_bytes, 2 * 4096U);
   EXPECT_TRUE(first.more);
   EXPECT_EQ(scan.age.history_unknown, 2U);
+  EXPECT_EQ(scan.score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 2}));
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec, 1814400);
   const ReclaimResult second = SlabAllocatorTestPeer::ReclaimLifetimeClass(
       allocator, 0, 3, 8, scan, &evicted);
   EXPECT_EQ(second.victims, 1U);
@@ -114,6 +192,9 @@ TEST(SlabLifetimeBackground, VictimAndHeadroomLimitsAreIndependent) {
   EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(scan.age.total_sec, 0U);
   EXPECT_EQ(scan.age.history_unknown, 3U);
+  EXPECT_EQ(scan.score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 1}));
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec, 907200);
   EXPECT_EQ(allocator.Classes()[0].free_slots, 3U);
   EXPECT_EQ(SlabAllocatorTestPeer::ReclaimLifetimeClass(allocator, 0, 3, 8,
                                                         scan, &evicted)
@@ -121,6 +202,8 @@ TEST(SlabLifetimeBackground, VictimAndHeadroomLimitsAreIndependent) {
             0U);
   EXPECT_LE(scan.visits, 32U);
   EXPECT_EQ(scan.age.history_unknown, 3U);
+  EXPECT_EQ(scan.score.nonnegative_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec, 0);
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
 }
 
@@ -247,6 +330,10 @@ TEST(SlabLifetimeBackground, FailedPersistenceStopsWithoutFreeingOrRetrying) {
   EXPECT_EQ(scan.age.total_sec, 0U);
   EXPECT_EQ(scan.age.history_unknown, 0U);
   EXPECT_EQ(result.freed_slot_bytes, 0U);
+  EXPECT_EQ(scan.score.nonnegative_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(scan.score.negative_magnitude_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec, 0);
+  EXPECT_DOUBLE_EQ(scan.score.negative_magnitude_total_sec, 0);
   EXPECT_FALSE(result.more);
   EXPECT_EQ(scan.result, ScanResult::kPersistenceError);
   EXPECT_EQ(attempts, 1U);
@@ -275,6 +362,9 @@ TEST(SlabLifetimeBackground, FailureWithinPieceKeepsEarlierSuccessOnly) {
   EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(scan.age.total_sec, 0U);
   EXPECT_EQ(scan.age.history_unknown, 1U);
+  EXPECT_EQ(scan.score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 1}));
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec, 907200);
   EXPECT_EQ(result.freed_slot_bytes, 4096U);
   EXPECT_FALSE(result.more);
   EXPECT_EQ(scan.result, ScanResult::kPersistenceError);
@@ -313,6 +403,10 @@ TEST(SlabLifetimeBackground, FinalClockFailureStopsPieceBeforePersistence) {
   EXPECT_FALSE(result.more);
   EXPECT_EQ(samples, 2U);
   EXPECT_EQ(writes, 0U);
+  EXPECT_EQ(scan.score.nonnegative_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(scan.score.negative_magnitude_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(scan.score.nonnegative_total_sec, 0);
+  EXPECT_DOUBLE_EQ(scan.score.negative_magnitude_total_sec, 0);
   EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(scan.age.total_sec, 0U);
   EXPECT_EQ(scan.age.history_unknown, 0U);
@@ -445,6 +539,16 @@ TEST_F(LifetimeBackgroundStoreTest, MixedPayloadBytesConserveAcrossQuietTicks) {
             (std::array<uint64_t, 8>{}));
   EXPECT_EQ(store_->GetStats().lifetime_background_age.total_sec, 0U);
   EXPECT_EQ(store_->GetStats().lifetime_background_age.history_unknown, 0U);
+  EXPECT_EQ(store_->GetStats().lifetime_background_score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(
+      store_->GetStats().lifetime_background_score.negative_magnitude_buckets,
+      (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(
+      store_->GetStats().lifetime_background_score.nonnegative_total_sec, 0);
+  EXPECT_DOUBLE_EQ(
+      store_->GetStats().lifetime_background_score.negative_magnitude_total_sec,
+      0);
   EXPECT_EQ(store_->GetStats().lifetime_background_freed_slot_bytes, 0U);
   EXPECT_EQ(store_->GetStats().lifetime_background_freed_payload_bytes, 0U);
 }
@@ -477,6 +581,13 @@ TEST_F(LifetimeBackgroundStoreTest,
   const DiskSlabStore::Stats stats = store_->GetStats();
   EXPECT_EQ(stats.reclaimed_slots, 0U);
   EXPECT_EQ(stats.lifetime_background_victims, 0U);
+  EXPECT_EQ(stats.lifetime_background_score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.lifetime_background_score.negative_magnitude_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(stats.lifetime_background_score.nonnegative_total_sec, 0);
+  EXPECT_DOUBLE_EQ(stats.lifetime_background_score.negative_magnitude_total_sec,
+                   0);
   EXPECT_EQ(stats.lifetime_background_freed_slot_bytes, 0U);
   EXPECT_EQ(stats.lifetime_background_freed_payload_bytes, 0U);
   EXPECT_EQ(stats.watermark_evictions, 4U);
@@ -497,6 +608,13 @@ TEST_F(LifetimeBackgroundStoreTest, RealInvalidationFailureRetainsResident) {
   EXPECT_GT(stats.metadata_io_errors, 0U);
   EXPECT_EQ(stats.reclaimed_slots, 0U);
   EXPECT_EQ(stats.lifetime_background_victims, 0U);
+  EXPECT_EQ(stats.lifetime_background_score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.lifetime_background_score.negative_magnitude_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(stats.lifetime_background_score.nonnegative_total_sec, 0);
+  EXPECT_DOUBLE_EQ(stats.lifetime_background_score.negative_magnitude_total_sec,
+                   0);
   EXPECT_EQ(stats.lifetime_background_freed_slot_bytes, 0U);
   EXPECT_EQ(stats.lifetime_background_freed_payload_bytes, 0U);
   EXPECT_EQ(stats.lifetime_background_budget_exhausted, 0U);
@@ -512,6 +630,10 @@ TEST_F(LifetimeBackgroundStoreTest,
   DiskSlabStoreTestPeer::YieldHook(*store_, [&] {
     EXPECT_EQ(store_->GetStats().reclaimed_slots, 128U);
     EXPECT_EQ(store_->GetStats().lifetime_background_age.buckets[0], 128U);
+    const DiskSlabStore::Stats completed = store_->GetStats();
+    EXPECT_EQ(completed.lifetime_background_score.nonnegative_buckets[6], 128U);
+    EXPECT_DOUBLE_EQ(completed.lifetime_background_score.nonnegative_total_sec,
+                     232243200);
     DiskSlabStoreTestPeer::FailInvalidation(*store_);
     ++yields;
   });
@@ -525,6 +647,14 @@ TEST_F(LifetimeBackgroundStoreTest,
             (std::array<uint64_t, 8>{128}));
   EXPECT_EQ(stats.lifetime_background_age.total_sec, 0U);
   EXPECT_EQ(stats.lifetime_background_age.history_unknown, 0U);
+  EXPECT_EQ(stats.lifetime_background_score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 128}));
+  EXPECT_DOUBLE_EQ(stats.lifetime_background_score.nonnegative_total_sec,
+                   232243200);
+  EXPECT_EQ(stats.lifetime_background_score.negative_magnitude_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(stats.lifetime_background_score.negative_magnitude_total_sec,
+                   0);
   EXPECT_EQ(stats.lifetime_background_freed_slot_bytes, 128 * 4096U);
   EXPECT_EQ(stats.lifetime_background_freed_payload_bytes, 128 * 3U);
   EXPECT_EQ(stats.metadata_io_errors, 1U);
@@ -553,6 +683,14 @@ TEST_F(LifetimeBackgroundStoreTest, HardClockStopsOnlyUnstartedPieces) {
             (std::array<uint64_t, 8>{128}));
   EXPECT_EQ(stopped.lifetime_background_age.total_sec, 0U);
   EXPECT_EQ(stopped.lifetime_background_age.history_unknown, 0U);
+  EXPECT_EQ(stopped.lifetime_background_score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 128}));
+  EXPECT_DOUBLE_EQ(stopped.lifetime_background_score.nonnegative_total_sec,
+                   232243200);
+  EXPECT_EQ(stopped.lifetime_background_score.negative_magnitude_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(
+      stopped.lifetime_background_score.negative_magnitude_total_sec, 0);
   EXPECT_EQ(stopped.lifetime_background_freed_slot_bytes, 128 * 4096U);
   EXPECT_EQ(stopped.lifetime_background_freed_payload_bytes, 128 * 3U);
   EXPECT_EQ(stopped.committed_objects, 472U);
@@ -588,6 +726,16 @@ TEST_F(LifetimeBackgroundStoreTest,
       aged += count;
     }
     EXPECT_EQ(aged, stats.lifetime_background_victims);
+    uint64_t scored = 0;
+    for (const uint64_t count :
+         stats.lifetime_background_score.nonnegative_buckets) {
+      scored += count;
+    }
+    for (const uint64_t count :
+         stats.lifetime_background_score.negative_magnitude_buckets) {
+      scored += count;
+    }
+    EXPECT_EQ(scored, stats.lifetime_background_victims);
     EXPECT_EQ(stats.lifetime_background_age.buckets[0], 1U);
     seconds_.store(60);
     std::string bytes;
@@ -603,6 +751,14 @@ TEST_F(LifetimeBackgroundStoreTest,
   EXPECT_EQ(stats.lifetime_background_age.buckets,
             (std::array<uint64_t, 8>{1, 0, 1}));
   EXPECT_EQ(stats.lifetime_background_age.total_sec, 60U);
+  EXPECT_EQ(stats.lifetime_background_score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 2}));
+  EXPECT_DOUBLE_EQ(stats.lifetime_background_score.nonnegative_total_sec,
+                   3628785);
+  EXPECT_EQ(stats.lifetime_background_score.negative_magnitude_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(stats.lifetime_background_score.negative_magnitude_total_sec,
+                   0);
   EXPECT_EQ(stats.lifetime_background_age.history_unknown, 0U);
   EXPECT_FALSE(store_->IsCached(Key(600)));
   EXPECT_FALSE(store_->IsCached(Key(1200)));
@@ -628,6 +784,15 @@ TEST_F(LifetimeBackgroundStoreTest, ActualBackgroundThreadReclaimsAndJoins) {
             concurrent.lifetime_background_victims);
   EXPECT_EQ(concurrent.lifetime_background_age.total_sec, 0U);
   EXPECT_EQ(concurrent.lifetime_background_age.history_unknown, 0U);
+  EXPECT_EQ(concurrent.lifetime_background_score.nonnegative_buckets[6],
+            concurrent.lifetime_background_victims);
+  EXPECT_DOUBLE_EQ(
+      concurrent.lifetime_background_score.nonnegative_total_sec,
+      1814400.0 * static_cast<double>(concurrent.lifetime_background_victims));
+  EXPECT_EQ(concurrent.lifetime_background_score.negative_magnitude_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(
+      concurrent.lifetime_background_score.negative_magnitude_total_sec, 0);
   EXPECT_LT(store_->Count(), 16U);
   store_.reset();  // Joins the real reclaim thread before reopening its files.
   store_ = std::make_unique<DiskSlabStore>(StoreOptions(16));

@@ -1067,6 +1067,18 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_class_age.total_sec += st.lifetime_class_age.total_sec;
     sum.lifetime_class_age.history_unknown +=
         st.lifetime_class_age.history_unknown;
+    for (size_t bucket = 0;
+         bucket < sum.lifetime_class_score.nonnegative_buckets.size();
+         ++bucket) {
+      sum.lifetime_class_score.nonnegative_buckets[bucket] +=
+          st.lifetime_class_score.nonnegative_buckets[bucket];
+      sum.lifetime_class_score.negative_magnitude_buckets[bucket] +=
+          st.lifetime_class_score.negative_magnitude_buckets[bucket];
+    }
+    sum.lifetime_class_score.nonnegative_total_sec +=
+        st.lifetime_class_score.nonnegative_total_sec;
+    sum.lifetime_class_score.negative_magnitude_total_sec +=
+        st.lifetime_class_score.negative_magnitude_total_sec;
     sum.lifetime_class_freed_slot_bytes += st.lifetime_class_freed_slot_bytes;
     sum.lifetime_class_freed_payload_bytes +=
         st.lifetime_class_freed_payload_bytes;
@@ -1085,6 +1097,18 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
         st.lifetime_background_age.total_sec;
     sum.lifetime_background_age.history_unknown +=
         st.lifetime_background_age.history_unknown;
+    for (size_t bucket = 0;
+         bucket < sum.lifetime_background_score.nonnegative_buckets.size();
+         ++bucket) {
+      sum.lifetime_background_score.nonnegative_buckets[bucket] +=
+          st.lifetime_background_score.nonnegative_buckets[bucket];
+      sum.lifetime_background_score.negative_magnitude_buckets[bucket] +=
+          st.lifetime_background_score.negative_magnitude_buckets[bucket];
+    }
+    sum.lifetime_background_score.nonnegative_total_sec +=
+        st.lifetime_background_score.nonnegative_total_sec;
+    sum.lifetime_background_score.negative_magnitude_total_sec +=
+        st.lifetime_background_score.negative_magnitude_total_sec;
     sum.lifetime_background_freed_slot_bytes +=
         st.lifetime_background_freed_slot_bytes;
     sum.lifetime_background_freed_payload_bytes +=

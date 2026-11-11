@@ -347,6 +347,10 @@ class SlabAllocator {
     uint64_t freed_slot_bytes = 0;
     uint64_t freed_payload_bytes = 0;
     LifetimeDonorAgeStats age{};  // Cumulative successful pre-wipe ages.
+    // Successful scores for the latest PutImpl/ReclaimLifetimeClass call.
+    // Reset once at call entry, not per victim; merge directly, never subtract
+    // cumulative floating sums across unlocked pieces. Age remains cumulative.
+    LifetimeDonorScoreStats score{};
     uint64_t visit_limit = 0;
     uint64_t slice_limit = 0;
     uint64_t version = 0;

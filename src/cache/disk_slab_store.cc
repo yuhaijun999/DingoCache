@@ -1682,6 +1682,19 @@ DiskWriteResult DiskSlabStore::AllocateForPutLocked(
       lifetime_class_age_.total_sec += completed.age.total_sec - age.total_sec;
       lifetime_class_age_.history_unknown +=
           completed.age.history_unknown - age.history_unknown;
+      // Score is per allocator call, unlike cumulative age. Never subtract
+      // floating cumulative totals: a huge earlier piece can erase small ones.
+      for (size_t bucket = 0;
+           bucket < completed.score.nonnegative_buckets.size(); ++bucket) {
+        lifetime_class_score_.nonnegative_buckets[bucket] +=
+            completed.score.nonnegative_buckets[bucket];
+        lifetime_class_score_.negative_magnitude_buckets[bucket] +=
+            completed.score.negative_magnitude_buckets[bucket];
+      }
+      lifetime_class_score_.nonnegative_total_sec +=
+          completed.score.nonnegative_total_sec;
+      lifetime_class_score_.negative_magnitude_total_sec +=
+          completed.score.negative_magnitude_total_sec;
       if (completed.result == SlabAllocator::LifetimeScanResult::kNoCandidate)
         ++lifetime_class_no_candidate_;
     }
@@ -2597,6 +2610,19 @@ bool DiskSlabStore::ReclaimLifetimeClass(size_t cls_index, size_t target_free,
     lifetime_background_age_.total_sec += scan.age.total_sec - age.total_sec;
     lifetime_background_age_.history_unknown +=
         scan.age.history_unknown - age.history_unknown;
+    // Score is per allocator call, unlike cumulative age. Never subtract
+    // floating cumulative totals: a huge earlier piece can erase small ones.
+    for (size_t bucket = 0; bucket < scan.score.nonnegative_buckets.size();
+         ++bucket) {
+      lifetime_background_score_.nonnegative_buckets[bucket] +=
+          scan.score.nonnegative_buckets[bucket];
+      lifetime_background_score_.negative_magnitude_buckets[bucket] +=
+          scan.score.negative_magnitude_buckets[bucket];
+    }
+    lifetime_background_score_.nonnegative_total_sec +=
+        scan.score.nonnegative_total_sec;
+    lifetime_background_score_.negative_magnitude_total_sec +=
+        scan.score.negative_magnitude_total_sec;
     lifetime_background_victims_ += result.victims;
     lifetime_background_freed_slot_bytes_ += result.freed_slot_bytes;
     reclaimed_.fetch_add(result.victims, std::memory_order_relaxed);
@@ -3172,6 +3198,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.lifetime_class_no_candidate = lifetime_class_no_candidate_;
   st.lifetime_class_victims = lifetime_class_victims_;
   st.lifetime_class_age = lifetime_class_age_;
+  st.lifetime_class_score = lifetime_class_score_;
   st.lifetime_class_freed_slot_bytes = lifetime_class_freed_slot_bytes_;
   st.lifetime_class_freed_payload_bytes = lifetime_class_freed_payload_bytes_;
   st.lifetime_background_scan_visits = lifetime_background_scan_visits_;
@@ -3181,6 +3208,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.lifetime_background_no_candidate = lifetime_background_no_candidate_;
   st.lifetime_background_victims = lifetime_background_victims_;
   st.lifetime_background_age = lifetime_background_age_;
+  st.lifetime_background_score = lifetime_background_score_;
   st.lifetime_background_freed_slot_bytes =
       lifetime_background_freed_slot_bytes_;
   st.lifetime_background_freed_payload_bytes =

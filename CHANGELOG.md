@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export successful foreground/background lifetime class scores as separate
+  nonnegative and absolute-negative distributions. Reuse the existing final
+  pre-wipe time and settle each call without cumulative floating subtraction.
+
 - Export successful foreground/background lifetime class eviction ages, keeping
   unknown recovered history separate and avoiding cross-piece double counting.
   Add a final pre-invalidation clock check; refuse not-yet-started class wipes
