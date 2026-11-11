@@ -1059,6 +1059,14 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_scan_budget_exhausted += st.lifetime_scan_budget_exhausted;
     sum.lifetime_class_no_candidate += st.lifetime_class_no_candidate;
     sum.lifetime_class_victims += st.lifetime_class_victims;
+    for (size_t bucket = 0; bucket < sum.lifetime_class_age.buckets.size();
+         ++bucket) {
+      sum.lifetime_class_age.buckets[bucket] +=
+          st.lifetime_class_age.buckets[bucket];
+    }
+    sum.lifetime_class_age.total_sec += st.lifetime_class_age.total_sec;
+    sum.lifetime_class_age.history_unknown +=
+        st.lifetime_class_age.history_unknown;
     sum.lifetime_class_freed_slot_bytes += st.lifetime_class_freed_slot_bytes;
     sum.lifetime_class_freed_payload_bytes +=
         st.lifetime_class_freed_payload_bytes;
@@ -1068,6 +1076,15 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
         st.lifetime_background_budget_exhausted;
     sum.lifetime_background_no_candidate += st.lifetime_background_no_candidate;
     sum.lifetime_background_victims += st.lifetime_background_victims;
+    for (size_t bucket = 0; bucket < sum.lifetime_background_age.buckets.size();
+         ++bucket) {
+      sum.lifetime_background_age.buckets[bucket] +=
+          st.lifetime_background_age.buckets[bucket];
+    }
+    sum.lifetime_background_age.total_sec +=
+        st.lifetime_background_age.total_sec;
+    sum.lifetime_background_age.history_unknown +=
+        st.lifetime_background_age.history_unknown;
     sum.lifetime_background_freed_slot_bytes +=
         st.lifetime_background_freed_slot_bytes;
     sum.lifetime_background_freed_payload_bytes +=

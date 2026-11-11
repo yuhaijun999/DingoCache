@@ -98,6 +98,7 @@ class DiskSlabStoreTestPeer {
   static void TickBackground(DiskSlabStore& store) {
     store.ReclaimLifetimeTick(1);
   }
+  static void TickReclaimer(DiskSlabStore& store) { store.ReclaimTick(); }
   static void TickWatermark(DiskSlabStore& store) {
     // No background worker runs in this test. Isolate global reclamation from
     // the independent class headroom pass, without replacing its allocator.
@@ -943,6 +944,275 @@ TEST(Metrics, DonorBytesAggregateAcrossDisksAndResetOnRecovery) {
   }
   server.reset();
   fs::remove_all(dir);
+}
+
+TEST(Metrics, ClassAndBackgroundAgesStaySeparateAndExcludeRecoveredHistory) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "134217728");
+  const ScopedEnv cold_window("DFKV_SLAB_COLD_STEAL_WINDOW", "8");
+  const ScopedEnv watermark("DFKV_SLAB_EVICT_HIGH_PCT", "0");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  for (bool background : {false, true}) {
+    SCOPED_TRACE(background ? "background" : "class");
+    const fs::path dir =
+        fs::temp_directory_path() /
+        (background ? "dfkv_metrics_background_age" : "dfkv_metrics_class_age");
+    fs::remove_all(dir);
+    std::atomic<uint64_t> seconds{0};
+    const DiskLifetimeConfig config = BucketMetricConfig();
+    std::atomic<bool> armed{false};
+    std::atomic<bool> write_started{false};
+    std::atomic<unsigned> samples{0};
+    std::atomic<unsigned> samples_before_write{0};
+    std::atomic<unsigned> writes{0};
+    std::atomic<uint64_t> selected_at{0};
+    std::atomic<uint64_t> final_at{0};
+    std::atomic<uint64_t> after_write_at{0};
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+    options.capacity_bytes = 2ULL << 30;
+    options.engine = "slab";
+    options.eviction_policy = "lifetime";
+    options.lifetime_config = config;
+    options.lifetime_clock =
+        std::make_shared<DiskLifetimeClock>(DiskLifetimeHorizon(config), [&] {
+          if (!armed.load()) return seconds.load();
+          const unsigned sample = samples.fetch_add(1) + 1;
+          if (write_started.load()) return after_write_at.load();
+          const unsigned final_sample = background ? 6 : 7;
+          return sample < final_sample ? selected_at.load() : final_at.load();
+        });
+    std::unique_ptr<KvNodeServer> server =
+        std::make_unique<KvNodeServer>(options);
+    ASSERT_TRUE(server->Healthy());
+    server->set_identity("reclaim-age-node", "reclaim-age-group");
+    const std::string identity =
+        R"(node="reclaim-age-node",group="reclaim-age-group")";
+    const std::string path = background ? "background" : "class";
+    // Literal expected boundaries are independent of the production constants.
+    const std::array<const char*, 8> bounds = {
+        "0", "1", "60", "3600", "86400", "604800", "2592000", "+Inf"};
+    const auto expect_age = [&](const std::array<uint64_t, 2>& counts,
+                                const std::array<uint64_t, 2>& sums,
+                                const std::array<uint64_t, 2>& unknown,
+                                const std::array<uint64_t, 8>& disk0_buckets,
+                                const std::array<uint64_t, 8>& disk1_buckets) {
+      const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+      const std::string text = server->MetricsText();
+      const std::array<DiskSlabStore::Stats, 2> disks = {
+          group.DiskSlabStats(0), group.DiskSlabStats(1)};
+      const DiskSlabStore::Stats total = group.SlabStats();
+      const SlabAllocator::LifetimeDonorAgeStats& total_age =
+          background ? total.lifetime_background_age : total.lifetime_class_age;
+      const std::array<std::array<uint64_t, 8>, 2> expected = {disk0_buckets,
+                                                               disk1_buckets};
+      for (const char* prefix : {"dfkv_slab_", "dfkv_slab_disk_"}) {
+        EXPECT_NE(text.find(std::string("# TYPE ") + prefix + "lifetime_" +
+                            path + "_age_seconds histogram\n"),
+                  std::string::npos);
+        EXPECT_NE(text.find(std::string("# TYPE ") + prefix + "lifetime_" +
+                            path + "_age_history_unknown_total counter\n"),
+                  std::string::npos);
+      }
+      uint64_t global_cumulative = 0;
+      std::array<uint64_t, 2> cumulative{};
+      for (size_t bucket = 0; bucket < bounds.size(); ++bucket) {
+        for (size_t disk = 0; disk < disks.size(); ++disk) {
+          cumulative[disk] += expected[disk][bucket];
+          global_cumulative += expected[disk][bucket];
+          const SlabAllocator::LifetimeDonorAgeStats& age =
+              background ? disks[disk].lifetime_background_age
+                         : disks[disk].lifetime_class_age;
+          EXPECT_EQ(age.buckets[bucket], expected[disk][bucket]);
+          const std::string labels = "{disk=\"" + options.cache_dirs[disk] +
+                                     "\",disk_index=\"" + std::to_string(disk) +
+                                     "\",le=\"" + bounds[bucket] + "\"," +
+                                     identity + "} ";
+          EXPECT_NE(text.find("\ndfkv_slab_disk_lifetime_" + path +
+                              "_age_seconds_bucket" + labels +
+                              std::to_string(cumulative[disk]) + "\n"),
+                    std::string::npos);
+        }
+        EXPECT_EQ(total_age.buckets[bucket],
+                  expected[0][bucket] + expected[1][bucket]);
+        EXPECT_NE(text.find("\ndfkv_slab_lifetime_" + path +
+                            "_age_seconds_bucket{le=\"" +
+                            std::string(bounds[bucket]) + "\"," + identity +
+                            "} " + std::to_string(global_cumulative) + "\n"),
+                  std::string::npos);
+      }
+      for (size_t disk = 0; disk < disks.size(); ++disk) {
+        EXPECT_EQ(cumulative[disk], counts[disk]);
+        const SlabAllocator::LifetimeDonorAgeStats& age =
+            background ? disks[disk].lifetime_background_age
+                       : disks[disk].lifetime_class_age;
+        EXPECT_EQ(age.total_sec, sums[disk]);
+        EXPECT_EQ(age.history_unknown, unknown[disk]);
+        if (options.eviction_policy == "lifetime") {
+          EXPECT_EQ(counts[disk] + unknown[disk],
+                    background ? disks[disk].lifetime_background_victims
+                               : disks[disk].lifetime_class_victims);
+        }
+        const SlabAllocator::LifetimeDonorAgeStats& other =
+            background ? disks[disk].lifetime_class_age
+                       : disks[disk].lifetime_background_age;
+        for (const SlabAllocator::LifetimeDonorAgeStats* excluded :
+             {&other, &disks[disk].lifetime_watermark_age,
+              &disks[disk].lifetime_donor_age}) {
+          EXPECT_EQ(excluded->buckets, (std::array<uint64_t, 8>{}));
+          EXPECT_EQ(excluded->total_sec, 0U);
+          EXPECT_EQ(excluded->history_unknown, 0U);
+        }
+        EXPECT_EQ(background ? disks[disk].lifetime_class_victims
+                             : disks[disk].lifetime_background_victims,
+                  0U);
+        EXPECT_EQ(disks[disk].watermark_slot_removals, 0U);
+        EXPECT_EQ(disks[disk].lifetime_donor_released_residents, 0U);
+        const std::string labels = "{disk=\"" + options.cache_dirs[disk] +
+                                   "\",disk_index=\"" + std::to_string(disk) +
+                                   "\"," + identity + "} ";
+        for (const std::pair<const char*, uint64_t>& sample :
+             {std::pair<const char*, uint64_t>{"seconds_count", counts[disk]},
+              {"seconds_sum", sums[disk]},
+              {"history_unknown_total", unknown[disk]}}) {
+          EXPECT_NE(text.find("\ndfkv_slab_disk_lifetime_" + path + "_age_" +
+                              std::string(sample.first) + labels +
+                              std::to_string(sample.second) + "\n"),
+                    std::string::npos);
+        }
+      }
+      EXPECT_EQ(total_age.total_sec, sums[0] + sums[1]);
+      EXPECT_EQ(total_age.history_unknown, unknown[0] + unknown[1]);
+      for (const std::pair<const char*, uint64_t>& sample :
+           {std::pair<const char*, uint64_t>{"seconds_count",
+                                             counts[0] + counts[1]},
+            {"seconds_sum", sums[0] + sums[1]},
+            {"history_unknown_total", unknown[0] + unknown[1]}}) {
+        EXPECT_NE(text.find("\ndfkv_slab_lifetime_" + path + "_age_" +
+                            std::string(sample.first) + "{" + identity + "} " +
+                            std::to_string(sample.second) + "\n"),
+                  std::string::npos);
+      }
+    };
+    const std::array<uint64_t, 8> empty{};
+    ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {0, 0}, empty, empty));
+    for (size_t disk = 0; disk < 2; ++disk) {
+      DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+          KvNodeServerTestPeer::Group(*server), disk);
+      for (uint64_t key = 1; key <= 8; ++key) {
+        ASSERT_EQ(store.Cache({key, 0}, "old", 3), Status::kOk);
+      }
+      ASSERT_EQ(store.Count(), 8U);
+      // Disk0 commits at0, disk1 at2. Distinct final ages1/61 exercise both
+      // aggregation and cumulative output; selection and post-I/O ages differ.
+      selected_at.store(disk == 0 ? 0 : 62);
+      final_at.store(disk == 0 ? 1 : 63);
+      after_write_at.store(disk == 0 ? 2 : 100);
+      samples.store(0);
+      samples_before_write.store(0);
+      writes.store(0);
+      write_started.store(false);
+      ASSERT_TRUE(DiskSlabStoreTestPeer::ObserveSlotEvict(store, [&] {
+        writes.fetch_add(1);
+        samples_before_write.store(samples.load());
+        write_started.store(true);
+      }));  // Delegate to the real slot-record invalidation, not fake success.
+      // Background: entry/D guards then allocator guard/selection/final
+      // guard/final timestamp. Foreground: unavailable donor guard/time and
+      // cold guard precede those four allocator reads (window8, put_seq8).
+      armed.store(true);
+      if (background) {
+        DiskSlabStoreTestPeer::TickBackground(store);
+      } else {
+        ASSERT_EQ(store.Cache({9, 0}, "new", 3), Status::kOk);
+      }
+      armed.store(false);
+      seconds.store(after_write_at.load());
+      EXPECT_EQ(writes.load(), 1U);
+      EXPECT_EQ(samples_before_write.load(), background ? 6U : 7U);
+      EXPECT_GE(samples.load(), background ? 6U : 8U);
+      EXPECT_EQ(store.Count(), background ? 7U : 8U);
+      EXPECT_FALSE(store.IsCached({1, 0}));
+      std::string survivor;
+      EXPECT_EQ(store.Range({2, 0}, 0, 0, &survivor), Status::kOk);
+      EXPECT_EQ(survivor, "old");
+    }
+    ASSERT_NO_FATAL_FAILURE(expect_age({1, 1}, {1, 61}, {0, 0},
+                                       {0, 1, 0, 0, 0, 0, 0, 0},
+                                       {0, 0, 0, 1, 0, 0, 0, 0}));
+    server.reset();
+    server = std::make_unique<KvNodeServer>(options);
+    ASSERT_TRUE(server->Healthy());
+    server->set_identity("reclaim-age-node", "reclaim-age-group");
+    ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {0, 0}, empty, empty));
+    // Every disk1 recovered resident accepts a real read, so its selected
+    // victim cannot merely be another unread seed. Disk0 remains unread.
+    DiskSlabStore& read_store =
+        DiskCacheGroupTestPeer::Slab(KvNodeServerTestPeer::Group(*server), 1);
+    const uint64_t last_key = background ? 8 : 9;
+    for (uint64_t key = 2; key <= last_key; ++key) {
+      std::string recovered;
+      DiskResidentIdentity identity;
+      ASSERT_EQ(
+          read_store.RangeWithIdentity({key, 0}, 0, 0, &recovered, &identity),
+          Status::kOk);
+      ASSERT_EQ(recovered, key == 9 ? "new" : "old");
+      read_store.NotifyLifetimeReadSuccess(
+          {key, 0}, identity, recovered.size(),
+          DiskSlabStore::LifetimeReadSource::kDisk);
+    }
+    ASSERT_EQ(read_store.GetStats().lifetime_reads.applied,
+              background ? 7U : 8U);
+    seconds.store(1100);
+    for (size_t disk = 0; disk < 2; ++disk) {
+      DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+          KvNodeServerTestPeer::Group(*server), disk);
+      ASSERT_EQ(store.Cache({10, 0}, "fresh", 5), Status::kOk);
+      if (background) {
+        DiskSlabStoreTestPeer::TickBackground(store);
+      }
+      EXPECT_EQ(store.Count(), background ? 7U : 8U);
+      std::string survivor;
+      EXPECT_EQ(store.Range({10, 0}, 0, 0, &survivor), Status::kOk);
+      EXPECT_EQ(survivor, "fresh");
+    }
+    ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {1, 1}, empty, empty));
+    server.reset();
+    options.eviction_policy = "legacy";
+    options.lifetime_clock.reset();
+    options.lifetime_config.reset();
+    server = std::make_unique<KvNodeServer>(options);
+    ASSERT_TRUE(server->Healthy());
+    server->set_identity("reclaim-age-node", "reclaim-age-group");
+    for (size_t disk = 0; disk < 2; ++disk) {
+      DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+          KvNodeServerTestPeer::Group(*server), disk);
+      ASSERT_EQ(store.Cache({11, 0}, "legacy", 6), Status::kOk);
+      if (background) {
+        DiskSlabStoreTestPeer::TickReclaimer(store);
+        EXPECT_EQ(store.GetStats().reclaimed_slots, 2U);
+      }
+      EXPECT_EQ(store.Count(), background ? 6U : 8U);
+      EXPECT_GT(store.EvictedBytes(), 0U);
+    }
+    ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {0, 0}, empty, empty));
+    server.reset();
+    options.engine = "file";
+    options.cache_dirs = {(dir / "file").string()};
+    server = std::make_unique<KvNodeServer>(options);
+    ASSERT_TRUE(server->Healthy());
+    const std::string file_text = server->MetricsText();
+    for (const char* name :
+         {"dfkv_slab_lifetime_class_age_", "dfkv_slab_disk_lifetime_class_age_",
+          "dfkv_slab_lifetime_background_age_",
+          "dfkv_slab_disk_lifetime_background_age_"}) {
+      EXPECT_EQ(file_text.find(name), std::string::npos);
+    }
+    server.reset();
+    fs::remove_all(dir);
+  }
 }
 
 TEST(Metrics, WatermarkAgeUsesFinalPreWriteTimeAndExcludesRecoveredHistory) {

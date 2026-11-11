@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -42,6 +43,12 @@ class DiskSlabStoreTestPeer {
   }
   static void YieldHook(DiskSlabStore& store, std::function<void()> hook) {
     store.lifetime_scan_yield_hook_for_test_ = std::move(hook);
+  }
+  static bool ObserveSlotEvict(DiskSlabStore& store,
+                               std::function<void()> observer) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    return SlabAllocatorTestPeer::ObserveSlotEvict(*store.alloc_,
+                                                   std::move(observer));
   }
   static void FailInvalidation(DiskSlabStore& store) {
     const std::lock_guard<std::mutex> lock(store.mu_);
@@ -99,6 +106,235 @@ void AddResident(SlabAllocator& allocator, uint64_t id,
   }
 }
 
+TEST(SlabLifetimeEviction, AgeUsesFixedDisplayBoundaries) {
+  struct Case {
+    uint32_t seconds;
+    size_t bucket;
+  };
+  const std::array<Case, 14> cases = {{{0, 0},
+                                       {1, 1},
+                                       {2, 2},
+                                       {60, 2},
+                                       {61, 3},
+                                       {3600, 3},
+                                       {3601, 4},
+                                       {86400, 4},
+                                       {86401, 5},
+                                       {604800, 5},
+                                       {604801, 6},
+                                       {2592000, 6},
+                                       {2592001, 7},
+                                       {UINT32_MAX, 7}}};
+  for (const Case& test : cases) {
+    SCOPED_TRACE(test.seconds);
+    const DiskLifetimeConfig config;
+    uint64_t seconds = 0;
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                  [&] { return seconds; });
+    SlabAllocator allocator(AllocatorOptions(2));
+    const DiskLifetimeState state = NewDiskLifetimeState(0);
+    ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 1, &state));
+    seconds = test.seconds;
+    Scan scan(config, clock);
+    std::vector<BlockKey> evicted;
+    bool denied = false;
+    ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                         &evicted, &denied));
+    EXPECT_FALSE(denied);
+    EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+    for (size_t bucket = 0; bucket < scan.age.buckets.size(); ++bucket) {
+      EXPECT_EQ(scan.age.buckets[bucket], bucket == test.bucket ? 1U : 0U);
+    }
+    EXPECT_EQ(scan.age.total_sec, test.seconds);
+    EXPECT_EQ(scan.age.history_unknown, 0U);
+    EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+  }
+}
+
+TEST(SlabLifetimeEviction, AgeUsesFinalPreWipeTime) {
+  const DiskLifetimeConfig config;
+  bool armed = false;
+  unsigned samples = 0;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&] {
+    const uint64_t sampled = seconds;
+    if (armed) {
+      ++samples;
+      seconds = 20;
+    }
+    return sampled;
+  });
+  unsigned writes = 0;
+  SlabAllocator::Options options = AllocatorOptions(2);
+  options.on_slot_evict = [&](const SlabAllocator::SlotRef&) {
+    ++writes;
+    seconds = 1000;
+    return true;
+  };
+  SlabAllocator allocator(options);
+  const DiskLifetimeState state = NewDiskLifetimeState(0);
+  ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 1, &state));
+  seconds = 19;
+  armed = true;
+  Scan scan(config, clock);
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                       &evicted, &denied));
+  EXPECT_FALSE(denied);
+  EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+  EXPECT_EQ(samples, 2U);  // Selection and the final pre-wipe recheck.
+  EXPECT_EQ(writes, 1U);
+  EXPECT_EQ(scan.visits, 1U);
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{0, 0, 1}));
+  EXPECT_EQ(scan.age.total_sec, 20U);
+  EXPECT_EQ(scan.age.history_unknown, 0U);
+}
+
+TEST(SlabLifetimeEviction, AgeSaturatesFutureAnchorAtZero) {
+  const DiskLifetimeConfig config;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&] { return seconds; });
+  SlabAllocator allocator(AllocatorOptions(2));
+  // Defensive synthetic state: production commits never lead their clock.
+  const DiskLifetimeState state = NewDiskLifetimeState(30);
+  ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 1, &state));
+  seconds = 20;
+  Scan scan(config, clock);
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                       &evicted, &denied));
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{1}));
+  EXPECT_EQ(scan.age.total_sec, 0U);
+  EXPECT_EQ(scan.age.history_unknown, 0U);
+}
+
+TEST(SlabLifetimeEviction, AgeExcludesRecoveredHistoryAfterRealRead) {
+  const DiskLifetimeConfig config;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&] { return seconds; });
+  SlabAllocator allocator(AllocatorOptions(4));
+  const DiskLifetimeState state = RecoveredDiskLifetimeState(2);
+  ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 1, &state));
+  ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 2, &state));
+  seconds = 10;
+  ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, Key(2), 2,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  seconds = 20;
+  Scan scan(config, clock);
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                       &evicted, &denied));
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                       &evicted, &denied));
+  EXPECT_EQ(scan.victims, 2U);
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(scan.age.total_sec, 0U);
+  EXPECT_EQ(scan.age.history_unknown, 2U);
+}
+
+TEST(SlabLifetimeEviction, FinalClockFailureDeniesPutBeforeWipeOrFallback) {
+  const DiskLifetimeConfig config;
+  bool armed = false;
+  unsigned samples = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&] {
+    if (!armed) return uint64_t{0};
+    return ++samples == 1 ? uint64_t{19} : uint64_t{UINT32_MAX} + 1;
+  });
+  unsigned guards = 0;
+  unsigned writes = 0;
+  SlabAllocator::Options options = AllocatorOptions(2);
+  options.can_reclaim = [&] {
+    ++guards;
+    return true;
+  };
+  options.on_slot_evict = [&](const SlabAllocator::SlotRef&) {
+    ++writes;
+    return true;
+  };
+  SlabAllocator allocator(options);
+  const DiskLifetimeState state = NewDiskLifetimeState(0);
+  ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 1, &state));
+  ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 2, &state));
+  Scan scan(config, clock);
+  // Resume the class stage so pre-class growth/cold-donor probes are skipped.
+  scan.result = ScanResult::kRetry;
+  armed = true;
+  guards = 0;
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  SlabAllocator::SlotRef ref;
+  EXPECT_FALSE(SlabAllocatorTestPeer::PutWithLifetimeScan(
+      allocator, Key(3), 1, &ref, &evicted, scan, &denied));
+  EXPECT_TRUE(denied);
+  EXPECT_EQ(samples, 2U);
+  EXPECT_EQ(guards, 2U);  // Class entry and pre-wipe only, no donor fallback.
+  EXPECT_EQ(writes, 0U);
+  EXPECT_EQ(scan.victims, 0U);
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(scan.age.total_sec, 0U);
+  EXPECT_EQ(scan.age.history_unknown, 0U);
+  EXPECT_EQ(allocator.Count(), 2U);
+  EXPECT_TRUE(evicted.empty());
+  EXPECT_FALSE(allocator.Contains(Key(3)));
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
+TEST(SlabLifetimeEviction, FinalClockFailureKeepsEarlierSuccessfulAge) {
+  const DiskLifetimeConfig config;
+  bool armed = false;
+  unsigned samples = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&] {
+    if (!armed) return uint64_t{0};
+    ++samples;
+    if (samples == 1) return uint64_t{19};
+    if (samples == 2) return uint64_t{20};
+    if (samples == 3) return uint64_t{30};
+    return uint64_t{UINT32_MAX} + 1;
+  });
+  unsigned writes = 0;
+  SlabAllocator::Options options = AllocatorOptions(2);
+  options.on_slot_evict = [&](const SlabAllocator::SlotRef&) {
+    ++writes;
+    return true;
+  };
+  SlabAllocator allocator(options);
+  const DiskLifetimeState state = NewDiskLifetimeState(0);
+  ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 1, &state));
+  ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 2, &state));
+  Scan scan(config, clock);
+  armed = true;
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                       &evicted, &denied));
+  EXPECT_FALSE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                        &evicted, &denied));
+  EXPECT_TRUE(denied);
+  EXPECT_EQ(samples, 4U);
+  EXPECT_EQ(writes, 1U);
+  EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+  EXPECT_TRUE(allocator.Contains(Key(2)));
+  EXPECT_EQ(scan.victims, 1U);
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{0, 0, 1}));
+  EXPECT_EQ(scan.age.total_sec, 20U);
+  EXPECT_EQ(scan.age.history_unknown, 0U);
+  armed = false;  // Raw-clock rollback must not reopen the hard gate.
+  denied = false;
+  Scan next_scan(config, clock);
+  EXPECT_FALSE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, next_scan,
+                                                        &evicted, &denied));
+  EXPECT_EQ(writes, 1U);
+  EXPECT_EQ(next_scan.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(next_scan.age.total_sec, 0U);
+  EXPECT_EQ(next_scan.age.history_unknown, 0U);
+}
+
 TEST(SlabLifetimeEviction, SuccessfulEventCountersSurviveLaterFailure) {
   SlabAllocator::Options options = AllocatorOptions(2);
   unsigned attempts = 0;
@@ -127,6 +363,9 @@ TEST(SlabLifetimeEviction, SuccessfulEventCountersSurviveLaterFailure) {
   EXPECT_EQ(scan.victims, 1U);
   EXPECT_EQ(scan.freed_slot_bytes, 4096U);
   EXPECT_EQ(scan.freed_payload_bytes, 17U);
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(scan.age.total_sec, 0U);
+  EXPECT_EQ(scan.age.history_unknown, 1U);
   EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
   EXPECT_TRUE(allocator.Contains(Key(2)));
 }
@@ -254,6 +493,9 @@ TEST(SlabLifetimeEviction,
       allocator, Key(3), 1, &ref, &evicted, scan, &denied));
   EXPECT_EQ(scan.result, ScanResult::kPersistenceError);
   EXPECT_EQ(attempts, 1U);
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(scan.age.total_sec, 0U);
+  EXPECT_EQ(scan.age.history_unknown, 0U);
   EXPECT_EQ(allocator.Count(), 2U);
   EXPECT_TRUE(evicted.empty());
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
@@ -538,12 +780,78 @@ TEST_F(LifetimeClassStoreTest, ScalarDirectAndBatchReclaimTheCheckedResident) {
     EXPECT_EQ(bytes, "new");
     const DiskSlabStore::Stats stats = store_->GetStats();
     EXPECT_EQ(stats.lifetime_class_victims, 1U);
+    EXPECT_EQ(stats.lifetime_class_age.buckets, (std::array<uint64_t, 8>{1}));
+    EXPECT_EQ(stats.lifetime_class_age.total_sec, 0U);
+    EXPECT_EQ(stats.lifetime_class_age.history_unknown, 0U);
     EXPECT_EQ(stats.lifetime_class_freed_slot_bytes, 4096U);
     EXPECT_EQ(stats.lifetime_class_freed_payload_bytes, 3U);
     EXPECT_EQ(stats.lifetime_class_scan_visits, 2U);
     EXPECT_EQ(stats.lifetime_scan_budget_exhausted, 0U);
     EXPECT_EQ(DiskSlabStoreTestPeer::Flights(*store_), 0U);
     EXPECT_TRUE(DiskSlabStoreTestPeer::IndexesValid(*store_));
+  }
+}
+
+TEST_F(LifetimeClassStoreTest, FinalClockFailureReturnsTypedBackpressure) {
+  constexpr uint32_t kResidents = 1100;
+  for (const char* mode : {"scalar", "direct", "batch"}) {
+    SCOPED_TRACE(mode);
+    store_.reset();
+    std::filesystem::remove_all(dir_);
+    bool armed = false;
+    unsigned samples = 0;
+    unsigned writes = 0;
+    const std::shared_ptr<DiskLifetimeClock> clock =
+        std::make_shared<DiskLifetimeClock>(DiskLifetimeHorizon(config_), [&] {
+          if (!armed) return uint64_t{0};
+          // After the first pinned slice, the resumed class path reads entry
+          // guard, selection, final guard, then the final pre-wipe timestamp.
+          return ++samples == 4 ? uint64_t{UINT32_MAX} + 1 : uint64_t{19};
+        });
+    DiskSlabStore::Options options = Options(kResidents);
+    options.lifetime_clock = clock;
+    store_ = std::make_unique<DiskSlabStore>(options);
+    ASSERT_TRUE(store_->Healthy()) << store_->StartupError();
+    ASSERT_NO_FATAL_FAILURE(Seed(kResidents, true));
+    ASSERT_TRUE(DiskSlabStoreTestPeer::Unpin(*store_, Key(kResidents)));
+    ASSERT_TRUE(
+        DiskSlabStoreTestPeer::ObserveSlotEvict(*store_, [&] { ++writes; }));
+    unsigned yields = 0;
+    DiskSlabStoreTestPeer::YieldHook(*store_, [&] {
+      ++yields;
+      armed = true;
+    });
+    const DiskSlabStore::Stats before = store_->GetStats();
+    const DiskWriteResult result = Write(mode, Key(2000));
+    armed = false;
+    EXPECT_EQ(result.status, Status::kCacheFull);
+    EXPECT_EQ(result.reason, DiskWriteReason::kLifetimeClockExhausted);
+    EXPECT_FALSE(result.identity.valid());
+    EXPECT_EQ(yields, 1U);
+    EXPECT_EQ(samples, 4U);
+    EXPECT_EQ(writes, 0U);
+    EXPECT_TRUE(store_->Healthy());
+    EXPECT_EQ(store_->Count(), kResidents);
+    EXPECT_FALSE(store_->IsCached(Key(2000)));
+    EXPECT_EQ(DiskSlabStoreTestPeer::Flights(*store_), 0U);
+    const DiskSlabStore::Stats after = store_->GetStats();
+    EXPECT_EQ(after.lifetime_class_scan_visits, kResidents);
+    EXPECT_EQ(after.lifetime_class_scan_slices, 2U);
+    EXPECT_EQ(after.lifetime_class_victims, 0U);
+    EXPECT_EQ(after.lifetime_class_age.buckets, (std::array<uint64_t, 8>{}));
+    EXPECT_EQ(after.lifetime_class_age.total_sec, 0U);
+    EXPECT_EQ(after.lifetime_class_age.history_unknown, 0U);
+    EXPECT_EQ(after.lifetime_donor_released_residents, 0U);
+    EXPECT_EQ(after.record_writes, before.record_writes);
+    EXPECT_EQ(after.metadata_io_errors, 0U);
+    EXPECT_EQ(after.committed_objects, kResidents);
+    for (const uint64_t id : {uint64_t{1}, uint64_t{kResidents}}) {
+      std::string bytes;
+      EXPECT_EQ(store_->Range(Key(id), 0, 0, &bytes), Status::kOk);
+      EXPECT_EQ(bytes, "old");
+    }
+    EXPECT_TRUE(DiskSlabStoreTestPeer::IndexesValid(*store_));
+    store_.reset();  // Destroy borrowed callbacks before their captured locals.
   }
 }
 
@@ -631,10 +939,15 @@ TEST_F(LifetimeClassStoreTest, FailedNewWriteRetainsSuccessfulEvictionBytes) {
     std::filesystem::remove_all(dir_);
     ASSERT_NO_FATAL_FAILURE(Create(2));
     ASSERT_NO_FATAL_FAILURE(Seed(2, false));
+    seconds_.fetch_add(61);
     DiskSlabStoreTestPeer::FailPayloadWrite(*store_);
     EXPECT_EQ(Write(mode, Key(3)).status, Status::kIOError);
     const DiskSlabStore::Stats stats = store_->GetStats();
     EXPECT_EQ(stats.lifetime_class_victims, 1U);
+    EXPECT_EQ(stats.lifetime_class_age.buckets,
+              (std::array<uint64_t, 8>{0, 0, 0, 1}));
+    EXPECT_EQ(stats.lifetime_class_age.total_sec, 61U);
+    EXPECT_EQ(stats.lifetime_class_age.history_unknown, 0U);
     EXPECT_EQ(stats.lifetime_class_freed_slot_bytes, 4096U);
     EXPECT_EQ(stats.lifetime_class_freed_payload_bytes, 3U);
     EXPECT_EQ(store_->EvictedBytes(), 3U);

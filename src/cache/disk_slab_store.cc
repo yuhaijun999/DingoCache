@@ -1655,6 +1655,9 @@ DiskWriteResult DiskSlabStore::AllocateForPutLocked(
     const uint64_t victims = scan ? scan->victims : 0;
     const uint64_t slot_bytes = scan ? scan->freed_slot_bytes : 0;
     const uint64_t payload_bytes = scan ? scan->freed_payload_bytes : 0;
+    // The scan owns cumulative events across retries; merge this call only.
+    const SlabAllocator::LifetimeDonorAgeStats age =
+        scan ? scan->age : SlabAllocator::LifetimeDonorAgeStats{};
     const bool allocated =
         alloc_->PutImpl(key, len, ref, &evicted, nullptr, &reclaim_denied,
                         scan ? &*scan : nullptr);
@@ -1662,15 +1665,24 @@ DiskWriteResult DiskSlabStore::AllocateForPutLocked(
     for (const BlockKey& victim : evicted)
       evicted_bytes_ += ErasePayloadLocked(victim.Filename());
     if (scan) {
-      lifetime_class_scan_visits_ += scan->visits - visits;
-      lifetime_class_scan_slices_ += scan->slices - slices;
+      const SlabAllocator::LifetimeScan& completed = *scan;
+      lifetime_class_scan_visits_ += completed.visits - visits;
+      lifetime_class_scan_slices_ += completed.slices - slices;
       // The returned list may also contain donor victims. Consume only the
       // class-success snapshots, even if later allocation/payload I/O fails.
-      lifetime_class_victims_ += scan->victims - victims;
-      lifetime_class_freed_slot_bytes_ += scan->freed_slot_bytes - slot_bytes;
+      lifetime_class_victims_ += completed.victims - victims;
+      lifetime_class_freed_slot_bytes_ +=
+          completed.freed_slot_bytes - slot_bytes;
       lifetime_class_freed_payload_bytes_ +=
-          scan->freed_payload_bytes - payload_bytes;
-      if (scan->result == SlabAllocator::LifetimeScanResult::kNoCandidate)
+          completed.freed_payload_bytes - payload_bytes;
+      for (size_t bucket = 0; bucket < age.buckets.size(); ++bucket) {
+        lifetime_class_age_.buckets[bucket] +=
+            completed.age.buckets[bucket] - age.buckets[bucket];
+      }
+      lifetime_class_age_.total_sec += completed.age.total_sec - age.total_sec;
+      lifetime_class_age_.history_unknown +=
+          completed.age.history_unknown - age.history_unknown;
+      if (completed.result == SlabAllocator::LifetimeScanResult::kNoCandidate)
         ++lifetime_class_no_candidate_;
     }
     if (allocated) return {Status::kOk};
@@ -2565,6 +2577,7 @@ bool DiskSlabStore::ReclaimLifetimeClass(size_t cls_index, size_t target_free,
     std::unique_lock<std::mutex> lock(mu_);
     if (!CanStartReclaim()) return false;
     const uint64_t before = scan.visits;
+    const SlabAllocator::LifetimeDonorAgeStats age = scan.age;
     const SlabAllocator::LifetimeReclaimResult result =
         alloc_->ReclaimLifetimeClass(cls_index, target_free,
                                      std::min<size_t>(128, remaining), scan,
@@ -2576,6 +2589,14 @@ bool DiskSlabStore::ReclaimLifetimeClass(size_t cls_index, size_t target_free,
       evicted_bytes_ += bytes;
       lifetime_background_freed_payload_bytes_ += bytes;
     }
+    // Settle before every return/yield; later pieces retain scan.age.
+    for (size_t bucket = 0; bucket < age.buckets.size(); ++bucket) {
+      lifetime_background_age_.buckets[bucket] +=
+          scan.age.buckets[bucket] - age.buckets[bucket];
+    }
+    lifetime_background_age_.total_sec += scan.age.total_sec - age.total_sec;
+    lifetime_background_age_.history_unknown +=
+        scan.age.history_unknown - age.history_unknown;
     lifetime_background_victims_ += result.victims;
     lifetime_background_freed_slot_bytes_ += result.freed_slot_bytes;
     reclaimed_.fetch_add(result.victims, std::memory_order_relaxed);
@@ -3150,6 +3171,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.lifetime_scan_budget_exhausted = lifetime_scan_budget_exhausted_;
   st.lifetime_class_no_candidate = lifetime_class_no_candidate_;
   st.lifetime_class_victims = lifetime_class_victims_;
+  st.lifetime_class_age = lifetime_class_age_;
   st.lifetime_class_freed_slot_bytes = lifetime_class_freed_slot_bytes_;
   st.lifetime_class_freed_payload_bytes = lifetime_class_freed_payload_bytes_;
   st.lifetime_background_scan_visits = lifetime_background_scan_visits_;
@@ -3158,6 +3180,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
       lifetime_background_budget_exhausted_;
   st.lifetime_background_no_candidate = lifetime_background_no_candidate_;
   st.lifetime_background_victims = lifetime_background_victims_;
+  st.lifetime_background_age = lifetime_background_age_;
   st.lifetime_background_freed_slot_bytes =
       lifetime_background_freed_slot_bytes_;
   st.lifetime_background_freed_payload_bytes =

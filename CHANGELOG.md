@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Export successful foreground/background lifetime class eviction ages, keeping
+  unknown recovered history separate and avoiding cross-piece double counting.
+  Add a final pre-invalidation clock check; refuse not-yet-started class wipes
+  past the hard clock bound while preserving completed work.
+
 - Export successful lifetime watermark scores as separate nonnegative and
   absolute-negative distributions. Reuse the final pre-wipe protection score
   without changing selection, budgets or invalidation rules.

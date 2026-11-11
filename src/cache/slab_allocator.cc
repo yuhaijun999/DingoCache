@@ -1053,6 +1053,18 @@ bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
   }
   if (best != kNoSlot) {
     if (!ReclaimAllowed(reclaim_denied)) return false;
+    // Recheck time after selection. An unrepresentable final time denies
+    // reclaim rather than persisting with stale age or falling back to donor.
+    if (!scan.clock.TryDrainNow(&now)) {
+      *reclaim_denied = true;
+      return false;
+    }
+    const std::optional<DiskLifetimeState>& selected =
+        resident_lifetime_states_[best];
+    assert(selected.has_value());
+    const bool history_unknown = selected->history_unknown;
+    const uint32_t age_sec =
+        now >= selected->anchor ? now - selected->anchor : 0;
     // No lock boundary since scoring: pin, generation and membership cannot
     // have changed. Persist exactly one invalidation before freeing anything.
     if (opt_.on_slot_evict && !opt_.on_slot_evict(slots_[best].ref)) {
@@ -1062,6 +1074,18 @@ bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
     const BlockKey victim = slots_[best].key;
     const uint32_t slot_bytes = slots_[best].ref.slot_size;
     const uint64_t payload_bytes = slots_[best].useful_bytes;
+    // A later failed write does not undo this successful invalidation. Keep
+    // recovery history unknown even if a real read refreshed its anchor.
+    if (history_unknown) {
+      ++scan.age.history_unknown;
+    } else {
+      const std::array<uint32_t, 7>& bounds = kLifetimeDonorAgeBoundsSec;
+      const size_t bucket = static_cast<size_t>(
+          std::lower_bound(bounds.begin(), bounds.end(), age_sec) -
+          bounds.begin());
+      ++scan.age.buckets[bucket];
+      scan.age.total_sec += age_sec;
+    }
     FreeSlotLocked(best);
     if (evicted != nullptr) evicted->push_back(victim);
     ++evictions_;

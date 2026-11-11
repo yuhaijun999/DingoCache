@@ -193,6 +193,8 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_scan_budget_exhausted = 0;
     uint64_t lifetime_class_no_candidate = 0;
     uint64_t lifetime_class_victims = 0;
+    // Successful foreground class ages; unknown recovery history is separate.
+    SlabAllocator::LifetimeDonorAgeStats lifetime_class_age{};
     uint64_t lifetime_class_freed_slot_bytes = 0;
     uint64_t lifetime_class_freed_payload_bytes = 0;
     uint64_t lifetime_background_scan_visits = 0;
@@ -201,6 +203,8 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_background_no_candidate = 0;
     // Successful background class victims only; excludes watermark/donor work.
     uint64_t lifetime_background_victims = 0;
+    // Successful background class ages, excluding foreground/donor/watermark.
+    SlabAllocator::LifetimeDonorAgeStats lifetime_background_age{};
     uint64_t lifetime_background_freed_slot_bytes = 0;
     uint64_t lifetime_background_freed_payload_bytes = 0;
     uint64_t lifetime_watermark_budget_exhausted = 0;
@@ -641,6 +645,7 @@ class DiskSlabStore : public StoreEngine {
   uint64_t lifetime_scan_budget_exhausted_ = 0;
   uint64_t lifetime_class_no_candidate_ = 0;
   uint64_t lifetime_class_victims_ = 0;
+  SlabAllocator::LifetimeDonorAgeStats lifetime_class_age_{};
   // Successful foreground class byte counters, guarded by mu_.
   uint64_t lifetime_class_freed_slot_bytes_ = 0;
   uint64_t lifetime_class_freed_payload_bytes_ = 0;
@@ -650,6 +655,7 @@ class DiskSlabStore : public StoreEngine {
   uint64_t lifetime_background_no_candidate_ = 0;
   // Successful background class counters, guarded by mu_.
   uint64_t lifetime_background_victims_ = 0;
+  SlabAllocator::LifetimeDonorAgeStats lifetime_background_age_{};
   uint64_t lifetime_background_freed_slot_bytes_ = 0;
   uint64_t lifetime_background_freed_payload_bytes_ = 0;
   uint64_t lifetime_watermark_budget_exhausted_ = 0;

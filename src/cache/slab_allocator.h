@@ -346,6 +346,7 @@ class SlabAllocator {
     uint64_t victims = 0;
     uint64_t freed_slot_bytes = 0;
     uint64_t freed_payload_bytes = 0;
+    LifetimeDonorAgeStats age{};  // Cumulative successful pre-wipe ages.
     uint64_t visit_limit = 0;
     uint64_t slice_limit = 0;
     uint64_t version = 0;
