@@ -1175,3 +1175,49 @@ also pay fixed object/possible frame costs even though they record no scores.
 Reset, score arithmetic, bin updates, Store/Group merges and text rendering have
 nonzero cost; these sizes are not full stack, RSS, recovery-peak or performance
 budget acceptance evidence.
+
+### Logical read-class observation foundation (not exported yet)
+
+The internal `ObserveLifetimeReadClasses` Store/allocator API observes retained,
+initialized lifetime states, including pinned and hidden deferred-Remove data.
+It is not a visible-payload or readability gauge. State-less hard-drain commits
+are excluded. The five estimates follow the existing business classes W/R/O1/
+O2/O3 (last means three or more actual reads), independently of scoring MAX_READS.
+Recovery's virtual reads remain logical W until a real accepted read, then O1;
+recovered residents never enter the NEW write-window class R.
+
+W is exact. R is an upper-bound estimate, and each outside-window O class can be
+underestimated until pending expiry settles. All five sum exactly to the retained
+initialized population in the same allocator snapshot. Exact R ends strictly
+after original `put_at + P`, not after the refreshed anchor. A separate fixed B
+ring rounds this deadline to quantum `Q = ceil(P / (B - 1))`, so extra expiry lag
+is at most Q-1 seconds even without another GET. Default P=180/B=24 gives Q=8 and
+maximum lag 7 seconds. This quantum is NOT protection bucket G (default 12 hours), a new
+user setting, or an acceptance threshold. The pure exact classifier is unchanged.
+
+The snapshot returns availability, sampled shared-clock offset, Q, lag bound and
+actual R-ring vector backing bytes. It takes one allocator lock, samples the
+shared clock once (advancing its monotonic floor), and visits at most B <= 64 pages;
+there is no resident enumeration or snapshot heap allocation. Hard exhaustion
+returns unavailable while retaining backing/resolution facts; numeric zero then
+is not an empty-cache observation. Disabled legacy/RAM/shadow paths allocate no
+R ring and read no clock through this observation API.
+
+Bookkeeping reuses accepted commit/read/final-release lifecycle points, adding
+plain count updates and bounded ring arithmetic but no per-resident fields,
+clocks, locks or atomics. Failed reads/invalidation and deferred visibility loss
+do not debit a still-retained resident. Rebuild reconstructs counts rather than
+persisting or replaying historical events. Fixed allocator layout and ring costs
+are nonzero, including fixed layout in disabled modes. The API's `ring_bytes`
+accounts for the new backing; older memory gauges remain partial and do not yet
+include this ring. Group/Prometheus export and that gauge wiring are the next
+increment, not delivered here; no existing dashboard/alert is switched to these
+estimates and no complete memory/performance budget is established.
+
+Measured GCC layout for this foundation: Allocator 1032 to 1104 bytes (+72,
+including Options 200 to 208); Store 2800, Stats 2080, state 12 and Scan 888 bytes
+remain unchanged. The observation value is 80 bytes. R-ring backing is 32 bytes
+per retained bucket (default 24 means 768 bytes, maximum 64 means 2048 bytes), once
+per enabled allocator, not per resident or extent. Disabled allocators still pay
+the fixed 72-byte layout increase. These are component sizes, not heap overhead,
+full stack usage, incremental RSS or recovery-peak acceptance measurements.

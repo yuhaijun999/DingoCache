@@ -89,6 +89,9 @@ class SlabAllocator {
     // Derived from validated config, never independent environment reads.
     uint64_t lifetime_bucket_sec = 0;
     uint32_t lifetime_bucket_count = 0;
+    // Internal logical-read ledger: validated P, or zero when disabled. Its
+    // separate expiry quantum is derived from P and B, not protection G.
+    uint64_t lifetime_read_window_sec = 0;
     // Borrowed immutable donor context. The owning Store must outlive this
     // allocator, as for can_reclaim. Both are null in legacy/RAM/shadow paths.
     const DiskLifetimeConfig* lifetime_donor_config = nullptr;
@@ -258,6 +261,22 @@ class SlabAllocator {
   // must be the owner's shared monotonic clock; sampling advances its floor.
   // Hard exhaustion keeps backing bytes but provides no usable estimate.
   LifetimeBucketObservation ObserveLifetimeBuckets(
+      const DiskLifetimeClock& clock) const;
+  struct LifetimeReadClassObservation {
+    // Indexed by DiskLifetimeReadClass. Initialized allocator-retained states,
+    // including hidden/pinned residents, not Store-visible payloads. W is
+    // exact; R may expire late by the bound below and each outside class is a
+    // lower bound until that expiry. All five sum to the tracked population.
+    std::array<uint64_t, 5> resident_estimates{};
+    uint64_t sampled_at_sec = 0;  // Shared clock offset; valid when available.
+    uint64_t expiry_quantum_sec = 0;    // R-only quantum, separate from G.
+    uint64_t expiry_lag_bound_sec = 0;  // At most quantum - 1 seconds.
+    uint64_t ring_bytes = 0;  // Actual retained R-ring element backing.
+    bool available = false;   // Disabled/hard clock has no usable estimates.
+  };
+  // O(B), one A lock and one shared-clock sample; no resident walk/allocation.
+  // Sampling advances the clock floor. Backing/resolution survive hard stop.
+  LifetimeReadClassObservation ObserveLifetimeReadClasses(
       const DiskLifetimeClock& clock) const;
   struct LifetimeQueueStat {
     uint32_t slot_size = 0;  // Zero denotes the global index, not a size class.
@@ -544,6 +563,8 @@ class SlabAllocator {
   void LinkBeforeGlobalHandLocked(uint32_t meta_index);
   void LinkResidentLocked(uint32_t meta_index);
   void FreeSlotLocked(uint32_t meta_index);
+  void AddLifetimeReadClassLocked(const DiskLifetimeState& state);
+  void RemoveLifetimeReadClassLocked(const DiskLifetimeState& state);
   void LinkLifetimeLocked(uint32_t meta_index);
   void UnlinkLifetimeLocked(uint32_t meta_index);
   LifetimeQueue& LifetimeQueueFor(uint32_t meta_index, size_t index,
@@ -619,6 +640,15 @@ class SlabAllocator {
   // One latest-generation aggregate per ring position across all extents.
   // Older delayed registrations must never replace a newer generation.
   std::vector<LifetimeBucket> lifetime_bucket_summary_;
+  struct LifetimeReadWindowBucket {
+    uint64_t generation = 0;
+    std::array<uint64_t, 3> reads{};  // Actual reads 1, 2 and saturated 3+.
+  };
+  // Fixed totals and bounded ring, guarded by A; no per-resident token. Window
+  // membership is recoverable from immutable put_at and the last read anchor.
+  std::array<uint64_t, 4> lifetime_actual_reads_{};
+  std::vector<LifetimeReadWindowBucket> lifetime_read_windows_;
+  uint64_t lifetime_read_quantum_sec_ = 0;
   uint32_t lifetime_next_band_ =
       0;  // Global watermark turn, including quiet ticks.
   // Enabled-only class mutation versions, including pin eligibility changes.

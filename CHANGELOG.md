@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Track allocator-retained logical read-class estimates with bounded NEW-window
+  expiry lag and an internal Store observation API. Keep scoring queues separate;
+  metric export remains a subsequent step.
+
 - Export successful foreground/background lifetime class scores as separate
   nonnegative and absolute-negative distributions. Reuse the existing final
   pre-wipe time and settle each call without cumulative floating subtraction.

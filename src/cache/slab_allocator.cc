@@ -160,6 +160,16 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
   assert(opt_.lifetime_bucket_count == 0 ||
          (opt_.track_lifetime_state && opt_.lifetime_bucket_sec > 0 &&
           opt_.lifetime_bucket_count <= 64));
+  assert(opt_.lifetime_read_window_sec == 0 ||
+         (opt_.track_lifetime_state && opt_.lifetime_bucket_count >= 2 &&
+          opt_.lifetime_read_window_sec <= INT32_MAX));
+  if (opt_.lifetime_read_window_sec != 0) {
+    const uint64_t intervals = opt_.lifetime_bucket_count - 1;
+    lifetime_read_quantum_sec_ =
+        opt_.lifetime_read_window_sec / intervals +
+        (opt_.lifetime_read_window_sec % intervals != 0);
+    lifetime_read_windows_.resize(opt_.lifetime_bucket_count);
+  }
   assert((opt_.lifetime_donor_config == nullptr) ==
          (opt_.lifetime_donor_clock == nullptr));
   assert(
@@ -344,7 +354,11 @@ void SlabAllocator::CommitResidentGeneration(
          !resident_lifetime_states_[*index].has_value());
   resident_generations_[*index] = generation;
   if (opt_.track_lifetime_state && lifetime_state != nullptr) {
+    assert(opt_.lifetime_read_window_sec == 0 ||
+           (config != nullptr &&
+            config->protect_sec == opt_.lifetime_read_window_sec));
     resident_lifetime_states_[*index] = *lifetime_state;
+    AddLifetimeReadClassLocked(*lifetime_state);
     if (lifetime_state->history_unknown) {
       Class& cls = classes_[slots_[*index].ref.cls];
       ++cls.recovered_residents;
@@ -377,12 +391,15 @@ SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
   std::optional<DiskLifetimeState>& resident_state =
       resident_lifetime_states_[*index];
   if (!resident_state.has_value()) return LifetimeReadResult::kStateUnavailable;
-  DiskLifetimeState next_state = *resident_state;
+  assert(opt_.lifetime_read_window_sec == 0 ||
+         config.protect_sec == opt_.lifetime_read_window_sec);
+  const DiskLifetimeState& previous = *resident_state;
+  DiskLifetimeState next_state = previous;
   if (!ApplyDiskLifetimeRead(config, applied_at, &next_state))
     return LifetimeReadResult::kStateUnavailable;
   // Virtual recovery reads never leave the unread population. Only the first
   // accepted real read does; rejected updates keep both population ledgers.
-  if (resident_state->history_unknown && resident_state->actual_reads == 0 &&
+  if (previous.history_unknown && previous.actual_reads == 0 &&
       next_state.actual_reads != 0) {
     Class& cls = classes_[slots_[*index].ref.cls];
     assert(cls.recovered_unread_residents != 0);
@@ -392,7 +409,9 @@ SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
   // the new state first so a rejected update leaves state and links untouched.
   UnregisterLifetimeBucketLocked(*index);
   UnlinkLifetimeLocked(*index);
+  RemoveLifetimeReadClassLocked(previous);
   resident_state = next_state;
+  AddLifetimeReadClassLocked(next_state);
   LinkLifetimeLocked(*index);
   RegisterLifetimeBucketLocked(*index, config, applied_at);
   return LifetimeReadResult::kApplied;
@@ -833,6 +852,50 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
   return true;
 }
 
+void SlabAllocator::AddLifetimeReadClassLocked(const DiskLifetimeState& state) {
+  if (opt_.lifetime_read_window_sec == 0) return;
+  const size_t reads = state.actual_reads;
+  assert(reads < lifetime_actual_reads_.size());
+  ++lifetime_actual_reads_[reads];
+  const uint64_t window_end =
+      static_cast<uint64_t>(state.put_at) + opt_.lifetime_read_window_sec;
+  // The last accepted read determines membership, not fw or current time.
+  // An exactly-P first read is R even though it earns no early-read bonus.
+  if (reads == 0 || state.history_unknown || state.anchor > window_end) return;
+  const uint64_t generation = window_end / lifetime_read_quantum_sec_ + 1;
+  LifetimeReadWindowBucket& bucket =
+      lifetime_read_windows_[(generation - 1) % lifetime_read_windows_.size()];
+  // Delayed old states can register an expired page, but must never replace a
+  // newer one. Do not skip merely because a deadline has already passed: later
+  // removal infers registration from the same immutable window and anchor.
+  if (bucket.generation > generation) return;
+  if (bucket.generation != generation) {
+    bucket.generation = generation;
+    bucket.reads.fill(0);
+  }
+  ++bucket.reads[reads - 1];
+}
+
+void SlabAllocator::RemoveLifetimeReadClassLocked(
+    const DiskLifetimeState& state) {
+  if (opt_.lifetime_read_window_sec == 0) return;
+  const size_t reads = state.actual_reads;
+  assert(reads < lifetime_actual_reads_.size());
+  assert(lifetime_actual_reads_[reads] != 0);
+  --lifetime_actual_reads_[reads];
+  const uint64_t window_end =
+      static_cast<uint64_t>(state.put_at) + opt_.lifetime_read_window_sec;
+  if (reads == 0 || state.history_unknown || state.anchor > window_end) return;
+  const uint64_t generation = window_end / lifetime_read_quantum_sec_ + 1;
+  LifetimeReadWindowBucket& bucket =
+      lifetime_read_windows_[(generation - 1) % lifetime_read_windows_.size()];
+  // An old retained resident cannot debit a page reused by newer writes.
+  if (bucket.generation == generation) {
+    assert(bucket.reads[reads - 1] != 0);
+    --bucket.reads[reads - 1];
+  }
+}
+
 void SlabAllocator::FreeSlotLocked(uint32_t index) {
   if (opt_.track_lifetime_state) {
     UnregisterLifetimeBucketLocked(index);
@@ -884,6 +947,7 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
   if (opt_.track_lifetime_state) {
     const std::optional<DiskLifetimeState>& state =
         resident_lifetime_states_[index];
+    if (state.has_value()) RemoveLifetimeReadClassLocked(*state);
     if (state.has_value() && state->history_unknown) {
       // Visibility loss and pending Remove do not release this resident.
       // All reclaim paths debit here only after persistence permits reuse.
@@ -2077,6 +2141,39 @@ SlabAllocator::LifetimeBucketObservation SlabAllocator::ObserveLifetimeBuckets(
     if (bucket.generation > current_page)
       observation.protected_estimate += bucket.count;
   }
+  return observation;
+}
+
+SlabAllocator::LifetimeReadClassObservation
+SlabAllocator::ObserveLifetimeReadClasses(
+    const DiskLifetimeClock& clock) const {
+  if (opt_.lifetime_read_window_sec == 0) return {};
+  const std::lock_guard<std::mutex> lock(mu_);
+  LifetimeReadClassObservation observation;
+  observation.ring_bytes =
+      lifetime_read_windows_.capacity() * sizeof(LifetimeReadWindowBucket);
+  observation.expiry_quantum_sec = lifetime_read_quantum_sec_;
+  observation.expiry_lag_bound_sec = lifetime_read_quantum_sec_ - 1;
+  uint32_t now = 0;
+  if (!clock.TryDrainNow(&now)) return observation;
+  observation.sampled_at_sec = now;
+  const uint64_t current_page = now / lifetime_read_quantum_sec_;
+  std::array<uint64_t, 3> within_window{};
+  for (const LifetimeReadWindowBucket& bucket : lifetime_read_windows_) {
+    if (bucket.generation <= current_page) continue;
+    for (size_t reads = 0; reads < within_window.size(); ++reads)
+      within_window[reads] += bucket.reads[reads];
+  }
+  observation.resident_estimates[0] = lifetime_actual_reads_[0];
+  // O1/O2/O3 occupy enum indexes 2/3/4; R at index 1 combines all real reads.
+  for (size_t reads = 1; reads < lifetime_actual_reads_.size(); ++reads) {
+    const uint64_t within = within_window[reads - 1];
+    assert(lifetime_actual_reads_[reads] >= within);
+    observation.resident_estimates[1] += within;
+    observation.resident_estimates[reads + 1] =
+        lifetime_actual_reads_[reads] - within;
+  }
+  observation.available = true;
   return observation;
 }
 

@@ -608,6 +608,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
     // opt_ owns these immutable inputs for the entire allocator lifetime.
     ao.lifetime_donor_config = &*opt_.lifetime_config;
     ao.lifetime_donor_clock = opt_.lifetime_clock.get();
+    ao.lifetime_read_window_sec = opt_.lifetime_config->protect_sec;
     ao.lifetime_bucket_sec = opt_.lifetime_config->bucket_sec;
     ao.lifetime_bucket_count =
         static_cast<uint32_t>(opt_.lifetime_config->bucket_count);
@@ -2930,6 +2931,12 @@ std::vector<SlabAllocator::LifetimeQueueStat>
 DiskSlabStore::LifetimeQueueStats() const {
   if (!alloc_) return {};
   return alloc_->LifetimeQueueStats();
+}
+
+SlabAllocator::LifetimeReadClassObservation
+DiskSlabStore::ObserveLifetimeReadClasses() const {
+  if (!alloc_ || !opt_.lifetime_clock) return {};
+  return alloc_->ObserveLifetimeReadClasses(*opt_.lifetime_clock);
 }
 
 SlabAllocator::LifetimeBucketObservation DiskSlabStore::ObserveLifetimeBuckets()
