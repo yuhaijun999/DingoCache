@@ -273,6 +273,8 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_donor_unscored_victims_total` | counter | Successfully released donor residents without valid lifetime scoring state. Restored residents with unknown history but valid virtual-read state are scored, not unscored. |
 | `dfkv_slab_lifetime_donor_age_seconds` / `dfkv_slab_disk_lifetime_donor_age_seconds` | histogram | Known-history resident ages `max(0, pre_wipe_now - anchor)` for successful lifetime cross-class donor releases only. NEW unread anchors are commit times, not last GET times. Fixed finite `le` bounds in seconds: 0, 1, 60, 3600, 86400 (1 day), 604800 (7 days), 2592000 (30 days), followed by `+Inf`. Export cumulative `_bucket`, known-age `_count` and integer-seconds `_sum`; aggregate disjoint bins and sums across disks, not per-disk quantiles. These are display bins, not acceptance thresholds. |
 | `dfkv_slab_lifetime_donor_age_history_unknown_total` / `dfkv_slab_disk_lifetime_donor_age_history_unknown_total` | counter | Successful donor releases with valid scoring state but unknown recovered history, including after real reads. Excluded from age histogram and sum: a recovery seed or subsequent anchor must not masquerade as known historical age. Missing state or zero generation uses existing `donor_unscored_victims_total`, not another count. In one allocator snapshot, histogram count + history unknown + unscored = donor released residents. |
+| `dfkv_slab_lifetime_donor_score_nonnegative_seconds` / `dfkv_slab_disk_lifetime_donor_score_nonnegative_seconds` | histogram | Successful lifetime donor victims with pre-wipe `DiskLifetimeScore >= 0`, in score seconds. Zero belongs only to this distribution. Cumulative `_bucket`, `_count` and nonnegative floating-point `_sum`; finite `le` bounds 0, 1, 60, 3600, 86400, 604800, 2592000, then `+Inf`. Fixed display bins, not acceptance thresholds. |
+| `dfkv_slab_lifetime_donor_score_negative_magnitude_seconds` / `dfkv_slab_disk_lifetime_donor_score_negative_magnitude_seconds` | histogram | Absolute magnitudes of strictly negative successful-donor scores, with the same bounds and exposition. Its zero bucket stays empty. Kept separate from nonnegative scores so cancellation cannot hide loss or make the combined signed `_sum` unsuitable for rate queries. |
 | `dfkv_slab_disk_lifetime_donor_protected_victims_total` / `dfkv_slab_disk_lifetime_donor_protected_payload_bytes_total` / `dfkv_slab_disk_lifetime_donor_unscored_victims_total` | counter | Per-disk protection/unscored values with existing `disk` / `disk_index` labels. Empty donors, failed invalidation and skipped pins add zero; counters reset on store reconstruction. Scoring is fused into the existing O(N) selected-resident release loop, with no extra traversal; this release work is separate from the 8192-resident selector budget, not a latency bound or performance result. |
 | `dfkv_slab_lifetime_init_clock_hard_exhausted_total` | counter | 内部评分路径的 NEW 或恢复住户因超过32位时钟硬界限而跳过评分初始化的次数；数据提交和身份仍有效，不是 PUT 失败或 I/O 错误。未初始化状态不可用于评分。未注入评分配置的 legacy 及仅注入 clock 的路径恒为0，file 不输出此 slab 指标；此计数不代表外部 lifetime 已开放 |
 | `dfkv_slab_lifetime_read_success_total` / `dfkv_slab_lifetime_read_applied_total` | counter | 内部评分路径收到的非零逻辑成功读通知数 / 已对原住户应用的通知数；不是物理 I/O 数，不含失败、零字节、Lookup/Exist。同步请求/Into及其RAM、copy follower和PULL已成立授权均按逻辑请求计数；PULL在有效READ注册与授权所有权建立后、READY编码前通知，准备/RELEASE不补计；不是READY发送成功或客户端消费证明 |
@@ -1076,3 +1078,35 @@ timer. Its static size is not a complete stack-frame or RSS budget. This is
 not zero overhead or completed lock/latency acceptance: D wait and full
 completed-to-applied instrumentation remain separate work. No new alert/query
 migration is needed; existing metric names and heat rules are unchanged.
+
+### Successful donor score distributions
+
+Score observations use the same final pre-wipe time and successful extent
+invalidation boundary as donor age/protection accounting. Score is calculated
+once and reused for the unchanged strict `score > KEEP` comparison. Sign,
+bucket and protection decisions remain integer arithmetic. These are **score
+seconds**, not guaranteed remaining wall-clock lifetime or time until eviction.
+Recovered residents with valid virtual-read state are included, even when their
+history is unknown and their ages are excluded from known-history age bins.
+Missing state or zero generation uses the existing unscored counter; in one
+allocator snapshot, nonnegative count + negative-magnitude count + unscored
+victims equals released donor residents. Unknown-age count is not an additional
+term in this score partition.
+
+Both score `_sum` values deliberately use plain floating-point accumulation.
+A valid huge-BASE configuration can produce INT64_MAX scores, so only three
+victims would overflow a uint64 sum. Floating sums remain nonnegative and
+approximate (integer unit precision is not promised above 2^53); Prometheus also
+represents samples as floating point. Group sums merge each sign independently,
+while bucket counts stay uint64. Do not subtract these sums to infer a signed
+policy benefit or average age, or combine per-disk quantiles. Existing age sums
+keep their integer representation and are not converted to floating point by
+the shared renderer.
+
+Global/per-disk labels and runtime-reset semantics match donor age. Failed
+invalidation, skipped pins/guards, empty donors, ordinary Remove, class reclaim,
+watermark and legacy eviction add no score observations; file omits the
+families. No new key/request labels, clocks, locks, atomics, resident fields,
+maps or hooks. There is new fixed accounting state and bounded release-loop
+work, not zero cost or full RSS/performance-budget acceptance. Other eviction
+paths' score distributions and the rest of O5 remain pending.

@@ -175,8 +175,20 @@ class SlabAllocator {
     // Recovery origin remains unknown even after subsequent real reads.
     uint64_t history_unknown = 0;
   };
+  static constexpr std::array<uint32_t, 7> kLifetimeDonorScoreBoundsSec = {
+      0, 1, 60, 3600, 86400, 604800, 2592000};
+  struct LifetimeDonorScoreStats {
+    // Noncumulative score counts, split by sign; final bins are unbounded.
+    // Zero belongs only to nonnegative_buckets, never negative magnitude.
+    std::array<uint64_t, 8> nonnegative_buckets{};
+    std::array<uint64_t, 8> negative_magnitude_buckets{};
+    // Approximate nonnegative sums: valid large scores can overflow uint64_t.
+    double nonnegative_total_sec = 0;
+    double negative_magnitude_total_sec = 0;
+  };
   struct LifetimeDonorStats {
     LifetimeDonorAgeStats age{};
+    LifetimeDonorScoreStats score{};
     uint64_t coarse_extents = 0;
     uint64_t precise_extents = 0;
     uint64_t precise_residents = 0;

@@ -1354,10 +1354,29 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
           ++age.buckets[bucket];
           age.total_sec += age_sec;
         }
-        if (DiskLifetimeScore(config, state->anchor, state->scoring_reads(),
-                              state->first_early_read(), state->write_armed(),
-                              lifetime_now) >
-            static_cast<int64_t>(config.keep_score_sec)) {
+        const int64_t score = DiskLifetimeScore(
+            config, state->anchor, state->scoring_reads(),
+            state->first_early_read(), state->write_armed(), lifetime_now);
+        // Keep sign decisions integer. Unsigned subtraction is also safe for
+        // INT64_MIN; signed negation would overflow in that defensive case.
+        const bool nonnegative = score >= 0;
+        const uint64_t magnitude =
+            nonnegative ? static_cast<uint64_t>(score)
+                        : uint64_t{0} - static_cast<uint64_t>(score);
+        const std::array<uint32_t, 7>& bounds = kLifetimeDonorScoreBoundsSec;
+        const size_t bucket = static_cast<size_t>(
+            std::lower_bound(bounds.begin(), bounds.end(), magnitude) -
+            bounds.begin());
+        LifetimeDonorScoreStats& observation = lifetime_donor_stats_.score;
+        if (nonnegative) {
+          ++observation.nonnegative_buckets[bucket];
+          observation.nonnegative_total_sec += static_cast<double>(magnitude);
+        } else {
+          ++observation.negative_magnitude_buckets[bucket];
+          observation.negative_magnitude_total_sec +=
+              static_cast<double>(magnitude);
+        }
+        if (score > static_cast<int64_t>(config.keep_score_sec)) {
           ++lifetime_donor_stats_.protected_victims;
           lifetime_donor_stats_.protected_payload_bytes +=
               slots_[index].useful_bytes;

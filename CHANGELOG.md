@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export successful lifetime donor scores as separate nonnegative and absolute
+  negative distributions. Reuse the existing pre-wipe score and use floating
+  sums to avoid large legal scores overflowing integer histogram totals.
+
 - Export successful lifetime donor eviction ages using the existing pre-wipe
   timestamp. Separate unknown recovered history and failed invalidation from
   known-age samples without changing eviction selection or release rules.

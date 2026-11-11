@@ -223,6 +223,8 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_donor_unscored_victims = 0;
     // Known-history pre-wipe ages; recovered history stays separate.
     SlabAllocator::LifetimeDonorAgeStats lifetime_donor_age{};
+    // Signed score distributions; sums are approximate floating-point values.
+    SlabAllocator::LifetimeDonorScoreStats lifetime_donor_score{};
     uint64_t lifetime_bucket_entries = 0;
     uint64_t lifetime_bucket_bytes = 0;
     uint64_t lifetime_bucket_token_bytes = 0;

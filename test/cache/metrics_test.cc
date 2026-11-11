@@ -978,6 +978,208 @@ TEST(Metrics, DonorAgeTracksKnownHistoryAndExcludesRecoveredHistory) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, DonorScoreSeparatesSignsAndIncludesRecoveredScoringState) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "1048576");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_donor_score";
+  fs::remove_all(dir);
+  std::atomic<uint64_t> seconds{0};
+  const DiskLifetimeConfig config = BucketMetricConfig();
+  std::string error;
+  ASSERT_TRUE(ValidateDiskLifetimeConfig(config, &error)) << error;
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 2ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  options.lifetime_config = config;
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config), [&seconds] { return seconds.load(); });
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  server->set_identity("score-node", "score-group");
+  const std::string identity = R"(node="score-node",group="score-group")";
+  // These literal bounds and integer fixture scores independently constrain
+  // the recorder and renderer. Production sums intentionally use doubles.
+  const std::array<const char*, 8> bounds = {
+      "0", "1", "60", "3600", "86400", "604800", "2592000", "+Inf"};
+  using DiskBuckets = std::array<std::array<uint64_t, 8>, 2>;
+  const auto expect_scores = [&](const DiskBuckets& nonnegative,
+                                 const DiskBuckets& negative,
+                                 const std::array<double, 2>& nonnegative_sums,
+                                 const std::array<double, 2>& negative_sums) {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+    const std::string text = server->MetricsText();
+    const std::array<DiskSlabStore::Stats, 2> disks = {group.DiskSlabStats(0),
+                                                       group.DiskSlabStats(1)};
+    const DiskSlabStore::Stats total = group.SlabStats();
+    std::array<uint64_t, 2> released{};
+    for (unsigned sign = 0; sign < 2; ++sign) {
+      const DiskBuckets& expected = sign == 0 ? nonnegative : negative;
+      const std::array<double, 2>& sums =
+          sign == 0 ? nonnegative_sums : negative_sums;
+      const std::string suffix =
+          sign == 0 ? "nonnegative_seconds" : "negative_magnitude_seconds";
+      const std::string name = "dfkv_slab_lifetime_donor_score_" + suffix;
+      const std::string disk_name =
+          "dfkv_slab_disk_lifetime_donor_score_" + suffix;
+      EXPECT_NE(text.find("# TYPE " + name + " histogram\n"),
+                std::string::npos);
+      EXPECT_NE(text.find("# TYPE " + disk_name + " histogram\n"),
+                std::string::npos);
+      const std::array<uint64_t, 8>& total_buckets =
+          sign == 0 ? total.lifetime_donor_score.nonnegative_buckets
+                    : total.lifetime_donor_score.negative_magnitude_buckets;
+      uint64_t global_count = 0;
+      std::array<uint64_t, 2> counts{};
+      for (size_t bucket = 0; bucket < bounds.size(); ++bucket) {
+        for (size_t disk = 0; disk < disks.size(); ++disk) {
+          const std::array<uint64_t, 8>& actual =
+              sign == 0
+                  ? disks[disk].lifetime_donor_score.nonnegative_buckets
+                  : disks[disk].lifetime_donor_score.negative_magnitude_buckets;
+          EXPECT_EQ(actual[bucket], expected[disk][bucket]);
+          counts[disk] += expected[disk][bucket];
+          global_count += expected[disk][bucket];
+          const std::string labels = "{disk=\"" + options.cache_dirs[disk] +
+                                     "\",disk_index=\"" + std::to_string(disk) +
+                                     "\",le=\"" + bounds[bucket] + "\"," +
+                                     identity + "} ";
+          EXPECT_NE(text.find("\n" + disk_name + "_bucket" + labels +
+                              std::to_string(counts[disk]) + "\n"),
+                    std::string::npos);
+        }
+        EXPECT_EQ(total_buckets[bucket],
+                  expected[0][bucket] + expected[1][bucket]);
+        EXPECT_NE(
+            text.find("\n" + name + "_bucket{le=\"" + bounds[bucket] + "\"," +
+                      identity + "} " + std::to_string(global_count) + "\n"),
+            std::string::npos);
+      }
+      for (size_t disk = 0; disk < disks.size(); ++disk) {
+        const double actual_sum =
+            sign == 0
+                ? disks[disk].lifetime_donor_score.nonnegative_total_sec
+                : disks[disk].lifetime_donor_score.negative_magnitude_total_sec;
+        EXPECT_DOUBLE_EQ(actual_sum, sums[disk]);
+        released[disk] += counts[disk];
+        const std::string labels = "{disk=\"" + options.cache_dirs[disk] +
+                                   "\",disk_index=\"" + std::to_string(disk) +
+                                   "\"," + identity + "} ";
+        EXPECT_NE(text.find("\n" + disk_name + "_count" + labels +
+                            std::to_string(counts[disk]) + "\n"),
+                  std::string::npos);
+        EXPECT_NE(text.find("\n" + disk_name + "_sum" + labels +
+                            std::to_string(sums[disk]) + "\n"),
+                  std::string::npos);
+      }
+      const double total_sum =
+          sign == 0 ? total.lifetime_donor_score.nonnegative_total_sec
+                    : total.lifetime_donor_score.negative_magnitude_total_sec;
+      EXPECT_DOUBLE_EQ(total_sum, sums[0] + sums[1]);
+      EXPECT_NE(text.find("\n" + name + "_count{" + identity + "} " +
+                          std::to_string(global_count) + "\n"),
+                std::string::npos);
+      EXPECT_NE(text.find("\n" + name + "_sum{" + identity + "} " +
+                          std::to_string(sums[0] + sums[1]) + "\n"),
+                std::string::npos);
+    }
+    for (size_t disk = 0; disk < disks.size(); ++disk) {
+      EXPECT_EQ(released[disk] + disks[disk].lifetime_donor_unscored_victims,
+                disks[disk].lifetime_donor_released_residents);
+    }
+  };
+  const DiskBuckets empty{};
+  ASSERT_NO_FATAL_FAILURE(expect_scores(empty, empty, {0, 0}, {0, 0}));
+  const std::string incoming(1048577, 'n');
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+        KvNodeServerTestPeer::Group(*server), disk);
+    for (uint64_t key = 1; key <= disk + 1; ++key) {
+      ASSERT_EQ(store.Cache({key, 0}, "old", 3), Status::kOk);
+    }
+    seconds.store(disk == 0 ? 165 : 329);
+    ASSERT_EQ(store.Cache({10, 0}, "new", 3), Status::kOk);
+    seconds.store(disk == 0 ? 166 : 333);
+    ASSERT_EQ(store.Cache({100, 0}, incoming.data(), incoming.size()),
+              Status::kOk);
+    EXPECT_EQ(store.Count(), 1U);
+  }
+  // The real victims score (+220,-60) on disk0 and (+219,-61,-61) on disk1.
+  // Armed writes age by elapsed-P+floor(P/SLOW), so ages166/167 charge160/161.
+  // Independent signs must not cancel; the negative magnitudes straddle 60.
+  const DiskBuckets positive = {
+      {{0, 0, 0, 1, 0, 0, 0, 0}, {0, 0, 0, 1, 0, 0, 0, 0}}};
+  const DiskBuckets negative = {
+      {{0, 0, 1, 0, 0, 0, 0, 0}, {0, 0, 0, 2, 0, 0, 0, 0}}};
+  ASSERT_NO_FATAL_FAILURE(
+      expect_scores(positive, negative, {220, 219}, {60, 122}));
+  server.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  server->set_identity("score-node", "score-group");
+  ASSERT_NO_FATAL_FAILURE(expect_scores(empty, empty, {0, 0}, {0, 0}));
+  DiskSlabStore& read_store =
+      DiskCacheGroupTestPeer::Slab(KvNodeServerTestPeer::Group(*server), 1);
+  std::string recovered;
+  DiskResidentIdentity read_identity;
+  ASSERT_EQ(
+      read_store.RangeWithIdentity({100, 0}, 0, 0, &recovered, &read_identity),
+      Status::kOk);
+  ASSERT_EQ(recovered, incoming);
+  read_store.NotifyLifetimeReadSuccess(
+      {100, 0}, read_identity, recovered.size(),
+      DiskSlabStore::LifetimeReadSource::kDisk);
+  ASSERT_EQ(read_store.GetStats().lifetime_reads.applied, 1U);
+  seconds.store(334);
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+        KvNodeServerTestPeer::Group(*server), disk);
+    ASSERT_EQ(store.Cache({200, 0}, "new", 3), Status::kOk);
+    EXPECT_FALSE(store.IsCached({100, 0}));
+    EXPECT_EQ(store.GetStats().lifetime_donor_age.history_unknown, 1U);
+  }
+  // Unknown recovery history excludes age, NOT score. The unread seed scores
+  // 120-334=-214, while the real read refreshed disk1 to score 120-1=119.
+  const DiskBuckets recovered_positive = {
+      {{0, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 1, 0, 0, 0, 0}}};
+  const DiskBuckets recovered_negative = {
+      {{0, 0, 0, 1, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}}};
+  ASSERT_NO_FATAL_FAILURE(expect_scores(recovered_positive, recovered_negative,
+                                        {0, 119}, {214, 0}));
+  server.reset();
+  options.eviction_policy = "legacy";
+  options.lifetime_clock.reset();
+  options.lifetime_config.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  server->set_identity("score-node", "score-group");
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+        KvNodeServerTestPeer::Group(*server), disk);
+    ASSERT_EQ(store.Cache({300, 0}, incoming.data(), incoming.size()),
+              Status::kOk);
+    EXPECT_FALSE(store.IsCached({200, 0}));
+  }
+  ASSERT_NO_FATAL_FAILURE(expect_scores(empty, empty, {0, 0}, {0, 0}));
+  server.reset();
+  options.engine = "file";
+  options.cache_dirs = {(dir / "file").string()};
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  const std::string file_text = server->MetricsText();
+  EXPECT_EQ(file_text.find("dfkv_slab_lifetime_donor_score_"),
+            std::string::npos);
+  EXPECT_EQ(file_text.find("dfkv_slab_disk_lifetime_donor_score_"),
+            std::string::npos);
+  server.reset();
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, AllocatorGaugesDistinguishPinnedRemovalFromSlotSlack) {
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
   const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");

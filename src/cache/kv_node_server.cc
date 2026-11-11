@@ -606,28 +606,37 @@ std::string KvNodeServer::MetricsText() const {
            "Retained residents by lifetime scoring index and band");
     header("dfkv_slab_disk_lifetime_queue_residents", "gauge",
            "Retained residents by disk lifetime scoring index and band");
-    const auto donor_age_histogram =
-        [&](const std::string& name,
-            const SlabAllocator::LifetimeDonorAgeStats& age,
+    // Preformatted sums retain exact age integers while score sums use double.
+    const auto donor_histogram =
+        [&](const std::string& name, const std::array<uint64_t, 8>& buckets,
+            const std::string& sum_text, const std::array<uint32_t, 7>& bounds,
             const std::string& labels) {
           uint64_t count = 0;
-          for (size_t bucket = 0; bucket < age.buckets.size(); ++bucket) {
-            count += age.buckets[bucket];
-            const std::string upper =
-                bucket < SlabAllocator::kLifetimeDonorAgeBoundsSec.size()
-                    ? std::to_string(
-                          SlabAllocator::kLifetimeDonorAgeBoundsSec[bucket])
-                    : "+Inf";
+          for (size_t bucket = 0; bucket < buckets.size(); ++bucket) {
+            count += buckets[bucket];
+            const std::string upper = bucket < bounds.size()
+                                          ? std::to_string(bounds[bucket])
+                                          : "+Inf";
             s += name + "_bucket" +
                  braces(labels + (labels.empty() ? "" : ",") + "le=\"" + upper +
                         "\"") +
                  " " + std::to_string(count) + "\n";
           }
-          s += name + "_sum" + braces(labels) + " " +
-               std::to_string(age.total_sec) + "\n";
+          s += name + "_sum" + braces(labels) + " " + sum_text + "\n";
           s += name + "_count" + braces(labels) + " " + std::to_string(count) +
                "\n";
         };
+    header("dfkv_slab_disk_lifetime_donor_score_nonnegative_seconds",
+           "histogram",
+           "Nonnegative scores of successful donor releases at pre-wipe time");
+    header("dfkv_slab_lifetime_donor_score_nonnegative_seconds", "histogram",
+           "Nonnegative scores of successful donor releases at pre-wipe time");
+    header("dfkv_slab_disk_lifetime_donor_score_negative_magnitude_seconds",
+           "histogram",
+           "Absolute negative scores of successful donor releases");
+    header("dfkv_slab_lifetime_donor_score_negative_magnitude_seconds",
+           "histogram",
+           "Absolute negative scores of successful donor releases");
     header("dfkv_slab_disk_lifetime_donor_age_seconds", "histogram",
            "Successful donor pre-wipe ages since anchor with known history");
     header("dfkv_slab_lifetime_donor_age_seconds", "histogram",
@@ -986,8 +995,21 @@ std::string KvNodeServer::MetricsText() const {
              disk.lifetime_donor_protected_payload_bytes);
       sample("dfkv_slab_disk_lifetime_donor_unscored_victims_total",
              disk.lifetime_donor_unscored_victims);
-      donor_age_histogram("dfkv_slab_disk_lifetime_donor_age_seconds",
-                          disk.lifetime_donor_age, labels);
+      donor_histogram("dfkv_slab_disk_lifetime_donor_age_seconds",
+                      disk.lifetime_donor_age.buckets,
+                      std::to_string(disk.lifetime_donor_age.total_sec),
+                      SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
+      donor_histogram(
+          "dfkv_slab_disk_lifetime_donor_score_nonnegative_seconds",
+          disk.lifetime_donor_score.nonnegative_buckets,
+          std::to_string(disk.lifetime_donor_score.nonnegative_total_sec),
+          SlabAllocator::kLifetimeDonorScoreBoundsSec, labels);
+      donor_histogram(
+          "dfkv_slab_disk_lifetime_donor_score_negative_magnitude_seconds",
+          disk.lifetime_donor_score.negative_magnitude_buckets,
+          std::to_string(
+              disk.lifetime_donor_score.negative_magnitude_total_sec),
+          SlabAllocator::kLifetimeDonorScoreBoundsSec, labels);
       sample("dfkv_slab_disk_lifetime_donor_age_history_unknown_total",
              disk.lifetime_donor_age.history_unknown);
       sample("dfkv_slab_disk_lifetime_donor_released_residents_total",
@@ -1217,8 +1239,20 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_donor_unscored_victims_total", "counter",
            "Released donor residents without valid lifetime scoring state",
            ss.lifetime_donor_unscored_victims);
-    donor_age_histogram("dfkv_slab_lifetime_donor_age_seconds",
-                        ss.lifetime_donor_age, "");
+    donor_histogram("dfkv_slab_lifetime_donor_age_seconds",
+                    ss.lifetime_donor_age.buckets,
+                    std::to_string(ss.lifetime_donor_age.total_sec),
+                    SlabAllocator::kLifetimeDonorAgeBoundsSec, "");
+    donor_histogram(
+        "dfkv_slab_lifetime_donor_score_nonnegative_seconds",
+        ss.lifetime_donor_score.nonnegative_buckets,
+        std::to_string(ss.lifetime_donor_score.nonnegative_total_sec),
+        SlabAllocator::kLifetimeDonorScoreBoundsSec, "");
+    donor_histogram(
+        "dfkv_slab_lifetime_donor_score_negative_magnitude_seconds",
+        ss.lifetime_donor_score.negative_magnitude_buckets,
+        std::to_string(ss.lifetime_donor_score.negative_magnitude_total_sec),
+        SlabAllocator::kLifetimeDonorScoreBoundsSec, "");
     metric("dfkv_slab_lifetime_donor_age_history_unknown_total", "counter",
            "Successful donor releases with unknown recovered history",
            ss.lifetime_donor_age.history_unknown);
