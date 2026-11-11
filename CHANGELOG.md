@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export successful lifetime donor eviction ages using the existing pre-wipe
+  timestamp. Separate unknown recovered history and failed invalidation from
+  known-age samples without changing eviction selection or release rules.
+
 - Export commit-map-visible recovered and unread populations separately from
   allocator-retained residents. Account for deferred Remove and failed
   invalidation without changing heat, visibility or physical release rules.

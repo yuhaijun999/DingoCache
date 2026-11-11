@@ -606,6 +606,34 @@ std::string KvNodeServer::MetricsText() const {
            "Retained residents by lifetime scoring index and band");
     header("dfkv_slab_disk_lifetime_queue_residents", "gauge",
            "Retained residents by disk lifetime scoring index and band");
+    const auto donor_age_histogram =
+        [&](const std::string& name,
+            const SlabAllocator::LifetimeDonorAgeStats& age,
+            const std::string& labels) {
+          uint64_t count = 0;
+          for (size_t bucket = 0; bucket < age.buckets.size(); ++bucket) {
+            count += age.buckets[bucket];
+            const std::string upper =
+                bucket < SlabAllocator::kLifetimeDonorAgeBoundsSec.size()
+                    ? std::to_string(
+                          SlabAllocator::kLifetimeDonorAgeBoundsSec[bucket])
+                    : "+Inf";
+            s += name + "_bucket" +
+                 braces(labels + (labels.empty() ? "" : ",") + "le=\"" + upper +
+                        "\"") +
+                 " " + std::to_string(count) + "\n";
+          }
+          s += name + "_sum" + braces(labels) + " " +
+               std::to_string(age.total_sec) + "\n";
+          s += name + "_count" + braces(labels) + " " + std::to_string(count) +
+               "\n";
+        };
+    header("dfkv_slab_disk_lifetime_donor_age_seconds", "histogram",
+           "Successful donor pre-wipe ages since anchor with known history");
+    header("dfkv_slab_lifetime_donor_age_seconds", "histogram",
+           "Successful donor pre-wipe ages since anchor with known history");
+    header("dfkv_slab_disk_lifetime_donor_age_history_unknown_total", "counter",
+           "Successful donor releases with unknown recovered history");
     header("dfkv_slab_disk_run_epoch", "gauge", "Dirty run epoch for this store instance");
     header("dfkv_slab_disk_capacity_bytes", "gauge", "Physical capacity for this store");
     header("dfkv_slab_disk_watermark_high_bytes", "gauge", "Resolved strict high threshold");
@@ -958,6 +986,10 @@ std::string KvNodeServer::MetricsText() const {
              disk.lifetime_donor_protected_payload_bytes);
       sample("dfkv_slab_disk_lifetime_donor_unscored_victims_total",
              disk.lifetime_donor_unscored_victims);
+      donor_age_histogram("dfkv_slab_disk_lifetime_donor_age_seconds",
+                          disk.lifetime_donor_age, labels);
+      sample("dfkv_slab_disk_lifetime_donor_age_history_unknown_total",
+             disk.lifetime_donor_age.history_unknown);
       sample("dfkv_slab_disk_lifetime_donor_released_residents_total",
              disk.lifetime_donor_released_residents);
       sample("dfkv_slab_disk_lifetime_donor_freed_slot_bytes_total",
@@ -1185,6 +1217,11 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_donor_unscored_victims_total", "counter",
            "Released donor residents without valid lifetime scoring state",
            ss.lifetime_donor_unscored_victims);
+    donor_age_histogram("dfkv_slab_lifetime_donor_age_seconds",
+                        ss.lifetime_donor_age, "");
+    metric("dfkv_slab_lifetime_donor_age_history_unknown_total", "counter",
+           "Successful donor releases with unknown recovered history",
+           ss.lifetime_donor_age.history_unknown);
     metric("dfkv_slab_lifetime_background_no_candidate_total", "counter",
            "Background class scans with no eligible candidate",
            ss.lifetime_background_no_candidate);

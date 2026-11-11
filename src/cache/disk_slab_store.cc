@@ -3086,6 +3086,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
     st.lifetime_donor_protected_victims = donor.protected_victims;
     st.lifetime_donor_protected_payload_bytes = donor.protected_payload_bytes;
     st.lifetime_donor_unscored_victims = donor.unscored_victims;
+    st.lifetime_donor_age = donor.age;
     st.steals = alloc_->Steals();
     st.cold_steals = alloc_->ColdSteals();
     st.watermark_evictions = alloc_->WatermarkEvictions();

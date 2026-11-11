@@ -2,6 +2,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -110,6 +111,162 @@ void Restore(SlabAllocator& allocator,
 void ExpectValid(const SlabAllocator& allocator) {
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeBucketsValid(allocator));
+  const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+  uint64_t known = 0;
+  for (const uint64_t count : stats.age.buckets) known += count;
+  EXPECT_EQ(known + stats.age.history_unknown + stats.unscored_victims,
+            stats.released_residents);
+}
+
+TEST(SlabLifetimeDonor, AgeBinsUsePreWipeTime) {
+  struct Case {
+    uint32_t age;
+    size_t bucket;
+  };
+  const std::array<Case, 13> cases = {{{0, 0},
+                                       {1, 1},
+                                       {2, 2},
+                                       {60, 2},
+                                       {61, 3},
+                                       {3600, 3},
+                                       {3601, 4},
+                                       {86400, 4},
+                                       {86401, 5},
+                                       {604800, 5},
+                                       {604801, 6},
+                                       {2592000, 6},
+                                       {2592001, 7}}};
+  for (const Case& test : cases) {
+    SCOPED_TRACE(test.age);
+    const DiskLifetimeConfig config = Config();
+    uint64_t seconds = 0;
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                  [&] { return seconds; });
+    SlabAllocator::Options options = Options(config, clock, 4, 1);
+    unsigned wipes = 0;
+    options.on_extent_bind = [&](uint32_t) {
+      ++wipes;
+      seconds += 100;  // Persistence time must not change the age snapshot.
+      return true;
+    };
+    SlabAllocator allocator(options);
+    ASSERT_TRUE(allocator.RestoreBulk({{Key(1), 4096, 0, 0, 1}}));
+    const DiskLifetimeState state = NewDiskLifetimeState(0);
+    SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(1), 1, &state,
+                                            &config, 0);
+    seconds = test.age;
+    std::vector<BlockKey> evicted;
+    ASSERT_EQ(SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted),
+              Result::kBound);
+    ASSERT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+    EXPECT_EQ(wipes, 1U);
+    const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+    for (size_t bucket = 0; bucket < 8; ++bucket) {
+      EXPECT_EQ(stats.age.buckets[bucket], bucket == test.bucket ? 1U : 0U);
+    }
+    EXPECT_EQ(stats.age.total_sec, test.age);
+    EXPECT_EQ(stats.age.history_unknown, 0U);
+    EXPECT_EQ(stats.unscored_victims, 0U);
+    ExpectValid(allocator);
+  }
+}
+
+TEST(SlabLifetimeDonor, AgeUsesRecheckedPreWipeTime) {
+  const DiskLifetimeConfig config = Config();
+  uint64_t seconds = 0;
+  bool advance = false;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&] {
+    const uint64_t sampled = seconds;
+    if (advance) seconds = 20;
+    return sampled;
+  });
+  SlabAllocator::Options options = Options(config, clock, 4, 1);
+  options.on_extent_bind = [&](uint32_t) {
+    seconds = 1000;
+    return true;
+  };
+  SlabAllocator allocator(options);
+  ASSERT_TRUE(allocator.RestoreBulk({{Key(1), 4096, 0, 0, 1}}));
+  const DiskLifetimeState state = NewDiskLifetimeState(0);
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(1), 1, &state,
+                                          &config, 0);
+  seconds = 19;
+  advance = true;  // Selection sees 19; the final pre-wipe recheck sees 20.
+  std::vector<BlockKey> evicted;
+  ASSERT_EQ(SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted),
+            Result::kBound);
+  const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+  EXPECT_EQ(stats.age.buckets[2], 1U);
+  EXPECT_EQ(stats.age.total_sec, 20U);
+  EXPECT_EQ(stats.age.history_unknown, 0U);
+  EXPECT_EQ(stats.unscored_victims, 0U);
+  ExpectValid(allocator);
+}
+
+TEST(SlabLifetimeDonor, AgeSaturatesFutureAnchorAtZero) {
+  const DiskLifetimeConfig config = Config();
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&] { return seconds; });
+  SlabAllocator allocator(Options(config, clock, 4, 1));
+  ASSERT_TRUE(allocator.RestoreBulk({{Key(1), 4096, 0, 0, 1}}));
+  const DiskLifetimeState state = NewDiskLifetimeState(20);
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(1), 1, &state,
+                                          &config, 20);
+  seconds = 10;  // Defensive state injection; a normal clock never regresses.
+  std::vector<BlockKey> evicted;
+  ASSERT_EQ(SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted),
+            Result::kBound);
+  const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+  EXPECT_EQ(stats.age.buckets[0], 1U);
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 0U);
+  EXPECT_EQ(stats.unscored_victims, 0U);
+  ExpectValid(allocator);
+}
+
+TEST(SlabLifetimeDonor, AgeSeparatesUnknownAndUninitializedHistory) {
+  const DiskLifetimeConfig config = Config();
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&] { return seconds; });
+  SlabAllocator allocator(Options(config, clock, 8, 1));
+  ASSERT_TRUE(allocator.RestoreBulk({{Key(1), 4096, 0, 0, 1},
+                                     {Key(2), 4096, 0, 1, 1},
+                                     {Key(3), 4096, 0, 2, 1},
+                                     {Key(4), 4096, 0, 3, 1},
+                                     {Key(5), 4096, 0, 4, 1}}));
+  const DiskLifetimeState known = NewDiskLifetimeState(0);
+  const DiskLifetimeState recovered = RecoveredDiskLifetimeState(2);
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(1), 1, &known,
+                                          &config, 0);
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(2), 2, &recovered,
+                                          &config, 0);
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(3), 3, &recovered,
+                                          &config, 0);
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(4), 4);
+  // Key(5) deliberately has neither a committed generation nor a heat state.
+  seconds = 40;
+  ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, Key(1), 1,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, Key(3), 3,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  seconds = 100;
+  std::vector<BlockKey> evicted;
+  ASSERT_EQ(SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted),
+            Result::kBound);
+  EXPECT_EQ(evicted.size(), 5U);
+  const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+  for (size_t bucket = 0; bucket < 8; ++bucket) {
+    EXPECT_EQ(stats.age.buckets[bucket], bucket == 2 ? 1U : 0U);
+  }
+  EXPECT_EQ(stats.age.total_sec, 60U);
+  EXPECT_EQ(stats.age.history_unknown, 2U);
+  EXPECT_EQ(stats.unscored_victims, 2U);
+  EXPECT_EQ(stats.released_residents, 5U);
+  ExpectValid(allocator);
 }
 
 TEST(SlabLifetimeDonor, FullPoolFindsTheOnlyLegalExtentAfter64) {
@@ -480,6 +637,9 @@ TEST(SlabLifetimeDonor,
   EXPECT_EQ(stats.protected_victims, 0U);
   EXPECT_EQ(stats.protected_payload_bytes, 0U);
   EXPECT_EQ(stats.unscored_victims, 0U);
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 0U);
   ExpectValid(allocator);
 }
 
@@ -571,6 +731,11 @@ TEST(SlabLifetimeDonor, GuardAndHardClockStopBeforeAnyPersistence) {
             Result::kReclaimDenied);
   EXPECT_EQ(attempts, 0U);
   EXPECT_TRUE(allocator.Contains(Key(1)));
+  const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  EXPECT_EQ(stats.age.history_unknown, 0U);
+  ExpectValid(allocator);
 }
 
 class Gate {
@@ -619,10 +784,12 @@ TEST(SlabLifetimeDonor, PinAndPutCannotOvertakeSelectedPersistence) {
               config, 0));
   std::atomic<bool> pin_started{false};
   std::atomic<bool> put_started{false};
+  std::atomic<bool> snapshot_started{false};
   std::vector<BlockKey> evicted;
   std::future<Result> steal;
   std::future<bool> pin;
   std::future<bool> put;
+  std::future<SlabAllocator::LifetimeDonorStats> snapshot;
   const OpenOnExit release{gate};
   steal = std::async(std::launch::async, [&] {
     return SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted);
@@ -638,13 +805,21 @@ TEST(SlabLifetimeDonor, PinAndPutCannotOvertakeSelectedPersistence) {
     std::vector<BlockKey> removed;
     return allocator.Put(Key(3), 1, &ref, &removed);
   });
+  snapshot = std::async(std::launch::async, [&] {
+    snapshot_started.store(true);
+    return allocator.DonorStats();
+  });
   const std::chrono::steady_clock::time_point until =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while ((!pin_started.load() || !put_started.load()) &&
+  while ((!pin_started.load() || !put_started.load() ||
+          !snapshot_started.load()) &&
          std::chrono::steady_clock::now() < until)
     std::this_thread::yield();
   ASSERT_TRUE(pin_started.load());
   ASSERT_TRUE(put_started.load());
+  ASSERT_TRUE(snapshot_started.load());
+  EXPECT_EQ(snapshot.wait_for(std::chrono::milliseconds(20)),
+            std::future_status::timeout);
   EXPECT_EQ(pin.wait_for(std::chrono::milliseconds(20)),
             std::future_status::timeout);
   EXPECT_EQ(put.wait_for(std::chrono::milliseconds(20)),
@@ -656,6 +831,13 @@ TEST(SlabLifetimeDonor, PinAndPutCannotOvertakeSelectedPersistence) {
   EXPECT_FALSE(pin.get());
   ASSERT_EQ(put.wait_for(std::chrono::seconds(5)), std::future_status::ready);
   EXPECT_TRUE(put.get());
+  ASSERT_EQ(snapshot.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  const SlabAllocator::LifetimeDonorStats captured = snapshot.get();
+  EXPECT_EQ(captured.released_residents, 1U);
+  EXPECT_EQ(captured.age.history_unknown, 1U);
+  EXPECT_EQ(captured.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(captured.age.total_sec, 0U);
   EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
   ExpectValid(allocator);
 }

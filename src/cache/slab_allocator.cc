@@ -1338,14 +1338,30 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
           resident_lifetime_states_[index];
       if (!state.has_value() || resident_generations_[index] == 0) {
         ++lifetime_donor_stats_.unscored_victims;
-      } else if (DiskLifetimeScore(config, state->anchor,
-                                   state->scoring_reads(),
-                                   state->first_early_read(),
-                                   state->write_armed(), lifetime_now) >
-                 static_cast<int64_t>(config.keep_score_sec)) {
-        ++lifetime_donor_stats_.protected_victims;
-        lifetime_donor_stats_.protected_payload_bytes +=
-            slots_[index].useful_bytes;
+      } else {
+        // Keep recovery-origin residents separate even after real reads;
+        // their earlier history remains unknown, unlike NEW residents.
+        LifetimeDonorAgeStats& age = lifetime_donor_stats_.age;
+        if (state->history_unknown) {
+          ++age.history_unknown;
+        } else {
+          const uint32_t age_sec =
+              lifetime_now >= state->anchor ? lifetime_now - state->anchor : 0;
+          const std::array<uint32_t, 7>& bounds = kLifetimeDonorAgeBoundsSec;
+          const size_t bucket = static_cast<size_t>(
+              std::lower_bound(bounds.begin(), bounds.end(), age_sec) -
+              bounds.begin());
+          ++age.buckets[bucket];
+          age.total_sec += age_sec;
+        }
+        if (DiskLifetimeScore(config, state->anchor, state->scoring_reads(),
+                              state->first_early_read(), state->write_armed(),
+                              lifetime_now) >
+            static_cast<int64_t>(config.keep_score_sec)) {
+          ++lifetime_donor_stats_.protected_victims;
+          lifetime_donor_stats_.protected_payload_bytes +=
+              slots_[index].useful_bytes;
+        }
       }
     }
     FreeSlotLocked(index);

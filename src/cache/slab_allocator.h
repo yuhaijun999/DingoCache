@@ -165,7 +165,18 @@ class SlabAllocator {
   uint64_t Evictions() const;
   uint64_t Steals() const;
   uint64_t ColdSteals() const;
+  // Fixed display bounds, not lifetime configuration or acceptance thresholds.
+  static constexpr std::array<uint32_t, 7> kLifetimeDonorAgeBoundsSec = {
+      0, 1, 60, 3600, 86400, 604800, 2592000};
+  struct LifetimeDonorAgeStats {
+    // Noncumulative known-history age counts; the final bin is unbounded.
+    std::array<uint64_t, 8> buckets{};
+    uint64_t total_sec = 0;  // Sum of max(0, pre-wipe time - anchor).
+    // Recovery origin remains unknown even after subsequent real reads.
+    uint64_t history_unknown = 0;
+  };
   struct LifetimeDonorStats {
+    LifetimeDonorAgeStats age{};
     uint64_t coarse_extents = 0;
     uint64_t precise_extents = 0;
     uint64_t precise_residents = 0;

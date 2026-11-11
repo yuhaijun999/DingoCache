@@ -271,6 +271,8 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_disk_lifetime_donor_released_residents_total` / `dfkv_slab_disk_lifetime_donor_freed_payload_bytes_total` / `dfkv_slab_disk_lifetime_donor_freed_slot_bytes_total` | counter | Per-disk values with existing `disk` / `disk_index` labels, aggregated across foreground, cold-steal and background growth donor entries. Mutually exclusive with foreground class, background class and watermark victims. Runtime counters reset on store reconstruction; recovery does not replay old eviction events. |
 | `dfkv_slab_lifetime_donor_protected_victims_total` / `dfkv_slab_lifetime_donor_protected_payload_bytes_total` | counter | Successful donor releases whose pre-wipe, rechecked-time score is strictly greater than KEEP, and their old payload bytes. Score equal to KEEP is not protected. Use released residents as the denominator; when unscored victims are nonzero, this fraction is only a known-protected lower bound, not evidence that all remaining victims were unprotected. All three donor entry paths are combined. |
 | `dfkv_slab_lifetime_donor_unscored_victims_total` | counter | Successfully released donor residents without valid lifetime scoring state. Restored residents with unknown history but valid virtual-read state are scored, not unscored. |
+| `dfkv_slab_lifetime_donor_age_seconds` / `dfkv_slab_disk_lifetime_donor_age_seconds` | histogram | Known-history resident ages `max(0, pre_wipe_now - anchor)` for successful lifetime cross-class donor releases only. NEW unread anchors are commit times, not last GET times. Fixed finite `le` bounds in seconds: 0, 1, 60, 3600, 86400 (1 day), 604800 (7 days), 2592000 (30 days), followed by `+Inf`. Export cumulative `_bucket`, known-age `_count` and integer-seconds `_sum`; aggregate disjoint bins and sums across disks, not per-disk quantiles. These are display bins, not acceptance thresholds. |
+| `dfkv_slab_lifetime_donor_age_history_unknown_total` / `dfkv_slab_disk_lifetime_donor_age_history_unknown_total` | counter | Successful donor releases with valid scoring state but unknown recovered history, including after real reads. Excluded from age histogram and sum: a recovery seed or subsequent anchor must not masquerade as known historical age. Missing state or zero generation uses existing `donor_unscored_victims_total`, not another count. In one allocator snapshot, histogram count + history unknown + unscored = donor released residents. |
 | `dfkv_slab_disk_lifetime_donor_protected_victims_total` / `dfkv_slab_disk_lifetime_donor_protected_payload_bytes_total` / `dfkv_slab_disk_lifetime_donor_unscored_victims_total` | counter | Per-disk protection/unscored values with existing `disk` / `disk_index` labels. Empty donors, failed invalidation and skipped pins add zero; counters reset on store reconstruction. Scoring is fused into the existing O(N) selected-resident release loop, with no extra traversal; this release work is separate from the 8192-resident selector budget, not a latency bound or performance result. |
 | `dfkv_slab_lifetime_init_clock_hard_exhausted_total` | counter | 内部评分路径的 NEW 或恢复住户因超过32位时钟硬界限而跳过评分初始化的次数；数据提交和身份仍有效，不是 PUT 失败或 I/O 错误。未初始化状态不可用于评分。未注入评分配置的 legacy 及仅注入 clock 的路径恒为0，file 不输出此 slab 指标；此计数不代表外部 lifetime 已开放 |
 | `dfkv_slab_lifetime_read_success_total` / `dfkv_slab_lifetime_read_applied_total` | counter | 内部评分路径收到的非零逻辑成功读通知数 / 已对原住户应用的通知数；不是物理 I/O 数，不含失败、零字节、Lookup/Exist。同步请求/Into及其RAM、copy follower和PULL已成立授权均按逻辑请求计数；PULL在有效READ注册与授权所有权建立后、READY编码前通知，准备/RELEASE不补计；不是READY发送成功或客户端消费证明 |
@@ -342,6 +344,21 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_class_allocated_bytes{slot_size}` / `dfkv_slab_class_useful_bytes{slot_size}` / `dfkv_slab_class_fragmentation_bytes{slot_size}` | gauge | 每 class 的占用、有效 payload、内部碎片 |
 | `dfkv_slab_class_read_heat{slot_size}` / `dfkv_slab_class_put_total{slot_size}` | gauge / counter | 每 class 的衰减读热度 / 累计 PUT |
 | `dfkv_slab_failed_disks` / `dfkv_slab_healthy` | gauge | fail-closed disk 数 / 全部 slab disk 是否健康 |
+
+Donor age uses the already-rechecked final pre-wipe clock, not the earlier
+selection estimate or a new post-I/O clock. State stays under the existing
+allocator lock through persistence; publication follows successful extent
+invalidation and precedes resident release. A failed wipe, pinned/skipped donor,
+empty extent, ordinary Remove, class/background reclaim, watermark eviction or
+legacy eviction adds no donor age sample. Store reconstruction resets these
+runtime counters; clean recovery does not restore old observations. Global
+series retain node/group labels; per-disk series also retain disk/disk_index,
+and only histogram buckets add `le`. File-engine scrapes omit these families.
+No key/request labels, per-resident age fields, extra locks or clock calls are
+added. Recording does add bounded plain accounting work to the existing donor
+release loop; this is not a latency or full memory-budget acceptance result.
+Other eviction paths' ages, score histograms and recovered survival remain
+pending; the new histogram does not represent all eviction ages.
 
 前台和后台 lifetime 成功计数在 staged/explicit legacy 或 file 下不代表新策略生效：
 legacy slab 值为零，file 不导出 slab 系列。计数随进程/Store 重建重置，不恢复历史
