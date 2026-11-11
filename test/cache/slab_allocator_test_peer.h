@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -61,13 +62,31 @@ class SlabAllocatorTestPeer {
       if (allocator.classes_[cls].slot_size == slot_size) return cls;
     return allocator.classes_.size();
   }
+  // Observe an actual persistence attempt without replacing its result.
+  // The observer must be nonempty, must not reenter A, and borrowed captures
+  // must outlive the allocator. The existing callback is still invoked once.
+  static bool ObserveSlotEvict(SlabAllocator& allocator,
+                               std::function<void()> observer) {
+    const std::lock_guard<std::mutex> lock(allocator.mu_);
+    if (!allocator.opt_.on_slot_evict) return false;
+    const std::function<bool(const SlabAllocator::SlotRef&)> original =
+        allocator.opt_.on_slot_evict;
+    allocator.opt_.on_slot_evict = [original, observer = std::move(observer)](
+                                       const SlabAllocator::SlotRef& ref) {
+      observer();
+      return original(ref);
+    };
+    return true;
+  }
+  using LifetimeWatermarkStats = SlabAllocator::LifetimeWatermarkStats;
   static size_t EvictLifetimeToTarget(SlabAllocator& allocator, uint64_t target,
                                       size_t max_victims,
                                       const DiskLifetimeConfig& config,
                                       const DiskLifetimeClock& clock,
-                                      std::vector<BlockKey>* evicted) {
+                                      std::vector<BlockKey>* evicted,
+                                      LifetimeWatermarkStats* stats = nullptr) {
     return allocator.EvictLifetimeToTarget(target, max_victims, config, clock,
-                                           evicted);
+                                           evicted, stats);
   }
   using LifetimeScan = SlabAllocator::LifetimeScan;
   using LifetimeScanResult = SlabAllocator::LifetimeScanResult;

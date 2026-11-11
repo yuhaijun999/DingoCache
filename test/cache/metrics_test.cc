@@ -21,6 +21,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <limits>
 #include <memory>
@@ -40,6 +41,7 @@
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
+#include "slab_allocator_test_peer.h"
 #include "transport/wire.h"
 
 namespace dfkv {
@@ -82,6 +84,12 @@ class DiskSlabStoreTestPeer {
     return std::exchange(store.extent_fds_.at(ref.extent), fd);
   }
 
+  static bool ObserveSlotEvict(DiskSlabStore& store,
+                               std::function<void()> observer) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    return SlabAllocatorTestPeer::ObserveSlotEvict(*store.alloc_,
+                                                   std::move(observer));
+  }
   static void FailMetadata(DiskSlabStore& store) {
     const std::lock_guard<std::mutex> lock(store.mu_);
     if (store.table_fd_ >= 0) ::close(store.table_fd_);
@@ -477,6 +485,145 @@ TEST(Metrics, WatermarkPayloadBytesAggregateAcrossDisksWithoutDoubleCounting) {
       << repeated;
   EXPECT_NE(repeated.find("dfkv_evicted_bytes_total 48\n"), std::string::npos)
       << repeated;
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(Metrics, WatermarkProtectionUsesFinalPreWriteTime) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "1048576");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_metrics_watermark_keep";
+  fs::remove_all(dir);
+  const DiskLifetimeConfig config = BucketMetricConfig();
+  std::atomic<uint64_t> seconds{0};
+  std::atomic<bool> armed{false};
+  std::atomic<bool> write_started{false};
+  std::atomic<unsigned> samples{0};
+  std::atomic<unsigned> writes{0};
+  std::atomic<unsigned> samples_before_write{0};
+  std::atomic<uint64_t> selected_at{0};
+  std::atomic<uint64_t> final_at{0};
+  std::atomic<uint64_t> after_write_at{0};
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 2ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  options.lifetime_config = config;
+  options.lifetime_clock =
+      std::make_shared<DiskLifetimeClock>(DiskLifetimeHorizon(config), [&] {
+        if (!armed.load()) return seconds.load();
+        const unsigned sample = samples.fetch_add(1) + 1;
+        if (write_started.load()) return after_write_at.load();
+        return sample < 6 ? selected_at.load() : final_at.load();
+      });
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  server->set_identity("keep-node", "keep-group");
+  const std::string identity = R"(node="keep-node",group="keep-group")";
+  const auto expect_protected = [&](uint64_t disk0, uint64_t disk1) {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+    const std::string text = server->MetricsText();
+    const std::string name =
+        "dfkv_slab_lifetime_watermark_protected_victims_total";
+    const std::string disk_name =
+        "dfkv_slab_disk_lifetime_watermark_protected_victims_total";
+    EXPECT_NE(text.find("# TYPE " + name + " counter\n"), std::string::npos);
+    EXPECT_NE(text.find("# TYPE " + disk_name + " counter\n"),
+              std::string::npos);
+    EXPECT_EQ(group.SlabStats().lifetime_watermark_protected_victims,
+              disk0 + disk1);
+    EXPECT_NE(text.find("\n" + name + "{" + identity + "} " +
+                        std::to_string(disk0 + disk1) + "\n"),
+              std::string::npos);
+    for (size_t disk = 0; disk < 2; ++disk) {
+      const uint64_t expected = disk == 0 ? disk0 : disk1;
+      EXPECT_EQ(group.DiskSlabStats(disk).lifetime_watermark_protected_victims,
+                expected);
+      const std::string labels = "{disk=\"" + options.cache_dirs[disk] +
+                                 "\",disk_index=\"" + std::to_string(disk) +
+                                 "\"," + identity + "} ";
+      EXPECT_NE(text.find("\n" + disk_name + labels + std::to_string(expected) +
+                          "\n"),
+                std::string::npos);
+    }
+  };
+  ASSERT_NO_FATAL_FAILURE(expect_protected(0, 0));
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+        KvNodeServerTestPeer::Group(*server), disk);
+    ASSERT_EQ(store.Cache({1, 0}, "old", 3), Status::kOk);
+    ASSERT_EQ(store.Cache({2, 0}, "old", 3), Status::kOk);
+    // Armed NEW score is 100-(age-8+2): age15 scores91, age16 scoresKEEP90.
+    // Disk1 was committed at16; its final age15 stays protected even when the
+    // subsequent post-I/O observations reach age16.
+    selected_at.store(disk == 0 ? 15 : 31);
+    final_at.store(disk == 0 ? 16 : 31);
+    after_write_at.store(disk == 0 ? 16 : 32);
+    samples.store(0);
+    write_started.store(false);
+    writes.store(0);
+    samples_before_write.store(0);
+    ASSERT_TRUE(DiskSlabStoreTestPeer::ObserveSlotEvict(store, [&] {
+      writes.fetch_add(1);
+      samples_before_write.store(samples.load());
+      write_started.store(true);
+    }));  // The wrapper delegates to the real Store invalidation callback.
+    // Existing pre-write clock reads: Store entry guard, Store D guard,
+    // allocator loop guard, selection, final allocator guard, final timestamp.
+    // Assert that sequence at the actual write: another guard/read must not
+    // silently move the injected transition to a different protocol point.
+    armed.store(true);
+    DiskSlabStoreTestPeer::TickWatermark(store);
+    armed.store(false);
+    seconds.store(after_write_at.load());
+    EXPECT_EQ(writes.load(), 1U);
+    EXPECT_EQ(samples_before_write.load(), 6U);
+    EXPECT_GE(samples.load(), 7U);
+    EXPECT_EQ(store.Count(), 1U);
+    EXPECT_FALSE(store.IsCached({1, 0}));
+    std::string survivor;
+    EXPECT_EQ(store.Range({2, 0}, 0, 0, &survivor), Status::kOk);
+    EXPECT_EQ(survivor, "old");
+  }
+  ASSERT_NO_FATAL_FAILURE(expect_protected(0, 1));
+  server.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  server->set_identity("keep-node", "keep-group");
+  ASSERT_NO_FATAL_FAILURE(expect_protected(0, 0));
+  server.reset();
+  options.eviction_policy = "legacy";
+  options.lifetime_clock.reset();
+  options.lifetime_config.reset();
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  server->set_identity("keep-node", "keep-group");
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+        KvNodeServerTestPeer::Group(*server), disk);
+    ASSERT_EQ(store.Cache({3, 0}, "new", 3), Status::kOk);
+    DiskSlabStoreTestPeer::TickWatermark(store);
+    EXPECT_EQ(store.Count(), 1U);
+  }
+  ASSERT_NO_FATAL_FAILURE(expect_protected(0, 0));
+  server.reset();
+  options.engine = "file";
+  options.cache_dirs = {(dir / "file").string()};
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  const std::string file_text = server->MetricsText();
+  EXPECT_EQ(
+      file_text.find("dfkv_slab_lifetime_watermark_protected_victims_total"),
+      std::string::npos);
+  EXPECT_EQ(file_text.find(
+                "dfkv_slab_disk_lifetime_watermark_protected_victims_total"),
+            std::string::npos);
   server.reset();
   fs::remove_all(dir);
 }

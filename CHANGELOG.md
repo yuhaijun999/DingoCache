@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Correct lifetime watermark protected-victim counts to use the final pre-wipe
+  timestamp rather than earlier selection scores. Preserve victim selection,
+  scan budgets and success-only accounting; expose the existing per-disk counts.
+
 - Export successful lifetime donor scores as separate nonnegative and absolute
   negative distributions. Reuse the existing pre-wipe score and use floating
   sums to avoid large legal scores overflowing integer histogram totals.

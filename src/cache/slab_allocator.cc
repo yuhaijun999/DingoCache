@@ -1826,6 +1826,19 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
       continue;
     }
     if (!ReclaimAllowed() || !clock.TryDrainNow(&now)) break;
+    bool protected_victim = false;
+    if (stats != nullptr) {
+      // Selection's score can expire before this final pre-wipe time. A has
+      // stayed locked, so the selected state is still present and unchanged.
+      const std::optional<DiskLifetimeState>& selected =
+          resident_lifetime_states_[best];
+      assert(selected.has_value());
+      const DiskLifetimeState& state = *selected;
+      protected_victim =
+          DiskLifetimeScore(config, state.anchor, state.scoring_reads(),
+                            state.first_early_read(), state.write_armed(),
+                            now) > static_cast<int64_t>(config.keep_score_sec);
+    }
     // Unlike legacy's last-resident optimization, this path only clears one
     // slot record. No whole-extent donor operation belongs to watermarks.
     if (opt_.on_slot_evict) {
@@ -1839,9 +1852,7 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
     ++evictions_;
     ++watermark_evictions_;
     ++freed;
-    if (stats != nullptr &&
-        best_score > static_cast<int64_t>(config.keep_score_sec))
-      ++stats->protected_victims;
+    if (stats != nullptr && protected_victim) ++stats->protected_victims;
     // Replenish only the winning band; every other cached candidate will be
     // checked against the next round's common clock before competing again.
     candidates[best_band] = kNoSlot;

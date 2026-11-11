@@ -257,7 +257,7 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_lifetime_watermark_budget_exhausted_total` | counter | Internal lifetime watermark ticks stopped at the shared resident-visit cap; does not imply no eligible victim. |
 | `dfkv_slab_lifetime_watermark_no_candidate_total` | counter | Internal lifetime watermark scans that completed their stable traversal without an eligible candidate; separate from budget and metadata failure. |
 | `dfkv_slab_lifetime_watermark_pin_skips_total` | counter | Pinned resident checks in internal lifetime watermark scans; repeated checks count again. |
-| `dfkv_slab_lifetime_watermark_protected_victims_total` | counter | Successfully invalidated checked winners with score strictly above KEEP (soft-protection fallback). |
+| `dfkv_slab_lifetime_watermark_protected_victims_total` | counter | Successfully invalidated watermark victims with score strictly above effective KEEP at the final pre-wipe clock recheck (soft-protection fallback). Score equal to KEEP is not protected. Earlier candidate-selection scores and time spent in persistence do not classify the loss; failed invalidation contributes zero. Per-disk `dfkv_slab_disk_lifetime_watermark_protected_victims_total` uses the same rule and existing disk labels; global values sum per-disk counts. |
 | `dfkv_slab_lifetime_donor_coarse_extents_total` | counter | Extents visited in full-pool coarse passes, including rejected entries. |
 | `dfkv_slab_lifetime_donor_precise_extents_total` | counter | Extents completely examined for exact loss; at most 8 per selection. |
 | `dfkv_slab_lifetime_donor_precise_residents_total` | counter | Resident checks during precise selection; at most 8192 per selection. |
@@ -1110,3 +1110,24 @@ families. No new key/request labels, clocks, locks, atomics, resident fields,
 maps or hooks. There is new fixed accounting state and bounded release-loop
 work, not zero cost or full RSS/performance-budget acceptance. Other eviction
 paths' score distributions and the rest of O5 remain pending.
+
+### Watermark protected-victim timestamp correction
+
+Watermark selection already refreshes the bounded clock immediately before
+invalidating the selected slot. Protection accounting uses that saved final
+pre-wipe time, not the earlier candidate-comparison score or a new post-I/O
+sample. A winner that crosses KEEP between selection and this recheck is not
+reported protected; a winner protected at recheck remains counted if persistence
+subsequently crosses KEEP. Publication still requires successful invalidation
+and physical release. Partial success retains only completed victims.
+
+This corrects observation only: victim choice, selection scores, scan limits,
+cursors, pin handling, failure/health propagation and legacy behavior are
+unchanged. No reranking or added clock/lock/atomic/state/configuration/hook.
+When statistics are requested, there is one extra pure score evaluation for
+the selected victim; a null statistics pointer skips that work. This is not
+zero CPU cost or a performance acceptance claim. The existing global counter name/type/labels and
+runtime reset behavior are unchanged. The previously missing per-disk family
+`dfkv_slab_disk_lifetime_watermark_protected_victims_total` now exports the
+existing per-store counter with the standard disk/disk_index labels. Other O5 observation and acceptance work
+remains pending; no thresholds or default-policy changes follow from this fix.

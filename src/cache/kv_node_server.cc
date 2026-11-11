@@ -654,6 +654,9 @@ std::string KvNodeServer::MetricsText() const {
     header("dfkv_slab_disk_watermark_peak_high_bytes", "gauge", "Lifetime maximum of sampled above-high inputs; never phase qualification alone");
     header("dfkv_slab_disk_watermark_freed_payload_bytes_total", "counter",
            "Committed payload bytes removed by successful watermark victims");
+    header("dfkv_slab_disk_lifetime_watermark_protected_victims_total",
+           "counter",
+           "Successful watermark victims above KEEP at pre-wipe time");
     header("dfkv_slab_disk_lifetime_background_victims_total", "counter",
            "Successful lifetime background class victims");
     header("dfkv_slab_disk_lifetime_background_freed_slot_bytes_total",
@@ -858,6 +861,8 @@ std::string KvNodeServer::MetricsText() const {
         queue_totals[{queue.slot_size, queue.band}] += queue.residents;
       }
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      sample("dfkv_slab_disk_lifetime_watermark_protected_victims_total",
+             disk.lifetime_watermark_protected_victims);
       sample("dfkv_slab_disk_sync_payload_read_syscalls_total",
              disk.sync_payload_reads.syscalls);
       sample("dfkv_slab_disk_sync_payload_read_bytes_total",
