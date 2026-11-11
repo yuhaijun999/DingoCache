@@ -28,6 +28,7 @@
 #include "cache/disk_lifetime_state.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
+#include "cache/disk_write_result.h"
 #include "cache/kv_node_server.h"
 #include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
@@ -97,6 +98,20 @@ class DiskSlabStoreTestPeer {
   static void Tick(DiskSlabStore& store) { store.ReclaimTick(); }
   static void FailRecordWrites(DiskSlabStore& store) {
     store.record_write_hook_for_test_ = [] { return false; };
+  }
+  static std::pair<uint64_t, uint64_t> VisiblePopulation(
+      const DiskSlabStore& store) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    uint64_t recovered = 0;
+    uint64_t unread = 0;
+    // Independent traversal oracle for tests only, not a metrics scrape scan.
+    for (const DiskSlabStore::PayloadMap::value_type& entry :
+         store.committed_payloads_) {
+      EXPECT_FALSE(entry.second.recovered_unread && !entry.second.recovered);
+      recovered += entry.second.recovered;
+      unread += entry.second.recovered_unread;
+    }
+    return {recovered, unread};
   }
 };
 
@@ -249,6 +264,20 @@ class DiskLifetimePublicTest : public testing::Test {
     }
     EXPECT_EQ(total_recovered, recovered);
     EXPECT_EQ(total_unread, unread);
+  }
+  void ExpectVisible(const DiskSlabStore& store, uint64_t recovered,
+                     uint64_t unread) {
+    const DiskSlabStore::Stats stats = store.GetStats();
+    const std::pair<uint64_t, uint64_t> observed =
+        DiskSlabStoreTestPeer::VisiblePopulation(store);
+    EXPECT_EQ(stats.lifetime_visible_recovered_objects, observed.first);
+    EXPECT_EQ(stats.lifetime_visible_recovered_unread_objects, observed.second);
+    EXPECT_EQ(stats.lifetime_visible_recovered_objects, recovered);
+    EXPECT_EQ(stats.lifetime_visible_recovered_unread_objects, unread);
+    EXPECT_LE(stats.lifetime_visible_recovered_unread_objects,
+              stats.lifetime_visible_recovered_objects);
+    EXPECT_LE(stats.lifetime_visible_recovered_objects,
+              stats.committed_objects);
   }
   std::filesystem::path base_;
   std::atomic<uint64_t> seconds_{0};
@@ -459,12 +488,14 @@ TEST_F(DiskLifetimePublicTest,
       ASSERT_EQ(seed.Cache({1, 0}, "bytes", 5), Status::kOk);
       ASSERT_EQ(seed.Cache({2, 0}, "bytes", 5), Status::kOk);
       ExpectPopulation(seed, 0, 0);
+      ExpectVisible(seed, 0, 0);
     }
     DiskSlabStore recovered(options);
     ASSERT_TRUE(recovered.Healthy()) << recovered.StartupError();
     ASSERT_NO_FATAL_FAILURE(CheckRecovered(recovered, {1, 0}));
     ASSERT_NO_FATAL_FAILURE(CheckRecovered(recovered, {2, 0}));
     ExpectPopulation(recovered, 2, 2);
+    ExpectVisible(recovered, 2, 2);
     const uint32_t band =
         static_cast<uint32_t>(std::min<uint64_t>(3, max_reads));
     seconds_.store(1);
@@ -491,8 +522,10 @@ TEST_F(DiskLifetimePublicTest,
     }
     EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
     ExpectPopulation(recovered, 2, 1);
+    ExpectVisible(recovered, 2, 1);
     ASSERT_NO_FATAL_FAILURE(Read(recovered, {1, 0}));
     ExpectPopulation(recovered, 2, 1);  // Only the first real read leaves W.
+    ExpectVisible(recovered, 2, 1);     // Only the first real read leaves W.
     seconds_.store(0);
   }
 }
@@ -523,8 +556,10 @@ TEST_F(DiskLifetimePublicTest,
     ASSERT_TRUE(recovered.Healthy());
     ASSERT_NO_FATAL_FAILURE(CheckRecovered(recovered, {1, 0}));
     ExpectPopulation(recovered, 1, 1);
+    ExpectVisible(recovered, 1, 1);
     ASSERT_NO_FATAL_FAILURE(Read(recovered, {1, 0}));
     ExpectPopulation(recovered, 1, 0);
+    ExpectVisible(recovered, 1, 0);
   }
 }
 
@@ -546,6 +581,7 @@ TEST_F(DiskLifetimePublicTest, PublicLifetimeLegacyLifetimePreservesBytes) {
     if (policy == "legacy") {
       EXPECT_FALSE(group.TracksLifetimeState());
       ExpectPopulation(DiskCacheGroupTestPeer::Slab(group), 0, 0);
+      ExpectVisible(DiskCacheGroupTestPeer::Slab(group), 0, 0);
     } else {
       EXPECT_TRUE(DiskSlabStoreTestPeer::FormalRecovery(
           DiskCacheGroupTestPeer::Slab(group)));
@@ -563,6 +599,7 @@ TEST_F(DiskLifetimePublicTest, DirtyFormalRestartClearsRecordsAndHeat) {
   EXPECT_FALSE(recovered.IsCached({1, 0}));
   EXPECT_FALSE(DiskSlabStoreTestPeer::State(recovered, {1, 0}).has_value());
   ExpectPopulation(recovered, 0, 0);
+  ExpectVisible(recovered, 0, 0);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
 }
 
@@ -621,10 +658,26 @@ TEST_F(DiskLifetimePublicTest,
     ASSERT_TRUE(seed.IsCached({2, 0}));
     ASSERT_TRUE(seed.IsCached({3, 0}));
     ExpectPopulation(seed, 0, 0);
+    ExpectVisible(seed, 0, 0);
   }
   DiskSlabStore recovered(options);
   ASSERT_TRUE(recovered.Healthy());
   ExpectPopulation(recovered, 3, 3);
+  ExpectVisible(recovered, 3, 3);
+  const DiskWriteResult kept = recovered.CacheWithResult({1, 0}, "other", 5);
+  EXPECT_EQ(kept.status, Status::kOk);
+  EXPECT_EQ(kept.outcome, DiskWriteOutcome::kKeptExisting);
+  char replacement[] = "other";
+  const std::vector<DiskWriteResult> kept_batch =
+      recovered.CacheDirectBatchWithResults(
+          {{{1, 0}, replacement, 5, sizeof(replacement)},
+           {{2, 0}, replacement, 5, sizeof(replacement)}});
+  ASSERT_EQ(kept_batch.size(), 2U);
+  for (const DiskWriteResult& result : kept_batch) {
+    EXPECT_EQ(result.status, Status::kOk);
+    EXPECT_EQ(result.outcome, DiskWriteOutcome::kKeptExisting);
+  }
+  ExpectVisible(recovered, 3, 3);
   std::string bytes;
   DiskResidentIdentity mismatched;
   ASSERT_EQ(recovered.RangeWithIdentity({1, 0}, 0, 5, &bytes, &mismatched),
@@ -634,10 +687,26 @@ TEST_F(DiskLifetimePublicTest,
   ++mismatched.generation;
   recovered.NotifyLifetimeReadSuccess({1, 0}, mismatched, bytes.size());
   ExpectPopulation(recovered, 3, 3);
+  ExpectVisible(recovered, 3, 3);
   EXPECT_EQ(recovered.GetStats().lifetime_reads.race_lost, 1U);
   ASSERT_NO_FATAL_FAILURE(Read(recovered, {1, 0}));
   ASSERT_NO_FATAL_FAILURE(Read(recovered, {1, 0}));
   ExpectPopulation(recovered, 3, 2);
+  ExpectVisible(recovered, 3, 2);
+  const DiskWriteResult kept_after_read =
+      recovered.CacheWithResult({1, 0}, "other", 5);
+  EXPECT_EQ(kept_after_read.status, Status::kOk);
+  EXPECT_EQ(kept_after_read.outcome, DiskWriteOutcome::kKeptExisting);
+  const std::vector<DiskWriteResult> batch_after_read =
+      recovered.CacheDirectBatchWithResults(
+          {{{1, 0}, replacement, 5, sizeof(replacement)}});
+  ASSERT_EQ(batch_after_read.size(), 1U);
+  EXPECT_EQ(batch_after_read[0].status, Status::kOk);
+  EXPECT_EQ(batch_after_read[0].outcome, DiskWriteOutcome::kKeptExisting);
+  ExpectVisible(recovered, 3, 2);
+  ASSERT_EQ(recovered.Range({1, 0}, 0, 0, &bytes), Status::kOk);
+  EXPECT_EQ(bytes, "bytes");
+  ExpectVisible(recovered, 3, 2);  // Storage read alone does not apply heat.
   const std::vector<SlabAllocator::ClassStat> classes = recovered.ClassStats();
   for (const SlabAllocator::ClassStat& cls : classes) {
     EXPECT_EQ(cls.recovered_residents, cls.slot_size == 4096   ? 2U
@@ -648,14 +717,27 @@ TEST_F(DiskLifetimePublicTest,
   }
   ASSERT_EQ(recovered.Cache({4, 0}, "new", 3), Status::kOk);
   ExpectPopulation(recovered, 3, 2);  // NEW data has no recovered history.
+  ExpectVisible(recovered, 3, 2);     // NEW data has no recovered history.
   ASSERT_EQ(recovered.Remove({1, 0}), Status::kOk);
   ExpectPopulation(recovered, 2, 2);
+  ExpectVisible(recovered, 2, 2);
+  DiskResidentIdentity old_identity;
+  ASSERT_EQ(recovered.RangeWithIdentity({2, 0}, 0, 0, &bytes, &old_identity),
+            Status::kOk);
+  EXPECT_EQ(bytes, "bytes");
   ASSERT_EQ(recovered.Remove({2, 0}), Status::kOk);
   ExpectPopulation(recovered, 1, 1);
+  ExpectVisible(recovered, 1, 1);
   ASSERT_EQ(recovered.Cache({2, 0}, "replacement", 11), Status::kOk);
   ExpectPopulation(recovered, 1, 1);  // Recycled metadata starts as NEW.
+  ExpectVisible(recovered, 1, 1);     // Recycled metadata starts as NEW.
+  recovered.NotifyLifetimeReadSuccess({2, 0}, old_identity, 5);
+  ExpectVisible(recovered, 1, 1);
+  ASSERT_EQ(recovered.Range({2, 0}, 0, 0, &bytes), Status::kOk);
+  EXPECT_EQ(bytes, "replacement");
   ASSERT_EQ(recovered.Remove({3, 0}), Status::kOk);
   ExpectPopulation(recovered, 0, 0);
+  ExpectVisible(recovered, 0, 0);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
 }
 
@@ -672,6 +754,11 @@ TEST_F(DiskLifetimePublicTest,
     DiskSlabStore recovered(options);
     ASSERT_TRUE(recovered.Healthy());
     ExpectPopulation(recovered, 1, 1);
+    ExpectVisible(recovered, 1, 1);
+    std::string bytes;
+    DiskResidentIdentity original;
+    ASSERT_EQ(recovered.RangeWithIdentity({1, 0}, 0, 0, &bytes, &original),
+              Status::kOk);
     ReadLease first;
     ReadLease last;
     ASSERT_EQ(recovered.RangeDirectPrep({1, 0}, 0, 0, 4096, &first),
@@ -681,15 +768,85 @@ TEST_F(DiskLifetimePublicTest,
     ASSERT_EQ(recovered.Remove({1, 0}), Status::kOk);
     EXPECT_FALSE(recovered.IsCached({1, 0}));
     ExpectPopulation(recovered, 1, 1);  // Hidden, but still physically owned.
+    ExpectVisible(recovered, 0, 0);
+    recovered.NotifyLifetimeReadSuccess({1, 0}, original, bytes.size());
+    EXPECT_EQ(recovered.GetStats().lifetime_reads.race_not_visible, 1U);
+    ExpectVisible(recovered, 0, 0);
     first = ReadLease{};
     ExpectPopulation(recovered, 1, 1);
+    ExpectVisible(recovered, 0, 0);
     if (fail_invalidation) DiskSlabStoreTestPeer::FailRecordWrites(recovered);
     last = ReadLease{};
     EXPECT_EQ(recovered.Healthy(), !fail_invalidation);
     ExpectPopulation(recovered, fail_invalidation ? 1 : 0,
                      fail_invalidation ? 1 : 0);
+    ExpectVisible(recovered, 0, 0);
     EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
   }
+}
+
+TEST_F(DiskLifetimePublicTest, VisibleRecoverySurvivesImmediateRemoveFailure) {
+  const DiskSlabStore::Options options = StoreOptions();
+  {
+    DiskSlabStore seed(options);
+    ASSERT_TRUE(seed.Healthy());
+    ASSERT_EQ(seed.Cache({1, 0}, "bytes", 5), Status::kOk);
+  }
+  DiskSlabStore recovered(options);
+  ASSERT_TRUE(recovered.Healthy());
+  std::string bytes;
+  DiskResidentIdentity identity;
+  ASSERT_EQ(recovered.RangeWithIdentity({1, 0}, 0, 0, &bytes, &identity),
+            Status::kOk);
+  ExpectVisible(recovered, 1, 1);
+  DiskSlabStoreTestPeer::FailRecordWrites(recovered);
+  EXPECT_EQ(recovered.Remove({1, 0}), Status::kIOError);
+  EXPECT_FALSE(recovered.Healthy());
+  // Readiness is false, but durable invalidation did not remove the commit.
+  EXPECT_EQ(recovered.GetStats().committed_objects, 1U);
+  EXPECT_EQ(recovered.GetStats().payload_bytes, 5U);
+  ExpectPopulation(recovered, 1, 1);
+  ExpectVisible(recovered, 1, 1);
+  recovered.NotifyLifetimeReadSuccess({1, 0}, identity, bytes.size());
+  EXPECT_EQ(recovered.GetStats().lifetime_reads.io_unhealthy, 1U);
+  ExpectVisible(recovered, 1, 1);
+}
+
+TEST_F(DiskLifetimePublicTest, VisibleRecoveryDoesNotRequireInitializedHeat) {
+  DiskSlabStore::Options options = StoreOptions();
+  {
+    DiskSlabStore seed(options);
+    ASSERT_TRUE(seed.Healthy());
+    ASSERT_EQ(seed.Cache({1, 0}, "bytes", 5), Status::kOk);
+  }
+  if (!options.lifetime_config.has_value()) {
+    ADD_FAILURE() << "The test options must include lifetime config";
+    return;
+  }
+  unsigned clock_samples = 0;
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(*options.lifetime_config), [&clock_samples] {
+        // Origin and startup validation pass; recovery then crosses the bound.
+        return ++clock_samples <= 2 ? uint64_t{0} : uint64_t{UINT32_MAX} + 1;
+      });
+  DiskSlabStore recovered(options);
+  ASSERT_TRUE(recovered.Healthy()) << recovered.StartupError();
+  EXPECT_GE(clock_samples, 3U);
+  EXPECT_FALSE(DiskSlabStoreTestPeer::State(recovered, {1, 0}).has_value());
+  EXPECT_EQ(recovered.GetStats().lifetime_init_clock_hard_exhausted, 1U);
+  ExpectPopulation(recovered, 0, 0);
+  ExpectVisible(recovered, 1, 1);
+  std::string bytes;
+  DiskResidentIdentity identity;
+  ASSERT_EQ(recovered.RangeWithIdentity({1, 0}, 0, 0, &bytes, &identity),
+            Status::kOk);
+  ASSERT_EQ(bytes, "bytes");
+  ASSERT_TRUE(identity.valid());
+  ExpectVisible(recovered, 1, 1);  // Payload access alone is not applied heat.
+  recovered.NotifyLifetimeReadSuccess({1, 0}, identity, bytes.size());
+  EXPECT_EQ(recovered.GetStats().lifetime_reads.clock_hard_exhausted, 1U);
+  ExpectVisible(recovered, 1, 1);
+  ExpectPopulation(recovered, 0, 0);
 }
 
 TEST_F(DiskLifetimePublicTest, ConcurrentFirstReadsLeaveUnreadOnlyOnce) {
@@ -702,6 +859,7 @@ TEST_F(DiskLifetimePublicTest, ConcurrentFirstReadsLeaveUnreadOnlyOnce) {
   DiskSlabStore recovered(options);
   ASSERT_TRUE(recovered.Healthy());
   ExpectPopulation(recovered, 1, 1);
+  ExpectVisible(recovered, 1, 1);
   constexpr size_t kReaders = 4;
   std::vector<Status> results(kReaders, Status::kInvalid);
   std::vector<std::string> values(kReaders);
@@ -738,6 +896,7 @@ TEST_F(DiskLifetimePublicTest, ConcurrentFirstReadsLeaveUnreadOnlyOnce) {
     EXPECT_EQ(values[index], "bytes");
   }
   ExpectPopulation(recovered, 1, 0);
+  ExpectVisible(recovered, 1, 0);
   EXPECT_EQ(recovered.GetStats().lifetime_reads.applied, kReaders);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
 }
@@ -760,6 +919,7 @@ TEST_F(DiskLifetimePublicTest, ImmediateWatermarkCannotResurrectRecoveredKeys) {
     DiskSlabStore recovered(options);
     ASSERT_TRUE(recovered.Healthy());
     ExpectPopulation(recovered, 8, 8);
+    ExpectVisible(recovered, 8, 8);
     DiskSlabStoreTestPeer::Tick(recovered);
     EXPECT_GT(recovered.Count(), 0U);
     EXPECT_LE(recovered.Count(), 4U);
@@ -768,12 +928,14 @@ TEST_F(DiskLifetimePublicTest, ImmediateWatermarkCannotResurrectRecoveredKeys) {
     }
     EXPECT_EQ(recovered.Count(), survivors.size());
     ExpectPopulation(recovered, survivors.size(), survivors.size());
+    ExpectVisible(recovered, survivors.size(), survivors.size());
     EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
   }
   DiskSlabStore reopened(options);
   ASSERT_TRUE(reopened.Healthy());
   EXPECT_EQ(reopened.Count(), survivors.size());
   ExpectPopulation(reopened, survivors.size(), survivors.size());
+  ExpectVisible(reopened, survivors.size(), survivors.size());
   for (uint64_t key = 1; key <= 8; ++key) {
     const bool survived =
         std::find(survivors.begin(), survivors.end(), key) != survivors.end();
@@ -783,6 +945,7 @@ TEST_F(DiskLifetimePublicTest, ImmediateWatermarkCannotResurrectRecoveredKeys) {
     }
   }
   ExpectPopulation(reopened, survivors.size(), 0);
+  ExpectVisible(reopened, survivors.size(), 0);
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(reopened));
 }
 
@@ -800,12 +963,14 @@ TEST_F(DiskLifetimePublicTest, ImmediateDonorRebindDoesNotResurrectOldClass) {
     ASSERT_TRUE(recovered.Healthy());
     ASSERT_NO_FATAL_FAILURE(CheckRecovered(recovered, {1, 0}));
     ExpectPopulation(recovered, 8, 8);
+    ExpectVisible(recovered, 8, 8);
     ASSERT_EQ(recovered.Cache({100, 0}, large.data(), large.size()),
               Status::kOk);
     for (uint64_t key = 1; key <= 8; ++key)
       EXPECT_FALSE(recovered.IsCached({key, 0}));
     EXPECT_EQ(recovered.Count(), 1U);
     ExpectPopulation(recovered, 0, 0);
+    ExpectVisible(recovered, 0, 0);
     EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(recovered));
   }
   DiskSlabStore reopened(options);
@@ -813,8 +978,10 @@ TEST_F(DiskLifetimePublicTest, ImmediateDonorRebindDoesNotResurrectOldClass) {
   EXPECT_EQ(reopened.Count(), 1U);
   ASSERT_NO_FATAL_FAILURE(CheckRecovered(reopened, {100, 0}));
   ExpectPopulation(reopened, 1, 1);
+  ExpectVisible(reopened, 1, 1);
   ASSERT_NO_FATAL_FAILURE(Read(reopened, {100, 0}, large));
   ExpectPopulation(reopened, 1, 0);
+  ExpectVisible(reopened, 1, 0);
   for (uint64_t key = 1; key <= 8; ++key)
     EXPECT_FALSE(reopened.IsCached({key, 0}));
   EXPECT_TRUE(DiskSlabStoreTestPeer::Valid(reopened));

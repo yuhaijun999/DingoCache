@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export commit-map-visible recovered and unread populations separately from
+  allocator-retained residents. Account for deferred Remove and failed
+  invalidation without changing heat, visibility or physical release rules.
+
 - Export sampled read-notification lock-held intervals paired with acquisition
   samples. Reuse timing state without changing heat rules; exclude the new
   ledger update and actual mutex unlock from the measured interval.

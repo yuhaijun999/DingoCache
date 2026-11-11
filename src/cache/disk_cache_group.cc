@@ -1110,6 +1110,10 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_link_bytes += st.lifetime_link_bytes;
     sum.lifetime_queue_bytes += st.lifetime_queue_bytes;
     sum.lifetime_version_bytes += st.lifetime_version_bytes;
+    sum.lifetime_visible_recovered_objects +=
+        st.lifetime_visible_recovered_objects;
+    sum.lifetime_visible_recovered_unread_objects +=
+        st.lifetime_visible_recovered_unread_objects;
     sum.lifetime_recovered_objects += st.lifetime_recovered_objects;
     sum.lifetime_recovered_unread_objects +=
         st.lifetime_recovered_unread_objects;

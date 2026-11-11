@@ -1508,7 +1508,8 @@ bool DiskSlabStore::WritePayloadDirect(const SlabAllocator::SlotRef& r, char* da
   const size_t alen = (len + 4095) & ~static_cast<size_t>(4095);
   std::memset(data + len, 0, alen - len);  // caller's cap covers the padding
   // Slot offsets are slot_granularity (>= 4 KiB) aligned, so offset + alen stay
-  // inside the slot; the tail padding lands in bytes payload_len_ gates off.
+  // inside the slot; the tail padding lands in bytes committed_payloads_ gates
+  // off.
   return PwriteAll(extent_dio_fds_[r.extent], data, alen, r.offset);
 }
 
@@ -1529,7 +1530,7 @@ bool DiskSlabStore::ReserveResidentGenerationLocked(uint64_t* generation) {
 
 DiskResidentIdentity DiskSlabStore::ResidentIdentityLocked(
     const BlockKey& key, const std::string& fn) const {
-  if (!resident_identity_ || !Healthy() || payload_len_.count(fn) == 0)
+  if (!resident_identity_ || !Healthy() || committed_payloads_.count(fn) == 0)
     return {};
   const uint64_t generation = alloc_->ResidentGeneration(key);
   if (generation == 0) return {};
@@ -1560,8 +1561,21 @@ void DiskSlabStore::CommitPayloadLocked(const BlockKey& resident_key,
         resident_key, generation, state ? &*state : nullptr,
         opt_.lifetime_config ? &*opt_.lifetime_config : nullptr, offset);
   }
-  auto [it, inserted] = payload_len_.try_emplace(key, payload_len);
-  if (inserted) {
+  // Preserve recovered origin even if the bounded clock could not initialize
+  // heat. Replacement accounts from this map, never from already-freed A state.
+  const bool recovered_origin = opt_.lifetime_config.has_value() && recovered;
+  const CommittedPayload payload{payload_len, recovered_origin,
+                                 recovered_origin};
+  const std::pair<PayloadMap::iterator, bool> insertion =
+      committed_payloads_.try_emplace(key, payload);
+  const PayloadMap::iterator it = insertion.first;
+  if (!insertion.second) {
+    lifetime_visible_recovered_objects_ -= it->second.recovered;
+    lifetime_visible_recovered_unread_objects_ -= it->second.recovered_unread;
+  }
+  lifetime_visible_recovered_objects_ += payload.recovered;
+  lifetime_visible_recovered_unread_objects_ += payload.recovered_unread;
+  if (insertion.second) {
     committed_payload_bytes_ += payload_len;
     BlockKey parsed;
     if (BlockKey::ParseFilename(key, &parsed))
@@ -1570,18 +1584,22 @@ void DiskSlabStore::CommitPayloadLocked(const BlockKey& resident_key,
   }
   BlockKey parsed;
   if (BlockKey::ParseFilename(key, &parsed)) {
-    tenant_used_bytes_[parsed.tenant_hash] -= it->second;
+    tenant_used_bytes_[parsed.tenant_hash] -= it->second.length;
     tenant_used_bytes_[parsed.tenant_hash] += payload_len;
   }
-  committed_payload_bytes_ -= it->second;
-  it->second = payload_len;
+  committed_payload_bytes_ -= it->second.length;
+  it->second = payload;
   committed_payload_bytes_ += payload_len;
 }
 
 uint32_t DiskSlabStore::ErasePayloadLocked(const std::string& key) {
-  const auto it = payload_len_.find(key);
-  if (it == payload_len_.end()) return 0;
-  const uint32_t payload_len = it->second;
+  const PayloadMap::iterator it = committed_payloads_.find(key);
+  if (it == committed_payloads_.end()) return 0;
+  const uint32_t payload_len = it->second.length;
+  // A may already have freed this resident. The map owns the visible ledger;
+  // the absent-entry return above makes repeated erasure subtract zero.
+  lifetime_visible_recovered_objects_ -= it->second.recovered;
+  lifetime_visible_recovered_unread_objects_ -= it->second.recovered_unread;
   committed_payload_bytes_ -= payload_len;
   BlockKey parsed;
   if (BlockKey::ParseFilename(key, &parsed)) {
@@ -1591,7 +1609,7 @@ uint32_t DiskSlabStore::ErasePayloadLocked(const std::string& key) {
       if (tenant->second == 0) tenant_used_bytes_.erase(tenant);
     }
   }
-  payload_len_.erase(it);
+  committed_payloads_.erase(it);
   return payload_len;
 }
 
@@ -1677,12 +1695,12 @@ DiskWriteResult DiskSlabStore::AllocateForPutLocked(
 }
 
 // mu_ guards only the in-memory maps; the MB-scale payload I/O runs OUTSIDE it
-// (same discipline as KVStore::Cache and RamTier::Put), so concurrent ops to one
-// disk overlap in the kernel instead of serializing behind the store lock. The
-// slot bytes are protected across the unlocked window by a write-pin (a pinned
-// slot is never evicted/reused), and payload_len_ -- installed only after the
-// I/O lands -- is the commit point readers gate on, so an in-flight key reads
-// as a clean miss, never as torn bytes.
+// (same discipline as KVStore::Cache and RamTier::Put), so concurrent ops to
+// one disk overlap in the kernel instead of serializing behind the store lock.
+// The slot bytes are protected across the unlocked window by a write-pin (a
+// pinned slot is never evicted/reused), and committed_payloads_ -- installed
+// only after the I/O lands -- is the commit point readers gate on, so an
+// in-flight key reads as a clean miss, never as torn bytes.
 template <typename WriteFn>
 Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
                                 const WriteFn& write_payload,
@@ -1697,7 +1715,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
     std::unique_lock<std::mutex> lk(mu_);
     for (;;) {
       if (!Healthy()) return Status::kIOError;
-      if (payload_len_.count(fn) != 0) {
+      if (committed_payloads_.count(fn) != 0) {
         if (details != nullptr)
           details->outcome = DiskWriteOutcome::kKeptExisting;
         return Status::kOk;  // keep-first
@@ -1857,7 +1875,7 @@ Status DiskSlabStore::CacheDirectImpl(const BlockKey& key, char* data,
 //     is IOPS-bound at one synchronous DIO write per key), else a loop; then
 //     the 64 B records (buffered pwrites, cheap) in a loop;
 //   L2 (one mu_): per-item deferred-remove check, inflight release, failure
-//     rollback, payload_len_ commit.
+//     rollback, committed_payloads_ commit.
 std::vector<Status> DiskSlabStore::CacheDirectBatch(
     const std::vector<CacheBatchItem>& items) {
   return CacheDirectBatchImpl(items, nullptr);
@@ -1904,7 +1922,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
           out[i] = Status::kIOError;
           break;
         }
-        if (payload_len_.count(st[i].fn) != 0) {
+        if (committed_payloads_.count(st[i].fn) != 0) {
           if (details != nullptr)
             (*details)[i].outcome = DiskWriteOutcome::kKeptExisting;
           out[i] = Status::kOk;
@@ -2305,12 +2323,11 @@ bool DiskSlabStore::AcquireForRead(const BlockKey& key, const std::string& fn,
   if (!Healthy()) return false;
   {
     const std::lock_guard<std::mutex> lock(mu_);
-    const std::unordered_map<std::string, uint32_t>::const_iterator it =
-        payload_len_.find(fn);
-    if (it == payload_len_.end())
+    const PayloadMap::const_iterator it = committed_payloads_.find(fn);
+    if (it == committed_payloads_.end())
       return false;  // No committed visible payload.
     if (!alloc_->GetAndPin(key, ref)) return false;
-    *plen = it->second;
+    *plen = it->second.length;
     if (identity != nullptr) *identity = ResidentIdentityLocked(key, fn);
     inflight_[fn]++;
   }
@@ -2474,15 +2491,16 @@ bool DiskSlabStore::IsCached(const BlockKey& key) const {
   std::lock_guard<std::mutex> lk(mu_);
   // Commit-gated (matches what a Range would hit): an in-flight write or a
   // deferred-removed key reads as absent.
-  return payload_len_.count(key.Filename()) > 0;
+  return committed_payloads_.count(key.Filename()) > 0;
 }
 Status DiskSlabStore::Lookup(const BlockKey& key, ValueMetadata* out) const {
   if (!Healthy()) return Status::kIOError;
   if (out == nullptr) return Status::kInvalid;
   std::lock_guard<std::mutex> lk(mu_);
-  auto it = payload_len_.find(key.Filename());
-  if (it == payload_len_.end()) return Status::kNotFound;
-  out->value_len = it->second;
+  const PayloadMap::const_iterator it =
+      committed_payloads_.find(key.Filename());
+  if (it == committed_payloads_.end()) return Status::kNotFound;
+  out->value_len = it->second.length;
   return Status::kOk;
 }
 
@@ -2496,8 +2514,8 @@ Status DiskSlabStore::Remove(const BlockKey& key) {
   if (inflight_.count(fn)) {
     // An unlocked pread/pwrite holds this slot. Defer durable invalidation and
     // physical removal to the last releaser; readers gate off immediately via
-    // the payload_len_ erase. SlabAllocator's own deferred-remove state remains
-    // a final defense for callers that miss this higher-level ordering.
+    // the committed_payloads_ erase. SlabAllocator's own deferred-remove state
+    // remains a final defense for callers that miss this higher-level ordering.
     deferred_remove_.insert(fn);
     ++deferred_remove_total_;
     ErasePayloadLocked(fn);
@@ -2971,7 +2989,8 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
     ++lifetime_reads_.race_identity_scope;
     return;
   }
-  if (payload_len_.count(key.Filename()) == 0) {
+  const PayloadMap::iterator visible = committed_payloads_.find(key.Filename());
+  if (visible == committed_payloads_.end()) {
     ++lifetime_reads_.race_lost;
     ++lifetime_reads_.race_not_visible;
     return;
@@ -2984,6 +3003,12 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
   switch (result) {
     case SlabAllocator::LifetimeReadResult::kApplied:
       ++lifetime_reads_.applied;
+      // Keep recovery origin after reading. Only an accepted first heat event
+      // consumes unread membership, using the same D-protected map lookup.
+      if (visible->second.recovered_unread) {
+        visible->second.recovered_unread = false;
+        --lifetime_visible_recovered_unread_objects_;
+      }
       break;
     case SlabAllocator::LifetimeReadResult::kResidentChanged:
       ++lifetime_reads_.race_lost;
@@ -3132,9 +3157,12 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.sync_payload_reads = sync_payload_reads_;
   st.uring_payload_reads = uring_payload_reads_;
   st.payload_bytes = committed_payload_bytes_;
+  st.lifetime_visible_recovered_objects = lifetime_visible_recovered_objects_;
+  st.lifetime_visible_recovered_unread_objects =
+      lifetime_visible_recovered_unread_objects_;
   st.watermark_freed_payload_bytes = watermark_freed_payload_bytes_;
   st.lifetime_init_clock_hard_exhausted = lifetime_init_clock_hard_exhausted_;
-  st.committed_objects = payload_len_.size();
+  st.committed_objects = committed_payloads_.size();
   st.deferred_removes = deferred_remove_total_;
   st.inflight = inflight_.size();
   st.prep_holds = prep_holds_.size();

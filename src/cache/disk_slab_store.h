@@ -243,6 +243,9 @@ class DiskSlabStore : public StoreEngine {
     // Unread means no applied real reads; virtual recovery seeds do not count.
     uint64_t lifetime_recovered_objects = 0;
     uint64_t lifetime_recovered_unread_objects = 0;
+    // Commit-map membership, even if unhealthy or heat initialization failed.
+    uint64_t lifetime_visible_recovered_objects = 0;
+    uint64_t lifetime_visible_recovered_unread_objects = 0;
 
     uint64_t dio_write_fallbacks = 0;
     uint64_t dio_read_fallbacks = 0;
@@ -589,9 +592,16 @@ class DiskSlabStore : public StoreEngine {
   struct PrepHold { BlockKey key; std::string fn; };
   std::unordered_map<uint64_t, PrepHold> prep_holds_;
   uint64_t prep_token_seq_ = 0;
-  // key.Filename() -> its true payload length (slot_size >= this). Rebuilt on
-  // open from the table; the allocator only tracks slot size.
-  std::unordered_map<std::string, uint32_t> payload_len_;
+  // Reader-visible commit metadata, rebuilt on open. Recovery origin is
+  // independent of initialized allocator heat state; unread means no applied
+  // real read, not absence of storage access. NEW commits clear both flags.
+  struct CommittedPayload {
+    uint32_t length = 0;  // True payload length; slot size may be larger.
+    bool recovered = false;
+    bool recovered_unread = false;
+  };
+  using PayloadMap = std::unordered_map<std::string, CommittedPayload>;
+  PayloadMap committed_payloads_;
   // Enabled-only store identity. Failed writes consume reserved generations;
   // physical per-resident generations live in the allocator's dense array and
   // are cleared only when the slot is actually freed, not when hidden.
@@ -616,7 +626,7 @@ class DiskSlabStore : public StoreEngine {
   // Guards the in-memory maps and the allocate/lookup+pin step ONLY -- never
   // held across payload I/O (a pin protects the slot from eviction in the
   // unlocked window, inflight_/deferred_remove_ protect it from Remove;
-  // payload_len_ install after the write is the reader-visible commit).
+  // committed_payloads_ install after the write is the reader-visible commit).
   mutable std::mutex mu_;
   uint64_t lifetime_class_scan_visits_ = 0;
   uint64_t lifetime_class_scan_slices_ = 0;
@@ -648,6 +658,9 @@ class DiskSlabStore : public StoreEngine {
   SyncPayloadReadCounters sync_payload_reads_{};  // under mu_
   AsyncReadCounters uring_payload_reads_{};       // under mu_
   uint64_t committed_payload_bytes_ = 0;  // under mu_
+  // Visible recovered origin and no applied real read, independent of A state.
+  uint64_t lifetime_visible_recovered_objects_ = 0;         // under mu_
+  uint64_t lifetime_visible_recovered_unread_objects_ = 0;  // under mu_
   uint64_t lifetime_init_clock_hard_exhausted_ = 0;  // under mu_
   bool ok_ = false;
   std::atomic<bool> metadata_failed_{false};

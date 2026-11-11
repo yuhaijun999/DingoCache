@@ -318,7 +318,9 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
         "dfkv_slab_lifetime_state_bytes", "dfkv_slab_lifetime_link_bytes",
         "dfkv_slab_lifetime_queue_bytes", "dfkv_slab_lifetime_version_bytes",
         "dfkv_slab_lifetime_recovered_objects",
-        "dfkv_slab_lifetime_recovered_unread_objects"}) {
+        "dfkv_slab_lifetime_recovered_unread_objects",
+        "dfkv_slab_lifetime_visible_recovered_objects",
+        "dfkv_slab_lifetime_visible_recovered_unread_objects"}) {
     EXPECT_NE(text.find(std::string(name) + " 0\n"), std::string::npos);
   }
   EXPECT_NE(text.find("\ndfkv_slab_lifetime_bucket_estimate_available 0\n"),
@@ -394,7 +396,9 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
         "dfkv_slab_disk_lifetime_queue_bytes",
         "dfkv_slab_disk_lifetime_version_bytes",
         "dfkv_slab_disk_lifetime_recovered_objects",
-        "dfkv_slab_disk_lifetime_recovered_unread_objects"}) {
+        "dfkv_slab_disk_lifetime_recovered_unread_objects",
+        "dfkv_slab_disk_lifetime_visible_recovered_objects",
+        "dfkv_slab_disk_lifetime_visible_recovered_unread_objects"}) {
     EXPECT_NE(text.find(std::string(name) + labels), std::string::npos);
   }
   for (const char* name :
@@ -1659,11 +1663,18 @@ TEST(Metrics, RecoveredGaugesTrackReadsRemovalAndRestarts) {
   ASSERT_EQ(keys[0].size(), 3U);
   ASSERT_EQ(keys[1].size(), 1U);
   const auto expect_population = [&](uint64_t objects0, uint64_t unread0,
-                                     uint64_t objects1, uint64_t unread1) {
+                                     uint64_t objects1, uint64_t unread1,
+                                     uint64_t hidden_unread0 = 0) {
     const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
     const std::string text = server->MetricsText();
     const uint64_t objects[] = {objects0, objects1};
     const uint64_t unread[] = {unread0, unread1};
+    // This fixture hides one unread recovered disk-0 resident while pinned.
+    // Only this fully initialized-state fixture derives visible expectations
+    // from retained populations; a missing heat state has a different origin.
+    ASSERT_LE(hidden_unread0, unread0);
+    const uint64_t visible_objects[] = {objects0 - hidden_unread0, objects1};
+    const uint64_t visible_unread[] = {unread0 - hidden_unread0, unread1};
     uint64_t class_objects = 0;
     uint64_t class_unread = 0;
     const std::vector<SlabAllocator::ClassStat> classes = group.SlabClasses();
@@ -1675,6 +1686,14 @@ TEST(Metrics, RecoveredGaugesTrackReadsRemovalAndRestarts) {
     EXPECT_EQ(class_unread, unread0 + unread1);
     for (size_t disk = 0; disk < 2; ++disk) {
       const DiskSlabStore::Stats stats = group.DiskSlabStats(disk);
+      EXPECT_EQ(stats.lifetime_visible_recovered_objects,
+                visible_objects[disk]);
+      EXPECT_EQ(stats.lifetime_visible_recovered_unread_objects,
+                visible_unread[disk]);
+      EXPECT_LE(stats.lifetime_visible_recovered_unread_objects,
+                stats.lifetime_visible_recovered_objects);
+      EXPECT_LE(stats.lifetime_visible_recovered_objects,
+                stats.committed_objects);
       EXPECT_EQ(stats.lifetime_recovered_objects, objects[disk]);
       EXPECT_EQ(stats.lifetime_recovered_unread_objects, unread[disk]);
       EXPECT_LE(stats.lifetime_recovered_unread_objects,
@@ -1682,6 +1701,14 @@ TEST(Metrics, RecoveredGaugesTrackReadsRemovalAndRestarts) {
       const std::string labels = R"({disk=")" + options.cache_dirs[disk] +
                                  R"(",disk_index=")" + std::to_string(disk) +
                                  R"("} )";
+      EXPECT_NE(
+          text.find("dfkv_slab_disk_lifetime_visible_recovered_objects" +
+                    labels + std::to_string(visible_objects[disk]) + "\n"),
+          std::string::npos);
+      EXPECT_NE(
+          text.find("dfkv_slab_disk_lifetime_visible_recovered_unread_objects" +
+                    labels + std::to_string(visible_unread[disk]) + "\n"),
+          std::string::npos);
       EXPECT_NE(text.find("dfkv_slab_disk_lifetime_recovered_objects" + labels +
                           std::to_string(objects[disk]) + "\n"),
                 std::string::npos);
@@ -1689,6 +1716,20 @@ TEST(Metrics, RecoveredGaugesTrackReadsRemovalAndRestarts) {
                           labels + std::to_string(unread[disk]) + "\n"),
                 std::string::npos);
     }
+    const DiskSlabStore::Stats total = group.SlabStats();
+    EXPECT_EQ(total.lifetime_visible_recovered_objects,
+              visible_objects[0] + visible_objects[1]);
+    EXPECT_EQ(total.lifetime_visible_recovered_unread_objects,
+              visible_unread[0] + visible_unread[1]);
+    EXPECT_NE(
+        text.find("dfkv_slab_lifetime_visible_recovered_objects " +
+                  std::to_string(visible_objects[0] + visible_objects[1]) +
+                  "\n"),
+        std::string::npos);
+    EXPECT_NE(
+        text.find("dfkv_slab_lifetime_visible_recovered_unread_objects " +
+                  std::to_string(visible_unread[0] + visible_unread[1]) + "\n"),
+        std::string::npos);
     EXPECT_NE(text.find("dfkv_slab_lifetime_recovered_objects " +
                         std::to_string(objects0 + objects1) + "\n"),
               std::string::npos);
@@ -1699,7 +1740,11 @@ TEST(Metrics, RecoveredGaugesTrackReadsRemovalAndRestarts) {
          {"dfkv_slab_lifetime_recovered_objects",
           "dfkv_slab_lifetime_recovered_unread_objects",
           "dfkv_slab_disk_lifetime_recovered_objects",
-          "dfkv_slab_disk_lifetime_recovered_unread_objects"}) {
+          "dfkv_slab_disk_lifetime_recovered_unread_objects",
+          "dfkv_slab_lifetime_visible_recovered_objects",
+          "dfkv_slab_lifetime_visible_recovered_unread_objects",
+          "dfkv_slab_disk_lifetime_visible_recovered_objects",
+          "dfkv_slab_disk_lifetime_visible_recovered_unread_objects"}) {
       EXPECT_NE(text.find(std::string("# TYPE ") + name + " gauge\n"),
                 std::string::npos);
     }
@@ -1757,8 +1802,8 @@ TEST(Metrics, RecoveredGaugesTrackReadsRemovalAndRestarts) {
   ASSERT_EQ(disk0.RangeDirectPrep(keys[0][1], 0, 0, 8192, &lease), Status::kOk);
   ASSERT_EQ(disk0.Remove(keys[0][1]), Status::kOk);
   EXPECT_FALSE(disk0.IsCached(keys[0][1]));
-  // Hidden but pinned recovered residents remain in the allocator population.
-  ASSERT_NO_FATAL_FAILURE(expect_population(1, 1, 1, 0));
+  // Hidden but pinned residents remain in the allocator, not the commit map.
+  ASSERT_NO_FATAL_FAILURE(expect_population(1, 1, 1, 0, 1));
   lease = ReadLease{};
   ASSERT_TRUE(server->Healthy());
   ASSERT_NO_FATAL_FAILURE(expect_population(0, 0, 1, 0));
@@ -2905,7 +2950,11 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
         "dfkv_slab_lifetime_recovered_objects",
         "dfkv_slab_lifetime_recovered_unread_objects",
         "dfkv_slab_disk_lifetime_recovered_objects",
-        "dfkv_slab_disk_lifetime_recovered_unread_objects"}) {
+        "dfkv_slab_disk_lifetime_recovered_unread_objects",
+        "dfkv_slab_lifetime_visible_recovered_objects",
+        "dfkv_slab_lifetime_visible_recovered_unread_objects",
+        "dfkv_slab_disk_lifetime_visible_recovered_objects",
+        "dfkv_slab_disk_lifetime_visible_recovered_unread_objects"}) {
     EXPECT_EQ(text.find(name), std::string::npos);
   }
   EXPECT_EQ(text.find("dfkv_slab_watermark_freed_payload_bytes_total"),
