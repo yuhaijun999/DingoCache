@@ -209,6 +209,8 @@ class DiskSlabStore : public StoreEngine {
     uint64_t lifetime_watermark_protected_victims = 0;
     // Successful watermark ages; recovery-origin history stays separate.
     SlabAllocator::LifetimeDonorAgeStats lifetime_watermark_age{};
+    // Final pre-wipe scores, including valid recovered scoring state.
+    SlabAllocator::LifetimeDonorScoreStats lifetime_watermark_score{};
     uint64_t lifetime_donor_coarse_extents = 0;
     uint64_t lifetime_donor_precise_extents = 0;
     uint64_t lifetime_donor_precise_residents = 0;
@@ -655,6 +657,7 @@ class DiskSlabStore : public StoreEngine {
   uint64_t lifetime_watermark_pin_skips_ = 0;
   uint64_t lifetime_watermark_protected_victims_ = 0;
   SlabAllocator::LifetimeDonorAgeStats lifetime_watermark_age_{};
+  SlabAllocator::LifetimeDonorScoreStats lifetime_watermark_score_{};
 
   // Invoked only between class slices, after releasing BOTH lifecycle locks.
   std::function<void()> lifetime_scan_yield_hook_for_test_{};

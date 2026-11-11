@@ -646,6 +646,16 @@ std::string KvNodeServer::MetricsText() const {
     header("dfkv_slab_disk_lifetime_watermark_age_history_unknown_total",
            "counter",
            "Successful watermark victims with unknown recovered history");
+    header("dfkv_slab_disk_lifetime_watermark_score_nonnegative_seconds",
+           "histogram", "Nonnegative successful watermark pre-wipe scores");
+    header("dfkv_slab_lifetime_watermark_score_nonnegative_seconds",
+           "histogram", "Nonnegative successful watermark pre-wipe scores");
+    header("dfkv_slab_disk_lifetime_watermark_score_negative_magnitude_seconds",
+           "histogram",
+           "Absolute negative successful watermark pre-wipe scores");
+    header("dfkv_slab_lifetime_watermark_score_negative_magnitude_seconds",
+           "histogram",
+           "Absolute negative successful watermark pre-wipe scores");
     header("dfkv_slab_disk_lifetime_donor_age_seconds", "histogram",
            "Successful donor pre-wipe ages since anchor with known history");
     header("dfkv_slab_lifetime_donor_age_seconds", "histogram",
@@ -1015,6 +1025,17 @@ std::string KvNodeServer::MetricsText() const {
                       SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
       sample("dfkv_slab_disk_lifetime_watermark_age_history_unknown_total",
              disk.lifetime_watermark_age.history_unknown);
+      donor_histogram(
+          "dfkv_slab_disk_lifetime_watermark_score_nonnegative_seconds",
+          disk.lifetime_watermark_score.nonnegative_buckets,
+          std::to_string(disk.lifetime_watermark_score.nonnegative_total_sec),
+          SlabAllocator::kLifetimeDonorScoreBoundsSec, labels);
+      donor_histogram(
+          "dfkv_slab_disk_lifetime_watermark_score_negative_magnitude_seconds",
+          disk.lifetime_watermark_score.negative_magnitude_buckets,
+          std::to_string(
+              disk.lifetime_watermark_score.negative_magnitude_total_sec),
+          SlabAllocator::kLifetimeDonorScoreBoundsSec, labels);
       donor_histogram("dfkv_slab_disk_lifetime_donor_age_seconds",
                       disk.lifetime_donor_age.buckets,
                       std::to_string(disk.lifetime_donor_age.total_sec),
@@ -1266,6 +1287,17 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_watermark_age_history_unknown_total", "counter",
            "Successful watermark victims with unknown recovered history",
            ss.lifetime_watermark_age.history_unknown);
+    donor_histogram(
+        "dfkv_slab_lifetime_watermark_score_nonnegative_seconds",
+        ss.lifetime_watermark_score.nonnegative_buckets,
+        std::to_string(ss.lifetime_watermark_score.nonnegative_total_sec),
+        SlabAllocator::kLifetimeDonorScoreBoundsSec, "");
+    donor_histogram(
+        "dfkv_slab_lifetime_watermark_score_negative_magnitude_seconds",
+        ss.lifetime_watermark_score.negative_magnitude_buckets,
+        std::to_string(
+            ss.lifetime_watermark_score.negative_magnitude_total_sec),
+        SlabAllocator::kLifetimeDonorScoreBoundsSec, "");
     donor_histogram("dfkv_slab_lifetime_donor_age_seconds",
                     ss.lifetime_donor_age.buckets,
                     std::to_string(ss.lifetime_donor_age.total_sec),

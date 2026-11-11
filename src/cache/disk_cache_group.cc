@@ -1086,6 +1086,18 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_watermark_age.total_sec += st.lifetime_watermark_age.total_sec;
     sum.lifetime_watermark_age.history_unknown +=
         st.lifetime_watermark_age.history_unknown;
+    for (size_t bucket = 0;
+         bucket < sum.lifetime_watermark_score.nonnegative_buckets.size();
+         ++bucket) {
+      sum.lifetime_watermark_score.nonnegative_buckets[bucket] +=
+          st.lifetime_watermark_score.nonnegative_buckets[bucket];
+      sum.lifetime_watermark_score.negative_magnitude_buckets[bucket] +=
+          st.lifetime_watermark_score.negative_magnitude_buckets[bucket];
+    }
+    sum.lifetime_watermark_score.nonnegative_total_sec +=
+        st.lifetime_watermark_score.nonnegative_total_sec;
+    sum.lifetime_watermark_score.negative_magnitude_total_sec +=
+        st.lifetime_watermark_score.negative_magnitude_total_sec;
     sum.lifetime_donor_coarse_extents += st.lifetime_donor_coarse_extents;
     sum.lifetime_donor_precise_extents += st.lifetime_donor_precise_extents;
     sum.lifetime_donor_precise_residents += st.lifetime_donor_precise_residents;

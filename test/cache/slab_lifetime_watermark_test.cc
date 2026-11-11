@@ -3,9 +3,11 @@
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -116,6 +118,186 @@ void SeedState(SlabAllocator& allocator, uint64_t id,
   SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(id), id, &state);
 }
 
+DiskLifetimeConfig ScoreConfig(uint64_t base) {
+  DiskLifetimeConfig config;
+  config.base_sec = base;
+  config.read_bonus_sec = 0;
+  config.max_reads = 1;
+  config.boost_sec = 1;
+  config.keep_score_sec = base - 1;
+  config.protect_sec = config.slowdown = config.bucket_sec = 1;
+  config.bucket_count = 2;
+  config.high_pct = 0;
+  std::string error;
+  EXPECT_TRUE(ValidateDiskLifetimeConfig(config, &error)) << error;
+  return config;
+}
+
+void ExpectEmptyScore(const SlabAllocator::LifetimeDonorScoreStats& score) {
+  EXPECT_EQ(score.nonnegative_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(score.negative_magnitude_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(score.nonnegative_total_sec, 0);
+  EXPECT_DOUBLE_EQ(score.negative_magnitude_total_sec, 0);
+}
+
+TEST(SlabLifetimeWatermark, ScoreBinsSeparateSignsIncludingZero) {
+  struct Case {
+    uint32_t magnitude;
+    size_t bucket;
+  };
+  const std::array<Case, 13> cases = {{{0, 0},
+                                       {1, 1},
+                                       {2, 2},
+                                       {60, 2},
+                                       {61, 3},
+                                       {3600, 3},
+                                       {3601, 4},
+                                       {86400, 4},
+                                       {86401, 5},
+                                       {604800, 5},
+                                       {604801, 6},
+                                       {2592000, 6},
+                                       {2592001, 7}}};
+  for (const bool negative : {false, true}) {
+    for (const Case& test : cases) {
+      if (negative && test.magnitude == 0) continue;
+      SCOPED_TRACE(negative);
+      SCOPED_TRACE(test.magnitude);
+      const DiskLifetimeConfig config = ScoreConfig(3000000);
+      uint64_t seconds = 0;
+      const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                    [&] { return seconds; });
+      unsigned writes = 0;
+      SlabAllocator::Options options = Options(2, 1);
+      options.on_slot_evict = [&](const SlabAllocator::SlotRef&) {
+        ++writes;
+        return true;
+      };
+      SlabAllocator allocator(options);
+      ASSERT_NO_FATAL_FAILURE(
+          SeedState(allocator, 1, RecoveredDiskLifetimeState(1)));
+      seconds = negative ? config.base_sec + test.magnitude
+                         : config.base_sec - test.magnitude;
+      std::vector<BlockKey> evicted;
+      SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
+      ASSERT_EQ(Evict(allocator, 0, 1, config, clock, &evicted, &stats), 1U);
+      EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+      EXPECT_EQ(writes, 1U);
+      for (size_t bucket = 0; bucket < 8; ++bucket) {
+        EXPECT_EQ(stats.score.nonnegative_buckets[bucket],
+                  !negative && bucket == test.bucket ? 1U : 0U);
+        EXPECT_EQ(stats.score.negative_magnitude_buckets[bucket],
+                  negative && bucket == test.bucket ? 1U : 0U);
+      }
+      EXPECT_DOUBLE_EQ(stats.score.nonnegative_total_sec,
+                       negative ? 0 : test.magnitude);
+      EXPECT_DOUBLE_EQ(stats.score.negative_magnitude_total_sec,
+                       negative ? test.magnitude : 0);
+      EXPECT_EQ(stats.age.history_unknown, 1U);
+      EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+    }
+  }
+}
+
+TEST(SlabLifetimeWatermark, ScoreUsesFinalPreWipeTimeAndNullableStats) {
+  for (const bool with_stats : {false, true}) {
+    SCOPED_TRACE(with_stats);
+    const DiskLifetimeConfig config = ScoreConfig(100);
+    uint64_t seconds = 0;
+    bool armed = false;
+    unsigned samples = 0;
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&] {
+      const uint64_t sampled = seconds;
+      if (armed) {
+        ++samples;
+        seconds = 20;
+      }
+      return sampled;
+    });
+    unsigned writes = 0;
+    SlabAllocator::Options options = Options(2, 1);
+    options.on_slot_evict = [&](const SlabAllocator::SlotRef&) {
+      ++writes;
+      seconds = 1000;
+      return true;
+    };
+    SlabAllocator allocator(options);
+    ASSERT_NO_FATAL_FAILURE(
+        SeedState(allocator, 1, RecoveredDiskLifetimeState(1)));
+    seconds = 19;  // Selection81; final80; post-I/O -900.
+    armed = true;
+    SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
+    stats.score.nonnegative_buckets[0] = 99;
+    stats.score.negative_magnitude_buckets[0] = 99;
+    stats.score.nonnegative_total_sec = 99;
+    stats.score.negative_magnitude_total_sec = 99;
+    std::vector<BlockKey> evicted;
+    ASSERT_EQ(Evict(allocator, 0, 1, config, clock, &evicted,
+                    with_stats ? &stats : nullptr),
+              1U);
+    EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+    EXPECT_EQ(writes, 1U);
+    EXPECT_EQ(samples, 2U);
+    EXPECT_EQ(allocator.WatermarkScanVisits(), 1U);
+    EXPECT_EQ(stats.score.nonnegative_buckets[0], with_stats ? 0U : 99U);
+    EXPECT_EQ(stats.score.nonnegative_buckets[3], with_stats ? 1U : 0U);
+    EXPECT_EQ(stats.score.negative_magnitude_buckets,
+              (std::array<uint64_t, 8>{with_stats ? 0U : 99U}));
+    EXPECT_DOUBLE_EQ(stats.score.nonnegative_total_sec, with_stats ? 80 : 99);
+    EXPECT_DOUBLE_EQ(stats.score.negative_magnitude_total_sec,
+                     with_stats ? 0 : 99);
+  }
+}
+
+TEST(SlabLifetimeWatermark, ScoreSumDoesNotWrapForValidNearInt64Maximum) {
+  const uint64_t maximum = std::numeric_limits<int64_t>::max();
+  const DiskLifetimeConfig config = ScoreConfig(maximum - 1);
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [] { return 0; });
+  SlabAllocator allocator(Options(4, 1));
+  for (uint64_t id = 1; id <= 3; ++id) {
+    ASSERT_NO_FATAL_FAILURE(SeedState(allocator, id, NewDiskLifetimeState(0)));
+  }
+  ASSERT_EQ(DiskLifetimeScore(config, 0, 0, false, true, 0),
+            std::numeric_limits<int64_t>::max());
+  std::vector<BlockKey> evicted;
+  SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
+  ASSERT_EQ(Evict(allocator, 0, 3, config, clock, &evicted, &stats), 3U);
+  EXPECT_EQ(evicted.size(), 3U);
+  EXPECT_EQ(stats.score.nonnegative_buckets[7], 3U);
+  EXPECT_TRUE(std::isfinite(stats.score.nonnegative_total_sec));
+  EXPECT_DOUBLE_EQ(stats.score.nonnegative_total_sec,
+                   3.0 * static_cast<double>(maximum));
+  EXPECT_GT(stats.score.nonnegative_total_sec,
+            static_cast<double>(std::numeric_limits<uint64_t>::max()));
+  EXPECT_EQ(stats.score.negative_magnitude_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(stats.score.negative_magnitude_total_sec, 0);
+  EXPECT_EQ(stats.protected_victims, 3U);
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
+TEST(SlabLifetimeWatermark, ScoreCountsLargestClockReachableDeficit) {
+  const DiskLifetimeConfig config = ScoreConfig(1);
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&] { return seconds; });
+  SlabAllocator allocator(Options(2, 1));
+  ASSERT_NO_FATAL_FAILURE(
+      SeedState(allocator, 1, RecoveredDiskLifetimeState(1)));
+  // Draining reaches UINT32_MAX, not UINT64_MAX. Runtime watermarks cannot
+  // reach INT64_MIN; its safe conversion is a defensive arithmetic property.
+  seconds = UINT32_MAX;
+  std::vector<BlockKey> evicted;
+  SlabAllocatorTestPeer::LifetimeWatermarkStats stats;
+  ASSERT_EQ(Evict(allocator, 0, 1, config, clock, &evicted, &stats), 1U);
+  EXPECT_EQ(stats.score.negative_magnitude_buckets[7], 1U);
+  EXPECT_DOUBLE_EQ(stats.score.negative_magnitude_total_sec,
+                   static_cast<double>(UINT32_MAX) - 1);
+  EXPECT_EQ(stats.score.nonnegative_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(stats.score.nonnegative_total_sec, 0);
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
 TEST(SlabLifetimeWatermark, AgeUsesFixedDisplayBoundaries) {
   struct Case {
     uint32_t seconds;
@@ -224,6 +406,12 @@ TEST(SlabLifetimeWatermark, AgeExcludesRecoveredHistoryEvenAfterRealRead) {
   EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(stats.age.total_sec, 0U);
   EXPECT_EQ(stats.age.history_unknown, 2U);
+  EXPECT_EQ(stats.score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 2}));
+  EXPECT_DOUBLE_EQ(stats.score.nonnegative_total_sec, 2419170);
+  EXPECT_EQ(stats.score.negative_magnitude_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(stats.score.negative_magnitude_total_sec, 0);
   EXPECT_EQ(allocator.Count(), 0U);
 }
 
@@ -535,10 +723,15 @@ TEST(SlabLifetimeWatermark, CountByteAndZeroLimitsStopImmediately) {
   stats.age.buckets[0] = 99;
   stats.age.total_sec = 99;
   stats.age.history_unknown = 99;
+  stats.score.nonnegative_buckets[0] = 99;
+  stats.score.negative_magnitude_buckets[0] = 99;
+  stats.score.nonnegative_total_sec = 99;
+  stats.score.negative_magnitude_total_sec = 99;
   EXPECT_EQ(Evict(allocator, 0, 0, config, clock, &evicted, &stats), 0U);
   EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(stats.age.total_sec, 0U);
   EXPECT_EQ(stats.age.history_unknown, 0U);
+  ExpectEmptyScore(stats.score);
   EXPECT_EQ(allocator.WatermarkScanVisits(), 0U);
   EXPECT_EQ(Evict(allocator, 0, 1, config, clock, &evicted), 1U);
   EXPECT_EQ(allocator.Count(), 3U);
@@ -577,6 +770,7 @@ TEST(SlabLifetimeWatermark, FullPinnedTraversalStopsWithoutRevisiting) {
   EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(stats.age.total_sec, 0U);
   EXPECT_EQ(stats.age.history_unknown, 0U);
+  ExpectEmptyScore(stats.score);
   EXPECT_EQ(allocator.WatermarkScanVisits(), 12U);
   EXPECT_TRUE(evicted.empty());
   EXPECT_EQ(allocator.Count(), 12U);
@@ -651,11 +845,16 @@ TEST(SlabLifetimeWatermark, PersistenceFailureDoesNotFreeOrRetry) {
   stats.age.buckets[0] = 99;
   stats.age.total_sec = 99;
   stats.age.history_unknown = 99;
+  stats.score.nonnegative_buckets[0] = 99;
+  stats.score.negative_magnitude_buckets[0] = 99;
+  stats.score.nonnegative_total_sec = 99;
+  stats.score.negative_magnitude_total_sec = 99;
   EXPECT_EQ(Evict(allocator, 0, 256, config, clock, &evicted, &stats), 0U);
   EXPECT_EQ(stats.protected_victims, 0U);
   EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(stats.age.total_sec, 0U);
   EXPECT_EQ(stats.age.history_unknown, 0U);
+  ExpectEmptyScore(stats.score);
   EXPECT_EQ(attempts, 1U);
   EXPECT_EQ(observed, 1U);
   EXPECT_TRUE(evicted.empty());
@@ -683,6 +882,12 @@ TEST(SlabLifetimeWatermark,
   EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(stats.age.total_sec, 0U);
   EXPECT_EQ(stats.age.history_unknown, 1U);
+  EXPECT_EQ(stats.score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 1}));
+  EXPECT_DOUBLE_EQ(stats.score.nonnegative_total_sec, 604800);
+  EXPECT_EQ(stats.score.negative_magnitude_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(stats.score.negative_magnitude_total_sec, 0);
   EXPECT_EQ(attempts, 2U);
   EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
   EXPECT_EQ(allocator.Count(), 2U);
@@ -769,6 +974,12 @@ TEST(SlabLifetimeWatermark, HardClockStopsAfterCompletedInvalidation) {
   EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(stats.age.total_sec, 0U);
   EXPECT_EQ(stats.age.history_unknown, 1U);
+  EXPECT_EQ(stats.score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 1}));
+  EXPECT_DOUBLE_EQ(stats.score.nonnegative_total_sec, 604800);
+  EXPECT_EQ(stats.score.negative_magnitude_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(stats.score.negative_magnitude_total_sec, 0);
   EXPECT_EQ(attempts, 1U);
   EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
   EXPECT_EQ(allocator.Count(), 2U);
@@ -778,6 +989,7 @@ TEST(SlabLifetimeWatermark, HardClockStopsAfterCompletedInvalidation) {
   EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(stats.age.total_sec, 0U);
   EXPECT_EQ(stats.age.history_unknown, 0U);
+  ExpectEmptyScore(stats.score);
   EXPECT_EQ(attempts, 1U);
 }
 
@@ -983,6 +1195,23 @@ TEST_F(LifetimeWatermarkStoreTest, ConcurrentReadsKeepPinnedSurvivorByteExact) {
         failures.fetch_add(1);
       } else {
         store_->NotifyLifetimeReadSuccess(Key(64), identity, value.size());
+        const DiskSlabStore::Stats snapshot = store_->GetStats();
+        uint64_t scored = 0;
+        uint64_t aged = snapshot.lifetime_watermark_age.history_unknown;
+        for (const uint64_t count :
+             snapshot.lifetime_watermark_score.nonnegative_buckets) {
+          scored += count;
+        }
+        for (const uint64_t count :
+             snapshot.lifetime_watermark_score.negative_magnitude_buckets) {
+          scored += count;
+        }
+        for (const uint64_t count : snapshot.lifetime_watermark_age.buckets) {
+          aged += count;
+        }
+        // Both counters share D in this snapshot; allocator-wide values
+        // gathered earlier by GetStats are not part of this live equality.
+        if (scored != aged) failures.fetch_add(1);
       }
     }
   });
@@ -1000,6 +1229,13 @@ TEST_F(LifetimeWatermarkStoreTest, ConcurrentReadsKeepPinnedSurvivorByteExact) {
   EXPECT_EQ(age.buckets, (std::array<uint64_t, 8>{63}));
   EXPECT_EQ(age.total_sec, 0U);
   EXPECT_EQ(age.history_unknown, 0U);
+  const SlabAllocator::LifetimeDonorScoreStats score =
+      store_->GetStats().lifetime_watermark_score;
+  EXPECT_EQ(score.nonnegative_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 63}));
+  EXPECT_DOUBLE_EQ(score.nonnegative_total_sec, 114307200);
+  EXPECT_EQ(score.negative_magnitude_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_DOUBLE_EQ(score.negative_magnitude_total_sec, 0);
   EXPECT_EQ(store_->GetStats().lifetime_reads.successful, 256U);
   EXPECT_EQ(store_->GetStats().lifetime_reads.applied, 256U);
   EXPECT_EQ(store_->TenantUsedBytes(7), 10U);

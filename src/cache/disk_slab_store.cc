@@ -2745,6 +2745,17 @@ void DiskSlabStore::ReclaimTick(
         }
         lifetime_watermark_age_.total_sec += stats.age.total_sec;
         lifetime_watermark_age_.history_unknown += stats.age.history_unknown;
+        for (size_t bucket = 0; bucket < stats.score.nonnegative_buckets.size();
+             ++bucket) {
+          lifetime_watermark_score_.nonnegative_buckets[bucket] +=
+              stats.score.nonnegative_buckets[bucket];
+          lifetime_watermark_score_.negative_magnitude_buckets[bucket] +=
+              stats.score.negative_magnitude_buckets[bucket];
+        }
+        lifetime_watermark_score_.nonnegative_total_sec +=
+            stats.score.nonnegative_total_sec;
+        lifetime_watermark_score_.negative_magnitude_total_sec +=
+            stats.score.negative_magnitude_total_sec;
       } else {
         alloc_->EvictColdToTarget(evict_low_bytes_, evict_max_victims_per_tick_,
                                   &evicted);
@@ -3157,6 +3168,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.lifetime_watermark_protected_victims =
       lifetime_watermark_protected_victims_;
   st.lifetime_watermark_age = lifetime_watermark_age_;
+  st.lifetime_watermark_score = lifetime_watermark_score_;
 
   st.lifetime_reads = lifetime_reads_;
   st.lifetime_read_processing = lifetime_read_processing_;

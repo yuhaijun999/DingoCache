@@ -1827,6 +1827,7 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
     }
     if (!ReclaimAllowed() || !clock.TryDrainNow(&now)) break;
     bool protected_victim = false;
+    int64_t victim_score = 0;
     bool history_unknown = false;
     uint32_t victim_age_sec = 0;
     if (stats != nullptr) {
@@ -1838,10 +1839,11 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
       const DiskLifetimeState& state = *selected;
       history_unknown = state.history_unknown;
       victim_age_sec = now >= state.anchor ? now - state.anchor : 0;
-      protected_victim =
+      victim_score =
           DiskLifetimeScore(config, state.anchor, state.scoring_reads(),
-                            state.first_early_read(), state.write_armed(),
-                            now) > static_cast<int64_t>(config.keep_score_sec);
+                            state.first_early_read(), state.write_armed(), now);
+      protected_victim =
+          victim_score > static_cast<int64_t>(config.keep_score_sec);
     }
     // Unlike legacy's last-resident optimization, this path only clears one
     // slot record. No whole-extent donor operation belongs to watermarks.
@@ -1864,6 +1866,24 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
             bounds.begin());
         ++age.buckets[bucket];
         age.total_sec += victim_age_sec;
+      }
+      // Reuse the final pre-wipe integer score, including recovered states.
+      // Unsigned subtraction also handles the defensive INT64_MIN case.
+      const bool nonnegative = victim_score >= 0;
+      const uint64_t magnitude =
+          nonnegative ? static_cast<uint64_t>(victim_score)
+                      : uint64_t{0} - static_cast<uint64_t>(victim_score);
+      const std::array<uint32_t, 7>& bounds = kLifetimeDonorScoreBoundsSec;
+      const size_t bucket = static_cast<size_t>(
+          std::lower_bound(bounds.begin(), bounds.end(), magnitude) -
+          bounds.begin());
+      LifetimeDonorScoreStats& score = stats->score;
+      if (nonnegative) {
+        ++score.nonnegative_buckets[bucket];
+        score.nonnegative_total_sec += static_cast<double>(magnitude);
+      } else {
+        ++score.negative_magnitude_buckets[bucket];
+        score.negative_magnitude_total_sec += static_cast<double>(magnitude);
       }
     }
     FreeSlotLocked(best);

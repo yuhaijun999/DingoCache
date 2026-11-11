@@ -372,6 +372,7 @@ class SlabAllocator {
                                              std::vector<BlockKey>* evicted);
   struct LifetimeWatermarkStats {
     LifetimeDonorAgeStats age{};
+    LifetimeDonorScoreStats score{};
     uint64_t budget_exhausted = 0;
     uint64_t no_candidate = 0;
     uint64_t pin_skips = 0;

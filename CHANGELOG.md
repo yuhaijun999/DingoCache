@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export successful lifetime watermark scores as separate nonnegative and
+  absolute-negative distributions. Reuse the final pre-wipe protection score
+  without changing selection, budgets or invalidation rules.
+
 - Export successful lifetime watermark eviction ages using the existing final
   pre-wipe timestamp. Separate unknown recovered history, including after reads,
   without changing victim selection, scan budgets or invalidation rules.
