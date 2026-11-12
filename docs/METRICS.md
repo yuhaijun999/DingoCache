@@ -1333,11 +1333,11 @@ bytes, including calls that evict only NEW residents. Options 208, resident
 state 12 and read-class observation 80 bytes are unchanged. These are component
 layouts, not measurements of complete stack frames, heap/RSS or recovery peak.
 
-### Synchronous logical completion to lifetime application
+### Logical completion to lifetime application
 
 The `dfkv_slab_lifetime_read_completion_to_apply_*` and corresponding
 `dfkv_slab_disk_lifetime_read_completion_to_apply_*` families observe a sampled
-**synchronous Node logical-completion publication → successful owner update**
+**Node synchronous completion or PULL grant publication → successful owner update**
 interval. Suffixes `samples_total` and `ns_total` are counters; `max_ns` is a
 gauge. The per-disk families use the existing disk/disk_index labels; global
 sums/counts add and maxima take max. No key/request labels are introduced.
@@ -1352,9 +1352,10 @@ success and preparation alone do not create an eligible sampled notification.
 In particular, a disk read later changed to I/O error by final deferred-Remove
 invalidation is not a successful producer event.
 
-Capture selects the first and every 64th eligible nonempty synchronous success
+Capture selects the first and every 64th eligible nonempty logical success
 **per thread across Nodes/stores**. Disabled or empty calls do not touch the
-phase or a clock. The producer carries one transient completion token through
+phase or a clock. Synchronous and completion-aware PULL producers share this phase on a thread.
+The producer carries one transient completion token through
 Group/Store; downstream code does not resample. A selected successful update
 captures its endpoint only after lifetime state, both indexes and bucket
 bookkeeping are complete, while allocator A is still held. The interval includes
@@ -1385,11 +1386,30 @@ internal sampling metadata is also treated as missing); not_sampled means the
 producer participated but deliberately skipped this sample. not_applied means
 selected but rejected by the existing heat-result checks; invalid means applied
 with unusable timestamp ordering. These are an independent partition, not more
-logical successes, sources or heat outcomes. Current PULL forwarding and legacy
-internal direct-notification callers default to **Missing**. PULL timestamp
-capture is a subsequent increment: these metrics do not claim transport grant
-completion coverage. PULL must eventually capture after valid grant/MR ownership
-is established, not at preparation, CQE completion, READY send or RELEASE.
+logical successes, sources or heat outcomes. The production PULL observer now
+forwards completion metadata unchanged. Old three/four-argument transport
+observers and internal direct-notification callers still default to **Missing**.
+
+PULL captures at the once-eligible grant-recording boundary, after final
+preparation success, valid MR registration and installed grant ownership, but
+before the notified counter and observer invocation. Thus it includes observer
+dispatch/delay, routing and accepted update work, not preceding MR registration
+or ownership bookkeeping. It is not preparation, CQE completion, READY send,
+client receipt or RELEASE. Duplicate, empty and no-observer grants do not advance
+the sampler or read its clock. Once consumed, a grant is not replayed on observer
+replacement, READY failure, release or teardown; rejected heat remains a valid
+grant with no applied-delay sample. The bounded heat timestamp remains the
+owner's current time, not the earlier grant timestamp.
+
+The completion-aware handler and its sampling flag are configured before Start;
+handler/owner must outlive Stop and callbacks remain synchronous, thread-safe
+and nonthrowing. Production enables sampling from immutable lifetime tracking,
+not merely clock presence or dynamic health. Old handler setters always disable
+sampling, including replacement/clear; no observer also disables capture. This
+preserves ordinary legacy/file behavior. Internal metadata-only opt-in follows
+the same tracking rule as synchronous reads. CPU tests exercise this post-MR
+helper boundary and real Node/Store application, not actual registration or
+READY delivery; real RDMA/RXE plus io_uring hardware acceptance remains deferred.
 
 The elapsed values are sampled sum/count/max, not a histogram, percentile, p99,
 all-request elapsed total or a latency acceptance result. Short-lived threads
@@ -1409,6 +1429,9 @@ processing and held timers retain their own reads; two is not a total-request
 clock-cost claim. Plain counters and larger fixed Store/Stats snapshots and text
 rendering have costs, including shared disabled layouts. No resident field, new
 lock, shared sampling atomic, persistent record or user parameter is added.
+The PULL adapter adds a setup-only bool, unified callback forwarding and a
+transient token; legacy adapters and disabled token construction are not free.
+Existing per-request grant notification atomics are unchanged.
 Complete heap/RSS, lock contention, p99 and strategy performance acceptance remain
 unfinished; no existing alert/dashboard is switched to these new samples.
 
@@ -1418,3 +1441,8 @@ Scan 960 and read-class observation 80 bytes are unchanged. These are component
 layouts, not total stack-frame, heap/RSS, recovery-peak or performance-budget
 measurements. Passing a default token is source-compatible for existing internal
 C++ callers; it does not add a C/transport wire field.
+
+Measured GCC RDMA+io_uring layouts for PULL forwarding: RdmaServer 1432 to
+1440 bytes (+8 for the flag/alignment); Node 102232, Store 3072, Stats 2424 and
+completion token 16 bytes are unchanged. This is fixed object layout, not a
+measurement of callback heap allocation, complete stack/RSS or latency budget.

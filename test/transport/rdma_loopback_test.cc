@@ -12,6 +12,7 @@
 #include "cache/disk_cache_group.h"
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
@@ -87,9 +88,8 @@ class KvNodeServerTestPeer {
   static bool TracksPullHeat(const KvNodeServer& server) {
     return server.group_.TracksLifetimeState();
   }
-  static DiskSlabStore::LifetimeReadCounters PullHeatCounters(
-      const KvNodeServer& server) {
-    return server.group_.SlabStats().lifetime_reads;
+  static DiskSlabStore::Stats PullHeatStats(const KvNodeServer& server) {
+    return server.group_.SlabStats();
   }
   static DiskWriteResult PersistPullSource(KvNodeServer& server,
                                            const BlockKey& key) {
@@ -592,6 +592,16 @@ class RdmaPullHeatTest : public ::testing::Test {
           node_->NotifyLifetimeReadSuccessForKey(key, identity, bytes, source);
         });
   }
+  void InstallCompletionObserver() {
+    transport_.SetPullReadSuccessWithCompletionHandler(
+        [this](const BlockKey& key, const DiskResidentIdentity& identity,
+               size_t bytes, PreparedRead::Source source,
+               const DiskLifetimeReadCompletion& completion) {
+          node_->NotifyLifetimeReadSuccessForKey(key, identity, bytes, source,
+                                                 completion);
+        },
+        node_->TracksLifetimeState());
+  }
   DiskResidentIdentity Seed() {
     const DiskWriteResult result =
         KvNodeServerTestPeer::PersistPullSource(*node_, key_);
@@ -619,8 +629,14 @@ class RdmaPullHeatTest : public ::testing::Test {
                                         source);
   }
   DiskSlabStore::LifetimeReadCounters Counters() const {
-    const DiskSlabStore::LifetimeReadCounters counters =
-        KvNodeServerTestPeer::PullHeatCounters(*node_);
+    const DiskSlabStore::Stats stats =
+        KvNodeServerTestPeer::PullHeatStats(*node_);
+    const DiskSlabStore::LifetimeReadCounters& counters = stats.lifetime_reads;
+    EXPECT_EQ(counters.successful,
+              counters.completion_missing + counters.completion_not_sampled +
+                  counters.completion_not_applied +
+                  counters.completion_invalid +
+                  stats.lifetime_read_completion_to_apply.samples);
     EXPECT_EQ(counters.successful,
               counters.applied + counters.no_binding + counters.race_lost +
                   counters.clock_hard_exhausted + counters.io_unhealthy +
@@ -655,6 +671,261 @@ class RdmaPullHeatTest : public ::testing::Test {
   const BlockKey key_{99201, 0};
   alignas(4096) char staging_[4096] = {};
 };
+
+// These CPU tests exercise the real grant-recording helper and Node/Store
+// notification chain, not successful verbs registration or client delivery.
+TEST_F(RdmaPullHeatTest, CompletionSamplingSelectsFirstAndEvery64Grants) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_EQ(Finish(read), Status::kOk);
+  ASSERT_TRUE(read.source_identity() == identity);
+  ASSERT_EQ(std::string(read.data(), read.payload_len()), "value");
+  unsigned calls = 0;
+  transport_.SetPullReadSuccessWithCompletionHandler(
+      [this, &calls](const BlockKey& key, const DiskResidentIdentity& source_id,
+                     size_t bytes, PreparedRead::Source source,
+                     const DiskLifetimeReadCompletion& completion) {
+        const unsigned position = calls++;
+        EXPECT_EQ(source, PreparedRead::Source::kDiskStaging);
+        EXPECT_EQ(completion.sampling,
+                  position % 64 == 0
+                      ? DiskLifetimeReadCompletion::Sampling::kSampled
+                      : DiskLifetimeReadCompletion::Sampling::kNotSampled);
+        if (completion.sampling ==
+            DiskLifetimeReadCompletion::Sampling::kSampled) {
+          EXPECT_LE(completion.completed_at, std::chrono::steady_clock::now());
+        }
+        node_->NotifyLifetimeReadSuccessForKey(key, source_id, bytes, source,
+                                               completion);
+      },
+      node_->TracksLifetimeState());
+  std::thread producer([&] {
+    for (unsigned request = 0; request < 129; ++request) {
+      bool recorded = false;
+      Grant(read.source_identity(), recorded, read.source());
+      Grant(read.source_identity(), recorded, read.source());
+    }
+  });
+  producer.join();
+  EXPECT_EQ(calls, 129U);
+  const DiskSlabStore::Stats stats =
+      KvNodeServerTestPeer::PullHeatStats(*node_);
+  EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 3U);
+  EXPECT_GT(stats.lifetime_read_completion_to_apply.total_ns, 0U);
+  EXPECT_EQ(Counters().completion_not_sampled, 126U);
+  EXPECT_EQ(Counters().completion_missing, 0U);
+  EXPECT_EQ(Counters().applied, 129U);
+  ExpectPullNotificationMetrics(transport_, 129, 129, 0, 0);
+  EXPECT_TRUE(read.Abort());
+  EXPECT_EQ(Counters().successful, 129U);  // Cleanup does not emit completion.
+}
+
+TEST_F(RdmaPullHeatTest, CompletionSkippedPathsAndOldSettersPreservePhase) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  unsigned completion_calls = 0;
+  unsigned legacy_calls = 0;
+  unsigned source_calls = 0;
+  std::vector<DiskLifetimeReadCompletion::Sampling> observed;
+  const auto completion_observer =
+      [&](const BlockKey&, const DiskResidentIdentity&, size_t,
+          PreparedRead::Source, const DiskLifetimeReadCompletion& completion) {
+        ++completion_calls;
+        observed.push_back(completion.sampling);
+      };
+  std::thread producer([&] {
+    transport_.SetPullReadSuccessWithCompletionHandler(completion_observer,
+                                                       false);
+    bool disabled = false;
+    Grant(identity, disabled);
+    transport_.SetPullReadSuccessWithCompletionHandler({}, true);
+    bool no_observer = false;
+    Grant(identity, no_observer);
+    transport_.SetPullReadSuccessWithCompletionHandler(completion_observer,
+                                                       true);
+    bool empty = false;
+    RdmaServerTestPeer::RecordPullGrant(transport_, key_, identity, 0, empty);
+    Grant(identity, empty);  // An empty event is consumed, not replayed.
+    Grant(identity, no_observer);
+    transport_.SetPullReadSuccessHandler([&](const BlockKey&,
+                                             const DiskResidentIdentity&,
+                                             size_t) { ++legacy_calls; });
+    bool legacy = false;
+    Grant(identity, legacy);
+    transport_.SetPullReadSuccessWithSourceHandler(
+        [&](const BlockKey&, const DiskResidentIdentity&, size_t,
+            PreparedRead::Source) { ++source_calls; });
+    bool with_source = false;
+    Grant(identity, with_source);
+    transport_.SetPullReadSuccessWithCompletionHandler(completion_observer,
+                                                       true);
+    bool first = false;
+    Grant(identity, first);
+    Grant(identity, first);
+    bool second = false;
+    Grant(identity, second);
+    // Only the two participating nonempty grants advanced the shared phase.
+    for (unsigned phase = 2; phase < 64; ++phase) {
+      EXPECT_EQ(CaptureDiskLifetimeReadCompletion(true, 5).sampling,
+                DiskLifetimeReadCompletion::Sampling::kNotSampled);
+    }
+    EXPECT_EQ(CaptureDiskLifetimeReadCompletion(true, 5).sampling,
+              DiskLifetimeReadCompletion::Sampling::kSampled);
+    transport_.SetPullReadSuccessWithSourceHandler({});
+    bool cleared = false;
+    Grant(identity, cleared);
+  });
+  producer.join();
+  EXPECT_EQ(completion_calls, 3U);
+  EXPECT_EQ(legacy_calls, 1U);
+  EXPECT_EQ(source_calls, 1U);
+  const std::vector<DiskLifetimeReadCompletion::Sampling> expected{
+      DiskLifetimeReadCompletion::Sampling::kMissing,
+      DiskLifetimeReadCompletion::Sampling::kSampled,
+      DiskLifetimeReadCompletion::Sampling::kNotSampled};
+  EXPECT_EQ(observed, expected);
+  ExpectPullNotificationMetrics(transport_, 5, 3, 1, 2);
+  EXPECT_EQ(Counters().successful,
+            0U);  // This observer deliberately only records.
+}
+
+TEST_F(RdmaPullHeatTest, CompletionDelayIncludesObserverWaitBeforeForwarding) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  Seed();
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  ASSERT_EQ(Finish(read), Status::kOk);
+  std::promise<DiskLifetimeReadCompletion> entered;
+  std::future<DiskLifetimeReadCompletion> captured = entered.get_future();
+  std::promise<void> release;
+  std::future<void> resume = release.get_future();
+  transport_.SetPullReadSuccessWithCompletionHandler(
+      [&](const BlockKey& key, const DiskResidentIdentity& identity,
+          size_t bytes, PreparedRead::Source source,
+          const DiskLifetimeReadCompletion& completion) {
+        entered.set_value(completion);
+        resume.wait();
+        node_->NotifyLifetimeReadSuccessForKey(key, identity, bytes, source,
+                                               completion);
+      },
+      node_->TracksLifetimeState());
+  std::thread producer([&] {
+    bool recorded = false;
+    Grant(read.source_identity(), recorded, read.source());
+    Grant(read.source_identity(), recorded, read.source());
+  });
+  const bool observer_ready =
+      captured.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  if (observer_ready) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const std::chrono::steady_clock::time_point released_at =
+      std::chrono::steady_clock::now();
+  // Release and join before a fatal assertion, even if notification regresses.
+  release.set_value();
+  producer.join();
+  ASSERT_TRUE(observer_ready);
+  const DiskLifetimeReadCompletion completion = captured.get();
+  ASSERT_EQ(completion.sampling,
+            DiskLifetimeReadCompletion::Sampling::kSampled);
+  ASSERT_LE(completion.completed_at, released_at);
+  const uint64_t observed_wait_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          released_at - completion.completed_at)
+          .count());
+  const DiskSlabStore::Stats stats =
+      KvNodeServerTestPeer::PullHeatStats(*node_);
+  EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 1U);
+  EXPECT_GE(stats.lifetime_read_completion_to_apply.total_ns, observed_wait_ns);
+  EXPECT_GE(stats.lifetime_read_completion_to_apply.max_ns, observed_wait_ns);
+  EXPECT_EQ(Counters().applied, 1U);
+  EXPECT_EQ(Counters().transport_disk_staging, 1U);
+  ExpectPullNotificationMetrics(transport_, 1, 1, 0, 0);
+  EXPECT_TRUE(read.Abort());
+}
+
+TEST_F(RdmaPullHeatTest, CompletionSamplingSharesSyncAndGrantThreadPhase) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  InstallCompletionObserver();
+  std::thread producer([&] {
+    char output[5] = {};
+    size_t bytes = 0;
+    ASSERT_EQ(
+        node_->RangeIntoForKey(key_, 0, 5, output, sizeof(output), &bytes),
+        Status::kOk);
+    EXPECT_EQ(std::string(output, bytes), "value");
+    for (unsigned request = 0; request < 63; ++request) {
+      bool recorded = false;
+      Grant(identity, recorded, PreparedRead::Source::kDiskStaging);
+    }
+    const DiskSlabStore::Stats before =
+        KvNodeServerTestPeer::PullHeatStats(*node_);
+    EXPECT_EQ(before.lifetime_read_completion_to_apply.samples, 1U);
+    EXPECT_EQ(before.lifetime_reads.completion_not_sampled, 63U);
+    bool selected = false;
+    Grant(identity, selected, PreparedRead::Source::kDiskStaging);
+  });
+  producer.join();
+  const DiskSlabStore::Stats stats =
+      KvNodeServerTestPeer::PullHeatStats(*node_);
+  EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 2U);
+  EXPECT_EQ(Counters().completion_not_sampled, 63U);
+  EXPECT_EQ(Counters().successful, 65U);
+  EXPECT_EQ(Counters().source_transport_grant, 64U);
+  EXPECT_EQ(Counters().completion_missing, 0U);
+}
+
+TEST_F(RdmaPullHeatTest, CompletionSamplingConservesConcurrentGrants) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Seed();
+  InstallCompletionObserver();
+  std::vector<std::thread> producers;
+  producers.reserve(4);
+  for (unsigned worker = 0; worker < 4; ++worker) {
+    producers.emplace_back([&] {
+      for (unsigned request = 0; request < 65; ++request) {
+        bool recorded = false;
+        Grant(identity, recorded, PreparedRead::Source::kDiskStaging);
+        Grant(identity, recorded, PreparedRead::Source::kDiskStaging);
+      }
+    });
+  }
+  for (std::thread& producer : producers) {
+    producer.join();
+  }
+  const DiskSlabStore::Stats stats =
+      KvNodeServerTestPeer::PullHeatStats(*node_);
+  EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 8U);
+  EXPECT_EQ(Counters().completion_not_sampled, 252U);
+  EXPECT_EQ(Counters().completion_missing, 0U);
+  EXPECT_EQ(Counters().applied, 260U);
+  ExpectPullNotificationMetrics(transport_, 260, 260, 0, 0);
+}
+
+TEST_F(RdmaPullHeatTest, CompletionAwareClockOnlyLegacyDoesNotConsumePhase) {
+  ASSERT_NO_FATAL_FAILURE(Create(false));
+  const DiskWriteResult result =
+      KvNodeServerTestPeer::PersistPullSource(*node_, key_);
+  ASSERT_EQ(result.status, Status::kOk);
+  EXPECT_FALSE(result.identity.valid());
+  EXPECT_FALSE(node_->TracksLifetimeState());
+  InstallCompletionObserver();
+  std::thread producer([&] {
+    bool recorded = false;
+    Grant(result.identity, recorded);
+    EXPECT_EQ(CaptureDiskLifetimeReadCompletion(true, 5).sampling,
+              DiskLifetimeReadCompletion::Sampling::kSampled);
+  });
+  producer.join();
+  EXPECT_EQ(Counters().successful, 0U);
+  const DiskSlabStore::Stats stats =
+      KvNodeServerTestPeer::PullHeatStats(*node_);
+  EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 0U);
+  ExpectPullNotificationMetrics(transport_, 1, 0, 0, 0);
+}
 
 TEST_F(RdmaPullHeatTest, ClockOnlyLegacyGrantNeverSamplesCompletionTime) {
   const ScopedEnv ram_on("DFKV_RAM_TIER", "1");
@@ -777,6 +1048,7 @@ TEST_F(RdmaPullHeatTest, StagedMoveKeepsDiskToRamOriginUntilGrant) {
   const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
   const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
   ASSERT_NO_FATAL_FAILURE(Create());
+  InstallCompletionObserver();
   const DiskResidentIdentity identity = Seed();
   PreparedRead prepared = Prepare();
   ASSERT_EQ(prepared.status(), Status::kOk);
@@ -809,6 +1081,7 @@ TEST_F(RdmaPullHeatTest, StagedMoveKeepsDiskToRamOriginUntilGrant) {
   EXPECT_EQ(Counters().source_transport_grant, 1U);
   EXPECT_FALSE(moved.Abort());
   EXPECT_EQ(Counters().successful, 1U);
+  EXPECT_EQ(Counters().completion_missing, 0U);
 }
 
 TEST_F(RdmaPullHeatTest, CommitBeforeGrantAndReleaseNeverDuplicatesHeat) {
@@ -888,6 +1161,7 @@ TEST_F(RdmaPullHeatTest, SynchronousSourceHandlerCarriesDiskThenRamToGrant) {
   const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
   const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
   ASSERT_NO_FATAL_FAILURE(Create());
+  InstallCompletionObserver();
   ASSERT_TRUE(node_->ram_enabled());
   const DiskResidentIdentity expected_identity = Seed();
   unsigned calls = 0;
@@ -974,6 +1248,7 @@ TEST_F(RdmaPullHeatTest, SynchronousSourceHandlerCarriesDiskThenRamToGrant) {
   EXPECT_EQ(calls, 4U);
   transport_.set_range_with_source_handler({});
   EXPECT_FALSE(RdmaServerTestPeer::HasRangeHandler(transport_));
+  EXPECT_EQ(Counters().completion_missing, 0U);
 }
 
 TEST_F(RdmaPullHeatTest, OptionalHandlerAndEmptyGrantsStayUncounted) {
@@ -1048,20 +1323,24 @@ TEST_F(RdmaPullHeatTest, NotificationReentryConsumesBeforeObserver) {
   const DiskResidentIdentity identity = Seed();
   bool recorded = false;
   unsigned callbacks = 0;
-  transport_.SetPullReadSuccessHandler(
-      [this, &recorded, &callbacks](const BlockKey& key,
-                                    const DiskResidentIdentity& source,
-                                    size_t bytes) {
+  transport_.SetPullReadSuccessWithCompletionHandler(
+      [this, &recorded, &callbacks](
+          const BlockKey& key, const DiskResidentIdentity& source, size_t bytes,
+          PreparedRead::Source route,
+          const DiskLifetimeReadCompletion& completion) {
         ++callbacks;
         EXPECT_TRUE(recorded);
         ExpectPullNotificationMetrics(transport_, 1, 0, 0, 0);
         Grant(source, recorded);
-        node_->NotifyLifetimeReadSuccessForKey(key, source, bytes);
-      });
+        node_->NotifyLifetimeReadSuccessForKey(key, source, bytes, route,
+                                               completion);
+      },
+      node_->TracksLifetimeState());
   Grant(identity, recorded);
   EXPECT_EQ(callbacks, 1u);
   ExpectPullNotificationMetrics(transport_, 1, 1, 0, 0);
   EXPECT_EQ(Counters().applied, 1u);
+  EXPECT_EQ(Counters().completion_missing, 0U);
   transport_.SetPullReadSuccessHandler({});
 }
 
@@ -1112,6 +1391,7 @@ TEST_F(RdmaPullHeatTest, NotificationCountsConcurrentIndependentGenerations) {
 
 TEST_F(RdmaPullHeatTest, CanceledOrFailedPreparationDoesNotGrant) {
   ASSERT_NO_FATAL_FAILURE(Create());
+  InstallCompletionObserver();
   Seed();
   PreparedRead canceled = Prepare();
   ASSERT_EQ(canceled.status(), Status::kOk);
@@ -1122,7 +1402,20 @@ TEST_F(RdmaPullHeatTest, CanceledOrFailedPreparationDoesNotGrant) {
   EXPECT_EQ(failed.FinishStorage(Status::kIOError, 0), Status::kIOError);
   EXPECT_FALSE(failed.source_identity().valid());
   EXPECT_TRUE(failed.Abort());
+  PreparedRead rejected = Prepare();
+  ASSERT_EQ(rejected.status(), Status::kOk);
+  ASSERT_EQ(Finish(rejected), Status::kOk);
+  transport_.SetRestartRequiredHandler([] { return true; });
+  std::thread producer([&] {
+    EXPECT_FALSE(RdmaServerTestPeer::AdmitPullGrant(transport_, rejected));
+    EXPECT_EQ(CaptureDiskLifetimeReadCompletion(true, 5).sampling,
+              DiskLifetimeReadCompletion::Sampling::kSampled);
+  });
+  producer.join();
+  transport_.SetRestartRequiredHandler({});
+  EXPECT_FALSE(rejected.owns_cleanup());
   EXPECT_EQ(Counters().successful, 0U);
+  EXPECT_EQ(Counters().completion_missing, 0U);
   EXPECT_EQ(KvNodeServerTestPeer::DiskReadLeases(*node_), 0U);
   ExpectPullNotificationMetrics(transport_, 0, 0, 0, 0);
 }
@@ -1134,14 +1427,16 @@ TEST_F(RdmaPullHeatTest, BoundAndUnboundRamKeepPinUntilGrantTeardown) {
   const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
   const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
   ASSERT_NO_FATAL_FAILURE(Create());
+  InstallCompletionObserver();
   ASSERT_TRUE(node_->ram_enabled());
   const DiskResidentIdentity identity = Seed();
   RamTier& ram = KvNodeServerTestPeer::Ram(*node_);
   for (const bool bound : {true, false}) {
-    if (bound)
+    if (bound) {
       ASSERT_TRUE(ram.PutDurable(key_, "value", 5, identity));
-    else
+    } else {
       ASSERT_TRUE(ram.PutDurable(key_, "value", 5));
+    }
     PreparedRead read;
     ASSERT_TRUE(node_->RamPinnedHitForKey(key_, 0, 5, &read));
     ASSERT_EQ(Finish(read), Status::kOk);
@@ -1161,6 +1456,7 @@ TEST_F(RdmaPullHeatTest, BoundAndUnboundRamKeepPinUntilGrantTeardown) {
   EXPECT_EQ(Counters().applied, 1U);
   EXPECT_EQ(Counters().no_binding, 1U);
   EXPECT_EQ(Counters().transport_ram_hit, 2U);
+  EXPECT_EQ(Counters().completion_missing, 0U);
 }
 
 TEST_F(RdmaPullHeatTest, PublishedFollowerHasItsOwnLogicalGrant) {
@@ -1170,6 +1466,7 @@ TEST_F(RdmaPullHeatTest, PublishedFollowerHasItsOwnLogicalGrant) {
   const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
   const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
   ASSERT_NO_FATAL_FAILURE(Create());
+  InstallCompletionObserver();
   KvNodeServerTestPeer::EnablePullCoalescing(*node_);
   const DiskResidentIdentity identity = Seed();
   PreparedRead leader = Prepare();
@@ -1219,10 +1516,12 @@ TEST_F(RdmaPullHeatTest, PublishedFollowerHasItsOwnLogicalGrant) {
   EXPECT_TRUE(ram.Remove(key_));
   EXPECT_EQ(ram.UsedBytes(), 0U);
   EXPECT_EQ(Counters().applied, 2U);
+  EXPECT_EQ(Counters().completion_missing, 0U);
 }
 
 TEST_F(RdmaPullHeatTest, DeferredRemoveKeepsOriginalBytesButLosesHeatRace) {
   ASSERT_NO_FATAL_FAILURE(Create());
+  InstallCompletionObserver();
   const DiskResidentIdentity original = Seed();
   PreparedRead read = Prepare();
   ASSERT_EQ(read.status(), Status::kOk);
@@ -1231,10 +1530,15 @@ TEST_F(RdmaPullHeatTest, DeferredRemoveKeepsOriginalBytesButLosesHeatRace) {
   EXPECT_TRUE(read.source_identity() == original);
   const DiskResidentIdentity replacement = Seed();
   ASSERT_NE(original.generation, replacement.generation);
-  bool grant_recorded = false;
-  Grant(read.source_identity(), grant_recorded);
+  std::thread producer([&] {
+    bool grant_recorded = false;
+    Grant(read.source_identity(), grant_recorded, read.source());
+  });
+  producer.join();
   EXPECT_EQ(Counters().race_lost, 1U);
   EXPECT_EQ(Counters().applied, 0U);
+  EXPECT_EQ(Counters().completion_not_applied, 1U);
+  EXPECT_EQ(Counters().completion_missing, 0U);
   ExpectPullNotificationMetrics(transport_, 1, 0, 0, 0);
   EXPECT_TRUE(read.Abort());
   EXPECT_TRUE(node_->Healthy());
@@ -1286,6 +1590,7 @@ TEST_F(RdmaPullHeatTest, AlreadyPreparedGrantUsesDrainTimeAndHardStopIsSticky) {
 
 TEST_F(RdmaPullHeatTest, DirectFallbackExportsSourceWithoutHeatingStorageRead) {
   ASSERT_NO_FATAL_FAILURE(Create());
+  InstallCompletionObserver();
   const DiskResidentIdentity identity = Seed();
   for (unsigned request = 0; request < 2; ++request) {
     const char* data = nullptr;
@@ -1310,6 +1615,7 @@ TEST_F(RdmaPullHeatTest, DirectFallbackExportsSourceWithoutHeatingStorageRead) {
   EXPECT_EQ(Counters().applied, 2U);
   EXPECT_EQ(Counters().transport_synchronous_fallback, 2U);
   EXPECT_EQ(Counters().transport_fallback_disk, 2U);
+  EXPECT_EQ(Counters().completion_missing, 0U);
 }
 
 std::string SelfHdr() { return "test/model"; }

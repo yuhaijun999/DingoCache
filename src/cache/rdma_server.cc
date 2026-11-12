@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/rdma_request_order.h"
 #include "cache/store_engine.h"
@@ -220,9 +221,13 @@ void RdmaServer::RecordPullGrant(const BlockKey& key,
     pull_read_notification_no_observer_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
+  // Ownership is established at both call sites. Capture this once-eligible
+  // grant publication before observer dispatch, not at preparation or READY.
+  const DiskLifetimeReadCompletion completion =
+      CaptureDiskLifetimeReadCompletion(sample_pull_completion_, bytes);
   // Invocation is observed before callback reentry, not proof of applied heat.
   pull_read_notification_notified_.fetch_add(1, std::memory_order_relaxed);
-  pull_read_success_handler_(key, identity, bytes, source);
+  pull_read_success_handler_(key, identity, bytes, source, completion);
 }
 
 RdmaServer::RdmaServer(Handler handler, size_t max_msg,

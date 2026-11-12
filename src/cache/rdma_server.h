@@ -26,6 +26,7 @@
 #ifdef DFKV_WITH_URING
 #include "cache/uring_reader.h"
 #endif
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/ram_tier.h"
 #include "cache/store_engine.h"
@@ -140,23 +141,48 @@ class RdmaServer {
   using PullReadSuccessWithSourceHandler =
       std::function<void(const BlockKey&, const DiskResidentIdentity&, size_t,
                          PreparedRead::Source)>;
+  using PullReadSuccessWithCompletionHandler = std::function<void(
+      const BlockKey&, const DiskResidentIdentity&, size_t,
+      PreparedRead::Source, const DiskLifetimeReadCompletion&)>;
   void SetPullReadSuccessHandler(PullReadSuccessHandler handler) {
     if (!handler) {
-      pull_read_success_handler_ = {};
+      SetPullReadSuccessWithCompletionHandler({}, false);
       return;
     }
-    pull_read_success_handler_ = [handler = std::move(handler)](
-                                     const BlockKey& key,
-                                     const DiskResidentIdentity& identity,
-                                     size_t bytes, PreparedRead::Source) {
-      handler(key, identity, bytes);
-    };
+    SetPullReadSuccessWithCompletionHandler(
+        [handler = std::move(handler)](const BlockKey& key,
+                                       const DiskResidentIdentity& identity,
+                                       size_t bytes, PreparedRead::Source,
+                                       const DiskLifetimeReadCompletion&) {
+          handler(key, identity, bytes);
+        },
+        false);
   }
   // Same callback lifetime and once-only contract as the legacy setter.
   // Source describes preparation, not registered memory or physical I/O.
   void SetPullReadSuccessWithSourceHandler(
       PullReadSuccessWithSourceHandler handler) {
+    if (!handler) {
+      SetPullReadSuccessWithCompletionHandler({}, false);
+      return;
+    }
+    SetPullReadSuccessWithCompletionHandler(
+        [handler = std::move(handler)](
+            const BlockKey& key, const DiskResidentIdentity& identity,
+            size_t bytes, PreparedRead::Source source,
+            const DiskLifetimeReadCompletion&) {
+          handler(key, identity, bytes, source);
+        },
+        false);
+  }
+  // Capture at the established grant boundary, before invoking the observer.
+  // Sampling must be enabled only for lifetime tracking. Legacy setters disable
+  // it; replacing/clearing handlers follows the same before-Start contract.
+  void SetPullReadSuccessWithCompletionHandler(
+      PullReadSuccessWithCompletionHandler handler, bool sample_completion) {
     pull_read_success_handler_ = std::move(handler);
+    sample_pull_completion_ =
+        sample_completion && static_cast<bool>(pull_read_success_handler_);
   }
   // Pinned arena hit lookup (B5-3 zero-copy pull GET): returns true with a
   // send-pinned arena address the dynamic-pull READY can name directly, or
@@ -291,7 +317,8 @@ class RdmaServer {
 
   Handler handler_;
   RangeWithSourceHandler range_handler_;
-  PullReadSuccessWithSourceHandler pull_read_success_handler_;
+  PullReadSuccessWithCompletionHandler pull_read_success_handler_;
+  bool sample_pull_completion_ = false;
   CacheDirectHandler cache_direct_handler_;
   CacheDirectBatchHandler cache_direct_batch_handler_;
   PrepareReadHandler prepare_read_handler_;

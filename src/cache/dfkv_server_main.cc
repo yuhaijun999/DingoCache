@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "cache/disk_cache_group.h"
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/kv_node_server.h"
 #include "common/config_dump.h"
@@ -435,12 +436,15 @@ int main(int argc, char** argv) {
                char* staging, size_t cap) {
           return srv.PrepareReadForKey(key, off, len, staging, cap);
         });
-    rsrv->SetPullReadSuccessWithSourceHandler(
+    rsrv->SetPullReadSuccessWithCompletionHandler(
         [&srv](const dfkv::BlockKey& key,
                const dfkv::DiskResidentIdentity& identity, size_t bytes,
-               dfkv::PreparedRead::Source source) {
-          srv.NotifyLifetimeReadSuccessForKey(key, identity, bytes, source);
-        });
+               dfkv::PreparedRead::Source source,
+               const dfkv::DiskLifetimeReadCompletion& completion) {
+          srv.NotifyLifetimeReadSuccessForKey(key, identity, bytes, source,
+                                              completion);
+        },
+        srv.TracksLifetimeState());
     rsrv->SetRestartRequiredHandler(
         [&srv] { return srv.LifetimeRestartRequired(); });
     // B5-3: dynamic-pull GETs of arena-resident values serve the pinned arena

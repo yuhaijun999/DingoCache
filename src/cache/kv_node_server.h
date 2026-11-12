@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "cache/disk_cache_group.h"
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/ram_tier.h"
@@ -66,6 +67,8 @@ class KvNodeServer {
     return group_.Healthy() && !ram_required_failed_ &&
            (!ram_ || ram_->healthy());
   }
+  // Immutable startup decision; clock-only legacy stores do not track heat.
+  bool TracksLifetimeState() const { return group_.TracksLifetimeState(); }
   // Active lifetime admission/restart signal, independent of storage health.
   // Null clock (normal legacy) returns false without reading a clock.
   bool LifetimeRestartRequired() const {
@@ -169,10 +172,11 @@ class KvNodeServer {
   // unheated.
   void NotifyLifetimeReadSuccessForKey(
       const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
-      PreparedRead::Source source = PreparedRead::Source::kUnclassified) {
+      PreparedRead::Source source = PreparedRead::Source::kUnclassified,
+      const DiskLifetimeReadCompletion& completion = {}) {
     group_.NotifyLifetimeReadSuccess(
         key, identity, bytes,
-        DiskSlabStore::LifetimeReadSource::kTransportGrant, source);
+        DiskSlabStore::LifetimeReadSource::kTransportGrant, source, completion);
   }
 
   bool ram_enabled() const { return ram_ != nullptr; }
