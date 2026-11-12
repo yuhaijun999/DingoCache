@@ -503,11 +503,34 @@ class DiskSlabStore : public StoreEngine {
       const;
   // Current coarse protection estimate; unavailable is not an empty cache.
   SlabAllocator::LifetimeBucketObservation ObserveLifetimeBuckets() const;
+  // Immutable evidence captured before a synchronous read evaluates the key.
+  // A history match is not a current-generation or causal-miss guarantee.
+  struct EvictionGhostReadWitness {
+    enum class Result : unsigned char {
+      kDisabled = 0,     // Recording is not enabled for this owner.
+      kUnavailable = 1,  // Health or clock prevented an entry lookup.
+      kNoHistory = 2,    // No retained past event, not proof of no eviction.
+      kHistory = 3       // Retained event existed at the entry snapshot.
+    };
+    Result result = Result::kDisabled;
+    // Snapshot minus retained settlement time, if matched.
+    uint64_t age_sec = 0;
+  };
+  // Immutable opt-in; no sampling, routing or lock is needed when disabled.
+  bool TracksEvictionGhost() const { return opt_.eviction_ghost_capacity != 0; }
+  EvictionGhostReadWitness CaptureEvictionGhostRead(const BlockKey& key) const;
+  // Caller commits once, only for a genuine final synchronous kNotFound,
+  // using the same key/owner as capture. Never re-query history after the miss.
+  void RecordEvictionGhostMiss(const EvictionGhostReadWitness& witness);
   struct EvictionGhostObservation {
     DiskEvictionGhost::Snapshot history;
     uint64_t recorded =
         0;                 // Accepted eviction events, including repeated keys.
     uint64_t dropped = 0;  // Missing clock/allocation evidence, not lost data.
+    uint64_t sync_read_misses = 0;  // Only the two instrumented Node APIs.
+    uint64_t sync_read_lookup_unavailable = 0;
+    uint64_t sync_read_history_matches = 0;
+    uint64_t sync_read_entry_snapshot_age_sec = 0;  // Sum for matched misses.
   };
   // One D-locked snapshot. Time bounds are batch-settlement samples AFTER
   // successful invalidation, not exact eviction times or complete coverage.
@@ -631,6 +654,10 @@ class DiskSlabStore : public StoreEngine {
   std::unique_ptr<DiskEvictionGhost> eviction_ghost_;
   uint64_t ghost_recorded_ = 0;  // Guarded by D, like the ghost container.
   uint64_t ghost_dropped_ = 0;
+  uint64_t ghost_sync_read_misses_ = 0;
+  uint64_t ghost_sync_read_lookup_unavailable_ = 0;
+  uint64_t ghost_sync_read_history_matches_ = 0;
+  uint64_t ghost_sync_read_entry_snapshot_age_sec_ = 0;
   std::vector<int> extent_fds_;      // resident, one per extent (buffered)
   std::vector<int> extent_dio_fds_;  // O_DIRECT twins (only when direct_writes)
   int table_fd_ = -1;                // slots.tbl

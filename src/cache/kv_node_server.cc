@@ -603,6 +603,16 @@ std::string KvNodeServer::MetricsText() const {
            "Accepted eviction events, including repeated keys");
     header("dfkv_slab_disk_lifetime_ghost_dropped_total", "counter",
            "Eviction events missing clock or allocation evidence");
+    header("dfkv_slab_disk_lifetime_ghost_sync_read_misses_total", "counter",
+           "Final NotFound from the two instrumented synchronous Node APIs");
+    header("dfkv_slab_disk_lifetime_ghost_sync_read_lookup_unavailable_total",
+           "counter", "Synchronous misses without a usable entry lookup");
+    header("dfkv_slab_disk_lifetime_ghost_sync_read_history_matches_total",
+           "counter", "Synchronous misses with retained history at entry");
+    header(
+        "dfkv_slab_disk_lifetime_ghost_sync_read_entry_snapshot_age_seconds_"
+        "total",
+        "counter", "Sum of retained entry-snapshot ages for matched misses");
     header("dfkv_slab_disk_lifetime_ghost_oldest_settled_at_sec", "gauge",
            "Oldest retained batch settlement clock offset, not a window");
     header("dfkv_slab_disk_lifetime_ghost_newest_settled_at_sec", "gauge",
@@ -977,6 +987,16 @@ std::string KvNodeServer::MetricsText() const {
              ghost.history.capacity_limited ? 1 : 0);
       sample("dfkv_slab_disk_lifetime_ghost_recorded_total", ghost.recorded);
       sample("dfkv_slab_disk_lifetime_ghost_dropped_total", ghost.dropped);
+      sample("dfkv_slab_disk_lifetime_ghost_sync_read_misses_total",
+             ghost.sync_read_misses);
+      sample("dfkv_slab_disk_lifetime_ghost_sync_read_lookup_unavailable_total",
+             ghost.sync_read_lookup_unavailable);
+      sample("dfkv_slab_disk_lifetime_ghost_sync_read_history_matches_total",
+             ghost.sync_read_history_matches);
+      sample(
+          "dfkv_slab_disk_lifetime_ghost_sync_read_entry_snapshot_age_seconds_"
+          "total",
+          ghost.sync_read_entry_snapshot_age_sec);
       if (ghost.history.oldest_evicted_at_sec.has_value()) {
         sample("dfkv_slab_disk_lifetime_ghost_oldest_settled_at_sec",
                *ghost.history.oldest_evicted_at_sec);
@@ -2135,6 +2155,8 @@ Status KvNodeServer::ProcessRequestForKey(
     case WireOp::kRange: {
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
+      const DiskSlabStore::EvictionGhostReadWitness ghost_read =
+          group_.CaptureEvictionGhostRead(key);
       const bool track_lifetime = group_.TracksLifetimeState();
       DiskResidentIdentity read_identity;
       DiskSlabStore::LifetimeReadSource read_source =
@@ -2223,6 +2245,7 @@ Status KvNodeServer::ProcessRequestForKey(
           bytes_read_.fetch_add(out_data->size(), std::memory_order_relaxed);
         } else if (st == Status::kNotFound) {
           cache_miss_.fetch_add(1, std::memory_order_relaxed);
+          group_.RecordEvictionGhostMiss(key, ghost_read);
         } else if (st == Status::kIOError) {
           get_io_err_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -2335,6 +2358,8 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
   if (out_len == nullptr) out_len = &local_size;
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
+  const DiskSlabStore::EvictionGhostReadWitness ghost_read =
+      group_.CaptureEvictionGhostRead(key);
   if (ram_) {
     RamTier::Hit h;
     if (ram_->GetPrep(key, offset, length, &h)) {  // RAM hit: copy out, no disk
@@ -2391,6 +2416,7 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
           PreparedRead::Source::kUnclassified, completion);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
+    group_.RecordEvictionGhostMiss(key, ghost_read);
   } else if (st == Status::kIOError) {
     get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }

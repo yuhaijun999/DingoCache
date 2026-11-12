@@ -1507,6 +1507,10 @@ identity labels; no key/request labels or global ghost families are added:
 | `dfkv_slab_disk_lifetime_ghost_capacity_limited` | gauge | Sticky indication that an old retained key was discarded at capacity. |
 | `dfkv_slab_disk_lifetime_ghost_recorded_total` | counter | Accepted successful-eviction events, including repeated keys. |
 | `dfkv_slab_disk_lifetime_ghost_dropped_total` | counter | Events missing clock/allocation evidence, not lost cache data. |
+| `dfkv_slab_disk_lifetime_ghost_sync_read_misses_total` | counter | Final `kNotFound` from the two instrumented synchronous Node APIs while recording is enabled. Not all GET misses. |
+| `dfkv_slab_disk_lifetime_ghost_sync_read_lookup_unavailable_total` | counter | Those misses whose pre-read witness could not establish a usable health/clock lookup. |
+| `dfkv_slab_disk_lifetime_ghost_sync_read_history_matches_total` | counter | Those misses with a retained full-tenant-key event at the pre-read snapshot. Association, not an eviction-caused-miss counter. |
+| `dfkv_slab_disk_lifetime_ghost_sync_read_entry_snapshot_age_seconds_total` | counter | Sum of snapshot-to-retained-settlement ages for matched misses, including valid zero; excludes later read latency. |
 | `dfkv_slab_disk_lifetime_ghost_oldest_settled_at_sec` | gauge | Oldest retained batch-settlement clock offset; omitted if empty, valid zero emitted. |
 | `dfkv_slab_disk_lifetime_ghost_newest_settled_at_sec` | gauge | Newest retained batch-settlement clock offset; omitted if empty, valid zero emitted. |
 
@@ -1535,7 +1539,48 @@ Capacity truncation and recording gaps must both be disclosed. Raw oldest/newest
 bounds, their difference and retained counts do not prove a complete effective
 observation interval; equal-time records may already have been discarded. The
 container may stage one extra node/index entry, and node/bucket/allocator/peak RSS
-costs are not yet accepted. No causal miss/recomputation association exists yet:
-historical key matches and repeated PUTs are not proof of eviction-caused business
-loss. These diagnostics do not establish full E4 coverage or authorize new-policy
+costs are not yet accepted. Historical key matches and repeated PUTs are not
+proof of eviction-caused business loss. These diagnostics do not establish full
+E4 coverage or authorize new-policy
 performance trials, formal A/B or the default-policy flip.
+
+
+#### Synchronous miss association boundary
+
+Only `ProcessRequestForKey(kRange)` and `RangeIntoForKey` participate, including
+individual coalescer followers and their own-read fallbacks. After existing
+admission, each takes a D-locked per-key witness **before** evaluating RAM,
+metadata, coalescing or disk contents. Only its final server-API `kNotFound`
+commits that same witness once; there is no post-miss history lookup. Thus an
+eviction settling later during a read cannot fabricate an earlier snapshot
+match, including events with the same whole-second timestamp. Conversely, a
+positive witness stays valid if the retained entry is later truncated.
+
+"Entry" means the first lock-protected snapshot before read evaluation, not
+network arrival or function-call time: eviction may settle while the caller
+waits for D. Age measures that snapshot minus the retained event's **batch
+settlement** offset, not eviction-to-final-miss latency. A retained event may be
+older than a subsequently dropped event. The snapshot does not establish the
+current key generation or cause of absence: reinsert followed by Remove can
+still match older history. An unmatched lookup can reflect truncation, dropped
+evidence or reconstruction, never proof that the key was not evicted.
+
+The monitored miss count includes both usable and unavailable witnesses. With
+ordinary non-wrapped counters, matches plus unavailable cannot exceed monitored
+misses; the remainder has no retained match. Do not divide these cohort counts
+by global `cache_miss`, infer complete observation windows, unique clients,
+client delivery, recomputation tokens, TTFT or causal business loss. Repeated
+actual misses count per API invocation, not per unique key or flight.
+
+Successful reads (including RAM and empty reads), invalid/error results,
+PUT/Lookup/Exist/Remove, `RangeDirectForKey`, `PrepareReadForKey` and PULL grant
+callbacks do not add these counters. The latter are preparation/other cohorts,
+not silently counted as completed synchronous demands. Failed admission adds no
+witness or miss. Counters reset with Store reconstruction, like ghost history.
+
+Default capacity 0 skips new routing/D/clock work. With recording enabled, even
+successful synchronous reads acquire D and sample the shared clock at entry;
+final misses acquire D again to settle counters. These are real opt-in costs,
+not zero-overhead claims. Clock observations retain existing restart-floor
+semantics and do not backdate heat or change an already-established result.
+Complete resource/lock-cost and all-path demand coverage remain unaccepted.

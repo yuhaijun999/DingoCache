@@ -127,6 +127,17 @@ class DiskCacheGroup {
   bool TracksLifetimeState() const {
     return !slabs_.empty() && slabs_.front()->TracksLifetimeState();
   }
+  // Recording enablement is immutable and uniform across real slabs. This
+  // check skips routing, the disk lock and extra clock work when disabled.
+  bool TracksEvictionGhost() const {
+    return !slabs_.empty() && slabs_.front()->TracksEvictionGhost();
+  }
+  DiskSlabStore::EvictionGhostReadWitness CaptureEvictionGhostRead(
+      const BlockKey& key) const;
+  // Same key and owner as capture, once per final synchronous Node miss.
+  void RecordEvictionGhostMiss(
+      const BlockKey& key,
+      const DiskSlabStore::EvictionGhostReadWitness& witness);
   // One already-successful nonzero business read. Preparation/physical I/O
   // alone must not call this; the original source is not a residency promise.
   void NotifyLifetimeReadSuccess(

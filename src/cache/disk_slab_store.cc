@@ -607,6 +607,41 @@ void DiskSlabStore::RecordEvictionGhostLocked(
   }
 }
 
+DiskSlabStore::EvictionGhostReadWitness DiskSlabStore::CaptureEvictionGhostRead(
+    const BlockKey& key) const {
+  EvictionGhostReadWitness witness;
+  if (!eviction_ghost_) return witness;
+  const std::lock_guard<std::mutex> lock(mu_);
+  witness.result = EvictionGhostReadWitness::Result::kUnavailable;
+  uint32_t sampled_at = 0;
+  if (!Healthy() || !opt_.lifetime_clock->TryDrainNow(&sampled_at))
+    return witness;
+  const std::optional<uint64_t> age =
+      eviction_ghost_->LookupEvictionAge(key, sampled_at);
+  witness.result = age.has_value()
+                       ? EvictionGhostReadWitness::Result::kHistory
+                       : EvictionGhostReadWitness::Result::kNoHistory;
+  witness.age_sec = age.value_or(0);
+  return witness;
+}
+
+void DiskSlabStore::RecordEvictionGhostMiss(
+    const EvictionGhostReadWitness& witness) {
+  if (!eviction_ghost_ ||
+      witness.result == EvictionGhostReadWitness::Result::kDisabled)
+    return;
+  const std::lock_guard<std::mutex> lock(mu_);
+  ++ghost_sync_read_misses_;
+  // Use entry evidence even if history, health or the clock changed while
+  // reading. A later lookup could falsely match an eviction AFTER capture.
+  if (witness.result == EvictionGhostReadWitness::Result::kUnavailable) {
+    ++ghost_sync_read_lookup_unavailable_;
+  } else if (witness.result == EvictionGhostReadWitness::Result::kHistory) {
+    ++ghost_sync_read_history_matches_;
+    ghost_sync_read_entry_snapshot_age_sec_ += witness.age_sec;
+  }
+}
+
 DiskSlabStore::EvictionGhostObservation DiskSlabStore::ObserveEvictionGhost()
     const {
   const std::lock_guard<std::mutex> lock(mu_);
@@ -614,6 +649,12 @@ DiskSlabStore::EvictionGhostObservation DiskSlabStore::ObserveEvictionGhost()
   if (eviction_ghost_) observation.history = eviction_ghost_->GetSnapshot();
   observation.recorded = ghost_recorded_;
   observation.dropped = ghost_dropped_;
+  observation.sync_read_misses = ghost_sync_read_misses_;
+  observation.sync_read_lookup_unavailable =
+      ghost_sync_read_lookup_unavailable_;
+  observation.sync_read_history_matches = ghost_sync_read_history_matches_;
+  observation.sync_read_entry_snapshot_age_sec =
+      ghost_sync_read_entry_snapshot_age_sec_;
   return observation;
 }
 

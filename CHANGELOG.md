@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Associate final misses from the two synchronous Node read APIs with retained
+  eviction evidence captured before reading. Export per-disk cohort coverage
+  and snapshot-age sums without attributing causality or including PULL setup.
+
 - Add explicit per-disk eviction ghost capacity via server flag/environment,
   defaulting to disabled. Reject malformed input and unsupported owners before
   opening storage; entry limits are not a validated memory budget.

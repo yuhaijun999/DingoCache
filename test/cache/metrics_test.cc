@@ -5464,6 +5464,13 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
               expected.history.newest_evicted_at_sec);
     EXPECT_EQ(actual.recorded, expected.recorded);
     EXPECT_EQ(actual.dropped, expected.dropped);
+    EXPECT_EQ(actual.sync_read_misses, expected.sync_read_misses);
+    EXPECT_EQ(actual.sync_read_lookup_unavailable,
+              expected.sync_read_lookup_unavailable);
+    EXPECT_EQ(actual.sync_read_history_matches,
+              expected.sync_read_history_matches);
+    EXPECT_EQ(actual.sync_read_entry_snapshot_age_sec,
+              expected.sync_read_entry_snapshot_age_sec);
     const std::string text = server_->MetricsText();
     const std::string prefix = "dfkv_slab_disk_lifetime_ghost_";
     const std::string labels =
@@ -5477,7 +5484,14 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
           {"retained_entries", expected.history.retained},
           {"capacity_limited", expected.history.capacity_limited},
           {"recorded_total", expected.recorded},
-          {"dropped_total", expected.dropped}}) {
+          {"dropped_total", expected.dropped},
+          {"sync_read_misses_total", expected.sync_read_misses},
+          {"sync_read_lookup_unavailable_total",
+           expected.sync_read_lookup_unavailable},
+          {"sync_read_history_matches_total",
+           expected.sync_read_history_matches},
+          {"sync_read_entry_snapshot_age_seconds_total",
+           expected.sync_read_entry_snapshot_age_sec}}) {
       const std::string name = prefix + fact.first;
       EXPECT_NE(
           text.find("\n" + name + labels + std::to_string(fact.second) + "\n"),
@@ -5490,7 +5504,11 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
       EXPECT_NE(text.find("# TYPE " + prefix + suffix + " gauge\n"),
                 std::string::npos);
     }
-    for (const char* suffix : {"recorded_total", "dropped_total"}) {
+    for (const char* suffix :
+         {"recorded_total", "dropped_total", "sync_read_misses_total",
+          "sync_read_lookup_unavailable_total",
+          "sync_read_history_matches_total",
+          "sync_read_entry_snapshot_age_seconds_total"}) {
       EXPECT_NE(text.find("# TYPE " + prefix + suffix + " counter\n"),
                 std::string::npos);
     }
@@ -5521,7 +5539,7 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
       ++samples;
     }
     EXPECT_EQ(samples,
-              expected.history.oldest_evicted_at_sec.has_value() ? 8U : 6U);
+              expected.history.oldest_evicted_at_sec.has_value() ? 12U : 10U);
     EXPECT_EQ(text.find("dfkv_slab_lifetime_ghost_"), std::string::npos);
   }
   const ScopedEnv ram_{"DFKV_RAM_TIER", "0"};

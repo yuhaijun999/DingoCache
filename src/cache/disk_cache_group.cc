@@ -688,6 +688,24 @@ void DiskCacheGroup::NotifyLifetimeReadSuccess(
                                             transport_source, completion);
 }
 
+DiskSlabStore::EvictionGhostReadWitness
+DiskCacheGroup::CaptureEvictionGhostRead(const BlockKey& key) const {
+  if (!TracksEvictionGhost()) return {};
+  const size_t disk = RouteIndex(key);
+  return disk < slabs_.size() ? slabs_[disk]->CaptureEvictionGhostRead(key)
+                              : DiskSlabStore::EvictionGhostReadWitness{};
+}
+
+void DiskCacheGroup::RecordEvictionGhostMiss(
+    const BlockKey& key,
+    const DiskSlabStore::EvictionGhostReadWitness& witness) {
+  if (witness.result ==
+      DiskSlabStore::EvictionGhostReadWitness::Result::kDisabled)
+    return;
+  const size_t disk = RouteIndex(key);
+  if (disk < slabs_.size()) slabs_[disk]->RecordEvictionGhostMiss(witness);
+}
+
 void DiskCacheGroup::PreventCleanShutdown() {
   for (DiskSlabStore* slab : slabs_) slab->PreventCleanShutdown();
 }
