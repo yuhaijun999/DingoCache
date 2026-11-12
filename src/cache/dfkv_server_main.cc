@@ -6,15 +6,19 @@
 #include <atomic>
 #include <charconv>
 #include <csignal>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "cache/disk_cache_group.h"
+#include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/kv_node_server.h"
@@ -97,7 +101,12 @@ int main(int argc, char** argv) {
             "\nDisk eviction policy (passed directly, not an env facade):\n"
             "  --slab-eviction-policy <legacy|lifetime>\n"
             "  Overrides DFKV_SLAB_EVICTION_POLICY; lifetime is explicit "
-            "opt-in.\n") < 0 ||
+            "opt-in.\n"
+            "  --slab-eviction-ghost-capacity <entries>\n"
+            "  Overrides DFKV_SLAB_EVICTION_GHOST_CAPACITY; per disk, default "
+            "0 (off).\n"
+            "  Nonzero requires effective lifetime on real slabs; not a byte "
+            "budget.\n") < 0 ||
         std::fflush(out) != 0) {
       return 1;
     }
@@ -144,7 +153,8 @@ int main(int argc, char** argv) {
                    "--rdma-recv-chunk-bytes",
                    "--disk-hash-weight",
                    "--read-coalesce",
-                   "--slab-eviction-policy"});
+                   "--slab-eviction-policy",
+                   "--slab-eviction-ghost-capacity"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -317,6 +327,33 @@ int main(int argc, char** argv) {
                  args.error().c_str());
     return 2;
   }
+  // Resolve directly, not through an env facade: an explicit empty flag must
+  // reject rather than fall back to the environment. Reuse the strict parser.
+  const char* ghost_parameter = "DFKV_SLAB_EVICTION_GHOST_CAPACITY";
+  const char* ghost_env = std::getenv(ghost_parameter);
+  std::string ghost_text = ghost_env == nullptr ? "0" : ghost_env;
+  dfkv::config_dump::Source ghost_source =
+      ghost_env == nullptr ? dfkv::config_dump::Source::kDefault
+                           : dfkv::config_dump::Source::kEnv;
+  if (args.Has("--slab-eviction-ghost-capacity")) {
+    ghost_parameter = "--slab-eviction-ghost-capacity";
+    ghost_text = args.Get(ghost_parameter, "");
+    ghost_source = dfkv::config_dump::Source::kFlag;
+  }
+  uint64_t ghost_capacity = 0;
+  std::string ghost_error;
+  if (!dfkv::ParseDiskLifetimeUnsigned(ghost_parameter, ghost_text,
+                                       &ghost_capacity, &ghost_error)) {
+    DFKV_LOG_ERROR(ghost_error);
+    return 2;
+  }
+  if (ghost_capacity > std::numeric_limits<size_t>::max()) {
+    DFKV_LOG_ERROR(std::string(ghost_parameter) + "='" + ghost_text +
+                   "' must fit size_t per-disk entries");
+    return 2;
+  }
+  dfkv::config_dump::Record("DFKV_SLAB_EVICTION_GHOST_CAPACITY",
+                            std::to_string(ghost_capacity), ghost_source);
   // A mistyped --advertise (no ':') used to wrap rfind(':')+1 into a garbage
   // port; reject it up front rather than register an unreachable address.
   if (!advertise.empty() && !dfkv::IsValidHostPort(advertise)) {
@@ -366,6 +403,8 @@ int main(int argc, char** argv) {
   if (args.Has("--slab-eviction-policy")) {
     store_options.eviction_policy = args.Get("--slab-eviction-policy", "");
   }
+  store_options.eviction_ghost_capacity_per_disk =
+      static_cast<size_t>(ghost_capacity);
   KvNodeServer srv(std::move(store_options));
   // TCP request frames share the RDMA path's resolved max-value bound (OOM-DoS
   // guard; see utils/wire_limits.h).
@@ -373,6 +412,10 @@ int main(int argc, char** argv) {
   // Identity for Prometheus labels: reuse the MDS --id/--group when present.
   if (!node_id.empty() || group != "default") srv.set_identity(node_id, group);
   if (srv.Start(port) != Status::kOk) {
+    if (ghost_capacity != 0) {
+      DFKV_LOG_ERROR(std::string(ghost_parameter) + "='" + ghost_text +
+                     "': startup rejected; see preceding diagnostic");
+    }
     std::fprintf(stderr, "failed to start on port %d\n", port);
     return 1;
   }

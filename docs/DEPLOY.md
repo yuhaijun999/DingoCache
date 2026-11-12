@@ -463,6 +463,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--mds-registration-timeout-ms` / `DFKV_MDS_REGISTRATION_TIMEOUT_MS` | `60000` | 首次 MDS 注册截止（1000–600000） |
 | `--store-engine` / `DFKV_STORE_ENGINE` | `slab` | `slab` 为默认；`file` 为显式诊断 fallback |
 | `--slab-eviction-policy` / `DFKV_SLAB_EVICTION_POLICY` | 请求 lifetime，实际 staged legacy | 命令行优先且保留显式空；显式 `lifetime` 启用真实 slab 新策略，`legacy` 保留旧策略；空值、未知值及 file 显式 `lifetime` 在开盘前拒绝 |
+| `--slab-eviction-ghost-capacity` / `DFKV_SLAB_EVICTION_GHOST_CAPACITY` | `0`（关闭） | 每盘保留的 ghost 唯一 key 条目上限；命令行 > 环境变量 > 默认；非零要求真实 slab 生效 lifetime；不是字节预算 |
 | `--slab-write` / `DFKV_SLAB_WRITE` | `direct` | slab 数据面 O_DIRECT / buffered；文件系统不支持 DIO 时整店回退 buffered 并以 `wr=` 上报 |
 | `--ram-tier` / `DFKV_RAM_TIER` | `off` | RAM 热层（写穿+RDMA zero-copy GET） |
 | `--ram-tier-bytes` / `DFKV_RAM_TIER_BYTES` | `16 GiB` | arena 预算（pin 一次即注册） |
@@ -579,6 +580,22 @@ R45 已开放显式 lifetime，但未切换默认策略。启动配置通过已�
 `flag`；原始策略文本仍保留在 `DFKV_SLAB_EVICTION_POLICY` 行。effective/staged 的
 `(default)` 表示内建阶段闸门的决定，不是可独立设置的环境变量。不要只看请求值
 就把 staged legacy 或 file 当作新算法运行样本。
+
+ghost 记录可用 `--slab-eviction-ghost-capacity <entries>` 显式开启，优先于
+`DFKV_SLAB_EVICTION_GHOST_CAPACITY`，都不指定时为 `0`。两者均严格要求无符号
+十进制且能装入 `size_t`；显式空值、正负号、空白、后缀和溢出均在开盘前拒绝，
+错误含参数名、原输入和约束。命令行覆盖的非法环境变量不会参与校验。
+启动配置显示规范化容量及真实 `flag/env/default` 来源，不修改进程环境。
+
+该值是独立的观测启用请求，**不属于下方九项 inactive 评分参数**。非零容量在
+staged/explicit legacy、file 下拒绝启动，不会被忽略或偷偷激活 lifetime；零对这些
+模式仍合法。有效 lifetime 的 RAM write-back disk-ACK 闸门保持不变。
+
+同一个 N 逐盘传入，不拆分：D 个盘最终最多保留 D×N 个唯一 tenant-scoped key。
+这不是字节/RSS 限额、预分配、全局共享预算或可用内存保证；节点、哈希桶和插入期间
+暂存额外条目有开销，分配失败会丢观测证据。未核定生产容量上限或推荐非零值，必须
+另行完成资源预算与验收；此接线仅开放隔离功能验证，不表示允许生产灰度或默认切换。
+历史随 Store 重建清零；历史命中和原始时间界仍不是业务 miss 或完整有效观察窗口。
 
 以下九项仅供 lifetime 使用；在 staged/explicit legacy 或 file 下导出
 `inactive`，不会解析、校验或生效：

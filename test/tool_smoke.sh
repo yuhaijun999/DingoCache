@@ -2,6 +2,7 @@
 # Integration smoke for dfkv_server + dfkv_smoke + dfkvctl + dfkv_bench. arg1 = build dir.
 set -e
 BUILD="${1:?build dir}"
+unset DFKV_SLAB_EVICTION_GHOST_CAPACITY
 
 # --version: each binary prints its name + a version string and exits 0 (must NOT
 # fall through to running the daemon).
@@ -14,6 +15,7 @@ echo "version smoke OK"
 "$BUILD/dfkv_server" --help | grep -q \
   'storage backend: slab | file (default slab)'
 "$BUILD/dfkv_server" --help | grep -q -- '--slab-eviction-policy'
+"$BUILD/dfkv_server" --help | grep -q -- '--slab-eviction-ghost-capacity'
 rc=0
 help_error=$("$BUILD/dfkv_server" --help 2>&1 >/dev/full) || rc=$?
 [ "$rc" = 1 ] || { echo "help write failure: expected exit 1, got $rc"; exit 1; }
@@ -56,6 +58,9 @@ grep -qE 'DFKV_STORE_ENGINE[[:space:]]*= slab[[:space:]]+[(]default[)]' "$D/srv.
 grep -qE 'disk_eviction_requested[[:space:]]*= lifetime[[:space:]]+[(]default[)]' "$D/srv.out"
 grep -qE 'disk_eviction_effective[[:space:]]*= legacy' "$D/srv.out"
 grep -qE 'disk_eviction_staged[[:space:]]*= true' "$D/srv.out"
+grep -qE 'DFKV_SLAB_EVICTION_GHOST_CAPACITY[[:space:]]*= 0[[:space:]]+[(]default[)]' "$D/srv.out"
+"$BUILD/dfkvctl" stat "127.0.0.1:$P" >"$D/default-ghost.metrics"
+grep -qE '^dfkv_slab_disk_lifetime_ghost_capacity_entries\{.*\} 0$' "$D/default-ghost.metrics"
 echo "tool_smoke OK (port $P)"
 
 # Strict arg parsing: an unknown flag / bad number / bad --advertise must fail
@@ -511,3 +516,125 @@ timeout --kill-after=2s 3s "$BUILD/dfkv_server" --dir "$D/fifo-epoch" \
 [ "$rc" = 1 ]
 grep -q 'slab_state is truncated or has unexpected size/type' "$D/fifo-epoch.out"
 echo "non-regular slab_state refusal smoke OK"
+
+
+# Ghost capacity is a per-disk opt-in, not a byte budget or default policy flip.
+# Fail malformed values before any store is constructed, for both sources.
+for source in env flag; do
+  for value in '' -1 +1 ' 1' '1 ' 1x 1.5 18446744073709551616; do
+    selected=()
+    parameter=DFKV_SLAB_EVICTION_GHOST_CAPACITY
+    ghost_env="$value"
+    if [ "$source" = flag ]; then
+      parameter=--slab-eviction-ghost-capacity
+      selected=(--slab-eviction-ghost-capacity "$value")
+      ghost_env=0
+    fi
+    rc=0
+    DFKV_SLAB_EVICTION_GHOST_CAPACITY="$ghost_env" timeout 3s \
+      "$BUILD/dfkv_server" --dir "$D/ghost-invalid-a,$D/ghost-invalid-b" \
+      --cap 2147483648 --store-engine slab --slab-eviction-policy lifetime \
+      "${selected[@]}" >"$D/ghost-invalid.out" 2>&1 || rc=$?
+    [ "$rc" = 2 ] || { cat "$D/ghost-invalid.out"; exit 1; }
+    grep -q 'ERROR' "$D/ghost-invalid.out"
+    grep -qF -- "$parameter='$value'" "$D/ghost-invalid.out"
+    grep -q 'unsigned decimal' "$D/ghost-invalid.out"
+    [ ! -e "$D/ghost-invalid-a" ]
+    [ ! -e "$D/ghost-invalid-b" ]
+  done
+done
+rc=0
+"$BUILD/dfkv_server" --dir "$D/ghost-missing" \
+  --slab-eviction-ghost-capacity >"$D/ghost-missing.out" 2>&1 || rc=$?
+[ "$rc" = 2 ]
+grep -q 'missing value for --slab-eviction-ghost-capacity' "$D/ghost-missing.out"
+[ ! -e "$D/ghost-missing" ]
+
+# A valid nonzero value cannot silently activate lifetime on an inactive owner.
+for mode in staged legacy file; do
+  selected=(--store-engine slab)
+  [ "$mode" != legacy ] || selected+=(--slab-eviction-policy legacy)
+  [ "$mode" != file ] || selected=(--store-engine file --slab-eviction-policy legacy)
+  rc=0
+  env -u DFKV_SLAB_EVICTION_POLICY DFKV_SLAB_EVICTION_GHOST_CAPACITY=3 \
+    DFKV_RAM_TIER=0 timeout 3s "$BUILD/dfkv_server" \
+    --dir "$D/ghost-reject-a,$D/ghost-reject-b" --cap 2147483648 \
+    "${selected[@]}" >"$D/ghost-reject.out" 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { cat "$D/ghost-reject.out"; exit 1; }
+  grep -q "ERROR.*DFKV_SLAB_EVICTION_GHOST_CAPACITY='3'" "$D/ghost-reject.out"
+  grep -q 'effective lifetime' "$D/ghost-reject.out"
+  [ ! -e "$D/ghost-reject-a" ]
+  [ ! -e "$D/ghost-reject-b" ]
+done
+
+# Query real TCP stats: each disk receives the SAME capacity, never a split.
+# Zero is accepted with legacy/file, and a flag overrides even invalid env.
+for mode in env flag conflicting zero legacy file; do
+  selected=(--store-engine slab --slab-eviction-policy lifetime)
+  ghost_env=3
+  capacity=3
+  source=env
+  case "$mode" in
+    flag) ghost_env=invalid; capacity=4; source=flag
+      selected+=(--slab-eviction-ghost-capacity 4) ;;
+    conflicting) ghost_env=3; capacity=4; source=flag
+      selected+=(--slab-eviction-ghost-capacity 4) ;;
+    zero|legacy|file) ghost_env=3; capacity=0; source=flag
+      selected+=(--slab-eviction-ghost-capacity 0)
+      [ "$mode" != legacy ] || selected+=(--slab-eviction-policy legacy)
+      [ "$mode" != file ] || selected+=(--store-engine file --slab-eviction-policy legacy) ;;
+  esac
+  log="$D/ghost-$mode.out"
+  DFKV_SLAB_EVICTION_GHOST_CAPACITY="$ghost_env" DFKV_RAM_TIER=0 \
+    DFKV_LOG=info DFKV_SLAB_WRITE=buffered "$BUILD/dfkv_server" \
+    --dir "$D/ghost-$mode-a,$D/ghost-$mode-b" --cap 2147483648 \
+    --port 0 --slab-granularity 1048576 "${selected[@]}" >"$log" 2>&1 &
+  LIFETIME_PID=$!
+  port=""
+  for i in $(seq 1 150); do
+    port=$(awk '/^PORT /{print $2}' "$log" 2>/dev/null || true)
+    [ -n "$port" ] && \
+      grep -qE "DFKV_SLAB_EVICTION_GHOST_CAPACITY[[:space:]]*= $capacity[[:space:]]+[(]$source[)]" "$log" && break
+    sleep 0.02
+  done
+  [ -n "$port" ] || { cat "$log"; exit 1; }
+  grep -qE "DFKV_SLAB_EVICTION_GHOST_CAPACITY[[:space:]]*= $capacity[[:space:]]+[(]$source[)]" "$log"
+  "$BUILD/dfkv_smoke" --members "n=127.0.0.1:$port" --size 4096
+  "$BUILD/dfkvctl" stat "127.0.0.1:$port" >"$D/ghost-$mode.metrics"
+  if [ "$mode" = file ]; then
+    if grep -q 'dfkv_slab_disk_lifetime_ghost_' "$D/ghost-$mode.metrics"; then
+      echo "file backend unexpectedly emitted slab ghost metrics"
+      exit 1
+    fi
+  else
+    [ "$(grep -cE "^dfkv_slab_disk_lifetime_ghost_capacity_entries\{.*\} $capacity$" "$D/ghost-$mode.metrics")" = 2 ]
+  fi
+  kill "$LIFETIME_PID"
+  wait "$LIFETIME_PID"
+  LIFETIME_PID=""
+done
+echo "ghost capacity CLI/env priority, validation and per-disk metrics smoke OK"
+
+# Rejected observation requests must not recover or dirty an existing disk.
+for source in env flag; do
+  policy_metadata "$D/policy-slab" >"$D/ghost-clean.before"
+  policy_metadata "$D/cache" >"$D/ghost-dirty.before"
+  selected=()
+  ghost_env=3
+  if [ "$source" = flag ]; then
+    ghost_env=0
+    selected=(--slab-eviction-ghost-capacity 3)
+  fi
+  rc=0
+  DFKV_SLAB_EVICTION_GHOST_CAPACITY="$ghost_env" timeout 3s \
+    "$BUILD/dfkv_server" --dir "$D/policy-slab,$D/cache" \
+    --cap 2147483648 --store-engine slab --slab-eviction-policy legacy \
+    "${selected[@]}" >"$D/ghost-metadata.out" 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { cat "$D/ghost-metadata.out"; exit 1; }
+  grep -q 'effective lifetime' "$D/ghost-metadata.out"
+  policy_metadata "$D/policy-slab" >"$D/ghost-clean.after"
+  policy_metadata "$D/cache" >"$D/ghost-dirty.after"
+  cmp "$D/ghost-clean.before" "$D/ghost-clean.after"
+  cmp "$D/ghost-dirty.before" "$D/ghost-dirty.after"
+done
+echo "ghost refusal preserves clean/dirty metadata smoke OK"

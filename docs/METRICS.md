@@ -1484,15 +1484,17 @@ controlled coalescer fixtures, not real io_uring submissions or RDMA grants.
 They do not replace full mixed-RAM trace coverage, production completeness
 measurement, or deferred hardware acceptance.
 
-### Per-disk eviction ghost observations (internal opt-in)
+### Per-disk eviction ghost observations (explicit opt-in)
 
 `DiskCacheGroup::Options::eviction_ghost_capacity_per_disk` forwards the same
 retained-key limit to **each** real slab's internal `eviction_ghost_capacity`.
 This is not a total Group budget divided across disks or a heap-byte budget.
 Both default to **0 (disabled)**. Nonzero requires effective lifetime eviction
 with real slabs: file, custom factories, staged legacy and scoring-only shadow
-are rejected before any disk/factory is opened. The daemon still has no CLI/env
-option enabling this observation; no capacity/default rollout is implied.
+are rejected before any disk/factory is opened. The daemon accepts
+`--slab-eviction-ghost-capacity <entries>` over
+`DFKV_SLAB_EVICTION_GHOST_CAPACITY`, default 0. See DEPLOY.md for strict parsing
+and resource boundaries; this is not a default-capacity or production rollout.
 
 Slab-only per-disk families use existing `disk`, `disk_index` and optional node
 identity labels; no key/request labels or global ghost families are added:

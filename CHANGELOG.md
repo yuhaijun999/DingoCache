@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add explicit per-disk eviction ghost capacity via server flag/environment,
+  defaulting to disabled. Reject malformed input and unsupported owners before
+  opening storage; entry limits are not a validated memory budget.
+
 - Expose opt-in eviction ghost history per disk, including retained capacity,
   recording gaps, truncation and settlement bounds. Keep recording disabled by
   default and reject unsupported owners before opening storage; history alone
