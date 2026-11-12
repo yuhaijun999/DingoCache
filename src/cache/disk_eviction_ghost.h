@@ -14,7 +14,8 @@ namespace dfkv {
 // Bounded historical evidence, not a cache, heat ledger or miss counter.
 // The caller serializes ALL access and supplies monotonic seconds. Record only
 // successful disk evictions, never failed invalidations, Remove, PUT or
-// recovery. Runtime eviction/demand paths do not use this helper yet.
+// recovery. Store recording is internal opt-in; daemon enablement and demand
+// association are separate integration steps.
 class DiskEvictionGhost {
  public:
   struct Snapshot {

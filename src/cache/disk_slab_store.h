@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "cache/async_read_counters.h"
+#include "cache/disk_eviction_ghost.h"
 #include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
@@ -99,6 +100,10 @@ class DiskSlabStore : public StoreEngine {
     // Formal clean recovery uses virtual n=2. Internal staging fixtures keep
     // n=1; neither seed represents successful business reads or disk history.
     bool lifetime_recovery_two_reads = false;
+    // Internal opt-in observation, not a policy/configuration rollout. Zero
+    // disables it. Requires lifetime eviction; bounds retained unique keys,
+    // not heap bytes. No disk persistence or demand/miss inference.
+    size_t eviction_ghost_capacity = 0;
   };
 
   // Caller-observed completion path, not physical I/O or current residency.
@@ -498,6 +503,15 @@ class DiskSlabStore : public StoreEngine {
       const;
   // Current coarse protection estimate; unavailable is not an empty cache.
   SlabAllocator::LifetimeBucketObservation ObserveLifetimeBuckets() const;
+  struct EvictionGhostObservation {
+    DiskEvictionGhost::Snapshot history;
+    uint64_t recorded =
+        0;                 // Accepted eviction events, including repeated keys.
+    uint64_t dropped = 0;  // Missing clock/allocation evidence, not lost data.
+  };
+  // One D-locked snapshot. Time bounds are batch-settlement samples AFTER
+  // successful invalidation, not exact eviction times or complete coverage.
+  EvictionGhostObservation ObserveEvictionGhost() const;
   bool Healthy() const override {
     return ok_ && !metadata_failed_.load(std::memory_order_acquire);
   }
@@ -605,11 +619,18 @@ class DiskSlabStore : public StoreEngine {
            static_cast<uint64_t>(slot) * kRecBytes;
   }
 
+  // Caller holds D. Recording is auxiliary: missing evidence must not abort
+  // authoritative cleanup after successful physical eviction.
+  void RecordEvictionGhostLocked(const std::vector<BlockKey>& evicted);
+
   Options opt_;
   uint32_t num_extents_ = 0;
   uint32_t max_slots_per_extent_ = 0;
   std::vector<char> zero_extent_records_;
   std::unique_ptr<SlabAllocator> alloc_;
+  std::unique_ptr<DiskEvictionGhost> eviction_ghost_;
+  uint64_t ghost_recorded_ = 0;  // Guarded by D, like the ghost container.
+  uint64_t ghost_dropped_ = 0;
   std::vector<int> extent_fds_;      // resident, one per extent (buffered)
   std::vector<int> extent_dio_fds_;  // O_DIRECT twins (only when direct_writes)
   int table_fd_ = -1;                // slots.tbl

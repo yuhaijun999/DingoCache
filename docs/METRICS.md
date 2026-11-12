@@ -1483,3 +1483,37 @@ both request/Into APIs and MAX_READS 1/2/4/63; their registered async flights ar
 controlled coalescer fixtures, not real io_uring submissions or RDMA grants.
 They do not replace full mixed-RAM trace coverage, production completeness
 measurement, or deferred hardware acceptance.
+
+### Internal eviction ghost staging (not exported)
+
+`DiskSlabStore::Options::eviction_ghost_capacity` is an internal opt-in entry
+limit, default **0 (disabled)**; nonzero requires effective lifetime eviction
+and is rejected before opening disk files otherwise. DiskCacheGroup/daemon
+configuration does not enable it yet. It does not change selection, pin/ACK
+rules, disk format or the staged legacy default.
+
+The Store records the existing successful-eviction lists from foreground
+allocation (including donor), background class reclaim, background donor growth
+and watermark reclaim. Explicit Remove, replacement attempts and recovery do
+not create eviction evidence. A later PUT or invalidation failure does not undo
+an earlier successful eviction. One shared-clock sample under D timestamps each
+batch **after** allocator success: this is a settlement timestamp, not an exact
+per-victim invalidation completion time or the pre-I/O scoring timestamp.
+
+`ObserveEvictionGhost()` takes D and returns accepted/dropped **event** counts
+plus the bounded container snapshot. Retained entries count unique tenant-scoped
+keys; repeated evictions refresh the key. Clock exhaustion or ghost allocation
+failure increments dropped evidence without vetoing authoritative eviction or
+payload cleanup. A narrow `std::bad_alloc` catch is an auxiliary-memory containment
+exception to the normal business-result error protocol; it does not make the
+entire PUT/reclaim path OOM-safe. No additional clock sample occurs for disabled
+or empty batches.
+
+Capacity truncation and recording gaps must both be disclosed. Raw oldest/newest
+settlement times and retained counts are not a complete observation interval;
+equal-time records may already have been discarded. The container may stage one
+extra node/index entry, and its node/bucket/allocator/peak RSS costs are not yet
+accepted. This increment adds **no Prometheus families**, Group aggregation,
+production enablement or request/demand association. Historical key matches and
+repeated PUTs are not proof of an eviction-caused miss or recomputation. Ghost
+history and event counters are process-local and empty after reopening the Store.

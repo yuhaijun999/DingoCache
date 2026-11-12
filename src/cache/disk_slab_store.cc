@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -35,6 +36,7 @@
 #include <vector>
 
 #include "cache/async_read_counters.h"
+#include "cache/disk_eviction_ghost.h"
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
 #include "cache/disk_lifetime_read_completion.h"
@@ -579,10 +581,50 @@ bool DrainBatchWrites(io_uring* ring, size_t outstanding,
 #endif
 }  // namespace
 
+void DiskSlabStore::RecordEvictionGhostLocked(
+    const std::vector<BlockKey>& evicted) {
+  if (!eviction_ghost_ || evicted.empty()) return;
+  uint32_t settled_at = 0;
+  // One post-success batch sample, not the score's pre-wipe timestamp. Losing
+  // clock evidence cannot undo an invalidation or skip payload cleanup.
+  if (!opt_.lifetime_clock->TryDrainNow(&settled_at)) {
+    ghost_dropped_ += evicted.size();
+    return;
+  }
+  for (const BlockKey& key : evicted) {
+    try {
+      if (eviction_ghost_->RecordEviction(key, settled_at)) {
+        ++ghost_recorded_;
+      } else {
+        ++ghost_dropped_;
+      }
+    } catch (const std::bad_alloc&) {
+      // Auxiliary-memory containment only: the container preserves its prior
+      // history transactionally. Never propagate this new allocation failure
+      // into already-successful authoritative eviction/cleanup.
+      ++ghost_dropped_;
+    }
+  }
+}
+
+DiskSlabStore::EvictionGhostObservation DiskSlabStore::ObserveEvictionGhost()
+    const {
+  const std::lock_guard<std::mutex> lock(mu_);
+  EvictionGhostObservation observation;
+  if (eviction_ghost_) observation.history = eviction_ghost_->GetSnapshot();
+  observation.recorded = ghost_recorded_;
+  observation.dropped = ghost_dropped_;
+  return observation;
+}
+
 DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   if (!ValidateOptions()) {
     if (ok) *ok = false;
     return;
+  }
+  if (opt_.eviction_ghost_capacity != 0) {
+    eviction_ghost_ =
+        std::make_unique<DiskEvictionGhost>(opt_.eviction_ghost_capacity);
   }
   if (opt_.track_resident_identity) {
     resident_identity_ = std::make_unique<ResidentIdentityState>();
@@ -924,6 +966,8 @@ bool DiskSlabStore::ValidateExistingDataFiles(const Options& options,
 
 bool DiskSlabStore::ValidateOptions() {
   std::string error;
+  if (opt_.eviction_ghost_capacity != 0 && !opt_.lifetime_class_eviction)
+    return SetStartupError("eviction ghost requires lifetime eviction");
   if (opt_.lifetime_recovery_two_reads && !opt_.lifetime_class_eviction)
     return SetStartupError(
         "formal lifetime recovery requires lifetime eviction");
@@ -1664,6 +1708,7 @@ DiskWriteResult DiskSlabStore::AllocateForPutLocked(
         alloc_->PutImpl(key, len, ref, &evicted, nullptr, &reclaim_denied,
                         scan ? &*scan : nullptr);
     // An invalidation remains committed even when a later allocation fails.
+    RecordEvictionGhostLocked(evicted);
     for (const BlockKey& victim : evicted)
       evicted_bytes_ += ErasePayloadLocked(victim.Filename());
     if (scan) {
@@ -2605,6 +2650,7 @@ bool DiskSlabStore::ReclaimLifetimeClass(size_t cls_index, size_t target_free,
                                      &evicted);
     lifetime_background_scan_visits_ += scan.visits - before;
     ++lifetime_background_scan_slices_;
+    RecordEvictionGhostLocked(evicted);
     for (const BlockKey& key : evicted) {
       const uint32_t bytes = ErasePayloadLocked(key.Filename());
       evicted_bytes_ += bytes;
@@ -2700,6 +2746,7 @@ bool DiskSlabStore::ReclaimLifetimeGrowTick() {
       if (alloc_->PoolExtents() != 0) break;
       const SlabAllocator::ExtentBindResult result = alloc_->StealFromResult(
           donor, target, &evicted, SlabAllocator::kStripeWays);
+      RecordEvictionGhostLocked(evicted);
       for (const BlockKey& key : evicted)
         evicted_bytes_ += ErasePayloadLocked(key.Filename());
       if (result == SlabAllocator::ExtentBindResult::kUnavailable) {
@@ -2831,6 +2878,7 @@ void DiskSlabStore::ReclaimTick(
         watermark_freed_slot_bytes_.fetch_add(used_before - used_after,
                                                std::memory_order_relaxed);
       if (!evicted.empty()) {
+        RecordEvictionGhostLocked(evicted);
         if (after_watermark_evict) after_watermark_evict();
         for (const BlockKey& key : evicted) {
           // Consume the visible payload once, only after successful physical
