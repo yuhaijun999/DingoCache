@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -5415,3 +5416,222 @@ TEST(Metrics, ExistLatencyHistogramPresent) {
   EXPECT_GT(cnt, 0) << "sampler recorded no exist latency over 8192 probes";
   s->Stop();
 }
+
+namespace {
+class LifetimeGhostMetricsTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ = fs::temp_directory_path() /
+           ("dfkv_metrics_ghost_" + std::to_string(::getpid()) + "_" +
+            ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    fs::remove_all(dir_);
+    clock_ = std::make_shared<DiskLifetimeClock>(
+        DiskLifetimeHorizon(config_), [this] { return seconds_.load(); });
+  }
+  void TearDown() override {
+    server_.reset();
+    fs::remove_all(dir_);
+  }
+  DiskCacheGroup::Options Options() const {
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {(dir_ / "a").string(), (dir_ / "b").string()};
+    options.capacity_bytes = 2ULL << 30;
+    options.engine = "slab";
+    options.eviction_policy = "lifetime";
+    options.lifetime_config = config_;
+    options.lifetime_clock = clock_;
+    options.eviction_ghost_capacity_per_disk = 1;
+    return options;
+  }
+  void Create(const DiskCacheGroup::Options& options) {
+    server_ = std::make_unique<KvNodeServer>(options);
+    ASSERT_TRUE(server_->Healthy())
+        << KvNodeServerTestPeer::Group(*server_).StartupError();
+    server_->set_identity("ghost\"node", "ghost\\group\n");
+  }
+  void Check(size_t disk,
+             const DiskSlabStore::EvictionGhostObservation& expected) const {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server_);
+    const DiskSlabStore::EvictionGhostObservation actual =
+        group.DiskEvictionGhostObservation(disk);
+    EXPECT_EQ(actual.history.capacity, expected.history.capacity);
+    EXPECT_EQ(actual.history.retained, expected.history.retained);
+    EXPECT_EQ(actual.history.capacity_limited,
+              expected.history.capacity_limited);
+    EXPECT_EQ(actual.history.oldest_evicted_at_sec,
+              expected.history.oldest_evicted_at_sec);
+    EXPECT_EQ(actual.history.newest_evicted_at_sec,
+              expected.history.newest_evicted_at_sec);
+    EXPECT_EQ(actual.recorded, expected.recorded);
+    EXPECT_EQ(actual.dropped, expected.dropped);
+    const std::string text = server_->MetricsText();
+    const std::string prefix = "dfkv_slab_disk_lifetime_ghost_";
+    const std::string labels =
+        "{disk=\"" + group.DiskPath(disk) + "\",disk_index=\"" +
+        std::to_string(disk) +
+        R"(",node="ghost\"node",group="ghost\\group\n"} )";
+    for (const std::pair<const char*, uint64_t>& fact :
+         {std::pair<const char*, uint64_t>{"enabled",
+                                           expected.history.capacity != 0},
+          {"capacity_entries", expected.history.capacity},
+          {"retained_entries", expected.history.retained},
+          {"capacity_limited", expected.history.capacity_limited},
+          {"recorded_total", expected.recorded},
+          {"dropped_total", expected.dropped}}) {
+      const std::string name = prefix + fact.first;
+      EXPECT_NE(
+          text.find("\n" + name + labels + std::to_string(fact.second) + "\n"),
+          std::string::npos)
+          << name;
+    }
+    for (const char* suffix :
+         {"enabled", "capacity_entries", "retained_entries", "capacity_limited",
+          "oldest_settled_at_sec", "newest_settled_at_sec"}) {
+      EXPECT_NE(text.find("# TYPE " + prefix + suffix + " gauge\n"),
+                std::string::npos);
+    }
+    for (const char* suffix : {"recorded_total", "dropped_total"}) {
+      EXPECT_NE(text.find("# TYPE " + prefix + suffix + " counter\n"),
+                std::string::npos);
+    }
+    for (const std::pair<const char*, std::optional<uint64_t>>& bound :
+         {std::pair<const char*, std::optional<uint64_t>>{
+              "oldest_settled_at_sec", expected.history.oldest_evicted_at_sec},
+          {"newest_settled_at_sec", expected.history.newest_evicted_at_sec}}) {
+      const std::string sample = "\n" + prefix + bound.first + labels;
+      if (bound.second.has_value()) {
+        EXPECT_NE(text.find(sample + std::to_string(*bound.second) + "\n"),
+                  std::string::npos);
+      } else {
+        EXPECT_EQ(text.find(sample), std::string::npos);
+      }
+    }
+    // Reject additional key/request labels or unexpected ghost series on
+    // this disk, rather than merely finding the expected subset of samples.
+    size_t samples = 0;
+    for (size_t pos = text.find("\n" + prefix); pos != std::string::npos;
+         pos = text.find("\n" + prefix, pos + 1)) {
+      const std::string line =
+          text.substr(pos + 1, text.find('\n', pos + 1) - pos - 1);
+      if (line.find(",disk_index=\"" + std::to_string(disk) + "\"") ==
+          std::string::npos) {
+        continue;
+      }
+      EXPECT_NE(line.find(labels), std::string::npos) << line;
+      ++samples;
+    }
+    EXPECT_EQ(samples,
+              expected.history.oldest_evicted_at_sec.has_value() ? 8U : 6U);
+    EXPECT_EQ(text.find("dfkv_slab_lifetime_ghost_"), std::string::npos);
+  }
+  const ScopedEnv ram_{"DFKV_RAM_TIER", "0"};
+  const ScopedEnv write_mode_{"DFKV_SLAB_WRITE", "buffered"};
+  const ScopedEnv granularity_{"DFKV_SLAB_GRANULARITY", "1048576"};
+  const ScopedEnv reclaim_{"DFKV_SLAB_RECLAIM_MS", "0"};
+  const ScopedEnv table_sync_{"DFKV_SLAB_TABLE_SYNC_MS", "0"};
+  fs::path dir_;
+  const DiskLifetimeConfig config_ = BucketMetricConfig();
+  std::atomic<uint64_t> seconds_{0};
+  std::shared_ptr<DiskLifetimeClock> clock_;
+  std::unique_ptr<KvNodeServer> server_;
+};
+
+TEST_F(LifetimeGhostMetricsTest, DisabledSlabsEmitZerosAndFileOmitsFamilies) {
+  for (const char* policy : {"legacy", "lifetime", "file"}) {
+    SCOPED_TRACE(policy);
+    DiskCacheGroup::Options options = Options();
+    options.eviction_ghost_capacity_per_disk = 0;
+    options.eviction_policy = std::string(policy) == "file" ? "legacy" : policy;
+    if (std::string(policy) != "lifetime") {
+      options.lifetime_config.reset();
+      options.lifetime_clock.reset();
+    }
+    if (std::string(policy) == "file") options.engine = "file";
+    ASSERT_NO_FATAL_FAILURE(Create(options));
+    if (options.engine == "file") {
+      EXPECT_EQ(server_->MetricsText().find("dfkv_slab_disk_lifetime_ghost_"),
+                std::string::npos);
+    } else {
+      for (size_t disk = 0; disk < 2; ++disk) {
+        ASSERT_NO_FATAL_FAILURE(Check(disk, {}));
+      }
+    }
+    server_.reset();
+    fs::remove_all(dir_);
+  }
+}
+
+TEST_F(LifetimeGhostMetricsTest, PerDiskEvictionsBoundHistoryAndResetOnReopen) {
+  const DiskCacheGroup::Options options = Options();
+  ASSERT_NO_FATAL_FAILURE(Create(options));
+  DiskSlabStore::EvictionGhostObservation empty;
+  empty.history.capacity = 1;
+  for (size_t disk = 0; disk < 2; ++disk) {
+    ASSERT_NO_FATAL_FAILURE(Check(disk, empty));
+  }
+  DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server_);
+  // Exercise each real Store's watermark path directly, without inventing
+  // demand or depending on a key's Ketama route to choose the intended disk.
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(group, disk);
+    ASSERT_EQ(store.Cache({1, disk, 7}, "old", 3), Status::kOk);
+    ASSERT_EQ(store.Cache({2, disk, 7}, "old", 3), Status::kOk);
+    DiskSlabStoreTestPeer::TickWatermark(store);
+    EXPECT_EQ(store.Count(), 1U);
+  }
+  DiskSlabStore::EvictionGhostObservation once = empty;
+  once.recorded = 1;
+  once.history.retained = 1;
+  once.history.oldest_evicted_at_sec = 0;
+  once.history.newest_evicted_at_sec = 0;
+  for (size_t disk = 0; disk < 2; ++disk) {
+    ASSERT_NO_FATAL_FAILURE(Check(disk, once));
+  }
+  seconds_ = 17;
+  DiskSlabStore& disk0 = DiskCacheGroupTestPeer::Slab(group, 0);
+  ASSERT_EQ(disk0.Cache({3, 0, 7}, "new", 3), Status::kOk);
+  DiskSlabStoreTestPeer::TickWatermark(disk0);
+  EXPECT_EQ(disk0.Count(), 1U);
+  DiskSlabStore::EvictionGhostObservation twice = once;
+  twice.recorded = 2;
+  twice.history.capacity_limited = true;
+  twice.history.oldest_evicted_at_sec = 17;
+  twice.history.newest_evicted_at_sec = 17;
+  for (unsigned scrape = 0; scrape < 2; ++scrape) {
+    ASSERT_NO_FATAL_FAILURE(Check(0, twice));
+    ASSERT_NO_FATAL_FAILURE(Check(1, once));
+  }
+  server_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create(options));
+  EXPECT_EQ(server_->Count(), 2U);
+  for (size_t disk = 0; disk < 2; ++disk) {
+    ASSERT_NO_FATAL_FAILURE(Check(disk, empty));
+  }
+}
+
+TEST_F(LifetimeGhostMetricsTest, ClockDropPreservesSuccessfulPhysicalEviction) {
+  DiskCacheGroup::Options options = Options();
+  options.cache_dirs.resize(1);
+  options.capacity_bytes = 1ULL << 30;
+  ASSERT_NO_FATAL_FAILURE(Create(options));
+  DiskSlabStore& store =
+      DiskCacheGroupTestPeer::Slab(KvNodeServerTestPeer::Group(*server_), 0);
+  ASSERT_EQ(store.Cache({1, 0}, "old", 3), Status::kOk);
+  ASSERT_EQ(store.Cache({2, 0}, "old", 3), Status::kOk);
+  ASSERT_TRUE(DiskSlabStoreTestPeer::ObserveSlotEvict(store, [this] {
+    // Selection/pre-wipe clock samples succeeded. Only optional post-success
+    // evidence sampling crosses the hard bound inside this real invalidation.
+    seconds_ = std::numeric_limits<uint64_t>::max();
+  }));
+  DiskSlabStoreTestPeer::TickWatermark(store);
+  EXPECT_EQ(store.Count(), 1U);
+  EXPECT_EQ(store.EvictedBytes(), 3U);
+  EXPECT_TRUE(store.Healthy());
+  DiskSlabStore::EvictionGhostObservation dropped;
+  dropped.history.capacity = 1;
+  dropped.dropped = 1;
+  ASSERT_NO_FATAL_FAILURE(Check(0, dropped));
+  seconds_ = 0;
+  ASSERT_NO_FATAL_FAILURE(Check(0, dropped));
+}
+}  // namespace

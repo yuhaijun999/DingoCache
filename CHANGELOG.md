@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Expose opt-in eviction ghost history per disk, including retained capacity,
+  recording gaps, truncation and settlement bounds. Keep recording disabled by
+  default and reject unsupported owners before opening storage; history alone
+  is not evidence of an eviction-caused miss.
+
 - Carry sampled PULL grant completion through the lifetime observer, measuring
   dispatch and accepted owner update without backdating heat. Preserve legacy
   callback adapters, once-only grants and disabled-mode sampling behavior.

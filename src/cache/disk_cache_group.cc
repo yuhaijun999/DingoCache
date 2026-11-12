@@ -421,6 +421,11 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   // Until the separate default-policy flip, an unspecified request still uses
   // staged legacy. Only an explicit lifetime choice enables the public path.
   engine_ = use_slab ? "slab" : "file";
+  if (opt.eviction_ghost_capacity_per_disk != 0 &&
+      (!use_slab || opt.engine_factory || !opt.lifetime_class_eviction)) {
+    fail("eviction ghost requires effective lifetime with real slab engines");
+    return;
+  }
   if (opt.lifetime_class_eviction) {
     if (!use_slab || opt.engine_factory || !opt.lifetime_config.has_value()) {
       fail(std::string(formal_lifetime ? "explicit" : "internal") +
@@ -584,6 +589,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       so.lifetime_config = opt.lifetime_config;
       so.lifetime_class_eviction = opt.lifetime_class_eviction;
       so.lifetime_recovery_two_reads = formal_lifetime;
+      so.eviction_ghost_capacity = opt.eviction_ghost_capacity_per_disk;
       std::string error;
       if (!DiskSlabStore::ValidateGeometry(so, &error)) {
         fail(so.dir + ": " + error +
@@ -1340,6 +1346,12 @@ SlabAllocator::LifetimeReadClassObservation
 DiskCacheGroup::DiskLifetimeReadClassObservation(size_t i) const {
   if (i >= slabs_.size()) return {};
   return slabs_[i]->ObserveLifetimeReadClasses();
+}
+
+DiskSlabStore::EvictionGhostObservation
+DiskCacheGroup::DiskEvictionGhostObservation(size_t i) const {
+  if (i >= slabs_.size()) return {};
+  return slabs_[i]->ObserveEvictionGhost();
 }
 
 std::vector<SlabAllocator::ClassStat> DiskCacheGroup::SlabClasses() const {

@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/disk_cache_group.h"
 #include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
@@ -590,6 +591,22 @@ std::string KvNodeServer::MetricsText() const {
            "Negative attributed io_uring payload CQE results");
     header("dfkv_slab_disk_uring_payload_read_short_reads_total", "counter",
            "Nonnegative attributed payload CQEs below residual length");
+    header("dfkv_slab_disk_lifetime_ghost_enabled", "gauge",
+           "Configured ghost recording, not health or complete coverage");
+    header("dfkv_slab_disk_lifetime_ghost_capacity_entries", "gauge",
+           "Per-disk retained ghost key limit, not a byte budget");
+    header("dfkv_slab_disk_lifetime_ghost_retained_entries", "gauge",
+           "Unique tenant-scoped keys retained in eviction history");
+    header("dfkv_slab_disk_lifetime_ghost_capacity_limited", "gauge",
+           "Whether capacity has discarded retained eviction evidence");
+    header("dfkv_slab_disk_lifetime_ghost_recorded_total", "counter",
+           "Accepted eviction events, including repeated keys");
+    header("dfkv_slab_disk_lifetime_ghost_dropped_total", "counter",
+           "Eviction events missing clock or allocation evidence");
+    header("dfkv_slab_disk_lifetime_ghost_oldest_settled_at_sec", "gauge",
+           "Oldest retained batch settlement clock offset, not a window");
+    header("dfkv_slab_disk_lifetime_ghost_newest_settled_at_sec", "gauge",
+           "Newest retained batch settlement clock offset, not Unix time");
     header("dfkv_slab_disk_lifetime_bucket_protected_estimate", "gauge",
            "Bucket-rounded estimate of retained protected residents");
     header("dfkv_slab_disk_lifetime_bucket_estimate_available", "gauge",
@@ -946,6 +963,28 @@ std::string KvNodeServer::MetricsText() const {
       sample("dfkv_slab_disk_watermark_peak_high_bytes", st.watermark_peak_high_bytes);
       sample("dfkv_slab_disk_watermark_freed_payload_bytes_total",
              st.watermark_freed_payload_bytes);
+      // One D-locked snapshot per disk. Missing bounds are not zero time;
+      // different disks' histories must not be merged into a coverage window.
+      const DiskSlabStore::EvictionGhostObservation ghost =
+          group_.DiskEvictionGhostObservation(i);
+      sample("dfkv_slab_disk_lifetime_ghost_enabled",
+             ghost.history.capacity != 0 ? 1 : 0);
+      sample("dfkv_slab_disk_lifetime_ghost_capacity_entries",
+             ghost.history.capacity);
+      sample("dfkv_slab_disk_lifetime_ghost_retained_entries",
+             ghost.history.retained);
+      sample("dfkv_slab_disk_lifetime_ghost_capacity_limited",
+             ghost.history.capacity_limited ? 1 : 0);
+      sample("dfkv_slab_disk_lifetime_ghost_recorded_total", ghost.recorded);
+      sample("dfkv_slab_disk_lifetime_ghost_dropped_total", ghost.dropped);
+      if (ghost.history.oldest_evicted_at_sec.has_value()) {
+        sample("dfkv_slab_disk_lifetime_ghost_oldest_settled_at_sec",
+               *ghost.history.oldest_evicted_at_sec);
+      }
+      if (ghost.history.newest_evicted_at_sec.has_value()) {
+        sample("dfkv_slab_disk_lifetime_ghost_newest_settled_at_sec",
+               *ghost.history.newest_evicted_at_sec);
+      }
       const SlabAllocator::LifetimeBucketObservation buckets =
           group_.DiskLifetimeBucketObservation(i);
       sample("dfkv_slab_disk_lifetime_bucket_estimate_available",

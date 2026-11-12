@@ -111,6 +111,10 @@ class DiskCacheGroup {
     // path after validation. Requires real slabs and scoring config. RAM
     // write-back must explicitly select disk-ACK before any disk is opened.
     bool lifetime_class_eviction = false;
+    // Internal opt-in PER-DISK retained-key limit, not a split Group budget or
+    // heap-byte bound. Zero disables recording. Requires effective lifetime
+    // with real slabs; no daemon/CLI default rollout or demand inference.
+    size_t eviction_ghost_capacity_per_disk = 0;
   };
 
   explicit DiskCacheGroup(Options opt);
@@ -232,6 +236,10 @@ class DiskCacheGroup {
   // Per-disk metrics-only estimate; file/out-of-range views are unavailable.
   // Different disks are sampled separately, not at one global snapshot time.
   SlabAllocator::LifetimeReadClassObservation DiskLifetimeReadClassObservation(
+      size_t i) const;
+  // Each disk has an independent history. File/out-of-range views are empty;
+  // raw settlement timestamps must not be aggregated into a coverage window.
+  DiskSlabStore::EvictionGhostObservation DiskEvictionGhostObservation(
       size_t i) const;
   uint64_t TenantUsedBytes(uint64_t tenant_hash) const;
   uint64_t TenantDefaultQuotaBytes() const { return tenant_default_quota_bytes_; }

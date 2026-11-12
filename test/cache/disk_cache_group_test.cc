@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1276,6 +1277,9 @@ TEST_F(DiskGroupTest, ConfiguredQuotaFileFailsClosed) {
 namespace dfkv {
 class DiskCacheGroupTestPeer {
  public:
+  static size_t RouteIndex(const DiskCacheGroup& group, const BlockKey& key) {
+    return group.RouteIndex(key);
+  }
   static const DiskLifetimeClock* Clock(const DiskCacheGroup& group) {
     return group.lifetime_clock_.get();
   }
@@ -1712,4 +1716,133 @@ TEST_F(SharedLifetimeClockTest, LogicalReadCountersAggregateAcrossBothDisks) {
                   .GetStats()
                   .lifetime_reads.successful,
               3U);
+}
+
+TEST_F(SharedLifetimeClockTest, GhostRejectsInapplicableOwnersBeforeOpening) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv policy_env("DFKV_SLAB_EVICTION_POLICY");
+  for (const std::string mode :
+       {"legacy", "default", "shadow", "file", "factory"}) {
+    SCOPED_TRACE(mode);
+    DiskCacheGroup::Options options = Options();
+    options.cache_dirs = {(base_ / mode / "a").string(),
+                          (base_ / mode / "b").string()};
+    options.eviction_ghost_capacity_per_disk = 3;
+    if (mode == "default") options.eviction_policy.reset();
+    if (mode == "shadow") options.lifetime_config = DiskLifetimeConfig{};
+    if (mode == "file") options.engine = "file";
+    size_t factory_calls = 0;
+    if (mode == "factory") {
+      options.engine_factory = [&factory_calls](const std::string& dir,
+                                                uint64_t) {
+        ++factory_calls;
+        return std::make_unique<ProbeEngine>(dir, 0,
+                                             std::make_shared<BatchProbe>());
+      };
+    }
+    const DiskCacheGroup group(options);
+    EXPECT_FALSE(group.Healthy());
+    EXPECT_FALSE(group.StartupError().empty());
+    EXPECT_EQ(factory_calls, 0U);
+    EXPECT_FALSE(fs::exists(base_ / mode));
+  }
+}
+
+TEST_F(SharedLifetimeClockTest, GhostCapacityIsPerDiskAndBoundsAreEmpty) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  for (const size_t capacity : {size_t{0}, size_t{3}}) {
+    SCOPED_TRACE(capacity);
+    DiskCacheGroup::Options options = Options();
+    options.eviction_policy = "lifetime";
+    options.eviction_ghost_capacity_per_disk = capacity;
+    const DiskCacheGroup group(options);
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    ASSERT_EQ(group.DiskCount(), 2U);
+    for (size_t disk = 0; disk < group.DiskCount(); ++disk) {
+      const DiskSlabStore::EvictionGhostObservation observation =
+          group.DiskEvictionGhostObservation(disk);
+      EXPECT_EQ(observation.history.capacity, capacity);  // Not divided by 2.
+      EXPECT_EQ(observation.history.retained, 0U);
+      EXPECT_EQ(observation.recorded, 0U);
+      EXPECT_EQ(observation.dropped, 0U);
+      EXPECT_FALSE(observation.history.oldest_evicted_at_sec);
+      EXPECT_FALSE(observation.history.newest_evicted_at_sec);
+    }
+    for (const size_t disk :
+         {group.DiskCount(), std::numeric_limits<size_t>::max()}) {
+      EXPECT_EQ(group.DiskEvictionGhostObservation(disk).history.capacity, 0U);
+    }
+  }
+}
+
+TEST_F(SharedLifetimeClockTest, GhostFileObservationIsEmpty) {
+  DiskCacheGroup::Options options = Options();
+  options.engine = "file";
+  const DiskCacheGroup group(options);
+  ASSERT_TRUE(group.Healthy());
+  const DiskSlabStore::EvictionGhostObservation observation =
+      group.DiskEvictionGhostObservation(0);
+  EXPECT_EQ(observation.history.capacity, 0U);
+  EXPECT_EQ(observation.history.retained, 0U);
+  EXPECT_EQ(observation.recorded, 0U);
+  EXPECT_EQ(observation.dropped, 0U);
+  EXPECT_FALSE(observation.history.oldest_evicted_at_sec);
+  EXPECT_FALSE(observation.history.newest_evicted_at_sec);
+}
+
+TEST_F(SharedLifetimeClockTest, GhostRoutedEvictionsStayIndependentAndReset) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  // One sparse buffered slot per 1 GiB extent. Payload I/O stays three bytes;
+  // this is a correctness geometry, not a memory/performance trial.
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "1073741824");
+  DiskCacheGroup::Options options = Options();
+  options.eviction_policy = "lifetime";
+  options.eviction_ghost_capacity_per_disk = 1;
+  std::atomic<uint64_t> seconds{0};
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(DiskLifetimeConfig{}),
+      [&] { return seconds.load(); });
+  std::unique_ptr<DiskCacheGroup> group =
+      std::make_unique<DiskCacheGroup>(options);
+  ASSERT_TRUE(group->Healthy()) << group->StartupError();
+  std::array<std::vector<BlockKey>, 2> keys;
+  for (uint64_t id = 1;
+       id < 10000 && (keys[0].size() < 3 || keys[1].size() < 2); ++id) {
+    const BlockKey key{id, 0, 7};
+    const size_t disk = DiskCacheGroupTestPeer::RouteIndex(*group, key);
+    ASSERT_LT(disk, keys.size());
+    if (keys[disk].size() < (disk == 0 ? 3U : 2U)) keys[disk].push_back(key);
+  }
+  ASSERT_EQ(keys[0].size(), 3U);
+  ASSERT_EQ(keys[1].size(), 2U);
+  for (const std::vector<BlockKey>& disk_keys : keys) {
+    ASSERT_EQ(group->Cache(disk_keys[0], "old", 3), Status::kOk);
+    ASSERT_EQ(group->Cache(disk_keys[1], "new", 3), Status::kOk);
+  }
+  seconds = 9;
+  ASSERT_EQ(group->Cache(keys[0][2], "new", 3), Status::kOk);
+  for (size_t disk = 0; disk < keys.size(); ++disk) {
+    const DiskSlabStore::EvictionGhostObservation observation =
+        group->DiskEvictionGhostObservation(disk);
+    EXPECT_EQ(observation.recorded, disk == 0 ? 2U : 1U);
+    EXPECT_EQ(observation.dropped, 0U);
+    EXPECT_EQ(observation.history.retained, 1U);
+    EXPECT_EQ(observation.history.capacity_limited, disk == 0);
+    EXPECT_EQ(observation.history.oldest_evicted_at_sec, disk == 0 ? 9U : 0U);
+    EXPECT_EQ(observation.history.newest_evicted_at_sec, disk == 0 ? 9U : 0U);
+    EXPECT_FALSE(group->IsCached(keys[disk][0]));
+  }
+  EXPECT_EQ(group->Count(), 2U);
+  group.reset();
+  group = std::make_unique<DiskCacheGroup>(options);
+  ASSERT_TRUE(group->Healthy()) << group->StartupError();
+  EXPECT_EQ(group->Count(), 2U);
+  for (size_t disk = 0; disk < keys.size(); ++disk) {
+    const DiskSlabStore::EvictionGhostObservation observation =
+        group->DiskEvictionGhostObservation(disk);
+    EXPECT_EQ(observation.history.capacity, 1U);
+    EXPECT_EQ(observation.history.retained, 0U);
+    EXPECT_EQ(observation.recorded, 0U);
+    EXPECT_FALSE(observation.history.oldest_evicted_at_sec);
+  }
 }

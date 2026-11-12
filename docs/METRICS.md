@@ -1484,36 +1484,56 @@ controlled coalescer fixtures, not real io_uring submissions or RDMA grants.
 They do not replace full mixed-RAM trace coverage, production completeness
 measurement, or deferred hardware acceptance.
 
-### Internal eviction ghost staging (not exported)
+### Per-disk eviction ghost observations (internal opt-in)
 
-`DiskSlabStore::Options::eviction_ghost_capacity` is an internal opt-in entry
-limit, default **0 (disabled)**; nonzero requires effective lifetime eviction
-and is rejected before opening disk files otherwise. DiskCacheGroup/daemon
-configuration does not enable it yet. It does not change selection, pin/ACK
-rules, disk format or the staged legacy default.
+`DiskCacheGroup::Options::eviction_ghost_capacity_per_disk` forwards the same
+retained-key limit to **each** real slab's internal `eviction_ghost_capacity`.
+This is not a total Group budget divided across disks or a heap-byte budget.
+Both default to **0 (disabled)**. Nonzero requires effective lifetime eviction
+with real slabs: file, custom factories, staged legacy and scoring-only shadow
+are rejected before any disk/factory is opened. The daemon still has no CLI/env
+option enabling this observation; no capacity/default rollout is implied.
 
-The Store records the existing successful-eviction lists from foreground
-allocation (including donor), background class reclaim, background donor growth
-and watermark reclaim. Explicit Remove, replacement attempts and recovery do
-not create eviction evidence. A later PUT or invalidation failure does not undo
-an earlier successful eviction. One shared-clock sample under D timestamps each
-batch **after** allocator success: this is a settlement timestamp, not an exact
-per-victim invalidation completion time or the pre-I/O scoring timestamp.
+Slab-only per-disk families use existing `disk`, `disk_index` and optional node
+identity labels; no key/request labels or global ghost families are added:
 
-`ObserveEvictionGhost()` takes D and returns accepted/dropped **event** counts
-plus the bounded container snapshot. Retained entries count unique tenant-scoped
-keys; repeated evictions refresh the key. Clock exhaustion or ghost allocation
-failure increments dropped evidence without vetoing authoritative eviction or
+| Family | Type | Meaning |
+|---|---|---|
+| `dfkv_slab_disk_lifetime_ghost_enabled` | gauge | Configured capacity is nonzero; not storage health, freshness or complete coverage. |
+| `dfkv_slab_disk_lifetime_ghost_capacity_entries` | gauge | Per-disk retained unique-key limit, not bytes. |
+| `dfkv_slab_disk_lifetime_ghost_retained_entries` | gauge | Unique tenant-scoped keys currently retained. |
+| `dfkv_slab_disk_lifetime_ghost_capacity_limited` | gauge | Sticky indication that an old retained key was discarded at capacity. |
+| `dfkv_slab_disk_lifetime_ghost_recorded_total` | counter | Accepted successful-eviction events, including repeated keys. |
+| `dfkv_slab_disk_lifetime_ghost_dropped_total` | counter | Events missing clock/allocation evidence, not lost cache data. |
+| `dfkv_slab_disk_lifetime_ghost_oldest_settled_at_sec` | gauge | Oldest retained batch-settlement clock offset; omitted if empty, valid zero emitted. |
+| `dfkv_slab_disk_lifetime_ghost_newest_settled_at_sec` | gauge | Newest retained batch-settlement clock offset; omitted if empty, valid zero emitted. |
+
+File engines omit these families. Disabled slabs emit zero capacity/population/
+events/truncation and omit both timestamp samples. One D-locked snapshot supplies
+all fields for a disk. Different disks are observed separately; time bounds must
+not be summed or merged into a global complete window. The ghost snapshot does
+not sample the clock, although other existing `MetricsText` observations do.
+Repeated scrapes do not record or refresh ghost evidence. Configured enabled
+state and retained history remain observable even after a clock/health failure.
+Counters and history are process-local and empty after reopening a Store.
+
+The Store records existing successful-eviction lists from foreground allocation
+(including donor), background class reclaim, background donor growth and watermark
+reclaim. Explicit Remove, keep-existing PUT and recovery do not create eviction
+evidence. A later PUT or invalidation failure does not undo an earlier successful
+eviction. One shared-clock sample under D timestamps each batch **after** allocator
+success: this is a settlement offset, not Unix time, exact per-victim invalidation
+completion time or the pre-I/O scoring timestamp. Clock exhaustion or ghost
+allocation failure increments dropped without vetoing authoritative eviction or
 payload cleanup. A narrow `std::bad_alloc` catch is an auxiliary-memory containment
 exception to the normal business-result error protocol; it does not make the
-entire PUT/reclaim path OOM-safe. No additional clock sample occurs for disabled
-or empty batches.
+entire PUT/reclaim path OOM-safe. Disabled/empty batches add no clock sample.
 
 Capacity truncation and recording gaps must both be disclosed. Raw oldest/newest
-settlement times and retained counts are not a complete observation interval;
-equal-time records may already have been discarded. The container may stage one
-extra node/index entry, and its node/bucket/allocator/peak RSS costs are not yet
-accepted. This increment adds **no Prometheus families**, Group aggregation,
-production enablement or request/demand association. Historical key matches and
-repeated PUTs are not proof of an eviction-caused miss or recomputation. Ghost
-history and event counters are process-local and empty after reopening the Store.
+bounds, their difference and retained counts do not prove a complete effective
+observation interval; equal-time records may already have been discarded. The
+container may stage one extra node/index entry, and node/bucket/allocator/peak RSS
+costs are not yet accepted. No causal miss/recomputation association exists yet:
+historical key matches and repeated PUTs are not proof of eviction-caused business
+loss. These diagnostics do not establish full E4 coverage or authorize new-policy
+performance trials, formal A/B or the default-policy flip.
