@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -3724,6 +3725,92 @@ TEST_F(LifetimeSuccessReadTest, RequestAndIntoCountEachLogicalSuccess) {
       MetricVal(node_->MetricsText(), "dfkv_slab_lifetime_read_applied_total"),
       2);
   ExpectConservation(2);
+}
+
+// The requests are identical in every mode; only explicit clean RAM admission
+// differs. Sequential coalescing covers leaders, not concurrent followers.
+TEST_F(LifetimeSuccessReadTest, O5SameLogicalTraceAcrossRamAndCoalescing) {
+  for (const uint64_t max_reads : {1, 2, 4, 63}) {
+    for (const bool ram_enabled : {false, true}) {
+      for (const bool coalescing : {false, true}) {
+        SCOPED_TRACE("M=" + std::to_string(max_reads) +
+                     " RAM=" + std::to_string(ram_enabled) +
+                     " coalescing=" + std::to_string(coalescing));
+        const ScopedEnv ram("DFKV_RAM_TIER", ram_enabled ? "1" : "0");
+        DiskLifetimeConfig config;
+        config.max_reads = max_reads;
+        config.bucket_sec = 604800;
+        config.bucket_count = 64;
+        std::string error;
+        ASSERT_TRUE(ValidateDiskLifetimeConfig(config, &error)) << error;
+        ASSERT_NO_FATAL_FAILURE(CreateScored("lifetime", config));
+        ASSERT_EQ(node_->ram_enabled(), ram_enabled);
+        ASSERT_FALSE(node_->ram_ack_enabled());
+        DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+        ASSERT_TRUE(
+            DiskSlabStoreTestPeer::UsesLifetimePolicy(store, max_reads));
+        KvNodeServerWiringTestPeer::SetCoalescing(*node_, coalescing);
+        const BlockKey key{100100 + max_reads * 4 +
+                               static_cast<uint64_t>(ram_enabled) * 2 +
+                               static_cast<uint64_t>(coalescing),
+                           0};
+        const DiskWriteResult written = Seed(key);
+        ASSERT_EQ(written.status, Status::kOk);
+        ASSERT_TRUE(written.identity.valid());
+        ASSERT_EQ(State(key).scoring_reads(), 0U);
+        const uint32_t put_at = State(key).put_at;
+        const uint64_t source_start = seconds_.load(std::memory_order_relaxed);
+        uint64_t completed_reads = 0;
+        for (unsigned int i = 0; i < 6; ++i) {
+          const uint32_t elapsed = i < 3 ? 21 : 181;
+          seconds_.store(source_start + elapsed, std::memory_order_relaxed);
+          std::string value;
+          ASSERT_EQ(ReadFiveBytes(key, (i & 1U) != 0, &value), Status::kOk);
+          ASSERT_EQ(value, "value");
+          ++completed_reads;  // Independent of the notification counters.
+          const DiskLifetimeState state = State(key);
+          EXPECT_EQ(state.scoring_reads(), completed_reads);
+          EXPECT_EQ(state.actual_reads, std::min(completed_reads, uint64_t{3}));
+          EXPECT_EQ(state.anchor, put_at + elapsed);
+          EXPECT_EQ(state.put_at, put_at);
+          EXPECT_FALSE(state.history_unknown);
+          EXPECT_FALSE(state.write_armed());
+          EXPECT_TRUE(state.first_early_read());
+          // MAX_READS caps the score band, not the raw logical-read ledger.
+          EXPECT_EQ(DiskLifetimeBand(config, state.scoring_reads(),
+                                     state.first_early_read()),
+                    std::min(completed_reads + 1, max_reads));
+          if (i == 0 && ram_enabled) {
+            ASSERT_TRUE(KvNodeServerWiringTestPeer::Ram(*node_).PutDurable(
+                key, value.data(), value.size(), written.identity));
+            ASSERT_EQ(KvNodeServerWiringTestPeer::RamSource(*node_, key),
+                      written.identity);
+          }
+          ASSERT_EQ(Read(key, &value, 5, 0), Status::kOk);
+          EXPECT_TRUE(value.empty());
+          ASSERT_EQ(ReadFiveBytes({key.tenant_hash + 10000, 0}, (i & 1U) != 0,
+                                  &value),
+                    Status::kNotFound);
+          EXPECT_EQ(State(key).scoring_reads(), completed_reads);
+        }
+        const uint64_t disk_reads = ram_enabled ? 1 : completed_reads;
+        EXPECT_EQ(Counters().applied, completed_reads);
+        EXPECT_EQ(Counters().source_ram, completed_reads - disk_reads);
+        EXPECT_EQ(Counters().source_disk, coalescing ? 0 : disk_reads);
+        EXPECT_EQ(Counters().source_copy_leader, coalescing ? disk_reads : 0);
+        EXPECT_EQ(Counters().source_copy_follower, 0U);
+        EXPECT_EQ(Counters().completion_missing, 0U);
+        DiskResidentIdentity identity;
+        std::string disk_value;
+        ASSERT_EQ(
+            store.RangeWithIdentity(key, 0, 5, &disk_value, &identity, nullptr),
+            Status::kOk);
+        EXPECT_EQ(disk_value, "value");
+        EXPECT_EQ(identity, written.identity);
+        ExpectConservation(completed_reads);
+      }
+    }
+  }
 }
 
 TEST_F(LifetimeSuccessReadTest, CompletionSamplingSpansSyncReadApisAndSources) {
