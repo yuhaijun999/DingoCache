@@ -1446,3 +1446,40 @@ Measured GCC RDMA+io_uring layouts for PULL forwarding: RdmaServer 1432 to
 1440 bytes (+8 for the flag/alignment); Node 102232, Store 3072, Stats 2424 and
 completion token 16 bytes are unchanged. This is fixed object layout, not a
 measurement of callback heap allocation, complete stack/RSS or latency budget.
+
+
+### Logical-read applicability and fallback audit
+
+`dfkv_slab_lifetime_read_success_total` and its per-disk counterpart
+`dfkv_slab_disk_lifetime_read_success_total` count nonempty notifications
+received by opted-in Stores, including notifications rejected for missing bindings,
+changed residents, health or clock/state conditions. Its outcome/source and
+completion partitions prove internal accounting only. Neither those equalities
+nor `applied / success` independently proves that every applicable business
+request emitted exactly one notification. There is currently no independent
+production completion denominator for non-PULL requests.
+
+Coverage tests derive the expected count from completed request results and
+independently established source residency, not from another notification
+counter. Empty/failed requests, metadata access and mere preparation do not
+contribute. Unbound RAM successes are recorded separately: missing provenance
+neither establishes a same-generation disk copy nor proves its absence. This
+counter alone does not prove that an update was inapplicable or missed, and
+must not excuse lost provenance. Existing identity/visibility/generation checks
+record identified resident changes as races, not accepted updates to the original
+generation; health/clock failure precedence remains unchanged. Controlled
+same-generation fixtures also compare raw scoring reads before saturation; capped logical
+read-class counts alone cannot detect duplicate application after the third
+read. Different successful requests for the same key/identity are separate
+successes, not duplicates to suppress by key or resident identity.
+
+A copy-coalescer flight is not a logical read request. Same-thread async-flight
+fallback, failed-flight fallback and timeout fallback execute their own fill;
+only actual shared successful bytes are a copy follower. Each successful Node
+fallback contributes its own disk-source notification once. Registration,
+failed owner completion and repeated token cleanup do not create heat. The
+Node regression fixtures use actual disk I/O and explicit lifetime/disk-ACK,
+both request/Into APIs and MAX_READS 1/2/4/63; their registered async flights are
+controlled coalescer fixtures, not real io_uring submissions or RDMA grants.
+They do not replace full mixed-RAM trace coverage, production completeness
+measurement, or deferred hardware acceptance.

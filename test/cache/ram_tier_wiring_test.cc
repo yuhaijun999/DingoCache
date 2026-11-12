@@ -40,6 +40,7 @@
 #include "cache/kv_node_server.h"
 #include "cache/kv_store.h"
 #include "cache/ram_tier.h"
+#include "cache/read_coalescer.h"
 #include "cache/store_engine.h"
 #include "client/key_map.h"
 #include "common/kv_types.h"
@@ -108,6 +109,12 @@ class DiskSlabStoreTestPeer {
   }
   static void SetReadHook(DiskSlabStore& store, std::function<void()> hook) {
     store.read_acquired_hook_for_test_ = std::move(hook);
+  }
+  static bool UsesLifetimePolicy(const DiskSlabStore& store,
+                                 uint64_t max_reads) {
+    return store.opt_.lifetime_class_eviction &&
+           store.opt_.lifetime_config.has_value() &&
+           store.opt_.lifetime_config->max_reads == max_reads;
   }
   static void SetPayloadWriteHook(DiskSlabStore* store,
                                   std::function<bool()> hook) {
@@ -182,6 +189,16 @@ class KvNodeServerWiringTestPeer {
   }
   static uint64_t ReadEpoch(KvNodeServer& server, const BlockKey& key) {
     return server.CaptureReadEpoch(key);
+  }
+  static uint64_t RegisterReadFlight(KvNodeServer& server, const BlockKey& key,
+                                     uint64_t length) {
+    return server.read_coalescer_.TryRegisterAsync(
+        key, 0, length, false, 0, false, server.CaptureReadEpoch(key));
+  }
+  // The return value reports joined waiters, not successful completion.
+  static bool CompleteReadFlight(KvNodeServer& server, uint64_t token,
+                                 Status status) {
+    return server.read_coalescer_.CompleteAsync(token, status, nullptr, 0);
   }
   static bool Begin(KvNodeServer& server) { return server.TryBeginPut(); }
   static void End(KvNodeServer& server) { server.EndPut(); }
@@ -3563,20 +3580,47 @@ TEST_F(ProductionFlushResultTest, SuccessfulHardCrossingExposesInitSkipMetric) {
 
 class LifetimeSuccessReadTest : public ProductionFlushResultTest {
  protected:
-  void CreateScored() {
+  void CreateScored(const char* policy = "legacy",
+                    const DiskLifetimeConfig& config = {}) {
     node_.reset();
     DiskCacheGroup::Options options;
     options.cache_dirs = {(dir_ / "slab").string()};
     options.capacity_bytes = 1ull << 30;
     options.engine = "slab";
-    options.eviction_policy = "legacy";
-    options.lifetime_config = DiskLifetimeConfig{};
+    options.eviction_policy = policy;
+    options.lifetime_config = config;
     options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
         DiskLifetimeHorizon(*options.lifetime_config),
         [this] { return seconds_.load(std::memory_order_relaxed); });
     node_ = KvNodeServerWiringTestPeer::Create(options);
     ASSERT_TRUE(node_->Healthy());
     KvNodeServerWiringTestPeer::SetCoalescing(*node_, false);
+  }
+  void CreateFallbackPolicy(uint64_t max_reads) {
+    DiskLifetimeConfig config;
+    config.max_reads = max_reads;
+    // Cover the larger M=63 horizon without changing the scoring formula.
+    config.bucket_sec = 604800;
+    config.bucket_count = 64;
+    std::string error;
+    ASSERT_TRUE(ValidateDiskLifetimeConfig(config, &error)) << error;
+    ASSERT_NO_FATAL_FAILURE(CreateScored("lifetime", config));
+    ASSERT_EQ(KvNodeServerWiringTestPeer::DiskEngine(*node_), "slab");
+    ASSERT_TRUE(node_->TracksLifetimeState());
+    ASSERT_FALSE(node_->ram_ack_enabled());
+    ASSERT_FALSE(node_->ram_enabled());
+    ASSERT_TRUE(DiskSlabStoreTestPeer::UsesLifetimePolicy(
+        KvNodeServerWiringTestPeer::Slab(*node_), max_reads));
+    KvNodeServerWiringTestPeer::SetCoalescing(*node_, true);
+  }
+  Status ReadFiveBytes(const BlockKey& key, bool into, std::string* value) {
+    if (!into) return Read(key, value, 0, 5);
+    char buffer[5] = {};
+    size_t size = 0;
+    const Status status =
+        node_->RangeIntoForKey(key, 0, 5, buffer, sizeof(buffer), &size);
+    if (status == Status::kOk) value->assign(buffer, size);
+    return status;
   }
   DiskWriteResult Seed(const BlockKey& key,
                        const std::string& value = "value") {
@@ -4008,6 +4052,122 @@ TEST_F(LifetimeSuccessReadTest, CopyFollowersCountRequestsRatherThanOneIo) {
     EXPECT_EQ(stats.lifetime_reads.completion_invalid, 0U);
     EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, kRequests);
     ExpectConservation(kRequests);
+  }
+}
+
+// Register the coalescer ownership directly, but perform each fallback through
+// the real Node and disk. These tests do not submit an io_uring operation.
+TEST_F(LifetimeSuccessReadTest, O5FallbackSameThreadCountsOnlyOwnSuccess) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  for (const uint64_t max_reads : {1, 2, 4, 63}) {
+    for (const bool into : {false, true}) {
+      SCOPED_TRACE("M=" + std::to_string(max_reads) +
+                   " into=" + std::to_string(into));
+      ASSERT_NO_FATAL_FAILURE(CreateFallbackPolicy(max_reads));
+      const BlockKey key{100100 + max_reads * 2 + uint64_t{into}, 0};
+      const DiskWriteResult written = Seed(key);
+      ASSERT_EQ(written.status, Status::kOk);
+      ASSERT_TRUE(written.identity.valid());
+      ASSERT_EQ(State(key).scoring_reads(), 0U);  // Not a recovered seed.
+      ExpectConservation(0);
+      std::atomic<unsigned> reads{0};
+      DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+      DiskSlabStoreTestPeer::SetReadHook(
+          store, [&reads] { reads.fetch_add(1, std::memory_order_relaxed); });
+      Status result = Status::kInvalid;
+      std::string value;
+      std::thread reader([&] {
+        // Registration and the synchronous request must share a thread, or
+        // this would exercise a waiting follower instead of self fallback.
+        const uint64_t token =
+            KvNodeServerWiringTestPeer::RegisterReadFlight(*node_, key, 5);
+        ASSERT_NE(token, 0U);
+        const uint64_t epoch =
+            KvNodeServerWiringTestPeer::ReadEpoch(*node_, key);
+        EXPECT_TRUE(
+            KvNodeServerWiringTestPeer::ReadFlight(*node_, key, 0, 5, epoch));
+        result = ReadFiveBytes(key, into, &value);
+        EXPECT_TRUE(
+            KvNodeServerWiringTestPeer::ReadFlight(*node_, key, 0, 5, epoch));
+        EXPECT_FALSE(KvNodeServerWiringTestPeer::CompleteReadFlight(
+            *node_, token, Status::kIOError));  // No waiter had joined.
+        EXPECT_FALSE(KvNodeServerWiringTestPeer::CompleteReadFlight(
+            *node_, token, Status::kIOError));  // Cleanup cannot replay it.
+        EXPECT_FALSE(
+            KvNodeServerWiringTestPeer::ReadFlight(*node_, key, 0, 5, epoch));
+      });
+      reader.join();
+      DiskSlabStoreTestPeer::SetReadHook(store, {});
+      EXPECT_EQ(result, Status::kOk);
+      EXPECT_EQ(value, "value");
+      EXPECT_EQ(reads.load(std::memory_order_relaxed), 1U);
+      EXPECT_EQ(KvNodeServerWiringTestPeer::ReadTimeouts(*node_), 0U);
+      EXPECT_EQ(State(key).scoring_reads(), 1U);
+      EXPECT_EQ(State(key).actual_reads, 1U);
+      EXPECT_EQ(Counters().applied, 1U);
+      EXPECT_EQ(Counters().source_disk, 1U);
+      EXPECT_EQ(Counters().source_copy_leader, 0U);
+      EXPECT_EQ(Counters().source_copy_follower, 0U);
+      EXPECT_EQ(Counters().completion_missing, 0U);
+      ExpectConservation(1);
+    }
+  }
+}
+
+TEST_F(LifetimeSuccessReadTest, O5FallbackFailedFlightCountsOnlyOwnSuccess) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  for (const uint64_t max_reads : {1, 2, 4, 63}) {
+    for (const bool into : {false, true}) {
+      for (const Status owner_status : {Status::kIOError, Status::kOk}) {
+        SCOPED_TRACE("M=" + std::to_string(max_reads) +
+                     " into=" + std::to_string(into) + " owner_status=" +
+                     std::to_string(static_cast<unsigned>(owner_status)));
+        ASSERT_NO_FATAL_FAILURE(CreateFallbackPolicy(max_reads));
+        const BlockKey key{100300 + max_reads * 4 + uint64_t{into} * 2 +
+                               uint64_t{owner_status == Status::kOk},
+                           0};
+        const DiskWriteResult written = Seed(key);
+        ASSERT_EQ(written.status, Status::kOk);
+        ASSERT_TRUE(written.identity.valid());
+        ASSERT_EQ(State(key).scoring_reads(), 0U);
+        ExpectConservation(0);
+        const uint64_t token =
+            KvNodeServerWiringTestPeer::RegisterReadFlight(*node_, key, 5);
+        ASSERT_NE(token, 0U);
+        std::atomic<unsigned> reads{0};
+        DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+        DiskSlabStoreTestPeer::SetReadHook(
+            store, [&reads] { reads.fetch_add(1, std::memory_order_relaxed); });
+        Status result = Status::kInvalid;
+        std::string value;
+        std::thread reader([&] { result = ReadFiveBytes(key, into, &value); });
+        const bool joined =
+            KvNodeServerWiringTestPeer::WaitForReadFollowers(*node_);
+        // Both failure and no-data completion must wake the waiter to its own
+        // fill. Always terminate the flight and join before a fatal assertion.
+        const bool had_waiter = KvNodeServerWiringTestPeer::CompleteReadFlight(
+            *node_, token, owner_status);
+        reader.join();
+        DiskSlabStoreTestPeer::SetReadHook(store, {});
+        ASSERT_TRUE(joined);
+        EXPECT_TRUE(had_waiter);
+        EXPECT_EQ(KvNodeServerWiringTestPeer::ReadTimeouts(*node_), 0U);
+        EXPECT_EQ(result, Status::kOk);
+        EXPECT_EQ(value, "value");
+        EXPECT_EQ(reads.load(std::memory_order_relaxed), 1U);
+        EXPECT_EQ(State(key).scoring_reads(), 1U);
+        EXPECT_EQ(State(key).actual_reads, 1U);
+        EXPECT_EQ(Counters().applied, 1U);
+        EXPECT_EQ(Counters().source_disk, 1U);
+        EXPECT_EQ(Counters().source_copy_leader, 0U);
+        EXPECT_EQ(Counters().source_copy_follower, 0U);
+        EXPECT_EQ(Counters().completion_missing, 0U);
+        ExpectConservation(1);
+        EXPECT_FALSE(KvNodeServerWiringTestPeer::CompleteReadFlight(
+            *node_, token, owner_status));
+        ExpectConservation(1);  // Failed owner cleanup is not another GET.
+      }
+    }
   }
 }
 
