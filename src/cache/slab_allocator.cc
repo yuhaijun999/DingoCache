@@ -374,7 +374,8 @@ void SlabAllocator::CommitResidentGeneration(
 
 SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
     const BlockKey& key, uint64_t generation, const DiskLifetimeConfig& config,
-    const DiskLifetimeClock& clock) {
+    const DiskLifetimeClock& clock,
+    std::chrono::steady_clock::time_point* applied_time) {
   const std::lock_guard<std::mutex> lock(mu_);
   const uint32_t* index = index_.Find(key);
   if (!opt_.track_resident_identity || index == nullptr || generation == 0 ||
@@ -414,6 +415,9 @@ SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
   AddLifetimeReadClassLocked(next_state);
   LinkLifetimeLocked(*index);
   RegisterLifetimeBucketLocked(*index, config, applied_at);
+  if (applied_time != nullptr) {
+    *applied_time = std::chrono::steady_clock::now();
+  }
   return LifetimeReadResult::kApplied;
 }
 

@@ -32,6 +32,7 @@
 
 #include "cache/async_read_counters.h"
 #include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_write_result.h"
 #include "cache/new_put_demand_latch.h"
@@ -115,6 +116,11 @@ class DiskSlabStore : public StoreEngine {
   struct LifetimeReadCounters {
     uint64_t successful = 0;
     uint64_t applied = 0;
+    // Independent completion-coverage partition, alongside delay samples.
+    uint64_t completion_missing = 0;      // Caller supplied no provenance.
+    uint64_t completion_not_sampled = 0;  // Producer deliberately skipped it.
+    uint64_t completion_not_applied = 0;  // Selected, but heat was rejected.
+    uint64_t completion_invalid = 0;  // Selected timestamp is in the future.
     uint64_t no_binding = 0;
     uint64_t race_lost = 0;
     // Exclusive children of race_lost, not additional logical successes.
@@ -183,6 +189,8 @@ class DiskSlabStore : public StoreEngine {
   struct Stats {
     LifetimeReadCounters lifetime_reads{};
     LifetimeReadProcessingStats lifetime_read_processing{};
+    // Producer completion to successful owner application, sampled under A.
+    LifetimeReadTimingStats lifetime_read_completion_to_apply{};
     LifetimeReadLockWaitStats lifetime_read_lock_wait{};
     LifetimeReadLockHeldStats lifetime_read_lock_held{};
     SyncPayloadReadCounters sync_payload_reads{};
@@ -476,7 +484,8 @@ class DiskSlabStore : public StoreEngine {
       const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
       LifetimeReadSource source = LifetimeReadSource::kUnclassified,
       PreparedRead::Source transport_source =
-          PreparedRead::Source::kUnclassified);
+          PreparedRead::Source::kUnclassified,
+      const DiskLifetimeReadCompletion& completion = {});
   Stats GetStats() const;
   std::vector<SlabAllocator::ClassStat> ClassStats() const;
   // Metrics-only retained queue populations; not scores or logical read
@@ -681,6 +690,7 @@ class DiskSlabStore : public StoreEngine {
   LifetimeReadCounters lifetime_reads_{};  // under mu_
   LifetimeReadProcessingStats lifetime_read_processing_{};  // under mu_
   LifetimeReadLockWaitStats lifetime_read_lock_wait_{};     // under mu_
+  LifetimeReadTimingStats lifetime_read_completion_to_apply_{};  // under mu_
   LifetimeReadLockHeldStats lifetime_read_lock_held_{};     // under mu_
   SyncPayloadReadCounters sync_payload_reads_{};  // under mu_
   AsyncReadCounters uring_payload_reads_{};       // under mu_

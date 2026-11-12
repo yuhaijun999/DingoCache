@@ -34,6 +34,7 @@
 #include "cache/disk_cache_group.h"
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
@@ -443,7 +444,11 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
   for (const char* suffix :
        {"processing_samples_total", "processing_ns_total", "processing_max_ns",
         "lock_wait_samples_total", "lock_wait_ns_total", "lock_wait_max_ns",
-        "lock_held_samples_total", "lock_held_ns_total", "lock_held_max_ns"}) {
+        "lock_held_samples_total", "lock_held_ns_total", "lock_held_max_ns",
+        "completion_missing_total", "completion_not_sampled_total",
+        "completion_not_applied_total", "completion_invalid_total",
+        "completion_to_apply_samples_total", "completion_to_apply_ns_total",
+        "completion_to_apply_max_ns"}) {
     const std::string name = std::string("dfkv_slab_lifetime_read_") + suffix;
     EXPECT_NE(text.find("\n" + name + " 0\n"), std::string::npos);
     const std::string disk_name =
@@ -3050,6 +3055,176 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, CompletionToApplyTracksSyncSamplingAndMissingGrantCoverage) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_completion";
+  fs::remove_all(dir);
+  const DiskLifetimeConfig config = BucketMetricConfig();
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 2ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  options.lifetime_config = config;
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config), [] { return 0; });
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  server->set_identity("completion-node", "completion-group");
+  const std::string identity =
+      R"(node="completion-node",group="completion-group")";
+  std::vector<BlockKey> keys(2);
+  bool found[2] = {false, false};
+  for (uint64_t id = 1; id < 10000 && (!found[0] || !found[1]); ++id) {
+    const BlockKey key{id, 0};
+    const size_t disk = DiskCacheGroupTestPeer::RouteIndex(
+        KvNodeServerTestPeer::Group(*server), key);
+    ASSERT_LT(disk, 2U);
+    if (!found[disk]) {
+      keys[disk] = key;
+      found[disk] = true;
+    }
+  }
+  ASSERT_TRUE(found[0]);
+  ASSERT_TRUE(found[1]);
+  for (const BlockKey& key : keys) {
+    ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Cache(key, "value", 5),
+              Status::kOk);
+  }
+  // A fresh producer thread selects events 1 and 65 across both APIs/disks.
+  std::thread reader([&] {
+    for (unsigned int i = 0; i < 65; ++i) {
+      const BlockKey& key = keys[i == 64 ? 1 : 0];
+      if ((i & 1U) == 0) {
+        std::string value;
+        ASSERT_EQ(
+            server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                         key, 0, 5, nullptr, 0, &value),
+            Status::kOk);
+        EXPECT_EQ(value, "value");
+      } else {
+        char value[8] = {};
+        size_t size = 0;
+        ASSERT_EQ(
+            server->RangeIntoForKey(key, 0, 5, value, sizeof(value), &size),
+            Status::kOk);
+        EXPECT_EQ(std::string(value, size), "value");
+      }
+    }
+  });
+  reader.join();
+  DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+  DiskResidentIdentity sources[2];
+  for (size_t disk = 0; disk < 2; ++disk) {
+    std::string value;
+    ASSERT_EQ(DiskCacheGroupTestPeer::Slab(group, disk)
+                  .RangeWithIdentity(keys[disk], 0, 0, &value, &sources[disk]),
+              Status::kOk);
+    EXPECT_EQ(value, "value");
+  }
+  // The current real transport shim intentionally supplies no completion token.
+  server->NotifyLifetimeReadSuccessForKey(keys[0], sources[0], 5);
+  DiskLifetimeReadCompletion unselected;
+  unselected.sampling = DiskLifetimeReadCompletion::Sampling::kNotSampled;
+  group.NotifyLifetimeReadSuccess(
+      keys[0], sources[0], 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, unselected);
+  DiskLifetimeReadCompletion future;
+  future.sampling = DiskLifetimeReadCompletion::Sampling::kSampled;
+  future.completed_at = std::chrono::steady_clock::time_point::max();
+  group.NotifyLifetimeReadSuccess(keys[1], sources[1], 5,
+                                  DiskSlabStore::LifetimeReadSource::kDisk,
+                                  PreparedRead::Source::kUnclassified, future);
+  DiskLifetimeReadCompletion rejected;
+  rejected.sampling = DiskLifetimeReadCompletion::Sampling::kSampled;
+  rejected.completed_at = std::chrono::steady_clock::now();
+  group.NotifyLifetimeReadSuccess(
+      keys[1], {}, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, rejected);
+  const DiskSlabStore::Stats disks[2] = {group.DiskSlabStats(0),
+                                         group.DiskSlabStats(1)};
+  const DiskSlabStore::Stats total = group.SlabStats();
+  EXPECT_EQ(disks[0].lifetime_reads.successful, 66U);
+  EXPECT_EQ(disks[0].lifetime_reads.completion_missing, 1U);
+  EXPECT_EQ(disks[0].lifetime_reads.completion_not_sampled, 64U);
+  EXPECT_EQ(disks[0].lifetime_reads.completion_not_applied, 0U);
+  EXPECT_EQ(disks[0].lifetime_reads.completion_invalid, 0U);
+  EXPECT_EQ(disks[0].lifetime_read_completion_to_apply.samples, 1U);
+  EXPECT_EQ(disks[1].lifetime_reads.successful, 3U);
+  EXPECT_EQ(disks[1].lifetime_reads.completion_missing, 0U);
+  EXPECT_EQ(disks[1].lifetime_reads.completion_not_sampled, 0U);
+  EXPECT_EQ(disks[1].lifetime_reads.completion_not_applied, 1U);
+  EXPECT_EQ(disks[1].lifetime_reads.completion_invalid, 1U);
+  EXPECT_EQ(disks[1].lifetime_read_completion_to_apply.samples, 1U);
+  EXPECT_EQ(total.lifetime_reads.successful, 69U);
+  EXPECT_EQ(total.lifetime_reads.applied, 68U);
+  EXPECT_EQ(total.lifetime_reads.no_binding, 1U);
+  EXPECT_EQ(total.lifetime_read_completion_to_apply.samples, 2U);
+  EXPECT_EQ(total.lifetime_read_completion_to_apply.total_ns,
+            disks[0].lifetime_read_completion_to_apply.total_ns +
+                disks[1].lifetime_read_completion_to_apply.total_ns);
+  EXPECT_EQ(total.lifetime_read_completion_to_apply.max_ns,
+            std::max(disks[0].lifetime_read_completion_to_apply.max_ns,
+                     disks[1].lifetime_read_completion_to_apply.max_ns));
+  const auto check = [&](const DiskSlabStore::Stats& stats,
+                         const std::string& prefix, const std::string& labels) {
+    const DiskSlabStore::LifetimeReadCounters& reads = stats.lifetime_reads;
+    const DiskSlabStore::LifetimeReadTimingStats& timing =
+        stats.lifetime_read_completion_to_apply;
+    EXPECT_EQ(reads.successful, reads.completion_missing +
+                                    reads.completion_not_sampled +
+                                    reads.completion_not_applied +
+                                    reads.completion_invalid + timing.samples);
+    EXPECT_LE(timing.max_ns, timing.total_ns);
+    const std::string text = server->MetricsText();
+    for (const std::pair<const char*, uint64_t>& sample :
+         {std::pair<const char*, uint64_t>{"completion_missing_total",
+                                           reads.completion_missing},
+          {"completion_not_sampled_total", reads.completion_not_sampled},
+          {"completion_not_applied_total", reads.completion_not_applied},
+          {"completion_invalid_total", reads.completion_invalid},
+          {"completion_to_apply_samples_total", timing.samples},
+          {"completion_to_apply_ns_total", timing.total_ns},
+          {"completion_to_apply_max_ns", timing.max_ns}}) {
+      const std::string name = prefix + sample.first;
+      EXPECT_NE(text.find("\n" + name + labels + " " +
+                          std::to_string(sample.second) + "\n"),
+                std::string::npos);
+      const std::string type =
+          std::string(sample.first) == "completion_to_apply_max_ns" ? "gauge"
+                                                                    : "counter";
+      EXPECT_NE(text.find("# TYPE " + name + " " + type + "\n"),
+                std::string::npos);
+    }
+  };
+  for (size_t disk = 0; disk < 2; ++disk) {
+    const std::string labels = R"({disk=")" + options.cache_dirs[disk] +
+                               R"(",disk_index=")" + std::to_string(disk) +
+                               "\"," + identity + "}";
+    check(disks[disk], "dfkv_slab_disk_lifetime_read_", labels);
+  }
+  check(total, "dfkv_slab_lifetime_read_", "{" + identity + "}");
+  server.reset();
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config), [] { return 0; });
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  const DiskSlabStore::Stats reset =
+      KvNodeServerTestPeer::Group(*server).SlabStats();
+  EXPECT_EQ(reset.lifetime_reads.successful, 0U);
+  EXPECT_EQ(reset.lifetime_reads.completion_missing, 0U);
+  EXPECT_EQ(reset.lifetime_read_completion_to_apply.samples, 0U);
+  EXPECT_EQ(reset.lifetime_read_completion_to_apply.total_ns, 0U);
+  EXPECT_EQ(reset.lifetime_read_completion_to_apply.max_ns, 0U);
+  server.reset();
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, LifetimeReadClassGaugesTrackReadsExpiryAndRecovery) {
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
   const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
@@ -4966,7 +5141,21 @@ TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
                    .DiskLifetimeBucketObservation(0)
                    .available);
   for (const char* name :
-       {"dfkv_slab_lifetime_read_lock_held_samples_total",
+       {"dfkv_slab_lifetime_read_completion_missing_total",
+        "dfkv_slab_lifetime_read_completion_not_sampled_total",
+        "dfkv_slab_lifetime_read_completion_not_applied_total",
+        "dfkv_slab_lifetime_read_completion_invalid_total",
+        "dfkv_slab_lifetime_read_completion_to_apply_samples_total",
+        "dfkv_slab_lifetime_read_completion_to_apply_ns_total",
+        "dfkv_slab_lifetime_read_completion_to_apply_max_ns",
+        "dfkv_slab_disk_lifetime_read_completion_missing_total",
+        "dfkv_slab_disk_lifetime_read_completion_not_sampled_total",
+        "dfkv_slab_disk_lifetime_read_completion_not_applied_total",
+        "dfkv_slab_disk_lifetime_read_completion_invalid_total",
+        "dfkv_slab_disk_lifetime_read_completion_to_apply_samples_total",
+        "dfkv_slab_disk_lifetime_read_completion_to_apply_ns_total",
+        "dfkv_slab_disk_lifetime_read_completion_to_apply_max_ns",
+        "dfkv_slab_lifetime_read_lock_held_samples_total",
         "dfkv_slab_lifetime_read_lock_held_ns_total",
         "dfkv_slab_lifetime_read_lock_held_max_ns",
         "dfkv_slab_disk_lifetime_read_lock_held_samples_total",

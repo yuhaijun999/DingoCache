@@ -23,6 +23,7 @@
 
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
@@ -129,7 +130,8 @@ class DiskCacheGroup {
       DiskSlabStore::LifetimeReadSource source =
           DiskSlabStore::LifetimeReadSource::kUnclassified,
       PreparedRead::Source transport_source =
-          PreparedRead::Source::kUnclassified);
+          PreparedRead::Source::kUnclassified,
+      const DiskLifetimeReadCompletion& completion = {});
   // Actively sample the optional shared clock. Once exhausted, rollback cannot
   // clear the restart requirement. Does not mark storage unhealthy, stop new
   // requests, or drain accepted work; the future server gate must do those in

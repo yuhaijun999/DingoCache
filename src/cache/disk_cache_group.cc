@@ -22,6 +22,7 @@
 
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
@@ -672,12 +673,13 @@ bool DiskCacheGroup::Healthy() const {
 void DiskCacheGroup::NotifyLifetimeReadSuccess(
     const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
     DiskSlabStore::LifetimeReadSource source,
-    PreparedRead::Source transport_source) {
+    PreparedRead::Source transport_source,
+    const DiskLifetimeReadCompletion& completion) {
   if (bytes == 0 || !TracksLifetimeState()) return;
   const size_t disk = RouteIndex(key);
   if (disk < slabs_.size())
     slabs_[disk]->NotifyLifetimeReadSuccess(key, identity, bytes, source,
-                                            transport_source);
+                                            transport_source, completion);
 }
 
 void DiskCacheGroup::PreventCleanShutdown() {
@@ -1232,6 +1234,22 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.lifetime_read_processing.max_ns =
         std::max(sum.lifetime_read_processing.max_ns,
                  st.lifetime_read_processing.max_ns);
+
+    sum.lifetime_read_completion_to_apply.samples +=
+        st.lifetime_read_completion_to_apply.samples;
+    sum.lifetime_read_completion_to_apply.total_ns +=
+        st.lifetime_read_completion_to_apply.total_ns;
+    sum.lifetime_read_completion_to_apply.max_ns =
+        std::max(sum.lifetime_read_completion_to_apply.max_ns,
+                 st.lifetime_read_completion_to_apply.max_ns);
+    sum.lifetime_reads.completion_missing +=
+        st.lifetime_reads.completion_missing;
+    sum.lifetime_reads.completion_not_sampled +=
+        st.lifetime_reads.completion_not_sampled;
+    sum.lifetime_reads.completion_not_applied +=
+        st.lifetime_reads.completion_not_applied;
+    sum.lifetime_reads.completion_invalid +=
+        st.lifetime_reads.completion_invalid;
 
     sum.lifetime_reads.successful += st.lifetime_reads.successful;
     sum.lifetime_reads.applied += st.lifetime_reads.applied;

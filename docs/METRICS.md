@@ -1332,3 +1332,89 @@ Allocator grows 1104 to 1176 (+72); Store 2800 to 3016 (+216); Stats snapshot
 bytes, including calls that evict only NEW residents. Options 208, resident
 state 12 and read-class observation 80 bytes are unchanged. These are component
 layouts, not measurements of complete stack frames, heap/RSS or recovery peak.
+
+### Synchronous logical completion to lifetime application
+
+The `dfkv_slab_lifetime_read_completion_to_apply_*` and corresponding
+`dfkv_slab_disk_lifetime_read_completion_to_apply_*` families observe a sampled
+**synchronous Node logical-completion publication → successful owner update**
+interval. Suffixes `samples_total` and `ns_total` are counters; `max_ns` is a
+gauge. The per-disk families use the existing disk/disk_index labels; global
+sums/counts add and maxima take max. No key/request labels are introduced.
+
+The synchronous request RANGE boundary is its common success/ownership-ended
+point immediately before notification, after the existing branch hit/byte
+bookkeeping. RangeInto captures after RAM Hit release or final disk/coalescer
+result/output completion, before success counters where practical. This is
+neither physical storage completion nor client receipt. Every copy follower
+has its own logical completion after its output is ready. Read failure, empty
+success and preparation alone do not create an eligible sampled notification.
+In particular, a disk read later changed to I/O error by final deferred-Remove
+invalidation is not a successful producer event.
+
+Capture selects the first and every 64th eligible nonempty synchronous success
+**per thread across Nodes/stores**. Disabled or empty calls do not touch the
+phase or a clock. The producer carries one transient completion token through
+Group/Store; downstream code does not resample. A selected successful update
+captures its endpoint only after lifetime state, both indexes and bucket
+bookkeeping are complete, while allocator A is still held. The interval includes
+producer-to-Store dispatch, disk routing, D/A contention and accepted update
+work, not time before the declared producer boundary. It cannot be reconstructed
+from the existing independently sampled wait/body/held timers.
+
+The bounded lifetime `applied_at` used for heat remains sampled under the owner
+lock as before. Completion timestamps never backdate heat or revoke logical
+success. Rejected heat does not produce an applied-delay sample. Tokens contain
+actual same-process steady-clock readings, not Unix time or externally supplied
+wire values. A selected timestamp later than the application endpoint is counted
+invalid rather than wrapping into a huge unsigned latency or reporting a false
+zero; the already applied heat is preserved. Arbitrary forged clock epochs or
+unrepresentable-duration values are not supported timestamp inputs.
+
+Coverage is exported by four counter families, globally and per disk:
+`dfkv_slab[_disk]_lifetime_read_completion_missing_total`,
+`..._not_sampled_total`, `..._not_applied_total` and `..._invalid_total`.
+For each eligible Store notification snapshot under D:
+
+```
+successful = missing + not_sampled + not_applied + invalid + delay.samples
+```
+
+Missing means the caller did not supply completion provenance (unrecognized
+internal sampling metadata is also treated as missing); not_sampled means the
+producer participated but deliberately skipped this sample. not_applied means
+selected but rejected by the existing heat-result checks; invalid means applied
+with unusable timestamp ordering. These are an independent partition, not more
+logical successes, sources or heat outcomes. Current PULL forwarding and legacy
+internal direct-notification callers default to **Missing**. PULL timestamp
+capture is a subsequent increment: these metrics do not claim transport grant
+completion coverage. PULL must eventually capture after valid grant/MR ownership
+is established, not at preparation, CQE completion, READY send or RELEASE.
+
+The elapsed values are sampled sum/count/max, not a histogram, percentile, p99,
+all-request elapsed total or a latency acceptance result. Short-lived threads
+can oversample; TLS phase can correlate with routing and survives Store
+reconstruction on a surviving thread. Zero observed samples means unobserved,
+not zero latency. Restart resets Store counters but not another live thread's
+phase. Do not add means or maxima from the independent processing/wait/held
+cohorts. Counter ranges are finite uint64, including Group aggregation;
+cross-disk/global snapshots are not one atomic instant. The same-Store coverage
+partition is coherent under D. File omits the slab families; normal legacy slab
+emits zeros without completion sampling or lifetime D/A activity.
+
+Costs are nonzero: transient token construction/forwarding, per-thread phase and
+branches on eligible unsampled successes, one additional steady-clock read for
+selected rejected events, and two for selected applied events. Existing wait,
+processing and held timers retain their own reads; two is not a total-request
+clock-cost claim. Plain counters and larger fixed Store/Stats snapshots and text
+rendering have costs, including shared disabled layouts. No resident field, new
+lock, shared sampling atomic, persistent record or user parameter is added.
+Complete heap/RSS, lock contention, p99 and strategy performance acceptance remain
+unfinished; no existing alert/dashboard is switched to these new samples.
+
+Measured GCC sizes: completion token 16 bytes; Store 3016 to 3072 (+56),
+Stats 2368 to 2424 (+56). Allocator 1176, Options 208, resident state 12,
+Scan 960 and read-class observation 80 bytes are unchanged. These are component
+layouts, not total stack-frame, heap/RSS, recovery-peak or performance-budget
+measurements. Passing a default token is source-compatible for existing internal
+C++ callers; it does not add a C/transport wire field.

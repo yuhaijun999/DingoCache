@@ -21,6 +21,7 @@
 #define DFKV_SLAB_ALLOCATOR_H_
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -343,9 +344,12 @@ class SlabAllocator {
   // Caller holds the store lifecycle lock (D before A). Validate ownership,
   // sample the shared clock and update heat in one A critical section; a stale
   // credential must never sample time or mutate a later same-key resident.
-  LifetimeReadResult ApplyLifetimeRead(const BlockKey& key, uint64_t generation,
-                                       const DiskLifetimeConfig& config,
-                                       const DiskLifetimeClock& clock);
+  // A requested endpoint is written only after a successful update and both
+  // indexes are republished, while A is still held. It never determines heat.
+  LifetimeReadResult ApplyLifetimeRead(
+      const BlockKey& key, uint64_t generation,
+      const DiskLifetimeConfig& config, const DiskLifetimeClock& clock,
+      std::chrono::steady_clock::time_point* applied_time = nullptr);
   enum class LifetimeScanResult : unsigned char {
     kIdle = 0,             // No class scan was needed in this allocation.
     kRetry = 1,            // More class work remains; release D and A first.

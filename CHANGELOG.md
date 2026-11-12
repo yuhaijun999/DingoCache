@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Sample synchronous logical-read completion to successful lifetime application
+  under the allocator lock. Export separate missing, unselected, rejected and
+  invalid coverage; PULL timestamps remain explicitly unmeasured.
+
 - Export recovery-origin eviction boot ages across foreground, background,
   watermark and donor paths. Reuse final pre-wipe timestamps without treating
   current-run tenure as pre-restart history or a complete survival curve.

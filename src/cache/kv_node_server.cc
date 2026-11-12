@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/ram_tier.h"
@@ -857,6 +858,26 @@ std::string KvNodeServer::MetricsText() const {
     header(
         "dfkv_slab_disk_lifetime_read_transport_fallback_copy_follower_total",
         "counter", "Fallback grants with synchronous shared-result copies");
+    header(
+        "dfkv_slab_disk_lifetime_read_completion_missing_total", "counter",
+        "Successful read notifications without producer completion metadata");
+    header("dfkv_slab_disk_lifetime_read_completion_not_sampled_total",
+           "counter",
+           "Eligible producer completions outside the sampled cohort");
+    header("dfkv_slab_disk_lifetime_read_completion_not_applied_total",
+           "counter",
+           "Sampled producer completions whose heat was not applied");
+    header("dfkv_slab_disk_lifetime_read_completion_invalid_total", "counter",
+           "Applied sampled completions with invalid future timestamps");
+    header(
+        "dfkv_slab_disk_lifetime_read_completion_to_apply_samples_total",
+        "counter",
+        "Valid sampled producer-completion to allocator-application intervals");
+    header("dfkv_slab_disk_lifetime_read_completion_to_apply_ns_total",
+           "counter",
+           "Sampled producer-completion to allocator-application nanoseconds");
+    header("dfkv_slab_disk_lifetime_read_completion_to_apply_max_ns", "gauge",
+           "Maximum sampled completion to allocator-application nanoseconds");
     header("dfkv_slab_disk_lifetime_read_lock_held_samples_total", "counter",
            "Thread-local sampled read notification Store lock-held intervals");
     header("dfkv_slab_disk_lifetime_read_lock_wait_samples_total", "counter",
@@ -1043,6 +1064,20 @@ std::string KvNodeServer::MetricsText() const {
       sample(
           "dfkv_slab_disk_lifetime_read_transport_fallback_copy_follower_total",
           disk.lifetime_reads.transport_fallback_copy_follower);
+      sample("dfkv_slab_disk_lifetime_read_completion_missing_total",
+             disk.lifetime_reads.completion_missing);
+      sample("dfkv_slab_disk_lifetime_read_completion_not_sampled_total",
+             disk.lifetime_reads.completion_not_sampled);
+      sample("dfkv_slab_disk_lifetime_read_completion_not_applied_total",
+             disk.lifetime_reads.completion_not_applied);
+      sample("dfkv_slab_disk_lifetime_read_completion_invalid_total",
+             disk.lifetime_reads.completion_invalid);
+      sample("dfkv_slab_disk_lifetime_read_completion_to_apply_samples_total",
+             disk.lifetime_read_completion_to_apply.samples);
+      sample("dfkv_slab_disk_lifetime_read_completion_to_apply_ns_total",
+             disk.lifetime_read_completion_to_apply.total_ns);
+      sample("dfkv_slab_disk_lifetime_read_completion_to_apply_max_ns",
+             disk.lifetime_read_completion_to_apply.max_ns);
       sample("dfkv_slab_disk_lifetime_read_lock_held_samples_total",
              disk.lifetime_read_lock_held.samples);
       sample("dfkv_slab_disk_lifetime_read_lock_wait_samples_total",
@@ -1581,6 +1616,28 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_read_transport_fallback_copy_follower_total",
            "counter", "Fallback grants with synchronous shared-result copies",
            ss.lifetime_reads.transport_fallback_copy_follower);
+    metric("dfkv_slab_lifetime_read_completion_missing_total", "counter",
+           "Successful read notifications without producer completion metadata",
+           ss.lifetime_reads.completion_missing);
+    metric("dfkv_slab_lifetime_read_completion_not_sampled_total", "counter",
+           "Eligible producer completions outside the sampled cohort",
+           ss.lifetime_reads.completion_not_sampled);
+    metric("dfkv_slab_lifetime_read_completion_not_applied_total", "counter",
+           "Sampled producer completions whose heat was not applied",
+           ss.lifetime_reads.completion_not_applied);
+    metric("dfkv_slab_lifetime_read_completion_invalid_total", "counter",
+           "Applied sampled completions with invalid future timestamps",
+           ss.lifetime_reads.completion_invalid);
+    metric(
+        "dfkv_slab_lifetime_read_completion_to_apply_samples_total", "counter",
+        "Valid sampled producer-completion to allocator-application intervals",
+        ss.lifetime_read_completion_to_apply.samples);
+    metric("dfkv_slab_lifetime_read_completion_to_apply_ns_total", "counter",
+           "Sampled producer-completion to allocator-application nanoseconds",
+           ss.lifetime_read_completion_to_apply.total_ns);
+    metric("dfkv_slab_lifetime_read_completion_to_apply_max_ns", "gauge",
+           "Maximum sampled completion to allocator-application nanoseconds",
+           ss.lifetime_read_completion_to_apply.max_ns);
     metric("dfkv_slab_lifetime_read_lock_held_samples_total", "counter",
            "Thread-local sampled read notification Store lock-held intervals",
            ss.lifetime_read_lock_held.samples);
@@ -2133,9 +2190,15 @@ Status KvNodeServer::ProcessRequestForKey(
       }
       // Every request, including each copy follower, reaches this point once.
       // The RAM Hit scope has ended; no RAM lock/pin is needed by notification.
-      if (track_lifetime && st == Status::kOk)
-        group_.NotifyLifetimeReadSuccess(key, read_identity, out_data->size(),
-                                         read_source);
+      if (track_lifetime && st == Status::kOk) {
+        // This producer completion boundary follows output/pin finalization
+        // and the branch's existing hit/byte counters, not physical I/O end.
+        const DiskLifetimeReadCompletion completion =
+            CaptureDiskLifetimeReadCompletion(true, out_data->size());
+        group_.NotifyLifetimeReadSuccess(
+            key, read_identity, out_data->size(), read_source,
+            PreparedRead::Source::kUnclassified, completion);
+      }
       if (samp) get_lat_.Observe(NowSec() - t0);
       break;
     }
@@ -2242,11 +2305,14 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
       if (value_len) *value_len = h.value_len;
       if (track_lifetime) read_identity = h.identity;
       h = RamTier::Hit{};  // Finish RAM ownership before taking the disk lock.
+      const DiskLifetimeReadCompletion completion =
+          CaptureDiskLifetimeReadCompletion(track_lifetime, n);
       cache_hit_.fetch_add(1, std::memory_order_relaxed);
       bytes_read_.fetch_add(n, std::memory_order_relaxed);
       if (track_lifetime)
         group_.NotifyLifetimeReadSuccess(
-            key, read_identity, n, DiskSlabStore::LifetimeReadSource::kRam);
+            key, read_identity, n, DiskSlabStore::LifetimeReadSource::kRam,
+            PreparedRead::Source::kUnclassified, completion);
       if (samp) get_lat_.Observe(NowSec() - t0);
       return Status::kOk;
     }
@@ -2276,11 +2342,14 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
                                 value_len);
   }
   if (st == Status::kOk) {
+    const DiskLifetimeReadCompletion completion =
+        CaptureDiskLifetimeReadCompletion(track_lifetime, *out_len);
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
     if (track_lifetime)
-      group_.NotifyLifetimeReadSuccess(key, read_identity, *out_len,
-                                       read_source);
+      group_.NotifyLifetimeReadSuccess(
+          key, read_identity, *out_len, read_source,
+          PreparedRead::Source::kUnclassified, completion);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else if (st == Status::kIOError) {

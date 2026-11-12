@@ -18,6 +18,7 @@
 
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_lifetime_state.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
@@ -114,6 +115,17 @@ class DiskLifetimeReadTest : public ::testing::Test {
   DiskSlabStore::LifetimeReadCounters Counters() const {
     const DiskSlabStore::Stats stats = store_->GetStats();
     const DiskSlabStore::LifetimeReadCounters counters = stats.lifetime_reads;
+    const DiskSlabStore::LifetimeReadTimingStats completion =
+        stats.lifetime_read_completion_to_apply;
+    EXPECT_EQ(counters.successful,
+              counters.completion_missing + counters.completion_not_sampled +
+                  counters.completion_not_applied +
+                  counters.completion_invalid + completion.samples);
+    EXPECT_GE(completion.total_ns, completion.max_ns);
+    if (completion.samples == 0) {
+      EXPECT_EQ(completion.total_ns, 0U);
+      EXPECT_EQ(completion.max_ns, 0U);
+    }
     const DiskSlabStore::LifetimeReadLockHeldStats held =
         stats.lifetime_read_lock_held;
     EXPECT_EQ(held.samples, stats.lifetime_read_lock_wait.samples);
@@ -173,6 +185,269 @@ class DiskLifetimeReadTest : public ::testing::Test {
   std::unique_ptr<DiskSlabStore> store_;
   std::filesystem::path dir_;
 };
+
+TEST_F(DiskLifetimeReadTest,
+       CompletionCoverageSeparatesMetadataAndHeatOutcomes) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  DiskLifetimeReadCompletion completion;
+  store_->NotifyLifetimeReadSuccess(key_, identity, 5);
+  completion.sampling = DiskLifetimeReadCompletion::Sampling::kNotSampled;
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
+  completion.sampling = DiskLifetimeReadCompletion::Sampling::kSampled;
+  completion.completed_at = std::chrono::steady_clock::now();
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
+  completion.completed_at =
+      std::chrono::steady_clock::now() + std::chrono::hours(1);
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
+  completion.completed_at = std::chrono::steady_clock::now();
+  store_->NotifyLifetimeReadSuccess(
+      key_, {}, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
+  DiskResidentIdentity stale = identity;
+  ++stale.generation;
+  store_->NotifyLifetimeReadSuccess(
+      key_, stale, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
+  const DiskSlabStore::Stats stats = store_->GetStats();
+  EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 1U);
+  const DiskSlabStore::LifetimeReadCounters counters = Counters();
+  EXPECT_EQ(counters.successful, 6U);
+  EXPECT_EQ(counters.applied, 4U);
+  EXPECT_EQ(counters.completion_missing, 1U);
+  EXPECT_EQ(counters.completion_not_sampled, 1U);
+  EXPECT_EQ(counters.completion_not_applied, 2U);
+  EXPECT_EQ(counters.completion_invalid, 1U);
+  // Invalid measurement metadata does not revoke an otherwise valid heat event.
+  EXPECT_EQ(State().actual_reads, 3U);
+  EXPECT_EQ(counters.no_binding, 1U);
+  EXPECT_EQ(counters.race_generation_mismatch, 1U);
+}
+
+TEST_F(DiskLifetimeReadTest, CompletionDelayIncludesWaitBeforeStoreInvocation) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  std::promise<std::chrono::steady_clock::time_point> completed;
+  std::future<std::chrono::steady_clock::time_point> produced =
+      completed.get_future();
+  std::promise<void> release;
+  const std::shared_future<void> released = release.get_future().share();
+  std::promise<void> finished;
+  const std::future<void> done = finished.get_future();
+  std::thread notifier([&] {
+    DiskLifetimeReadCompletion completion;
+    completion.sampling = DiskLifetimeReadCompletion::Sampling::kSampled;
+    completion.completed_at = std::chrono::steady_clock::now();
+    completed.set_value(completion.completed_at);
+    released.wait();
+    store_->NotifyLifetimeReadSuccess(
+        key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+        PreparedRead::Source::kUnclassified, completion);
+    finished.set_value();
+  });
+  const std::future_status reached = produced.wait_for(std::chrono::seconds(5));
+  const std::future_status waiting =
+      done.wait_for(std::chrono::milliseconds(30));
+  const std::chrono::steady_clock::time_point released_at =
+      std::chrono::steady_clock::now();
+  // Always release/join before assertions. The measured boundary below is the
+  // actual handshake interval, not an asserted 30ms latency budget.
+  release.set_value();
+  notifier.join();
+  EXPECT_EQ(reached, std::future_status::ready);
+  EXPECT_EQ(waiting, std::future_status::timeout);
+  if (reached != std::future_status::ready) return;
+  const std::chrono::steady_clock::time_point completed_at = produced.get();
+  const uint64_t before_invocation_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(released_at -
+                                                           completed_at)
+          .count());
+  const DiskSlabStore::LifetimeReadTimingStats timing =
+      store_->GetStats().lifetime_read_completion_to_apply;
+  EXPECT_EQ(timing.samples, 1U);
+  EXPECT_GE(timing.total_ns, before_invocation_ns);
+  EXPECT_EQ(timing.total_ns, timing.max_ns);
+  EXPECT_EQ(Counters().applied, 1U);
+}
+
+TEST_F(DiskLifetimeReadTest, CompletionDelayIncludesLifecycleLockWait) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  std::unique_lock<std::mutex> lifecycle =
+      DiskSlabStoreTestPeer::HoldLifecycle(*store_);
+  std::promise<std::chrono::steady_clock::time_point> completed;
+  std::future<std::chrono::steady_clock::time_point> produced =
+      completed.get_future();
+  std::promise<void> finished;
+  const std::future<void> done = finished.get_future();
+  std::thread notifier([&] {
+    DiskLifetimeReadCompletion completion;
+    completion.sampling = DiskLifetimeReadCompletion::Sampling::kSampled;
+    completion.completed_at = std::chrono::steady_clock::now();
+    completed.set_value(completion.completed_at);
+    store_->NotifyLifetimeReadSuccess(
+        key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+        PreparedRead::Source::kUnclassified, completion);
+    finished.set_value();
+  });
+  const std::future_status reached = produced.wait_for(std::chrono::seconds(5));
+  const std::future_status waiting =
+      done.wait_for(std::chrono::milliseconds(30));
+  const std::chrono::steady_clock::time_point unlocked_at =
+      std::chrono::steady_clock::now();
+  lifecycle.unlock();
+  notifier.join();
+  EXPECT_EQ(reached, std::future_status::ready);
+  EXPECT_EQ(waiting, std::future_status::timeout);
+  if (reached != std::future_status::ready) return;
+  const std::chrono::steady_clock::time_point completed_at = produced.get();
+  const uint64_t locked_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(unlocked_at -
+                                                           completed_at)
+          .count());
+  const DiskSlabStore::LifetimeReadTimingStats timing =
+      store_->GetStats().lifetime_read_completion_to_apply;
+  EXPECT_EQ(timing.samples, 1U);
+  EXPECT_GE(timing.total_ns, locked_ns);
+  EXPECT_EQ(timing.total_ns, timing.max_ns);
+  EXPECT_EQ(Counters().applied, 1U);
+}
+
+TEST_F(DiskLifetimeReadTest, CompletionDelayEndsAfterWorkUnderAllocatorLock) {
+  struct ClockGate {
+    std::atomic<bool> block{false};
+    std::promise<void> entered;
+    std::shared_future<void> release;
+  };
+  const std::shared_ptr<ClockGate> gate = std::make_shared<ClockGate>();
+  std::promise<void> release;
+  gate->release = release.get_future().share();
+  const std::future<void> entered = gate->entered.get_future();
+  clock_ = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config_), [this, gate] {
+        samples_.fetch_add(1, std::memory_order_relaxed);
+        if (gate->block.load()) {
+          gate->entered.set_value();
+          gate->release.wait();
+        }
+        return seconds_.load(std::memory_order_relaxed);
+      });
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  const uint64_t clock_samples = samples_.load();
+  seconds_.store(120);
+  gate->block.store(true);
+  std::promise<std::chrono::steady_clock::time_point> completed;
+  std::future<std::chrono::steady_clock::time_point> produced =
+      completed.get_future();
+  std::promise<void> finished;
+  const std::future<void> done = finished.get_future();
+  std::thread notifier([&] {
+    DiskLifetimeReadCompletion completion;
+    completion.sampling = DiskLifetimeReadCompletion::Sampling::kSampled;
+    completion.completed_at = std::chrono::steady_clock::now();
+    completed.set_value(completion.completed_at);
+    store_->NotifyLifetimeReadSuccess(
+        key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+        PreparedRead::Source::kUnclassified, completion);
+    finished.set_value();
+  });
+  const std::future_status reached = entered.wait_for(std::chrono::seconds(5));
+  const std::future_status waiting =
+      done.wait_for(std::chrono::milliseconds(30));
+  const std::chrono::steady_clock::time_point released_at =
+      std::chrono::steady_clock::now();
+  release.set_value();
+  notifier.join();
+  gate->block.store(false);
+  EXPECT_EQ(reached, std::future_status::ready);
+  EXPECT_EQ(waiting, std::future_status::timeout);
+  const std::chrono::steady_clock::time_point completed_at = produced.get();
+  const uint64_t before_apply_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(released_at -
+                                                           completed_at)
+          .count());
+  const DiskSlabStore::LifetimeReadTimingStats timing =
+      store_->GetStats().lifetime_read_completion_to_apply;
+  EXPECT_EQ(timing.samples, 1U);
+  EXPECT_GE(timing.total_ns, before_apply_ns);
+  EXPECT_EQ(timing.total_ns, timing.max_ns);
+  EXPECT_EQ(samples_.load(), clock_samples + 1);
+  EXPECT_EQ(Counters().applied, 1U);
+  // The bounded owner clock, not the producer's steady timestamp, sets heat.
+  EXPECT_EQ(State().anchor, 20U);
+}
+
+TEST_F(DiskLifetimeReadTest,
+       CompletionSamplingConservesConcurrentNotifications) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const DiskResidentIdentity identity = Put();
+  std::vector<std::thread> notifiers;
+  for (unsigned notifier = 0; notifier < 4; ++notifier) {
+    notifiers.emplace_back([&] {
+      for (unsigned event = 0; event < 65; ++event) {
+        const DiskLifetimeReadCompletion completion =
+            CaptureDiskLifetimeReadCompletion(true, 5);
+        store_->NotifyLifetimeReadSuccess(
+            key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+            PreparedRead::Source::kUnclassified, completion);
+      }
+    });
+  }
+  for (std::thread& notifier : notifiers) notifier.join();
+  const DiskSlabStore::Stats stats = store_->GetStats();
+  EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 8U);
+  const DiskSlabStore::LifetimeReadCounters counters = Counters();
+  EXPECT_EQ(counters.successful, 260U);
+  EXPECT_EQ(counters.applied, 260U);
+  EXPECT_EQ(counters.completion_not_sampled, 252U);
+  EXPECT_EQ(counters.completion_missing, 0U);
+  EXPECT_EQ(counters.completion_not_applied, 0U);
+  EXPECT_EQ(counters.completion_invalid, 0U);
+  EXPECT_EQ(State().actual_reads, 3U);
+}
+
+TEST_F(DiskLifetimeReadTest,
+       CompletionStatisticsSkipDisabledAndResetOnRecovery) {
+  ASSERT_NO_FATAL_FAILURE(Create(false));
+  DiskResidentIdentity identity = Put();
+  DiskLifetimeReadCompletion completion;
+  completion.sampling = DiskLifetimeReadCompletion::Sampling::kSampled;
+  completion.completed_at = std::chrono::steady_clock::now();
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
+  EXPECT_EQ(store_->GetStats().lifetime_reads.successful, 0U);
+  EXPECT_EQ(store_->GetStats().lifetime_read_completion_to_apply.samples, 0U);
+  store_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create());
+  std::string bytes;
+  ASSERT_EQ(store_->RangeWithIdentity(key_, 0, 0, &bytes, &identity),
+            Status::kOk);
+  ASSERT_EQ(bytes, "value");
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 0, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
+  EXPECT_EQ(Counters().successful, 0U);
+  completion.completed_at = std::chrono::steady_clock::now();
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, bytes.size(), DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
+  EXPECT_EQ(store_->GetStats().lifetime_read_completion_to_apply.samples, 1U);
+  EXPECT_EQ(Counters().applied, 1U);
+  store_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create());
+  EXPECT_EQ(Counters().successful, 0U);
+  EXPECT_EQ(store_->GetStats().lifetime_read_completion_to_apply.samples, 0U);
+  EXPECT_EQ(store_->GetStats().lifetime_read_completion_to_apply.total_ns, 0U);
+  EXPECT_EQ(store_->GetStats().lifetime_read_completion_to_apply.max_ns, 0U);
+}
 
 TEST_F(DiskLifetimeReadTest, LockWaitSamplesPerThreadAndSkipsDisabledOrEmpty) {
   ASSERT_NO_FATAL_FAILURE(Create());
@@ -1041,15 +1316,26 @@ TEST_F(DiskLifetimeReadTest, SoftCrossingAppliesButHardCrossingIsSticky) {
   ASSERT_NO_FATAL_FAILURE(Create());
   const DiskResidentIdentity identity = Put();
   const uint64_t hard = std::numeric_limits<uint32_t>::max();
+  DiskLifetimeReadCompletion completion;
+  completion.sampling = DiskLifetimeReadCompletion::Sampling::kSampled;
+  completion.completed_at = std::chrono::steady_clock::now();
   seconds_.store(100 + hard - DiskLifetimeHorizon(config_) + 1);
-  store_->NotifyLifetimeReadSuccess(key_, identity, 5);
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
   EXPECT_EQ(Counters().applied, 1U);
   const uint32_t soft_anchor = State().anchor;
   seconds_.store(100 + hard + 1);
-  store_->NotifyLifetimeReadSuccess(key_, identity, 5);
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
   seconds_.store(101);
-  store_->NotifyLifetimeReadSuccess(key_, identity, 5);
+  store_->NotifyLifetimeReadSuccess(
+      key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
+      PreparedRead::Source::kUnclassified, completion);
   EXPECT_EQ(Counters().clock_hard_exhausted, 2U);
+  EXPECT_EQ(Counters().completion_not_applied, 2U);
+  EXPECT_EQ(store_->GetStats().lifetime_read_completion_to_apply.samples, 1U);
   EXPECT_EQ(State().anchor, soft_anchor);
   EXPECT_TRUE(store_->Healthy());
 }
@@ -1063,12 +1349,17 @@ TEST_F(DiskLifetimeReadTest,
   EXPECT_FALSE(store_->Healthy());
   seconds_.store(uint64_t{std::numeric_limits<uint32_t>::max()} + 101);
   const uint64_t samples = samples_.load();
+  DiskLifetimeReadCompletion completion;
+  completion.sampling = DiskLifetimeReadCompletion::Sampling::kSampled;
+  completion.completed_at = std::chrono::steady_clock::now();
   store_->NotifyLifetimeReadSuccess(
       key_, {}, 5, DiskSlabStore::LifetimeReadSource::kTransportGrant,
-      PreparedRead::Source::kDiskStaging);
+      PreparedRead::Source::kDiskStaging, completion);
   EXPECT_EQ(Counters().transport_disk_staging, 1U);
   EXPECT_EQ(Counters().io_unhealthy, 1U);
   EXPECT_EQ(Counters().no_binding, 0U);
+  EXPECT_EQ(Counters().completion_not_applied, 1U);
+  EXPECT_EQ(store_->GetStats().lifetime_read_completion_to_apply.samples, 0U);
   EXPECT_EQ(samples_.load(), samples);
 }
 
@@ -1111,17 +1402,22 @@ TEST(LifetimeReadStateValidation, UninitializedAndFutureStateFailClosed) {
   const BlockKey future{2, 0};
   SlabAllocator::SlotRef ref;
   std::vector<BlockKey> evicted;
+  const std::chrono::steady_clock::time_point untouched =
+      std::chrono::steady_clock::time_point::min();
+  std::chrono::steady_clock::time_point applied_time = untouched;
   ASSERT_TRUE(allocator.Put(empty, 4096, &ref, &evicted));
   SlabAllocatorTestPeer::CommitGeneration(&allocator, empty, 1);
-  EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, empty, 1,
-                                                     config, clock),
+  EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(
+                allocator, empty, 1, config, clock, &applied_time),
             SlabAllocatorTestPeer::LifetimeReadResult::kStateUnavailable);
+  EXPECT_EQ(applied_time, untouched);
   ASSERT_TRUE(allocator.Put(future, 4096, &ref, &evicted));
   const DiskLifetimeState state = NewDiskLifetimeState(10);
   SlabAllocatorTestPeer::CommitGeneration(&allocator, future, 2, &state);
-  EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, future, 2,
-                                                     config, clock),
+  EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(
+                allocator, future, 2, config, clock, &applied_time),
             SlabAllocatorTestPeer::LifetimeReadResult::kStateUnavailable);
+  EXPECT_EQ(applied_time, untouched);
   const SlabAllocatorTestPeer::LifetimeSnapshot snapshot =
       SlabAllocatorTestPeer::LifetimeSnapshotFor(allocator, future);
   if (!snapshot.second.has_value()) {
@@ -1130,10 +1426,30 @@ TEST(LifetimeReadStateValidation, UninitializedAndFutureStateFailClosed) {
   }
   EXPECT_EQ(snapshot.second->anchor, 10U);
   EXPECT_EQ(snapshot.second->actual_reads, 0U);
+  now = 111;
+  const std::chrono::steady_clock::time_point before =
+      std::chrono::steady_clock::now();
+  EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(
+                allocator, future, 2, config, clock, &applied_time),
+            SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  const std::chrono::steady_clock::time_point after =
+      std::chrono::steady_clock::now();
+  EXPECT_GE(applied_time, before);
+  EXPECT_LE(applied_time, after);
+  const SlabAllocatorTestPeer::LifetimeSnapshot updated =
+      SlabAllocatorTestPeer::LifetimeSnapshotFor(allocator, future);
+  if (!updated.second.has_value()) {
+    ADD_FAILURE() << "missing lifetime state after application";
+    return;
+  }
+  EXPECT_EQ(updated.second->anchor, 11U);
+  EXPECT_EQ(updated.second->actual_reads, 1U);
+  applied_time = untouched;
   now = uint64_t{std::numeric_limits<uint32_t>::max()} + 101;
-  EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, empty, 1,
-                                                     config, clock),
+  EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(
+                allocator, empty, 1, config, clock, &applied_time),
             SlabAllocatorTestPeer::LifetimeReadResult::kClockHardExhausted);
+  EXPECT_EQ(applied_time, untouched);
 }
 
 }  // namespace

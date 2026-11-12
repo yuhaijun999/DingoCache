@@ -37,6 +37,7 @@
 #include "cache/async_read_counters.h"
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_lifetime_state.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_write_result.h"
@@ -2963,7 +2964,8 @@ SlabAllocator::LifetimeBucketObservation DiskSlabStore::ObserveLifetimeBuckets()
 
 void DiskSlabStore::NotifyLifetimeReadSuccess(
     const BlockKey& key, const DiskResidentIdentity& identity, size_t bytes,
-    LifetimeReadSource source, PreparedRead::Source transport_source) {
+    LifetimeReadSource source, PreparedRead::Source transport_source,
+    const DiskLifetimeReadCompletion& completion) {
   // Keep disabled and empty successes off the lifetime lock/clock path.
   if (!opt_.lifetime_config.has_value() || bytes == 0) return;
   // Select before D without a shared atomic RMW. This phase belongs to the
@@ -2996,6 +2998,22 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
   const ScopedLifetimeReadTimer processing_timer(
       (lifetime_reads_.successful & 63U) == 1U ? &lifetime_read_processing_
                                                : nullptr);
+  const bool sampled =
+      completion.sampling == DiskLifetimeReadCompletion::Sampling::kSampled;
+  switch (completion.sampling) {
+    case DiskLifetimeReadCompletion::Sampling::kNotSampled:
+      ++lifetime_reads_.completion_not_sampled;
+      break;
+    case DiskLifetimeReadCompletion::Sampling::kSampled:
+      // Every early heat rejection retains this count. D hides the temporary
+      // value until an applied sample is settled into timing or invalid.
+      ++lifetime_reads_.completion_not_applied;
+      break;
+    case DiskLifetimeReadCompletion::Sampling::kMissing:
+    default:
+      ++lifetime_reads_.completion_missing;
+      break;
+  }
   // Source is an independent partition, including notifications left unheated.
   // The caller supplies one valid enumerator; do not infer it from identity.
   switch (source) {
@@ -3084,11 +3102,30 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
   // D orders visibility/removal; A checks the same physical generation and
   // samples actual application time atomically with the state update. Do not
   // use storage completion time or legacy Get/Touch as the heat event.
+  std::chrono::steady_clock::time_point applied_time{};
   const SlabAllocator::LifetimeReadResult result = alloc_->ApplyLifetimeRead(
-      key, identity.generation, *opt_.lifetime_config, *opt_.lifetime_clock);
+      key, identity.generation, *opt_.lifetime_config, *opt_.lifetime_clock,
+      sampled ? &applied_time : nullptr);
   switch (result) {
     case SlabAllocator::LifetimeReadResult::kApplied:
       ++lifetime_reads_.applied;
+      if (sampled) {
+        --lifetime_reads_.completion_not_applied;
+        if (applied_time < completion.completed_at) {
+          // Invalid measurement metadata never revokes accepted heat. Check
+          // before subtraction so future values cannot wrap the duration.
+          ++lifetime_reads_.completion_invalid;
+        } else {
+          const uint64_t elapsed_ns = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  applied_time - completion.completed_at)
+                  .count());
+          ++lifetime_read_completion_to_apply_.samples;
+          lifetime_read_completion_to_apply_.total_ns += elapsed_ns;
+          lifetime_read_completion_to_apply_.max_ns =
+              std::max(lifetime_read_completion_to_apply_.max_ns, elapsed_ns);
+        }
+      }
       // Keep recovery origin after reading. Only an accepted first heat event
       // consumes unread membership, using the same D-protected map lookup.
       if (visible->second.recovered_unread) {
@@ -3246,6 +3283,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
 
   st.lifetime_reads = lifetime_reads_;
   st.lifetime_read_processing = lifetime_read_processing_;
+  st.lifetime_read_completion_to_apply = lifetime_read_completion_to_apply_;
   st.lifetime_read_lock_wait = lifetime_read_lock_wait_;
   st.lifetime_read_lock_held = lifetime_read_lock_held_;
   st.sync_payload_reads = sync_payload_reads_;

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -120,12 +121,12 @@ class SlabAllocatorTestPeer {
     return allocator.lifetime_versions_[cls];
   }
   using LifetimeReadResult = SlabAllocator::LifetimeReadResult;
-  static LifetimeReadResult ApplyLifetimeRead(SlabAllocator& allocator,
-                                              const BlockKey& key,
-                                              uint64_t generation,
-                                              const DiskLifetimeConfig& config,
-                                              const DiskLifetimeClock& clock) {
-    return allocator.ApplyLifetimeRead(key, generation, config, clock);
+  static LifetimeReadResult ApplyLifetimeRead(
+      SlabAllocator& allocator, const BlockKey& key, uint64_t generation,
+      const DiskLifetimeConfig& config, const DiskLifetimeClock& clock,
+      std::chrono::steady_clock::time_point* applied_time = nullptr) {
+    return allocator.ApplyLifetimeRead(key, generation, config, clock,
+                                       applied_time);
   }
   using LifetimeSnapshot =
       std::pair<uint64_t, std::optional<DiskLifetimeState>>;
