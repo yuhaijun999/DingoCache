@@ -157,6 +157,97 @@ DiskLifetimeConfig BucketMetricConfig() {
   return config;
 }
 
+// Expected cohorts use literal display bounds, not the producer's constants.
+// The age is this run's shared-clock offset, never the refreshed read anchor.
+void ExpectRecoveredBootAgeMetrics(KvNodeServer& server,
+                                   const std::string& path,
+                                   const std::array<uint64_t, 2>& counts,
+                                   const std::array<uint64_t, 2>& boot_ages,
+                                   const std::string& identity = "") {
+  ASSERT_TRUE(path == "class" || path == "background" || path == "watermark" ||
+              path == "donor");
+  const DiskCacheGroup& group = KvNodeServerTestPeer::Group(server);
+  ASSERT_EQ(group.DiskCount(), 2U);
+  const std::string text = server.MetricsText();
+  const DiskSlabStore::Stats total = group.SlabStats();
+  const auto age_for_path = [&path](const DiskSlabStore::Stats& stats)
+      -> const SlabAllocator::LifetimeDonorAgeStats& {
+    if (path == "class") return stats.lifetime_class_age;
+    if (path == "background") return stats.lifetime_background_age;
+    if (path == "watermark") return stats.lifetime_watermark_age;
+    return stats.lifetime_donor_age;
+  };
+  const std::array<uint64_t, 7> bounds = {0,     1,      60,     3600,
+                                          86400, 604800, 2592000};
+  const std::string global_name =
+      "dfkv_slab_lifetime_" + path + "_recovered_boot_age_seconds";
+  const std::string disk_name =
+      "dfkv_slab_disk_lifetime_" + path + "_recovered_boot_age_seconds";
+  for (const std::string& name : {global_name, disk_name}) {
+    EXPECT_NE(text.find("# TYPE " + name + " histogram\n"), std::string::npos);
+  }
+  std::array<uint64_t, 8> expected_total{};
+  uint64_t expected_sum = 0;
+  for (size_t disk = 0; disk < 2; ++disk) {
+    const DiskSlabStore::Stats stats = group.DiskSlabStats(disk);
+    const SlabAllocator::LifetimeDonorAgeStats& age = age_for_path(stats);
+    const size_t selected_bucket = static_cast<size_t>(
+        std::lower_bound(bounds.begin(), bounds.end(), boot_ages[disk]) -
+        bounds.begin());
+    uint64_t cumulative = 0;
+    const std::string labels = R"(disk=")" + group.DiskPath(disk) +
+                               R"(",disk_index=")" + std::to_string(disk) +
+                               "\"";
+    for (size_t bucket = 0; bucket < 8; ++bucket) {
+      const uint64_t expected = bucket == selected_bucket ? counts[disk] : 0;
+      EXPECT_EQ(age.recovered_boot_age_buckets[bucket], expected);
+      expected_total[bucket] += expected;
+      cumulative += expected;
+      const std::string upper =
+          bucket < bounds.size() ? std::to_string(bounds[bucket]) : "+Inf";
+      const std::string suffix =
+          ",le=\"" + upper + "\"" + (identity.empty() ? "" : "," + identity);
+      EXPECT_NE(text.find("\n" + disk_name + "_bucket{" + labels + suffix +
+                          "} " + std::to_string(cumulative) + "\n"),
+                std::string::npos);
+    }
+    EXPECT_EQ(cumulative, age.history_unknown);
+    EXPECT_EQ(age.history_unknown, counts[disk]);
+    EXPECT_EQ(age.recovered_boot_age_total_sec, counts[disk] * boot_ages[disk]);
+    expected_sum += counts[disk] * boot_ages[disk];
+    const std::string suffix = identity.empty() ? "" : "," + identity;
+    for (const std::pair<const char*, uint64_t>& sample :
+         {std::pair<const char*, uint64_t>{"_count", counts[disk]},
+          {"_sum", counts[disk] * boot_ages[disk]}}) {
+      EXPECT_NE(text.find("\n" + disk_name + sample.first + "{" + labels +
+                          suffix + "} " + std::to_string(sample.second) + "\n"),
+                std::string::npos);
+    }
+  }
+  const SlabAllocator::LifetimeDonorAgeStats& age = age_for_path(total);
+  EXPECT_EQ(age.recovered_boot_age_buckets, expected_total);
+  EXPECT_EQ(age.recovered_boot_age_total_sec, expected_sum);
+  EXPECT_EQ(age.history_unknown, counts[0] + counts[1]);
+  uint64_t cumulative = 0;
+  for (size_t bucket = 0; bucket < 8; ++bucket) {
+    cumulative += expected_total[bucket];
+    const std::string upper =
+        bucket < bounds.size() ? std::to_string(bounds[bucket]) : "+Inf";
+    const std::string labels =
+        "le=\"" + upper + "\"" + (identity.empty() ? "" : "," + identity);
+    EXPECT_NE(text.find("\n" + global_name + "_bucket{" + labels + "} " +
+                        std::to_string(cumulative) + "\n"),
+              std::string::npos);
+  }
+  const std::string labels = identity.empty() ? "" : "{" + identity + "}";
+  EXPECT_NE(text.find("\n" + global_name + "_count" + labels + " " +
+                      std::to_string(counts[0] + counts[1]) + "\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("\n" + global_name + "_sum" + labels + " " +
+                      std::to_string(expected_sum) + "\n"),
+            std::string::npos);
+}
+
 std::unique_ptr<KvNodeServer> Start(fs::path dir, std::string* addr) {
   fs::remove_all(dir); fs::create_directories(dir);
   auto s = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
@@ -998,7 +1089,9 @@ TEST(Metrics, ClassAndBackgroundAgesStaySeparateAndExcludeRecoveredHistory) {
                                 const std::array<uint64_t, 2>& sums,
                                 const std::array<uint64_t, 2>& unknown,
                                 const std::array<uint64_t, 8>& disk0_buckets,
-                                const std::array<uint64_t, 8>& disk1_buckets) {
+                                const std::array<uint64_t, 8>& disk1_buckets,
+                                const std::array<uint64_t, 2>& boot_ages = {
+                                    0, 0}) {
       const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
       const std::string text = server->MetricsText();
       const std::array<DiskSlabStore::Stats, 2> disks = {
@@ -1095,6 +1188,8 @@ TEST(Metrics, ClassAndBackgroundAgesStaySeparateAndExcludeRecoveredHistory) {
                             std::to_string(sample.second) + "\n"),
                   std::string::npos);
       }
+      ASSERT_NO_FATAL_FAILURE(ExpectRecoveredBootAgeMetrics(
+          *server, path, unknown, boot_ages, identity));
     };
     const std::array<uint64_t, 8> empty{};
     ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {0, 0}, empty, empty));
@@ -1143,10 +1238,14 @@ TEST(Metrics, ClassAndBackgroundAgesStaySeparateAndExcludeRecoveredHistory) {
                                        {0, 1, 0, 0, 0, 0, 0, 0},
                                        {0, 0, 0, 1, 0, 0, 0, 0}));
     server.reset();
+    seconds.store(0);
+    options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+        DiskLifetimeHorizon(config), [&] { return seconds.load(); });
     server = std::make_unique<KvNodeServer>(options);
     ASSERT_TRUE(server->Healthy());
     server->set_identity("reclaim-age-node", "reclaim-age-group");
     ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {0, 0}, empty, empty));
+    seconds.store(50);
     // Every disk1 recovered resident accepts a real read, so its selected
     // victim cannot merely be another unread seed. Disk0 remains unread.
     DiskSlabStore& read_store =
@@ -1165,8 +1264,8 @@ TEST(Metrics, ClassAndBackgroundAgesStaySeparateAndExcludeRecoveredHistory) {
     }
     ASSERT_EQ(read_store.GetStats().lifetime_reads.applied,
               background ? 7U : 8U);
-    seconds.store(1100);
     for (size_t disk = 0; disk < 2; ++disk) {
+      seconds.store(disk == 0 ? 1100 : 3601);
       DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
           KvNodeServerTestPeer::Group(*server), disk);
       ASSERT_EQ(store.Cache({10, 0}, "fresh", 5), Status::kOk);
@@ -1178,7 +1277,8 @@ TEST(Metrics, ClassAndBackgroundAgesStaySeparateAndExcludeRecoveredHistory) {
       EXPECT_EQ(store.Range({10, 0}, 0, 0, &survivor), Status::kOk);
       EXPECT_EQ(survivor, "fresh");
     }
-    ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {1, 1}, empty, empty));
+    ASSERT_NO_FATAL_FAILURE(
+        expect_age({0, 0}, {0, 0}, {1, 1}, empty, empty, {1100, 3601}));
     server.reset();
     options.eviction_policy = "legacy";
     options.lifetime_clock.reset();
@@ -1204,6 +1304,11 @@ TEST(Metrics, ClassAndBackgroundAgesStaySeparateAndExcludeRecoveredHistory) {
     server = std::make_unique<KvNodeServer>(options);
     ASSERT_TRUE(server->Healthy());
     const std::string file_text = server->MetricsText();
+    for (const char* prefix : {"dfkv_slab_", "dfkv_slab_disk_"}) {
+      EXPECT_EQ(file_text.find(std::string(prefix) + "lifetime_" + path +
+                               "_recovered_boot_age_seconds"),
+                std::string::npos);
+    }
     for (const char* name :
          {"dfkv_slab_lifetime_class_age_", "dfkv_slab_disk_lifetime_class_age_",
           "dfkv_slab_lifetime_background_age_",
@@ -1213,6 +1318,98 @@ TEST(Metrics, ClassAndBackgroundAgesStaySeparateAndExcludeRecoveredHistory) {
     server.reset();
     fs::remove_all(dir);
   }
+}
+
+TEST(Metrics, RecoveredBootAgeStartsNewCohortOnCleanRestart) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "1048576");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_metrics_recovered_boot_cohorts";
+  fs::remove_all(dir);
+  const DiskLifetimeConfig config = BucketMetricConfig();
+  std::atomic<uint64_t> seconds{0};
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 2ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  options.lifetime_config = config;
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config), [&] { return seconds.load(); });
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  // Seed stores directly to isolate per-disk aggregation, not Group routing.
+  std::vector<BlockKey> keys[2] = {{{1, 0}, {2, 0}}, {{1, 0}, {2, 0}}};
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+        KvNodeServerTestPeer::Group(*server), disk);
+    for (const BlockKey& key : keys[disk]) {
+      ASSERT_EQ(store.Cache(key, "value", 5), Status::kOk);
+    }
+  }
+  server.reset();
+  for (uint64_t boot = 0; boot < 3; ++boot) {
+    SCOPED_TRACE(boot);
+    // Distinct source epochs make accidental absolute-time or previous-run
+    // accumulation visible. Each new clock encodes this cohort's boot as zero.
+    const uint64_t base = (boot + 1) * 10000;
+    seconds.store(base);
+    options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+        DiskLifetimeHorizon(config), [&] { return seconds.load(); });
+    server = std::make_unique<KvNodeServer>(options);
+    ASSERT_TRUE(server->Healthy());
+    for (const char* path : {"class", "background", "watermark", "donor"}) {
+      ASSERT_NO_FATAL_FAILURE(
+          ExpectRecoveredBootAgeMetrics(*server, path, {0, 0}, {0, 0}));
+    }
+    seconds.store(base + 50);
+    DiskSlabStore& read_store =
+        DiskCacheGroupTestPeer::Slab(KvNodeServerTestPeer::Group(*server), 1);
+    for (const BlockKey& key : keys[1]) {
+      std::string value;
+      DiskResidentIdentity identity;
+      ASSERT_EQ(read_store.RangeWithIdentity(key, 0, 0, &value, &identity),
+                Status::kOk);
+      ASSERT_EQ(value, "value");
+      read_store.NotifyLifetimeReadSuccess(
+          key, identity, value.size(),
+          DiskSlabStore::LifetimeReadSource::kDisk);
+    }
+    EXPECT_EQ(read_store.GetStats().lifetime_reads.applied, 2U);
+    for (size_t disk = 0; disk < 2; ++disk) {
+      seconds.store(base + (disk == 0 ? 61 : 3601));
+      DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+          KvNodeServerTestPeer::Group(*server), disk);
+      ASSERT_EQ(store.GetStats().lifetime_recovered_objects, 2U);
+      DiskSlabStoreTestPeer::TickWatermark(store);
+      ASSERT_EQ(store.Count(), 1U);
+      std::vector<BlockKey> survivors;
+      for (const BlockKey& key : keys[disk]) {
+        if (store.IsCached(key)) survivors.push_back(key);
+      }
+      ASSERT_EQ(survivors.size(), 1U);
+      const BlockKey fresh{100 + boot, 0};
+      ASSERT_EQ(store.Cache(fresh, "value", 5), Status::kOk);
+      survivors.push_back(fresh);
+      keys[disk] = std::move(survivors);
+      ASSERT_EQ(store.Count(), 2U);
+      // The retained recovery survivor is censored, not an eviction sample.
+      EXPECT_EQ(store.GetStats().lifetime_recovered_objects, 1U);
+    }
+    ASSERT_NO_FATAL_FAILURE(ExpectRecoveredBootAgeMetrics(*server, "watermark",
+                                                          {1, 1}, {61, 3601}));
+    for (const char* path : {"class", "background", "donor"}) {
+      ASSERT_NO_FATAL_FAILURE(
+          ExpectRecoveredBootAgeMetrics(*server, path, {0, 0}, {0, 0}));
+    }
+    server.reset();
+  }
+  fs::remove_all(dir);
 }
 
 TEST(Metrics, ClassAndBackgroundScoresUseFinalTimeAndIncludeRecoveredHistory) {
@@ -1566,7 +1763,9 @@ TEST(Metrics, WatermarkAgeUsesFinalPreWriteTimeAndExcludesRecoveredHistory) {
                               const std::array<uint64_t, 2>& sums,
                               const std::array<uint64_t, 2>& unknown,
                               const std::array<uint64_t, 8>& disk0_buckets,
-                              const std::array<uint64_t, 8>& disk1_buckets) {
+                              const std::array<uint64_t, 8>& disk1_buckets,
+                              const std::array<uint64_t, 2>& boot_ages = {0,
+                                                                          0}) {
     const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
     const std::string text = server->MetricsText();
     const std::array<DiskSlabStore::Stats, 2> disks = {group.DiskSlabStats(0),
@@ -1643,6 +1842,8 @@ TEST(Metrics, WatermarkAgeUsesFinalPreWriteTimeAndExcludesRecoveredHistory) {
                           std::to_string(sample.second) + "\n"),
                 std::string::npos);
     }
+    ASSERT_NO_FATAL_FAILURE(ExpectRecoveredBootAgeMetrics(
+        *server, "watermark", unknown, boot_ages, identity));
   };
   const std::array<uint64_t, 8> empty{};
   ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {0, 0}, empty, empty));
@@ -1685,10 +1886,14 @@ TEST(Metrics, WatermarkAgeUsesFinalPreWriteTimeAndExcludesRecoveredHistory) {
                                      {0, 1, 0, 0, 0, 0, 0, 0},
                                      {0, 0, 0, 1, 0, 0, 0, 0}));
   server.reset();
+  seconds.store(0);
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config), [&] { return seconds.load(); });
   server = std::make_unique<KvNodeServer>(options);
   ASSERT_TRUE(server->Healthy());
   server->set_identity("watermark-age-node", "watermark-age-group");
   ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {0, 0}, empty, empty));
+  seconds.store(50);
   // Read one recovered resident for real and apply its first notification.
   // Recovery history remains unknown, even though this refreshes its anchor.
   DiskSlabStore& read_store =
@@ -1705,8 +1910,8 @@ TEST(Metrics, WatermarkAgeUsesFinalPreWriteTimeAndExcludesRecoveredHistory) {
   ASSERT_EQ(read_store.GetStats().lifetime_reads.applied, 1U);
   // Both recovered residents are now much colder than a fresh NEW write.
   // One stayed unread; one accepted a real read, but neither has known history.
-  seconds.store(1100);
   for (size_t disk = 0; disk < 2; ++disk) {
+    seconds.store(disk == 0 ? 1100 : 3601);
     DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
         KvNodeServerTestPeer::Group(*server), disk);
     ASSERT_EQ(store.Cache({3, 0}, "new", 3), Status::kOk);
@@ -1717,7 +1922,8 @@ TEST(Metrics, WatermarkAgeUsesFinalPreWriteTimeAndExcludesRecoveredHistory) {
     EXPECT_EQ(store.Range({3, 0}, 0, 0, &survivor), Status::kOk);
     EXPECT_EQ(survivor, "new");
   }
-  ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {1, 1}, empty, empty));
+  ASSERT_NO_FATAL_FAILURE(
+      expect_age({0, 0}, {0, 0}, {1, 1}, empty, empty, {1100, 3601}));
   server.reset();
   options.eviction_policy = "legacy";
   options.lifetime_clock.reset();
@@ -1741,6 +1947,11 @@ TEST(Metrics, WatermarkAgeUsesFinalPreWriteTimeAndExcludesRecoveredHistory) {
   server = std::make_unique<KvNodeServer>(options);
   ASSERT_TRUE(server->Healthy());
   const std::string file_text = server->MetricsText();
+  for (const char* prefix : {"dfkv_slab_", "dfkv_slab_disk_"}) {
+    EXPECT_EQ(file_text.find(std::string(prefix) + "lifetime_" + "watermark" +
+                             "_recovered_boot_age_seconds"),
+              std::string::npos);
+  }
   EXPECT_EQ(file_text.find("dfkv_slab_lifetime_watermark_age_"),
             std::string::npos);
   EXPECT_EQ(file_text.find("dfkv_slab_disk_lifetime_watermark_age_"),
@@ -1779,7 +1990,9 @@ TEST(Metrics, DonorAgeTracksKnownHistoryAndExcludesRecoveredHistory) {
                               const std::array<uint64_t, 2>& sums,
                               const std::array<uint64_t, 2>& unknown,
                               const std::array<uint64_t, 8>& disk0_buckets,
-                              const std::array<uint64_t, 8>& disk1_buckets) {
+                              const std::array<uint64_t, 8>& disk1_buckets,
+                              const std::array<uint64_t, 2>& boot_ages = {0,
+                                                                          0}) {
     const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
     const std::string text = server->MetricsText();
     const std::array<DiskSlabStore::Stats, 2> disks = {group.DiskSlabStats(0),
@@ -1853,6 +2066,8 @@ TEST(Metrics, DonorAgeTracksKnownHistoryAndExcludesRecoveredHistory) {
                           std::to_string(sample.second) + "\n"),
                 std::string::npos);
     }
+    ASSERT_NO_FATAL_FAILURE(ExpectRecoveredBootAgeMetrics(
+        *server, "donor", unknown, boot_ages, identity));
   };
   const std::array<uint64_t, 8> empty{};
   ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {0, 0}, empty, empty));
@@ -1874,10 +2089,14 @@ TEST(Metrics, DonorAgeTracksKnownHistoryAndExcludesRecoveredHistory) {
                                      {0, 1, 0, 0, 0, 0, 0, 0},
                                      {0, 0, 0, 2, 0, 0, 0, 0}));
   server.reset();
+  seconds.store(0);
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config), [&] { return seconds.load(); });
   server = std::make_unique<KvNodeServer>(options);
   ASSERT_TRUE(server->Healthy());
   server->set_identity("age-node", "age-group");
   ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {0, 0}, empty, empty));
+  seconds.store(50);
   // Read one recovered resident for real and apply its first notification.
   // Recovery history remains unknown, even though this refreshes its anchor.
   DiskSlabStore& read_store =
@@ -1892,15 +2111,16 @@ TEST(Metrics, DonorAgeTracksKnownHistoryAndExcludesRecoveredHistory) {
       {100, 0}, read_identity, recovered.size(),
       DiskSlabStore::LifetimeReadSource::kDisk);
   ASSERT_EQ(read_store.GetStats().lifetime_reads.applied, 1U);
-  seconds.store(63);
   for (size_t disk = 0; disk < 2; ++disk) {
+    seconds.store(disk == 0 ? 63 : 3601);
     DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
         KvNodeServerTestPeer::Group(*server), disk);
     ASSERT_EQ(store.Cache({200, 0}, "new", 3), Status::kOk);
     EXPECT_FALSE(store.IsCached({100, 0}));
     EXPECT_EQ(store.Count(), 1U);
   }
-  ASSERT_NO_FATAL_FAILURE(expect_age({0, 0}, {0, 0}, {1, 1}, empty, empty));
+  ASSERT_NO_FATAL_FAILURE(
+      expect_age({0, 0}, {0, 0}, {1, 1}, empty, empty, {63, 3601}));
   server.reset();
   options.eviction_policy = "legacy";
   options.lifetime_clock.reset();
@@ -1922,6 +2142,11 @@ TEST(Metrics, DonorAgeTracksKnownHistoryAndExcludesRecoveredHistory) {
   server = std::make_unique<KvNodeServer>(options);
   ASSERT_TRUE(server->Healthy());
   const std::string file_text = server->MetricsText();
+  for (const char* prefix : {"dfkv_slab_", "dfkv_slab_disk_"}) {
+    EXPECT_EQ(file_text.find(std::string(prefix) + "lifetime_" + "donor" +
+                             "_recovered_boot_age_seconds"),
+              std::string::npos);
+  }
   EXPECT_EQ(file_text.find("dfkv_slab_lifetime_donor_age_"), std::string::npos);
   EXPECT_EQ(file_text.find("dfkv_slab_disk_lifetime_donor_age_"),
             std::string::npos);

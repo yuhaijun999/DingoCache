@@ -1064,8 +1064,12 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
          ++bucket) {
       sum.lifetime_class_age.buckets[bucket] +=
           st.lifetime_class_age.buckets[bucket];
+      sum.lifetime_class_age.recovered_boot_age_buckets[bucket] +=
+          st.lifetime_class_age.recovered_boot_age_buckets[bucket];
     }
     sum.lifetime_class_age.total_sec += st.lifetime_class_age.total_sec;
+    sum.lifetime_class_age.recovered_boot_age_total_sec +=
+        st.lifetime_class_age.recovered_boot_age_total_sec;
     sum.lifetime_class_age.history_unknown +=
         st.lifetime_class_age.history_unknown;
     for (size_t bucket = 0;
@@ -1093,9 +1097,13 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
          ++bucket) {
       sum.lifetime_background_age.buckets[bucket] +=
           st.lifetime_background_age.buckets[bucket];
+      sum.lifetime_background_age.recovered_boot_age_buckets[bucket] +=
+          st.lifetime_background_age.recovered_boot_age_buckets[bucket];
     }
     sum.lifetime_background_age.total_sec +=
         st.lifetime_background_age.total_sec;
+    sum.lifetime_background_age.recovered_boot_age_total_sec +=
+        st.lifetime_background_age.recovered_boot_age_total_sec;
     sum.lifetime_background_age.history_unknown +=
         st.lifetime_background_age.history_unknown;
     for (size_t bucket = 0;
@@ -1124,8 +1132,12 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
          ++bucket) {
       sum.lifetime_watermark_age.buckets[bucket] +=
           st.lifetime_watermark_age.buckets[bucket];
+      sum.lifetime_watermark_age.recovered_boot_age_buckets[bucket] +=
+          st.lifetime_watermark_age.recovered_boot_age_buckets[bucket];
     }
     sum.lifetime_watermark_age.total_sec += st.lifetime_watermark_age.total_sec;
+    sum.lifetime_watermark_age.recovered_boot_age_total_sec +=
+        st.lifetime_watermark_age.recovered_boot_age_total_sec;
     sum.lifetime_watermark_age.history_unknown +=
         st.lifetime_watermark_age.history_unknown;
     for (size_t bucket = 0;
@@ -1162,8 +1174,12 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
          ++bucket) {
       sum.lifetime_donor_age.buckets[bucket] +=
           st.lifetime_donor_age.buckets[bucket];
+      sum.lifetime_donor_age.recovered_boot_age_buckets[bucket] +=
+          st.lifetime_donor_age.recovered_boot_age_buckets[bucket];
     }
     sum.lifetime_donor_age.total_sec += st.lifetime_donor_age.total_sec;
+    sum.lifetime_donor_age.recovered_boot_age_total_sec +=
+        st.lifetime_donor_age.recovered_boot_age_total_sec;
     sum.lifetime_donor_age.history_unknown +=
         st.lifetime_donor_age.history_unknown;
     for (size_t bucket = 0;

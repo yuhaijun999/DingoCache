@@ -1266,3 +1266,69 @@ allocation in this export step. The observation value is 80 bytes; output string
 growth has ordinary allocation costs. This is not a lock-contention, RSS, latency
 or performance-budget acceptance claim. Existing alerts and dashboards do not
 depend on the new families.
+
+### Recovered eviction boot-age histograms
+
+For each lifetime eviction path (`class`, `background`, `watermark`, `donor`),
+`dfkv_slab_lifetime_<path>_recovered_boot_age_seconds` and its
+`dfkv_slab_disk_lifetime_<path>_recovered_boot_age_seconds` counterpart record
+successful recovery-origin victims' **current shared-clock boot offset at final
+pre-wipe time**. Per-disk labels are the existing `disk`/`disk_index`; optional
+node/group labels follow the existing renderer. There are no key/request labels.
+The fixed histogram bounds are 0, 1, 60, 3600, 86400, 604800, 2592000 and +Inf
+seconds, not new lifetime configuration or acceptance thresholds.
+
+These observations use initialized `history_unknown` states with valid resident
+identity. Recovery's virtual reads are not business reads; a later real read
+refreshes `anchor` but does not reset this boot-age measure. For example, a
+recovered resident read at 59 and successfully evicted at 61 contributes 61,
+not the refreshed-anchor age 2. The existing ordinary age histogram still omits
+it, and its existing `age_history_unknown_total` counter still increments.
+For each path, the new histogram count equals that same unknown-history count;
+known-history NEW residents never enter the recovered histogram.
+
+Only successful invalidation contributes. Failed persistence, skipped pins,
+refused hard-clock selections, uninitialized/unscored states and work not
+performed do not add a sample; completed victims remain recorded if a later
+piece or payload write fails. Selection-time and post-I/O times are not used.
+Donor victims share the already established final whole-extent pre-wipe time.
+Explicit Remove, rewrite and shutdown are **not** these eviction events and do
+not contribute. Watermark calls without a stats output do not collect samples.
+
+This is an **eviction-selected cohort exit distribution**, not true age before
+restart, time since the last read, duration since each object's individual
+reconstruction, or a full survival curve. The origin is the shared bounded
+clock's current-run origin used by recovered state initialization. Still-retained
+recovered objects are censored observations, separately exposed by the existing
+retained recovery gauges; evicted-only samples must not predict their lifetime.
+A clean restart rebuilds a fresh cohort and resets runtime counters. Reusing a
+clock in a test is not proof of a fresh process origin. Never add boot offsets
+across restarts or infer per-key cross-restart survival from these aggregates.
+Continuous-restart retention/replay acceptance remains unfinished.
+
+All eight families retain existing slab conventions: legacy emits zero
+histograms, while file omits them. Integer counts/sums merge across disks and
+owner slices using the existing snapshot protocols, without floating cumulative
+subtraction. They have finite uint64 counter range: exact integer accounting is
+conditional on no counter/sum overflow, including Group aggregation; a bounded
+32-bit timestamp alone is not a proof that arbitrary multi-disk sums cannot
+overflow. Existing cumulative-counter reset/wrap caveats apply. Global and
+per-disk snapshots are taken separately; cross-view equality is a quiescent
+invariant, not one atomic multi-disk instant. Each path's histogram count and
+unknown-history count are copied from the same owning snapshot.
+
+No new hot-path clock, lock, atomic, resident field, expiry ring or persistent
+record is introduced. Successful recovered victims add bounded bin arithmetic;
+existing age snapshots, per-call copies/deltas, Store/Group merges and metric
+rendering now carry larger fixed blocks. Disabled RAM/legacy layouts also pay
+shared fixed-type growth. This is nonzero instrumentation cost, not a completed
+heap/RSS/recovery-peak, contention, throughput or p99 budget assessment. Existing
+alerts/dashboards are not switched to the new families.
+
+Measured GCC component sizes for this addition: age statistics 80 to 152 bytes
+(+72), DonorStats 336 to 408, Scan 888 to 960, and watermark output 256 to 328.
+Allocator grows 1104 to 1176 (+72); Store 2800 to 3016 (+216); Stats snapshot
+2080 to 2368 (+288). Existing per-call age-before snapshots also copy 72 more
+bytes, including calls that evict only NEW residents. Options 208, resident
+state 12 and read-class observation 80 bytes are unchanged. These are component
+layouts, not measurements of complete stack frames, heap/RSS or recovery peak.

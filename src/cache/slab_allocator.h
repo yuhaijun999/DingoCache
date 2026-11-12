@@ -177,6 +177,12 @@ class SlabAllocator {
     uint64_t total_sec = 0;  // Sum of max(0, pre-wipe time - anchor).
     // Recovery origin remains unknown even after subsequent real reads.
     uint64_t history_unknown = 0;
+    // Successful recovery-origin victims at the final pre-wipe shared-clock
+    // offset. This is current-boot age, not pre-restart or last-read age.
+    // The bucket sum equals history_unknown; explicit Remove is excluded.
+    std::array<uint64_t, 8> recovered_boot_age_buckets{};
+    // Sum of those same successful victims' current-boot offsets, in seconds.
+    uint64_t recovered_boot_age_total_sec = 0;
   };
   static constexpr std::array<uint32_t, 7> kLifetimeDonorScoreBoundsSec = {
       0, 1, 60, 3600, 86400, 604800, 2592000};

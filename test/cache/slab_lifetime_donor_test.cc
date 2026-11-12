@@ -145,6 +145,11 @@ void ExpectValid(const SlabAllocator& allocator) {
   for (const uint64_t count : stats.score.negative_magnitude_buckets)
     scored += count;
   EXPECT_EQ(scored + stats.unscored_victims, stats.released_residents);
+  uint64_t recovered = 0;
+  for (const uint64_t count : stats.age.recovered_boot_age_buckets) {
+    recovered += count;
+  }
+  EXPECT_EQ(recovered, stats.age.history_unknown);
 }
 
 TEST(SlabLifetimeDonor, ScoreBinsSeparateSignsIncludingZero) {
@@ -295,6 +300,104 @@ TEST(SlabLifetimeDonor, ScoreCountsLargestClockReachableDeficit) {
   ExpectValid(allocator);
 }
 
+TEST(SlabLifetimeDonor, RecoveredBootAgeUsesBoundariesAfterRealRead) {
+  struct Case {
+    uint32_t seconds;
+    size_t bucket;
+  };
+  const std::array<Case, 14> cases = {{{0, 0},
+                                       {1, 1},
+                                       {2, 2},
+                                       {60, 2},
+                                       {61, 3},
+                                       {3600, 3},
+                                       {3601, 4},
+                                       {86400, 4},
+                                       {86401, 5},
+                                       {604800, 5},
+                                       {604801, 6},
+                                       {2592000, 6},
+                                       {2592001, 7},
+                                       {UINT32_MAX, 7}}};
+  for (const Case& test : cases) {
+    SCOPED_TRACE(test.seconds);
+    const DiskLifetimeConfig config = Config();
+    uint64_t seconds = 0;
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                  [&] { return seconds; });
+    SlabAllocator::Options options = Options(config, clock, 4, 1);
+    unsigned wipes = 0;
+    options.on_extent_bind = [&](uint32_t) {
+      ++wipes;
+      seconds += 100;
+      return true;
+    };
+    SlabAllocator allocator(options);
+    ASSERT_TRUE(allocator.RestoreBulk({{Key(1), 4096, 0, 0, 1}}));
+    const DiskLifetimeState state = RecoveredDiskLifetimeState(2);
+    SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(1), 1, &state,
+                                            &config, 0);
+    seconds = test.seconds / 2;
+    ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, Key(1), 1,
+                                                       config, clock),
+              SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+    seconds = test.seconds;
+    std::vector<BlockKey> evicted;
+    ASSERT_EQ(SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted),
+              Result::kBound);
+    EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+    EXPECT_EQ(wipes, 1U);
+    const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+    for (size_t bucket = 0; bucket < 8; ++bucket) {
+      EXPECT_EQ(stats.age.recovered_boot_age_buckets[bucket],
+                bucket == test.bucket ? 1U : 0U);
+    }
+    EXPECT_EQ(stats.age.recovered_boot_age_total_sec, test.seconds);
+    EXPECT_EQ(stats.age.history_unknown, 1U);
+    EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+    EXPECT_EQ(stats.age.total_sec, 0U);
+    ExpectValid(allocator);
+  }
+}
+
+TEST(SlabLifetimeDonor, RecoveredBootAgeUsesFinalRecheckNotReadAnchor) {
+  const DiskLifetimeConfig config = Config();
+  uint64_t seconds = 0;
+  bool advance = false;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&] {
+    const uint64_t sampled = seconds;
+    if (advance) seconds = 20;
+    return sampled;
+  });
+  SlabAllocator::Options options = Options(config, clock, 4, 1);
+  options.on_extent_bind = [&](uint32_t) {
+    seconds = 1000;
+    return true;
+  };
+  SlabAllocator allocator(options);
+  ASSERT_TRUE(allocator.RestoreBulk({{Key(1), 4096, 0, 0, 1}}));
+  const DiskLifetimeState state = RecoveredDiskLifetimeState(2);
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(1), 1, &state,
+                                          &config, 0);
+  seconds = 10;
+  ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, Key(1), 1,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  seconds = 19;
+  advance = true;
+  std::vector<BlockKey> evicted;
+  ASSERT_EQ(SlabAllocatorTestPeer::StealGeneric(allocator, 1, &evicted),
+            Result::kBound);
+  const SlabAllocator::LifetimeDonorStats stats = allocator.DonorStats();
+  EXPECT_EQ(stats.age.recovered_boot_age_buckets,
+            (std::array<uint64_t, 8>{0, 0, 1}));
+  EXPECT_EQ(stats.age.recovered_boot_age_total_sec, 20U);
+  EXPECT_EQ(stats.age.history_unknown, 1U);
+  EXPECT_EQ(stats.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.age.total_sec, 0U);
+  ExpectValid(allocator);
+}
+
 TEST(SlabLifetimeDonor, AgeBinsUsePreWipeTime) {
   struct Case {
     uint32_t age;
@@ -441,6 +544,9 @@ TEST(SlabLifetimeDonor, AgeSeparatesUnknownAndUninitializedHistory) {
   }
   EXPECT_EQ(stats.age.total_sec, 60U);
   EXPECT_EQ(stats.age.history_unknown, 2U);
+  EXPECT_EQ(stats.age.recovered_boot_age_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 2}));
+  EXPECT_EQ(stats.age.recovered_boot_age_total_sec, 200U);
   EXPECT_EQ(stats.unscored_victims, 2U);
   EXPECT_EQ(stats.released_residents, 5U);
   // Known-after-read score50, recovered-unread20, recovered-after-read60.

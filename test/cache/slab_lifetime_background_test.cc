@@ -93,6 +93,61 @@ void Seed(SlabAllocator& allocator, uint64_t id, bool pin = false) {
   }
 }
 
+TEST(SlabLifetimeBackground, RecoveredBootAgeAccumulatesSuccessfulPiecesOnly) {
+  unsigned attempts = 0;
+  SlabAllocator::Options options = Options(4);
+  options.on_slot_evict = [&](const SlabAllocator::SlotRef&) {
+    return ++attempts < 3;
+  };
+  SlabAllocator allocator(options);
+  for (uint64_t id = 1; id <= 3; ++id) {
+    ASSERT_NO_FATAL_FAILURE(Seed(allocator, id));
+  }
+  const DiskLifetimeConfig config;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&] { return seconds; });
+  seconds = 10;
+  ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, Key(1), 1,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  Scan scan(config, clock);
+  SetTickBudget(scan, 8);
+  std::vector<BlockKey> evicted;
+  seconds = 20;
+  const ReclaimResult first = SlabAllocatorTestPeer::ReclaimLifetimeClass(
+      allocator, 0, 4, 1, scan, &evicted);
+  ASSERT_EQ(first.victims, 1U);
+  EXPECT_TRUE(first.more);
+  EXPECT_EQ(scan.age.recovered_boot_age_buckets,
+            (std::array<uint64_t, 8>{0, 0, 1}));
+  EXPECT_EQ(scan.age.recovered_boot_age_total_sec, 20U);
+  seconds = 61;
+  const ReclaimResult second = SlabAllocatorTestPeer::ReclaimLifetimeClass(
+      allocator, 0, 4, 1, scan, &evicted);
+  ASSERT_EQ(second.victims, 1U);
+  EXPECT_TRUE(second.more);
+  EXPECT_EQ(scan.age.recovered_boot_age_buckets,
+            (std::array<uint64_t, 8>{0, 0, 1, 1}));
+  EXPECT_EQ(scan.age.recovered_boot_age_total_sec, 81U);
+  seconds = 100;
+  const ReclaimResult failed = SlabAllocatorTestPeer::ReclaimLifetimeClass(
+      allocator, 0, 4, 1, scan, &evicted);
+  EXPECT_EQ(failed.victims, 0U);
+  EXPECT_FALSE(failed.more);
+  EXPECT_EQ(scan.result, ScanResult::kPersistenceError);
+  EXPECT_EQ(attempts, 3U);
+  EXPECT_EQ(evicted.size(), 2U);
+  EXPECT_EQ(allocator.Count(), 1U);
+  EXPECT_EQ(scan.age.history_unknown, 2U);
+  EXPECT_EQ(scan.age.recovered_boot_age_buckets,
+            (std::array<uint64_t, 8>{0, 0, 1, 1}));
+  EXPECT_EQ(scan.age.recovered_boot_age_total_sec, 81U);
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(scan.age.total_sec, 0U);
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
 TEST(SlabLifetimeBackground, ScoreCallsKeepLargeSumThenSmallPieceIndependent) {
   const uint64_t maximum = std::numeric_limits<int64_t>::max();
   DiskLifetimeConfig config;
@@ -410,6 +465,8 @@ TEST(SlabLifetimeBackground, FinalClockFailureStopsPieceBeforePersistence) {
   EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(scan.age.total_sec, 0U);
   EXPECT_EQ(scan.age.history_unknown, 0U);
+  EXPECT_EQ(scan.age.recovered_boot_age_buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(scan.age.recovered_boot_age_total_sec, 0U);
   EXPECT_EQ(allocator.Count(), 2U);
   EXPECT_TRUE(evicted.empty());
 }
@@ -666,6 +723,57 @@ TEST_F(LifetimeBackgroundStoreTest,
   EXPECT_TRUE(DiskSlabStoreTestPeer::IndexesValid(*store_));
 }
 
+TEST_F(LifetimeBackgroundStoreTest,
+       RecoveredBootAgeKeepsCompletedPieceAfterRealInvalidationFailure) {
+  ASSERT_NO_FATAL_FAILURE(Create(600));
+  ASSERT_NO_FATAL_FAILURE(SeedStore(600));
+  store_.reset();
+  clock_ = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config_), [this] { return seconds_.load(); });
+  ASSERT_NO_FATAL_FAILURE(Create(600));
+  ASSERT_EQ(store_->Count(), 600U);
+  seconds_.store(20);
+  // Real NEW demand after recovery arms headroom; RestoreBulk itself does not
+  // invent PUT activity. These class evictions remain a separate cohort.
+  for (uint64_t id = 601; id <= 728; ++id) {
+    ASSERT_EQ(store_->Cache(Key(id), "new", 3), Status::kOk);
+  }
+  ASSERT_EQ(store_->GetStats().lifetime_class_victims, 128U);
+  seconds_.store(61);
+  unsigned yields = 0;
+  DiskSlabStoreTestPeer::YieldHook(*store_, [&] {
+    const DiskSlabStore::Stats completed = store_->GetStats();
+    EXPECT_EQ(completed.lifetime_background_victims, 128U);
+    EXPECT_EQ(completed.lifetime_background_age.history_unknown, 128U);
+    EXPECT_EQ(completed.lifetime_background_age.recovered_boot_age_buckets,
+              (std::array<uint64_t, 8>{0, 0, 0, 128}));
+    EXPECT_EQ(completed.lifetime_background_age.recovered_boot_age_total_sec,
+              7808U);
+    DiskSlabStoreTestPeer::FailInvalidation(*store_);
+    ++yields;
+  });
+  DiskSlabStoreTestPeer::Tick(*store_, 256);
+  const DiskSlabStore::Stats stats = store_->GetStats();
+  EXPECT_EQ(yields, 1U);
+  EXPECT_FALSE(store_->Healthy());
+  EXPECT_EQ(stats.lifetime_background_victims, 128U);
+  EXPECT_EQ(stats.lifetime_background_age.history_unknown, 128U);
+  EXPECT_EQ(stats.lifetime_background_age.recovered_boot_age_buckets,
+            (std::array<uint64_t, 8>{0, 0, 0, 128}));
+  EXPECT_EQ(stats.lifetime_background_age.recovered_boot_age_total_sec, 7808U);
+  EXPECT_EQ(stats.lifetime_background_age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(stats.lifetime_background_age.total_sec, 0U);
+  EXPECT_EQ(stats.lifetime_class_victims, 128U);
+  EXPECT_EQ(stats.lifetime_class_age.history_unknown, 128U);
+  EXPECT_EQ(stats.lifetime_class_age.recovered_boot_age_buckets,
+            (std::array<uint64_t, 8>{0, 0, 128}));
+  EXPECT_EQ(stats.lifetime_class_age.recovered_boot_age_total_sec, 2560U);
+  EXPECT_EQ(stats.committed_objects, 472U);
+  EXPECT_EQ(store_->Count(), 472U);
+  EXPECT_GT(stats.metadata_io_errors, 0U);
+  EXPECT_TRUE(DiskSlabStoreTestPeer::IndexesValid(*store_));
+}
+
 TEST_F(LifetimeBackgroundStoreTest, HardClockStopsOnlyUnstartedPieces) {
   ASSERT_NO_FATAL_FAILURE(Create(600));
   ASSERT_NO_FATAL_FAILURE(SeedStore(600));
@@ -726,6 +834,12 @@ TEST_F(LifetimeBackgroundStoreTest,
       aged += count;
     }
     EXPECT_EQ(aged, stats.lifetime_background_victims);
+    uint64_t recovered = 0;
+    for (const uint64_t count :
+         stats.lifetime_background_age.recovered_boot_age_buckets) {
+      recovered += count;
+    }
+    EXPECT_EQ(recovered, stats.lifetime_background_age.history_unknown);
     uint64_t scored = 0;
     for (const uint64_t count :
          stats.lifetime_background_score.nonnegative_buckets) {
@@ -784,6 +898,10 @@ TEST_F(LifetimeBackgroundStoreTest, ActualBackgroundThreadReclaimsAndJoins) {
             concurrent.lifetime_background_victims);
   EXPECT_EQ(concurrent.lifetime_background_age.total_sec, 0U);
   EXPECT_EQ(concurrent.lifetime_background_age.history_unknown, 0U);
+  EXPECT_EQ(concurrent.lifetime_background_age.recovered_boot_age_buckets,
+            (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(concurrent.lifetime_background_age.recovered_boot_age_total_sec,
+            0U);
   EXPECT_EQ(concurrent.lifetime_background_score.nonnegative_buckets[6],
             concurrent.lifetime_background_victims);
   EXPECT_DOUBLE_EQ(

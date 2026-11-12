@@ -305,6 +305,100 @@ TEST(SlabLifetimeEviction, PutCallScoresResetWithoutLosingSmallFollowingValue) {
   EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{1, 1}));
 }
 
+TEST(SlabLifetimeEviction, RecoveredBootAgeUsesFixedDisplayBoundaries) {
+  struct Case {
+    uint32_t seconds;
+    size_t bucket;
+  };
+  const std::array<Case, 14> cases = {{{0, 0},
+                                       {1, 1},
+                                       {2, 2},
+                                       {60, 2},
+                                       {61, 3},
+                                       {3600, 3},
+                                       {3601, 4},
+                                       {86400, 4},
+                                       {86401, 5},
+                                       {604800, 5},
+                                       {604801, 6},
+                                       {2592000, 6},
+                                       {2592001, 7},
+                                       {UINT32_MAX, 7}}};
+  for (const Case& test : cases) {
+    SCOPED_TRACE(test.seconds);
+    const DiskLifetimeConfig config;
+    uint64_t seconds = 0;
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                  [&] { return seconds; });
+    SlabAllocator allocator(AllocatorOptions(2));
+    const DiskLifetimeState state = RecoveredDiskLifetimeState(2);
+    ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 1, &state));
+    seconds = test.seconds;
+    Scan scan(config, clock);
+    std::vector<BlockKey> evicted;
+    bool denied = false;
+    ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                         &evicted, &denied));
+    EXPECT_FALSE(denied);
+    EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+    for (size_t bucket = 0; bucket < 8; ++bucket) {
+      EXPECT_EQ(scan.age.recovered_boot_age_buckets[bucket],
+                bucket == test.bucket ? 1U : 0U);
+    }
+    EXPECT_EQ(scan.age.recovered_boot_age_total_sec, test.seconds);
+    EXPECT_EQ(scan.age.history_unknown, 1U);
+    EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
+    EXPECT_EQ(scan.age.total_sec, 0U);
+    EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+  }
+}
+
+TEST(SlabLifetimeEviction, RecoveredBootAgeUsesFinalTimeNotRefreshedAnchor) {
+  const DiskLifetimeConfig config;
+  bool armed = false;
+  unsigned samples = 0;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&] {
+    const uint64_t sampled = seconds;
+    if (armed) {
+      ++samples;
+      seconds = 20;
+    }
+    return sampled;
+  });
+  unsigned writes = 0;
+  SlabAllocator::Options options = AllocatorOptions(2);
+  options.on_slot_evict = [&](const SlabAllocator::SlotRef&) {
+    ++writes;
+    seconds = 1000;
+    return true;
+  };
+  SlabAllocator allocator(options);
+  const DiskLifetimeState state = RecoveredDiskLifetimeState(2);
+  ASSERT_NO_FATAL_FAILURE(AddResident(allocator, 1, &state));
+  seconds = 10;
+  ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, Key(1), 1,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  seconds = 19;
+  armed = true;
+  Scan scan(config, clock);
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                       &evicted, &denied));
+  EXPECT_FALSE(denied);
+  EXPECT_EQ(evicted, std::vector<BlockKey>{Key(1)});
+  EXPECT_EQ(samples, 2U);
+  EXPECT_EQ(writes, 1U);
+  EXPECT_EQ(scan.age.recovered_boot_age_buckets,
+            (std::array<uint64_t, 8>{0, 0, 1}));
+  EXPECT_EQ(scan.age.recovered_boot_age_total_sec, 20U);
+  EXPECT_EQ(scan.age.history_unknown, 1U);
+  EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
+  EXPECT_EQ(scan.age.total_sec, 0U);
+}
+
 TEST(SlabLifetimeEviction, AgeUsesFixedDisplayBoundaries) {
   struct Case {
     uint32_t seconds;
@@ -346,6 +440,8 @@ TEST(SlabLifetimeEviction, AgeUsesFixedDisplayBoundaries) {
     }
     EXPECT_EQ(scan.age.total_sec, test.seconds);
     EXPECT_EQ(scan.age.history_unknown, 0U);
+    EXPECT_EQ(scan.age.recovered_boot_age_buckets, (std::array<uint64_t, 8>{}));
+    EXPECT_EQ(scan.age.recovered_boot_age_total_sec, 0U);
     EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
   }
 }
@@ -435,6 +531,9 @@ TEST(SlabLifetimeEviction, AgeExcludesRecoveredHistoryAfterRealRead) {
   EXPECT_EQ(scan.age.buckets, (std::array<uint64_t, 8>{}));
   EXPECT_EQ(scan.age.total_sec, 0U);
   EXPECT_EQ(scan.age.history_unknown, 2U);
+  EXPECT_EQ(scan.age.recovered_boot_age_buckets,
+            (std::array<uint64_t, 8>{0, 0, 2}));
+  EXPECT_EQ(scan.age.recovered_boot_age_total_sec, 40U);
   // Valid scores include recovered residents even though their ages are
   // unknown.
   EXPECT_EQ(scan.score.nonnegative_buckets,
@@ -998,6 +1097,9 @@ TEST_F(LifetimeClassStoreTest, ScalarDirectAndBatchReclaimTheCheckedResident) {
     EXPECT_EQ(stats.lifetime_class_age.buckets, (std::array<uint64_t, 8>{1}));
     EXPECT_EQ(stats.lifetime_class_age.total_sec, 0U);
     EXPECT_EQ(stats.lifetime_class_age.history_unknown, 0U);
+    EXPECT_EQ(stats.lifetime_class_age.recovered_boot_age_buckets,
+              (std::array<uint64_t, 8>{}));
+    EXPECT_EQ(stats.lifetime_class_age.recovered_boot_age_total_sec, 0U);
     EXPECT_EQ(stats.lifetime_class_score.nonnegative_buckets,
               (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 1}));
     EXPECT_DOUBLE_EQ(stats.lifetime_class_score.nonnegative_total_sec, 1814400);
@@ -1172,6 +1274,9 @@ TEST_F(LifetimeClassStoreTest, FailedNewWriteRetainsSuccessfulEvictionBytes) {
               (std::array<uint64_t, 8>{0, 0, 0, 1}));
     EXPECT_EQ(stats.lifetime_class_age.total_sec, 61U);
     EXPECT_EQ(stats.lifetime_class_age.history_unknown, 0U);
+    EXPECT_EQ(stats.lifetime_class_age.recovered_boot_age_buckets,
+              (std::array<uint64_t, 8>{}));
+    EXPECT_EQ(stats.lifetime_class_age.recovered_boot_age_total_sec, 0U);
     EXPECT_EQ(stats.lifetime_class_score.nonnegative_buckets,
               (std::array<uint64_t, 8>{0, 0, 0, 0, 0, 0, 1}));
     EXPECT_DOUBLE_EQ(stats.lifetime_class_score.nonnegative_total_sec, 1814385);

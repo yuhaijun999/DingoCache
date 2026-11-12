@@ -640,6 +640,28 @@ std::string KvNodeServer::MetricsText() const {
           s += name + "_count" + braces(labels) + " " + std::to_string(count) +
                "\n";
         };
+    header("dfkv_slab_disk_lifetime_class_recovered_boot_age_seconds",
+           "histogram",
+           "Successful recovered victim pre-wipe ages in the current boot");
+    header("dfkv_slab_lifetime_class_recovered_boot_age_seconds", "histogram",
+           "Successful recovered victim pre-wipe ages in the current boot");
+    header("dfkv_slab_disk_lifetime_background_recovered_boot_age_seconds",
+           "histogram",
+           "Successful recovered victim pre-wipe ages in the current boot");
+    header("dfkv_slab_lifetime_background_recovered_boot_age_seconds",
+           "histogram",
+           "Successful recovered victim pre-wipe ages in the current boot");
+    header("dfkv_slab_disk_lifetime_watermark_recovered_boot_age_seconds",
+           "histogram",
+           "Successful recovered victim pre-wipe ages in the current boot");
+    header("dfkv_slab_lifetime_watermark_recovered_boot_age_seconds",
+           "histogram",
+           "Successful recovered victim pre-wipe ages in the current boot");
+    header("dfkv_slab_disk_lifetime_donor_recovered_boot_age_seconds",
+           "histogram",
+           "Successful recovered victim pre-wipe ages in the current boot");
+    header("dfkv_slab_lifetime_donor_recovered_boot_age_seconds", "histogram",
+           "Successful recovered victim pre-wipe ages in the current boot");
     header("dfkv_slab_disk_lifetime_donor_score_nonnegative_seconds",
            "histogram",
            "Nonnegative scores of successful donor releases at pre-wipe time");
@@ -1100,6 +1122,12 @@ std::string KvNodeServer::MetricsText() const {
                       disk.lifetime_watermark_age.buckets,
                       std::to_string(disk.lifetime_watermark_age.total_sec),
                       SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
+      donor_histogram(
+          "dfkv_slab_disk_lifetime_watermark_recovered_boot_age_seconds",
+          disk.lifetime_watermark_age.recovered_boot_age_buckets,
+          std::to_string(
+              disk.lifetime_watermark_age.recovered_boot_age_total_sec),
+          SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
       sample("dfkv_slab_disk_lifetime_watermark_age_history_unknown_total",
              disk.lifetime_watermark_age.history_unknown);
       donor_histogram(
@@ -1139,18 +1167,34 @@ std::string KvNodeServer::MetricsText() const {
                       disk.lifetime_class_age.buckets,
                       std::to_string(disk.lifetime_class_age.total_sec),
                       SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
+      donor_histogram(
+          "dfkv_slab_disk_lifetime_class_recovered_boot_age_seconds",
+          disk.lifetime_class_age.recovered_boot_age_buckets,
+          std::to_string(disk.lifetime_class_age.recovered_boot_age_total_sec),
+          SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
       sample("dfkv_slab_disk_lifetime_class_age_history_unknown_total",
              disk.lifetime_class_age.history_unknown);
       donor_histogram("dfkv_slab_disk_lifetime_background_age_seconds",
                       disk.lifetime_background_age.buckets,
                       std::to_string(disk.lifetime_background_age.total_sec),
                       SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
+      donor_histogram(
+          "dfkv_slab_disk_lifetime_background_recovered_boot_age_seconds",
+          disk.lifetime_background_age.recovered_boot_age_buckets,
+          std::to_string(
+              disk.lifetime_background_age.recovered_boot_age_total_sec),
+          SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
       sample("dfkv_slab_disk_lifetime_background_age_history_unknown_total",
              disk.lifetime_background_age.history_unknown);
       donor_histogram("dfkv_slab_disk_lifetime_donor_age_seconds",
                       disk.lifetime_donor_age.buckets,
                       std::to_string(disk.lifetime_donor_age.total_sec),
                       SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
+      donor_histogram(
+          "dfkv_slab_disk_lifetime_donor_recovered_boot_age_seconds",
+          disk.lifetime_donor_age.recovered_boot_age_buckets,
+          std::to_string(disk.lifetime_donor_age.recovered_boot_age_total_sec),
+          SlabAllocator::kLifetimeDonorAgeBoundsSec, labels);
       donor_histogram(
           "dfkv_slab_disk_lifetime_donor_score_nonnegative_seconds",
           disk.lifetime_donor_score.nonnegative_buckets,
@@ -1395,6 +1439,11 @@ std::string KvNodeServer::MetricsText() const {
                     ss.lifetime_watermark_age.buckets,
                     std::to_string(ss.lifetime_watermark_age.total_sec),
                     SlabAllocator::kLifetimeDonorAgeBoundsSec, "");
+    donor_histogram(
+        "dfkv_slab_lifetime_watermark_recovered_boot_age_seconds",
+        ss.lifetime_watermark_age.recovered_boot_age_buckets,
+        std::to_string(ss.lifetime_watermark_age.recovered_boot_age_total_sec),
+        SlabAllocator::kLifetimeDonorAgeBoundsSec, "");
     metric("dfkv_slab_lifetime_watermark_age_history_unknown_total", "counter",
            "Successful watermark victims with unknown recovered history",
            ss.lifetime_watermark_age.history_unknown);
@@ -1434,6 +1483,11 @@ std::string KvNodeServer::MetricsText() const {
                     ss.lifetime_class_age.buckets,
                     std::to_string(ss.lifetime_class_age.total_sec),
                     SlabAllocator::kLifetimeDonorAgeBoundsSec, "");
+    donor_histogram(
+        "dfkv_slab_lifetime_class_recovered_boot_age_seconds",
+        ss.lifetime_class_age.recovered_boot_age_buckets,
+        std::to_string(ss.lifetime_class_age.recovered_boot_age_total_sec),
+        SlabAllocator::kLifetimeDonorAgeBoundsSec, "");
     metric("dfkv_slab_lifetime_class_age_history_unknown_total", "counter",
            "Successful class victims with unknown recovered history",
            ss.lifetime_class_age.history_unknown);
@@ -1441,6 +1495,11 @@ std::string KvNodeServer::MetricsText() const {
                     ss.lifetime_background_age.buckets,
                     std::to_string(ss.lifetime_background_age.total_sec),
                     SlabAllocator::kLifetimeDonorAgeBoundsSec, "");
+    donor_histogram(
+        "dfkv_slab_lifetime_background_recovered_boot_age_seconds",
+        ss.lifetime_background_age.recovered_boot_age_buckets,
+        std::to_string(ss.lifetime_background_age.recovered_boot_age_total_sec),
+        SlabAllocator::kLifetimeDonorAgeBoundsSec, "");
     metric("dfkv_slab_lifetime_background_age_history_unknown_total", "counter",
            "Successful background victims with unknown recovered history",
            ss.lifetime_background_age.history_unknown);
@@ -1448,6 +1507,11 @@ std::string KvNodeServer::MetricsText() const {
                     ss.lifetime_donor_age.buckets,
                     std::to_string(ss.lifetime_donor_age.total_sec),
                     SlabAllocator::kLifetimeDonorAgeBoundsSec, "");
+    donor_histogram(
+        "dfkv_slab_lifetime_donor_recovered_boot_age_seconds",
+        ss.lifetime_donor_age.recovered_boot_age_buckets,
+        std::to_string(ss.lifetime_donor_age.recovered_boot_age_total_sec),
+        SlabAllocator::kLifetimeDonorAgeBoundsSec, "");
     donor_histogram(
         "dfkv_slab_lifetime_donor_score_nonnegative_seconds",
         ss.lifetime_donor_score.nonnegative_buckets,

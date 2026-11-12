@@ -1679,10 +1679,16 @@ DiskWriteResult DiskSlabStore::AllocateForPutLocked(
       for (size_t bucket = 0; bucket < age.buckets.size(); ++bucket) {
         lifetime_class_age_.buckets[bucket] +=
             completed.age.buckets[bucket] - age.buckets[bucket];
+        lifetime_class_age_.recovered_boot_age_buckets[bucket] +=
+            completed.age.recovered_boot_age_buckets[bucket] -
+            age.recovered_boot_age_buckets[bucket];
       }
       lifetime_class_age_.total_sec += completed.age.total_sec - age.total_sec;
       lifetime_class_age_.history_unknown +=
           completed.age.history_unknown - age.history_unknown;
+      lifetime_class_age_.recovered_boot_age_total_sec +=
+          completed.age.recovered_boot_age_total_sec -
+          age.recovered_boot_age_total_sec;
       // Score is per allocator call, unlike cumulative age. Never subtract
       // floating cumulative totals: a huge earlier piece can erase small ones.
       for (size_t bucket = 0;
@@ -2607,10 +2613,16 @@ bool DiskSlabStore::ReclaimLifetimeClass(size_t cls_index, size_t target_free,
     for (size_t bucket = 0; bucket < age.buckets.size(); ++bucket) {
       lifetime_background_age_.buckets[bucket] +=
           scan.age.buckets[bucket] - age.buckets[bucket];
+      lifetime_background_age_.recovered_boot_age_buckets[bucket] +=
+          scan.age.recovered_boot_age_buckets[bucket] -
+          age.recovered_boot_age_buckets[bucket];
     }
     lifetime_background_age_.total_sec += scan.age.total_sec - age.total_sec;
     lifetime_background_age_.history_unknown +=
         scan.age.history_unknown - age.history_unknown;
+    lifetime_background_age_.recovered_boot_age_total_sec +=
+        scan.age.recovered_boot_age_total_sec -
+        age.recovered_boot_age_total_sec;
     // Score is per allocator call, unlike cumulative age. Never subtract
     // floating cumulative totals: a huge earlier piece can erase small ones.
     for (size_t bucket = 0; bucket < scan.score.nonnegative_buckets.size();
@@ -2790,9 +2802,13 @@ void DiskSlabStore::ReclaimTick(
         lifetime_watermark_protected_victims_ += stats.protected_victims;
         for (size_t bucket = 0; bucket < stats.age.buckets.size(); ++bucket) {
           lifetime_watermark_age_.buckets[bucket] += stats.age.buckets[bucket];
+          lifetime_watermark_age_.recovered_boot_age_buckets[bucket] +=
+              stats.age.recovered_boot_age_buckets[bucket];
         }
         lifetime_watermark_age_.total_sec += stats.age.total_sec;
         lifetime_watermark_age_.history_unknown += stats.age.history_unknown;
+        lifetime_watermark_age_.recovered_boot_age_total_sec +=
+            stats.age.recovered_boot_age_total_sec;
         for (size_t bucket = 0; bucket < stats.score.nonnegative_buckets.size();
              ++bucket) {
           lifetime_watermark_score_.nonnegative_buckets[bucket] +=

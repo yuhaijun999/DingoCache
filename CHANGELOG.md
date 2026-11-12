@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export recovery-origin eviction boot ages across foreground, background,
+  watermark and donor paths. Reuse final pre-wipe timestamps without treating
+  current-run tenure as pre-restart history or a complete survival curve.
+
 - Export per-disk logical read-class estimates with availability, sampled time,
   bounded expiry resolution and R-ring backing bytes. Omit unavailable
   populations rather than presenting them as empty caches.

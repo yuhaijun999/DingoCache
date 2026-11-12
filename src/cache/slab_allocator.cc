@@ -1145,6 +1145,11 @@ bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
     // recovery history unknown even if a real read refreshed its anchor.
     if (history_unknown) {
       ++scan.age.history_unknown;
+      const std::array<uint32_t, 7>& bounds = kLifetimeDonorAgeBoundsSec;
+      const size_t bucket = static_cast<size_t>(
+          std::lower_bound(bounds.begin(), bounds.end(), now) - bounds.begin());
+      ++scan.age.recovered_boot_age_buckets[bucket];
+      scan.age.recovered_boot_age_total_sec += now;
     } else {
       const std::array<uint32_t, 7>& bounds = kLifetimeDonorAgeBoundsSec;
       const size_t bucket = static_cast<size_t>(
@@ -1452,6 +1457,12 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
         LifetimeDonorAgeStats& age = lifetime_donor_stats_.age;
         if (state->history_unknown) {
           ++age.history_unknown;
+          const std::array<uint32_t, 7>& bounds = kLifetimeDonorAgeBoundsSec;
+          const size_t bucket = static_cast<size_t>(
+              std::lower_bound(bounds.begin(), bounds.end(), lifetime_now) -
+              bounds.begin());
+          ++age.recovered_boot_age_buckets[bucket];
+          age.recovered_boot_age_total_sec += lifetime_now;
         } else {
           const uint32_t age_sec =
               lifetime_now >= state->anchor ? lifetime_now - state->anchor : 0;
@@ -1971,6 +1982,12 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
       LifetimeDonorAgeStats& age = stats->age;
       if (history_unknown) {
         ++age.history_unknown;
+        const std::array<uint32_t, 7>& bounds = kLifetimeDonorAgeBoundsSec;
+        const size_t bucket = static_cast<size_t>(
+            std::lower_bound(bounds.begin(), bounds.end(), now) -
+            bounds.begin());
+        ++age.recovered_boot_age_buckets[bucket];
+        age.recovered_boot_age_total_sec += now;
       } else {
         const std::array<uint32_t, 7>& bounds = kLifetimeDonorAgeBoundsSec;
         const size_t bucket = static_cast<size_t>(
