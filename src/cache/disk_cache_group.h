@@ -227,6 +227,10 @@ class DiskCacheGroup {
   // Metrics-only bucket view; file/out-of-range views are unavailable.
   SlabAllocator::LifetimeBucketObservation DiskLifetimeBucketObservation(
       size_t i) const;
+  // Per-disk metrics-only estimate; file/out-of-range views are unavailable.
+  // Different disks are sampled separately, not at one global snapshot time.
+  SlabAllocator::LifetimeReadClassObservation DiskLifetimeReadClassObservation(
+      size_t i) const;
   uint64_t TenantUsedBytes(uint64_t tenant_hash) const;
   uint64_t TenantDefaultQuotaBytes() const { return tenant_default_quota_bytes_; }
   uint64_t TenantQuotaBytes(uint64_t tenant_hash) const {

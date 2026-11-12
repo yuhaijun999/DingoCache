@@ -2825,6 +2825,253 @@ TEST(Metrics, LifetimeBucketGaugesIncludeEmptyExtentsAndRetainedCapacity) {
   fs::remove_all(dir);
 }
 
+TEST(Metrics, LifetimeReadClassGaugesTrackReadsExpiryAndRecovery) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  DiskLifetimeConfig config = BucketMetricConfig();
+  config.max_reads = 1;  // Logical actual-read classes do not cap at MAX_READS.
+  std::atomic<uint64_t> seconds{0};
+  const fs::path dir = fs::temp_directory_path() / "dfkv_metrics_read_classes";
+  fs::remove_all(dir);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(dir / "a").string(), (dir / "b").string()};
+  options.capacity_bytes = 4ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  options.lifetime_config = config;
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config), [&] { return seconds.load(); });
+  std::unique_ptr<KvNodeServer> server =
+      std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  std::vector<BlockKey> keys[2];
+  for (uint64_t id = 1; id < 10000 && (keys[0].size() < 4 || keys[1].empty());
+       ++id) {
+    const BlockKey key{id, 0};
+    const size_t disk = DiskCacheGroupTestPeer::RouteIndex(
+        KvNodeServerTestPeer::Group(*server), key);
+    ASSERT_LT(disk, 2U);
+    if ((disk == 0 && keys[0].size() < 4) || (disk == 1 && keys[1].empty())) {
+      keys[disk].push_back(key);
+    }
+  }
+  ASSERT_EQ(keys[0].size(), 4U);
+  ASSERT_EQ(keys[1].size(), 1U);
+  const std::array<const char*, 5> names = {
+      "unread", "read_within_new_write_window",
+      "read_once_outside_new_write_window",
+      "read_twice_outside_new_write_window",
+      "read_three_or_more_outside_new_write_window"};
+  const auto expect_counts = [&](const std::array<uint64_t, 5>& disk0,
+                                 const std::array<uint64_t, 5>& disk1) {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server);
+    const std::string text = server->MetricsText();
+    for (size_t disk = 0; disk < 2; ++disk) {
+      const std::array<uint64_t, 5>& expected = disk == 0 ? disk0 : disk1;
+      const SlabAllocator::LifetimeReadClassObservation observation =
+          group.DiskLifetimeReadClassObservation(disk);
+      EXPECT_TRUE(observation.available);
+      EXPECT_EQ(observation.resident_estimates, expected);
+      EXPECT_EQ(observation.sampled_at_sec, seconds.load());
+      EXPECT_EQ(observation.expiry_quantum_sec, 2U);
+      EXPECT_EQ(observation.expiry_lag_bound_sec, 1U);
+      EXPECT_EQ(observation.ring_bytes, 8U * 32U);
+      const std::string labels = "disk=\"" + options.cache_dirs[disk] +
+                                 "\",disk_index=\"" + std::to_string(disk) +
+                                 "\"";
+      for (const std::pair<const char*, uint64_t>& fact :
+           {std::pair<const char*, uint64_t>{"available", 1},
+            {"sampled_at_sec", seconds.load()},
+            {"expiry_quantum_sec", 2},
+            {"expiry_lag_bound_sec", 1},
+            {"ring_bytes", 8U * 32U}}) {
+        EXPECT_NE(text.find("\ndfkv_slab_disk_lifetime_read_class_" +
+                            std::string(fact.first) + "{" + labels + "} " +
+                            std::to_string(fact.second) + "\n"),
+                  std::string::npos);
+      }
+      for (size_t index = 0; index < names.size(); ++index) {
+        EXPECT_NE(
+            text.find(
+                "\ndfkv_slab_disk_lifetime_read_class_resident_estimate{" +
+                labels + ",read_class=\"" + names[index] + "\"} " +
+                std::to_string(expected[index]) + "\n"),
+            std::string::npos);
+      }
+    }
+    for (const char* suffix :
+         {"resident_estimate", "available", "sampled_at_sec",
+          "expiry_quantum_sec", "expiry_lag_bound_sec", "ring_bytes"}) {
+      EXPECT_NE(text.find("# TYPE dfkv_slab_disk_lifetime_read_class_" +
+                          std::string(suffix) + " gauge\n"),
+                std::string::npos);
+    }
+    // Independent per-disk snapshots must not masquerade as one global sample.
+    EXPECT_EQ(text.find("dfkv_slab_lifetime_read_class_"), std::string::npos);
+    EXPECT_FALSE(
+        group.DiskLifetimeReadClassObservation(group.DiskCount()).available);
+  };
+  ASSERT_NO_FATAL_FAILURE(expect_counts({0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}));
+  for (const std::vector<BlockKey>& disk_keys : keys) {
+    for (const BlockKey& key : disk_keys) {
+      ASSERT_EQ(KvNodeServerTestPeer::Group(*server).Cache(key, "value", 5),
+                Status::kOk);
+    }
+  }
+  ASSERT_NO_FATAL_FAILURE(expect_counts({4, 0, 0, 0, 0}, {1, 0, 0, 0, 0}));
+  const auto read = [&](const BlockKey& key, unsigned int count) {
+    for (unsigned int i = 0; i < count; ++i) {
+      std::string value;
+      ASSERT_EQ(
+          server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                       key, 0, 0, nullptr, 0, &value),
+          Status::kOk);
+      EXPECT_EQ(value, "value");
+    }
+  };
+  seconds =
+      8;  // Inclusive original-PUT window, independent of first-read bonus.
+  ASSERT_NO_FATAL_FAILURE(read(keys[0][1], 1));
+  ASSERT_NO_FATAL_FAILURE(read(keys[0][2], 2));
+  ASSERT_NO_FATAL_FAILURE(read(keys[0][3], 5));
+  ASSERT_NO_FATAL_FAILURE(read(keys[1][0], 1));
+  ASSERT_NO_FATAL_FAILURE(expect_counts({1, 3, 0, 0, 0}, {0, 1, 0, 0, 0}));
+  seconds = 9;  // Exact R expiry is rounded to Q=2, hence one second of lag.
+  ASSERT_NO_FATAL_FAILURE(expect_counts({1, 3, 0, 0, 0}, {0, 1, 0, 0, 0}));
+  seconds = 10;  // No GET is needed to expose O1/O2/O3+ at rounded expiry.
+  ASSERT_NO_FATAL_FAILURE(expect_counts({1, 0, 1, 1, 1}, {0, 0, 1, 0, 0}));
+  ReadLease lease;
+  DiskSlabStore& disk1 =
+      DiskCacheGroupTestPeer::Slab(KvNodeServerTestPeer::Group(*server), 1);
+  ASSERT_EQ(disk1.RangeDirectPrep(keys[1][0], 0, 0, 4096, &lease), Status::kOk);
+  ASSERT_EQ(disk1.Remove(keys[1][0]), Status::kOk);
+  EXPECT_FALSE(disk1.IsCached(keys[1][0]));
+  ASSERT_NO_FATAL_FAILURE(expect_counts({1, 0, 1, 1, 1}, {0, 0, 1, 0, 0}));
+  lease = ReadLease{};
+  ASSERT_TRUE(disk1.Healthy());
+  ASSERT_NO_FATAL_FAILURE(expect_counts({1, 0, 1, 1, 1}, {0, 0, 0, 0, 0}));
+  server.reset();
+  seconds = 0;
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config), [&] { return seconds.load(); });
+  server = std::make_unique<KvNodeServer>(options);
+  ASSERT_TRUE(server->Healthy());
+  ASSERT_EQ(server->Count(), 4U);
+  ASSERT_NO_FATAL_FAILURE(expect_counts({4, 0, 0, 0, 0}, {0, 0, 0, 0, 0}));
+  ASSERT_NO_FATAL_FAILURE(read(keys[0][3], 1));
+  // Recovery's virtual scoring reads never turn into R or actual O3+ reads.
+  ASSERT_NO_FATAL_FAILURE(expect_counts({3, 0, 1, 0, 0}, {0, 0, 0, 0, 0}));
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(Metrics, LifetimeReadClassGaugesOmitUnavailablePopulationAndTime) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const DiskLifetimeConfig config = BucketMetricConfig();
+  std::atomic<uint64_t> seconds{0};
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_metrics_read_class_hard";
+  fs::remove_all(dir);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {dir.string()};
+  options.capacity_bytes = 2ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  options.lifetime_config = config;
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config), [&] { return seconds.load(); });
+  {
+    KvNodeServer server(options);
+    ASSERT_TRUE(server.Healthy());
+    ASSERT_EQ(KvNodeServerTestPeer::Group(server).Cache({1, 0}, "value", 5),
+              Status::kOk);
+    const std::string labels =
+        "{disk=\"" + dir.string() + R"(",disk_index="0"} )";
+    seconds = static_cast<uint64_t>(UINT32_MAX) + 1;
+    for (const uint64_t now : {seconds.load(), uint64_t{0}}) {
+      seconds = now;
+      const std::string text = server.MetricsText();
+      EXPECT_NE(text.find("\ndfkv_slab_disk_lifetime_read_class_available" +
+                          labels + "0\n"),
+                std::string::npos);
+      for (const std::pair<const char*, uint64_t>& fact :
+           {std::pair<const char*, uint64_t>{"expiry_quantum_sec", 2},
+            {"expiry_lag_bound_sec", 1},
+            {"ring_bytes", 8U * 32U}}) {
+        EXPECT_NE(text.find("\ndfkv_slab_disk_lifetime_read_class_" +
+                            std::string(fact.first) + labels +
+                            std::to_string(fact.second) + "\n"),
+                  std::string::npos);
+      }
+      EXPECT_EQ(
+          text.find("\ndfkv_slab_disk_lifetime_read_class_resident_estimate{"),
+          std::string::npos);
+      EXPECT_EQ(
+          text.find("\ndfkv_slab_disk_lifetime_read_class_sampled_at_sec{"),
+          std::string::npos);
+      const SlabAllocator::LifetimeReadClassObservation observation =
+          KvNodeServerTestPeer::Group(server).DiskLifetimeReadClassObservation(
+              0);
+      EXPECT_FALSE(observation.available);
+      EXPECT_EQ(observation.ring_bytes, 8U * 32U);
+      EXPECT_EQ(server.Count(), 1U);
+      EXPECT_TRUE(server.Healthy());
+    }
+  }
+  fs::remove_all(dir);
+}
+
+TEST(Metrics, LifetimeReadClassGaugesDistinguishLegacyFromFileEngine) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_metrics_read_class_off";
+  fs::remove_all(dir);
+  for (const char* engine : {"slab", "file"}) {
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {(dir / engine).string()};
+    options.capacity_bytes = 2ULL << 30;
+    options.engine = engine;
+    options.eviction_policy = "legacy";
+    KvNodeServer server(options);
+    ASSERT_TRUE(server.Healthy());
+    ASSERT_EQ(KvNodeServerTestPeer::Group(server).Cache({1, 0}, "value", 5),
+              Status::kOk);
+    const std::string text = server.MetricsText();
+    const SlabAllocator::LifetimeReadClassObservation observation =
+        KvNodeServerTestPeer::Group(server).DiskLifetimeReadClassObservation(0);
+    EXPECT_FALSE(observation.available);
+    EXPECT_EQ(observation.ring_bytes, 0U);
+    if (std::string(engine) == "file") {
+      EXPECT_EQ(text.find("dfkv_slab_disk_lifetime_read_class_"),
+                std::string::npos);
+    } else {
+      const std::string labels =
+          "{disk=\"" + options.cache_dirs[0] + R"(",disk_index="0"} )";
+      for (const char* suffix : {"available", "expiry_quantum_sec",
+                                 "expiry_lag_bound_sec", "ring_bytes"}) {
+        EXPECT_NE(text.find("\ndfkv_slab_disk_lifetime_read_class_" +
+                            std::string(suffix) + labels + "0\n"),
+                  std::string::npos);
+      }
+      EXPECT_EQ(
+          text.find("\ndfkv_slab_disk_lifetime_read_class_resident_estimate{"),
+          std::string::npos);
+      EXPECT_EQ(
+          text.find("\ndfkv_slab_disk_lifetime_read_class_sampled_at_sec{"),
+          std::string::npos);
+    }
+  }
+  fs::remove_all(dir);
+}
+
 TEST(Metrics, LifetimeBucketEstimateTracksExpiryRetentionAndRecovery) {
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
   const ScopedEnv coalesce("DFKV_READ_COALESCE", "0");
@@ -3003,7 +3250,7 @@ TEST(Metrics, LifetimeBucketEstimateOmitsUnknownAcrossClockBoundaries) {
   options.lifetime_clock =
       std::make_shared<DiskLifetimeClock>(DiskLifetimeHorizon(config), [&] {
         if (cross_hard.load())
-          return samples.fetch_add(1) == 0 ? maximum : maximum + 1;
+          return samples.fetch_add(1) < 2 ? maximum : maximum + 1;
         return seconds.load();
       });
   std::unique_ptr<KvNodeServer> server =
@@ -3053,12 +3300,30 @@ TEST(Metrics, LifetimeBucketEstimateOmitsUnknownAcrossClockBoundaries) {
   ASSERT_NO_FATAL_FAILURE(expect_text(server->MetricsText(), true, true));
   uint32_t offset = 0;
   EXPECT_FALSE(options.lifetime_clock->TryNow(&offset));
-  // A real shared-clock crossing occurs between the two disk observations.
+  // Each disk now samples protection and logical read classes separately.
+  // Cross the hard boundary after both first-disk observations, not between
+  // their independently valid snapshots.
   samples = 0;
   cross_hard = true;
   const std::string mixed = server->MetricsText();
-  EXPECT_EQ(samples.load(), 2U);
+  EXPECT_EQ(samples.load(), 4U);
   ASSERT_NO_FATAL_FAILURE(expect_text(mixed, true, false));
+  for (size_t disk = 0; disk < 2; ++disk) {
+    const std::string labels = "{disk=\"" + options.cache_dirs[disk] +
+                               "\",disk_index=\"" + std::to_string(disk) +
+                               "\"} ";
+    EXPECT_NE(mixed.find("\ndfkv_slab_disk_lifetime_read_class_available" +
+                         labels + (disk == 0 ? "1\n" : "0\n")),
+              std::string::npos);
+    const std::string sampled =
+        "\ndfkv_slab_disk_lifetime_read_class_sampled_at_sec" + labels;
+    if (disk == 0) {
+      EXPECT_NE(mixed.find(sampled + std::to_string(maximum) + "\n"),
+                std::string::npos);
+    } else {
+      EXPECT_EQ(mixed.find(sampled), std::string::npos);
+    }
+  }
   cross_hard = false;
   seconds = 0;
   ASSERT_NO_FATAL_FAILURE(expect_text(server->MetricsText(), false, false));

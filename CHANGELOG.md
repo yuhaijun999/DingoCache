@@ -2,9 +2,13 @@
 
 ## Unreleased
 
+- Export per-disk logical read-class estimates with availability, sampled time,
+  bounded expiry resolution and R-ring backing bytes. Omit unavailable
+  populations rather than presenting them as empty caches.
+
 - Track allocator-retained logical read-class estimates with bounded NEW-window
   expiry lag and an internal Store observation API. Keep scoring queues separate;
-  metric export remains a subsequent step.
+  per-disk metric export exposes availability separately.
 
 - Export successful foreground/background lifetime class scores as separate
   nonnegative and absolute-negative distributions. Reuse the existing final

@@ -595,6 +595,20 @@ std::string KvNodeServer::MetricsText() const {
            "Whether a current lifetime bucket estimate is available");
     header("dfkv_slab_disk_lifetime_bucket_summary_bytes", "gauge",
            "Retained global expiry summary vector backing bytes");
+    header("dfkv_slab_disk_lifetime_read_class_resident_estimate", "gauge",
+           "Retained initialized residents: unread exact, within-window upper "
+           "bound, outside-window lower bounds");
+    header("dfkv_slab_disk_lifetime_read_class_available", "gauge",
+           "Whether this disk has a usable current read-class estimate");
+    header("dfkv_slab_disk_lifetime_read_class_sampled_at_sec", "gauge",
+           "Read-class observation shared-clock offset, not wall time");
+    header(
+        "dfkv_slab_disk_lifetime_read_class_expiry_quantum_sec", "gauge",
+        "Read-class window expiry quantum, separate from protection buckets");
+    header("dfkv_slab_disk_lifetime_read_class_expiry_lag_bound_sec", "gauge",
+           "Maximum extra read-class window expiry lag in seconds");
+    header("dfkv_slab_disk_lifetime_read_class_ring_bytes", "gauge",
+           "Retained read-class expiry ring element backing bytes");
     using LifetimeQueueKey = std::pair<uint32_t, uint32_t>;
     std::map<LifetimeQueueKey, uint64_t> queue_totals;
     const auto queue_labels = [](uint32_t slot_size, uint32_t band) {
@@ -903,6 +917,36 @@ std::string KvNodeServer::MetricsText() const {
       bucket_summary_bytes += buckets.summary_bytes;
       bucket_estimate_available =
           bucket_estimate_available && buckets.available;
+      const SlabAllocator::LifetimeReadClassObservation read_classes =
+          group_.DiskLifetimeReadClassObservation(i);
+      sample("dfkv_slab_disk_lifetime_read_class_available",
+             read_classes.available ? 1 : 0);
+      sample("dfkv_slab_disk_lifetime_read_class_expiry_quantum_sec",
+             read_classes.expiry_quantum_sec);
+      sample("dfkv_slab_disk_lifetime_read_class_expiry_lag_bound_sec",
+             read_classes.expiry_lag_bound_sec);
+      sample("dfkv_slab_disk_lifetime_read_class_ring_bytes",
+             read_classes.ring_bytes);
+      if (read_classes.available) {
+        sample("dfkv_slab_disk_lifetime_read_class_sampled_at_sec",
+               read_classes.sampled_at_sec);
+        // Enum order is fixed independently of the configured score bands.
+        constexpr std::array<const char*, 5> kReadClassNames{
+            "unread", "read_within_new_write_window",
+            "read_once_outside_new_write_window",
+            "read_twice_outside_new_write_window",
+            "read_three_or_more_outside_new_write_window"};
+        for (size_t read_class = 0; read_class < kReadClassNames.size();
+             ++read_class) {
+          s += "dfkv_slab_disk_lifetime_read_class_resident_estimate" +
+               braces(labels + ",read_class=\"" + kReadClassNames[read_class] +
+                      "\"") +
+               " " +
+               std::to_string(read_classes.resident_estimates[read_class]) +
+               "\n";
+        }
+      }
+      // Do not sum independently timed read-class estimates into a global view.
       // Aggregate these same per-disk snapshots, not a second observation.
       const std::vector<SlabAllocator::LifetimeQueueStat> queues =
           group_.DiskLifetimeQueueStats(i);

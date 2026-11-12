@@ -25,6 +25,7 @@
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
+#include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
@@ -1299,6 +1300,12 @@ SlabAllocator::LifetimeBucketObservation
 DiskCacheGroup::DiskLifetimeBucketObservation(size_t i) const {
   if (i >= slabs_.size()) return {};
   return slabs_[i]->ObserveLifetimeBuckets();
+}
+
+SlabAllocator::LifetimeReadClassObservation
+DiskCacheGroup::DiskLifetimeReadClassObservation(size_t i) const {
+  if (i >= slabs_.size()) return {};
+  return slabs_[i]->ObserveLifetimeReadClasses();
 }
 
 std::vector<SlabAllocator::ClassStat> DiskCacheGroup::SlabClasses() const {

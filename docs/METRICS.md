@@ -1176,7 +1176,7 @@ Reset, score arithmetic, bin updates, Store/Group merges and text rendering have
 nonzero cost; these sizes are not full stack, RSS, recovery-peak or performance
 budget acceptance evidence.
 
-### Logical read-class observation foundation (not exported yet)
+### Logical read-class observations
 
 The internal `ObserveLifetimeReadClasses` Store/allocator API observes retained,
 initialized lifetime states, including pinned and hidden deferred-Remove data.
@@ -1209,10 +1209,10 @@ clocks, locks or atomics. Failed reads/invalidation and deferred visibility loss
 do not debit a still-retained resident. Rebuild reconstructs counts rather than
 persisting or replaying historical events. Fixed allocator layout and ring costs
 are nonzero, including fixed layout in disabled modes. The API's `ring_bytes`
-accounts for the new backing; older memory gauges remain partial and do not yet
-include this ring. Group/Prometheus export and that gauge wiring are the next
-increment, not delivered here; no existing dashboard/alert is switched to these
-estimates and no complete memory/performance budget is established.
+accounts for the new backing; older memory gauges remain partial and exclude
+this ring. The independent ring gauge below supplies that component without
+changing older gauge definitions. No existing dashboard/alert is switched to
+these estimates and no complete memory/performance budget is established.
 
 Measured GCC layout for this foundation: Allocator 1032 to 1104 bytes (+72,
 including Options 200 to 208); Store 2800, Stats 2080, state 12 and Scan 888 bytes
@@ -1221,3 +1221,48 @@ per retained bucket (default 24 means 768 bytes, maximum 64 means 2048 bytes), o
 per enabled allocator, not per resident or extent. Disabled allocators still pay
 the fixed 72-byte layout increase. These are component sizes, not heap overhead,
 full stack usage, incremental RSS or recovery-peak acceptance measurements.
+
+The Group delegates `DiskLifetimeReadClassObservation(disk_index)` to the same
+Store API. Prometheus exports these **per-disk gauges** for the slab engine:
+
+| Name (prefix `dfkv_slab_disk_lifetime_read_class_`) | Meaning |
+| --- | --- |
+| `resident_estimate` | Five estimates from one allocator snapshot, additionally labeled `read_class`. |
+| `available` | 1 for a usable snapshot, 0 for disabled tracking or hard clock exhaustion. |
+| `sampled_at_sec` | Snapshot's shared lifetime-clock offset in seconds, not Unix time. |
+| `expiry_quantum_sec` | R expiry rounding quantum Q (not protection bucket G). |
+| `expiry_lag_bound_sec` | Maximum extra R expiry lag Q-1, not measured observed lag. |
+| `ring_bytes` | Actual retained R-ring vector backing bytes, excluding heap metadata. |
+
+All six carry existing `disk` and `disk_index` labels. `resident_estimate` has
+exactly five fixed label values: `unread`, `read_within_new_write_window`,
+`read_once_outside_new_write_window`, `read_twice_outside_new_write_window`, and
+`read_three_or_more_outside_new_write_window`. These mean W/R/O1/O2/O3+, not
+MAX_READS bands. No key/request labels or dynamic read-count series are added.
+
+An enabled empty disk emits five population zeros with `available=1`. When
+unavailable, population **and sampled time samples are omitted**, not exported
+as zeros; `available=0` and ring/Q/lag facts remain. Disabled legacy slab emits
+availability and those three facts as zero; the file engine omits all six
+families. A hard-exhausted clock retains ring/Q/lag facts and cannot be reopened
+by a source-clock rollback. Failed metadata persistence does not make retained
+population disappear or claim readability. Restart rebuilds the ledger rather
+than restoring historical metric samples.
+
+No global population/time family is emitted: each disk has its own allocator
+lock and sampling point. For a deliberately non-atomic operational aggregate,
+`sum by (read_class) (dfkv_slab_disk_lifetime_read_class_resident_estimate)`
+sums only available disks; check availability for **all intended disks** before
+treating it as complete. Summed R is still an upper bound and O classes lower
+bounds only for the contributing observations, not an exact common-time
+classification. Never sum `sampled_at_sec` into a timestamp. Do not add population
+estimates to queue/visible/recovered counts: these are overlapping views.
+
+Each metrics scrape adds one enabled observation per slab disk: one allocator
+lock, one shared-clock read/floor update and O(B) bounded work, plus six-family
+text rendering. It reuses one observation for all five populations and facts;
+there is no extra resident scan, permanent field, hot-path clock or per-event
+allocation in this export step. The observation value is 80 bytes; output string
+growth has ordinary allocation costs. This is not a lock-contention, RSS, latency
+or performance-budget acceptance claim. Existing alerts and dashboards do not
+depend on the new families.
