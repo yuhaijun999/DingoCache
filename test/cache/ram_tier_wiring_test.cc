@@ -4142,6 +4142,105 @@ TEST_F(LifetimeSuccessReadTest, CopyFollowersCountRequestsRatherThanOneIo) {
   }
 }
 
+// Mix both APIs in each convoy and reverse the leader API. Every successful
+// caller counts, whether four disk reads or one shared read supplied its bytes.
+TEST_F(LifetimeSuccessReadTest, O5MixedApiConvoyCountsEveryLogicalSuccess) {
+  const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+  for (const uint64_t max_reads : {1, 2, 4, 63}) {
+    for (const bool coalescing : {false, true}) {
+      for (const bool leader_into : {false, true}) {
+        SCOPED_TRACE("M=" + std::to_string(max_reads) +
+                     " coalescing=" + std::to_string(coalescing) +
+                     " leader_into=" + std::to_string(leader_into));
+        ASSERT_NO_FATAL_FAILURE(CreateFallbackPolicy(max_reads));
+        KvNodeServerWiringTestPeer::SetCoalescing(*node_, coalescing);
+        const BlockKey key{101000 + max_reads * 4 +
+                               static_cast<uint64_t>(coalescing) * 2 +
+                               static_cast<uint64_t>(leader_into),
+                           0};
+        const DiskWriteResult written = Seed(key);
+        ASSERT_EQ(written.status, Status::kOk);
+        ASSERT_TRUE(written.identity.valid());
+        ASSERT_EQ(State(key).scoring_reads(), 0U);
+        const uint32_t put_at = State(key).put_at;
+        seconds_.fetch_add(21, std::memory_order_relaxed);
+        const std::shared_ptr<FlushBarrier> barrier =
+            std::make_shared<FlushBarrier>();
+        const OpenFlushOnExit release{*barrier};
+        std::atomic<unsigned int> reads{0};
+        DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+        DiskSlabStoreTestPeer::SetReadHook(store, [barrier, &reads] {
+          reads.fetch_add(1, std::memory_order_relaxed);
+          barrier->Block();
+        });
+        constexpr size_t kRequests = 4;
+        std::vector<Status> results(kRequests, Status::kInvalid);
+        std::vector<std::string> values(kRequests);
+        const auto request = [&](size_t index) {
+          const bool into = leader_into != ((index & 1U) != 0);
+          results[index] = ReadFiveBytes(key, into, &values[index]);
+        };
+        std::thread leader([&] { request(0); });
+        EXPECT_TRUE(barrier->AwaitEntry());
+        std::vector<std::thread> followers;
+        followers.reserve(kRequests - 1);
+        for (size_t i = 1; i < kRequests; ++i) {
+          followers.emplace_back([&, i] { request(i); });
+        }
+        if (coalescing) {
+          EXPECT_TRUE(KvNodeServerWiringTestPeer::WaitForReadFollowers(
+              *node_, kRequests - 1));
+        } else {
+          EXPECT_TRUE(WaitFor([&] {
+            return reads.load(std::memory_order_relaxed) == kRequests;
+          }));
+        }
+        barrier->Open();
+        leader.join();
+        for (std::thread& follower : followers) follower.join();
+        DiskSlabStoreTestPeer::SetReadHook(store, {});
+        uint64_t completed_reads = 0;
+        for (size_t i = 0; i < kRequests; ++i) {
+          ASSERT_EQ(results[i], Status::kOk);
+          ASSERT_EQ(values[i], "value");
+          ++completed_reads;
+        }
+        EXPECT_EQ(reads.load(std::memory_order_relaxed),
+                  coalescing ? 1 : kRequests);
+        EXPECT_EQ(KvNodeServerWiringTestPeer::ReadTimeouts(*node_), 0U);
+        const DiskLifetimeState state = State(key);
+        EXPECT_EQ(state.scoring_reads(), completed_reads);
+        EXPECT_EQ(state.actual_reads, 3U);
+        EXPECT_EQ(state.put_at, put_at);
+        EXPECT_EQ(state.anchor, put_at + 21);
+        EXPECT_FALSE(state.history_unknown);
+        EXPECT_FALSE(state.write_armed());
+        EXPECT_TRUE(state.first_early_read());
+        EXPECT_EQ(Counters().applied, completed_reads);
+        EXPECT_EQ(Counters().source_disk, coalescing ? 0 : completed_reads);
+        EXPECT_EQ(Counters().source_copy_leader, coalescing ? 1 : 0);
+        EXPECT_EQ(Counters().source_copy_follower,
+                  coalescing ? completed_reads - 1 : 0);
+        EXPECT_EQ(Counters().completion_missing, 0U);
+        DiskResidentIdentity identity;
+        std::string value;
+        ASSERT_EQ(
+            store.RangeWithIdentity(key, 0, 5, &value, &identity, nullptr),
+            Status::kOk);
+        EXPECT_EQ(value, "value");
+        EXPECT_EQ(identity, written.identity);
+        ASSERT_EQ(Read(key, &value, 5, 0), Status::kOk);
+        EXPECT_TRUE(value.empty());
+        ASSERT_EQ(
+            ReadFiveBytes({key.tenant_hash + 10000, 0}, leader_into, &value),
+            Status::kNotFound);
+        EXPECT_EQ(State(key).scoring_reads(), completed_reads);
+        ExpectConservation(completed_reads);
+      }
+    }
+  }
+}
+
 // Register the coalescer ownership directly, but perform each fallback through
 // the real Node and disk. These tests do not submit an io_uring operation.
 TEST_F(LifetimeSuccessReadTest, O5FallbackSameThreadCountsOnlyOwnSuccess) {
