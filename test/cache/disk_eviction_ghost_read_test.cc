@@ -462,6 +462,167 @@ TEST_F(DiskEvictionGhostReadTest,
 }
 
 TEST_F(DiskEvictionGhostReadTest,
+       CleanRecoveryNewHotReadsCrossProtectionBoundaryThroughFifteenMinutes) {
+  const ScopedEnv base("DFKV_SLAB_LIFE_BASE_SEC", "100");
+  const ScopedEnv bonus("DFKV_SLAB_LIFE_READ_BONUS_SEC", "10");
+  const ScopedEnv max_reads("DFKV_SLAB_LIFE_MAX_READS", "2");
+  const ScopedEnv protect("DFKV_SLAB_PROTECT_SEC", "180");
+  const ScopedEnv slowdown("DFKV_SLAB_PROTECT_SLOWDOWN", "4");
+  const ScopedEnv boost("DFKV_SLAB_PROTECT_BOOST_SEC", "120");
+  const ScopedEnv keep("DFKV_SLAB_KEEP_SCORE_SEC", "90");
+  const ScopedEnv bucket("DFKV_SLAB_BUCKET_SEC", "32");
+  const ScopedEnv buckets("DFKV_SLAB_BUCKET_COUNT", "8");
+  const ScopedEnv low("DFKV_SLAB_EVICT_LOW_PCT", "88");
+  const ScopedEnv high("DFKV_SLAB_EVICT_HIGH_PCT", "0");
+  config_.protect_sec = 180;
+  config_.bucket_sec = 32;
+  config_.max_reads = 2;
+  config_.boost_sec = 120;
+  ASSERT_NO_FATAL_FAILURE(Create(false, 1, 8, "lifetime", "slab", true, 8));
+  const std::string directory = Group().DiskPath(0);
+  struct Resident {
+    BlockKey key;
+    std::string value;
+  };
+  std::vector<Resident> original;
+  for (uint64_t id = 1; id <= 8; ++id) {
+    const Resident resident{Key(id), "o0" + std::to_string(id)};
+    ASSERT_EQ(Put(resident.key, resident.value.c_str()), Status::kOk);
+    original.push_back(resident);
+  }
+  ASSERT_NO_FATAL_FAILURE(Reopen(1000));
+  EXPECT_EQ(Group().DiskPath(0), directory);
+  ASSERT_EQ(server_->Count(), 8U);
+  ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 0, 0, 0, 0));
+  ASSERT_NO_FATAL_FAILURE(Check(0, 0, 0, 0));
+  const DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(Group(), 0);
+  // Membership checks are read-only: they must not manufacture business heat
+  // while identifying which tied recovered cold residents actually vanished.
+  const auto check_cold = [&](size_t expected) {
+    size_t retained = 0;
+    for (const Resident& resident : original) {
+      const std::optional<DiskLifetimeState> state =
+          DiskSlabStoreTestPeer::State(store, resident.key);
+      if (!state.has_value()) continue;
+      ++retained;
+      EXPECT_TRUE(state->history_unknown);
+      EXPECT_EQ(state->scoring_reads(), 2U);
+      EXPECT_EQ(state->actual_reads, 0U);
+      EXPECT_EQ(state->anchor, 0U);
+    }
+    EXPECT_EQ(retained, expected);
+  };
+  check_cold(8);
+  const std::array<Resident, 5> fresh{
+      Resident{Key(9), "a09"}, Resident{Key(10), "b10"},
+      Resident{Key(11), "c11"}, Resident{Key(12), "d12"},
+      Resident{Key(13), "e13"}};
+  for (size_t index = 0; index < 3; ++index) {
+    ASSERT_EQ(Put(fresh[index].key, fresh[index].value.c_str()), Status::kOk);
+  }
+  check_cold(5);
+  EXPECT_EQ(Group().DiskEvictionGhostObservation(0).recorded, 3U);
+  std::string bytes;
+  seconds_ = 1179;
+  ASSERT_EQ(Read(false, fresh[0].key, &bytes), Status::kOk);
+  EXPECT_EQ(bytes, fresh[0].value);
+  seconds_ = 1180;
+  ASSERT_EQ(Read(true, fresh[1].key, &bytes), Status::kOk);
+  EXPECT_EQ(bytes, fresh[1].value);
+  for (size_t index = 0; index < 2; ++index) {
+    const std::optional<DiskLifetimeState> state =
+        DiskSlabStoreTestPeer::State(store, fresh[index].key);
+    if (!state.has_value()) {
+      ADD_FAILURE() << "NEW resident vanished at the protection boundary";
+      return;
+    }
+    EXPECT_EQ(state->put_at, 0U);
+    EXPECT_EQ(state->anchor, 179U + index);
+    EXPECT_EQ(state->scoring_reads(), 1U);
+    EXPECT_EQ(state->actual_reads, 1U);
+    EXPECT_FALSE(state->history_unknown);
+    EXPECT_FALSE(state->write_armed());
+    // Early-read reward uses age < P, whereas logical R includes age == P.
+    EXPECT_EQ(state->first_early_read(), index == 0);
+    EXPECT_EQ(ClassifyDiskLifetimeRead(config_, *state, 180),
+              DiskLifetimeReadClass::kReadWithinNewWriteWindow);
+    EXPECT_EQ(ClassifyDiskLifetimeRead(config_, *state, 181),
+              DiskLifetimeReadClass::kReadOnceOutsideNewWriteWindow);
+  }
+  seconds_ = 1181;
+  ASSERT_EQ(Read(false, fresh[2].key, &bytes), Status::kOk);
+  EXPECT_EQ(bytes, fresh[2].value);
+  const std::optional<DiskLifetimeState> outside =
+      DiskSlabStoreTestPeer::State(store, fresh[2].key);
+  if (!outside.has_value()) {
+    ADD_FAILURE() << "NEW resident vanished after the protection boundary";
+    return;
+  }
+  EXPECT_EQ(ClassifyDiskLifetimeRead(config_, *outside, 181),
+            DiskLifetimeReadClass::kReadOnceOutsideNewWriteWindow);
+  seconds_ = 1899;
+  ASSERT_EQ(Put(fresh[3].key, fresh[3].value.c_str()), Status::kOk);
+  ASSERT_EQ(Read(true, fresh[3].key, &bytes), Status::kOk);
+  EXPECT_EQ(bytes, fresh[3].value);
+  check_cold(4);
+  seconds_ = 1900;
+  ASSERT_EQ(Put(fresh[4].key, fresh[4].value.c_str()), Status::kOk);
+  check_cold(3);
+  ASSERT_EQ(server_->Count(), 8U);
+  ASSERT_NO_FATAL_FAILURE(CheckSync(4, 0, 0, 0, 0, 0));
+  const std::array<uint32_t, 5> anchors{179, 180, 181, 899, 900};
+  for (size_t index = 0; index < fresh.size(); ++index) {
+    const std::optional<DiskLifetimeState> state =
+        DiskSlabStoreTestPeer::State(store, fresh[index].key);
+    if (!state.has_value()) {
+      ADD_FAILURE()
+          << "A new hot resident was evicted instead of recovered cold";
+      return;
+    }
+    EXPECT_FALSE(state->history_unknown);
+    EXPECT_EQ(state->put_at, index < 3 ? 0U : anchors[index]);
+    EXPECT_EQ(state->anchor, anchors[index]);
+    EXPECT_EQ(state->scoring_reads(), index == 4 ? 0U : 1U);
+    EXPECT_EQ(state->actual_reads, index == 4 ? 0U : 1U);
+    EXPECT_EQ(state->first_early_read(), index == 0 || index == 3);
+    EXPECT_EQ(state->write_armed(), index == 4);
+  }
+  // Only now validate every surviving value. These successful GETs are part of
+  // the explicit 12-result oracle, not inputs to any later victim choice.
+  for (const Resident& resident : original) {
+    const bool retained =
+        DiskSlabStoreTestPeer::State(store, resident.key).has_value();
+    ASSERT_EQ(Read(false, resident.key, &bytes),
+              retained ? Status::kOk : Status::kNotFound);
+    if (retained) {
+      EXPECT_EQ(bytes, resident.value);
+    }
+  }
+  for (const Resident& resident : fresh) {
+    ASSERT_EQ(Read(true, resident.key, &bytes), Status::kOk);
+    EXPECT_EQ(bytes, resident.value);
+  }
+  ASSERT_NO_FATAL_FAILURE(CheckSync(12, 0, 5, 0, 0, 0));
+  ASSERT_NO_FATAL_FAILURE(Check(0, 5, 5, 2701));
+  const DiskSlabStore::Stats stats = Group().DiskSlabStats(0);
+  EXPECT_EQ(stats.lifetime_reads.successful, 12U);
+  EXPECT_EQ(stats.lifetime_reads.applied, 12U);
+  EXPECT_EQ(stats.lifetime_class_victims, 5U);
+  const DiskSlabStore::EvictionGhostObservation ghost =
+      Group().DiskEvictionGhostObservation(0);
+  EXPECT_EQ(ghost.recorded, 5U);
+  EXPECT_EQ(ghost.dropped, 0U);
+  EXPECT_EQ(ghost.history.retained, 5U);
+  EXPECT_FALSE(ghost.history.capacity_limited);
+  EXPECT_FALSE(ghost.history.loss_time_unknown);
+  EXPECT_FALSE(ghost.history.lost_through_sec.has_value());
+  EXPECT_EQ(ghost.history.window_after_sec, std::optional<uint64_t>(0));
+  EXPECT_EQ(ghost.history.window_through_sec, std::optional<uint64_t>(900));
+  // Three retained events settled at t=0 are outside exclusive (0,900]. Raw
+  // miss association is not conditioned on that window: 3*900 + 1 + 0 = 2701.
+}
+
+TEST_F(DiskEvictionGhostReadTest,
        SyncResultCohortIsIndependentOfGhostAndPolicy) {
   for (const char* mode : {"file", "legacy", "lifetime_disabled", "lifetime"}) {
     for (const bool into : {false, true}) {
