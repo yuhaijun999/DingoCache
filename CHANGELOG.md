@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Expose lifetime scan checks, eligible candidates and pin skips by scoring
+  band and foreground/background/watermark path, per disk and in aggregate.
+  Preserve eviction order, budgets and existing queue-population metrics.
+
 - Add a critical, no-extra-delay alert for acknowledged RAM data dropped after
   terminal flush failure, with pinned Prometheus rule tests. Preserve generic
   health alerts and document scrape timing, restart resets and external routing.

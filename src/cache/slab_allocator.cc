@@ -212,6 +212,15 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
     lifetime_versions_.resize(classes_.size());
     lifetime_queues_.resize((classes_.size() + 1) *
                             (opt_.lifetime_max_reads + 1));
+    const uint32_t bands = opt_.lifetime_max_reads + 1;
+    lifetime_band_scans_.resize(3 * bands);
+    for (uint32_t path = 0; path < 3; ++path) {
+      for (uint32_t band = 0; band < bands; ++band) {
+        LifetimeBandScanStat& stat = lifetime_band_scans_[path * bands + band];
+        stat.path = static_cast<LifetimeScanPath>(path);
+        stat.band = band;
+      }
+    }
   }
 
   if (const char* w = std::getenv("DFKV_SLAB_COLD_STEAL_WINDOW")) {
@@ -1051,11 +1060,9 @@ void SlabAllocator::BumpLifetimeVersionLocked(uint32_t meta_index) {
   if (version != UINT64_MAX) ++version;
 }
 
-bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
-                                            LifetimeScan& scan,
-                                            std::vector<BlockKey>* evicted,
-                                            bool* reclaim_denied,
-                                            uint32_t max_visits) {
+bool SlabAllocator::EvictLifetimeFromLocked(
+    size_t cls_index, LifetimeScan& scan, std::vector<BlockKey>* evicted,
+    bool* reclaim_denied, uint32_t max_visits, LifetimeScanPath path) {
   const Class& cls = classes_[cls_index];
   if (!scan.initialized) {
     const uint64_t residents = cls.resident_count;
@@ -1116,10 +1123,18 @@ bool SlabAllocator::EvictLifetimeFromLocked(size_t cls_index,
       queue.cursor = scan.cursors[band];
       ++slice_visits;
       ++scan.visits;
+      // Match the existing paid check; persistence failure does not undo work.
+      LifetimeBandScanStat& stat =
+          lifetime_band_scans_[static_cast<size_t>(path) * bands + band];
+      ++stat.visits;
+      if (meta.refs != 0) {
+        ++stat.pin_skips;
+      }
       scan.done[band] = scan.cursors[band] == scan.starts[band];
       if (meta.live && !meta.remove_pending && meta.refs == 0 &&
           resident_generations_[current] != 0 &&
           resident_lifetime_states_[current].has_value()) {
+        ++stat.candidates;
         const DiskLifetimeState& state = *resident_lifetime_states_[current];
         const int64_t score = DiskLifetimeScore(
             scan.config, state.anchor, state.scoring_reads(),
@@ -1861,8 +1876,8 @@ SlabAllocator::LifetimeReclaimResult SlabAllocator::ReclaimLifetimeClass(
     bool denied = false;
     const uint32_t remaining =
         1024 - static_cast<uint32_t>(scan.visits - start_visits);
-    if (!EvictLifetimeFromLocked(cls_index, scan, evicted, &denied,
-                                 remaining)) {
+    if (!EvictLifetimeFromLocked(cls_index, scan, evicted, &denied, remaining,
+                                 LifetimeScanPath::kBackground)) {
       result.more = !denied && scan.result == LifetimeScanResult::kRetry;
       return result;
     }
@@ -1927,11 +1942,18 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
       ++visits;
       ++watermark_scan_steps_;
       const SlotMeta& meta = slots_[current];
+      LifetimeBandScanStat& band_stat = lifetime_band_scans_
+          [static_cast<size_t>(LifetimeScanPath::kWatermark) * bands + band];
+      ++band_stat.visits;
+      if (meta.refs != 0) {
+        ++band_stat.pin_skips;
+      }
       if (meta.refs != 0 && stats != nullptr) ++stats->pin_skips;
       if (meta.live && !meta.remove_pending && meta.refs == 0 &&
           resident_generations_[current] != 0 &&
           resident_lifetime_states_[current].has_value() &&
           lifetime_links_[current].band == band) {
+        ++band_stat.candidates;
         candidates[band] = current;
         done[band] = false;
         const DiskLifetimeState& state = *resident_lifetime_states_[current];
@@ -2244,6 +2266,12 @@ SlabAllocator::LifetimeQueueStats() const {
     }
   }
   return stats;
+}
+
+std::vector<SlabAllocator::LifetimeBandScanStat>
+SlabAllocator::LifetimeBandScanStats() const {
+  const std::lock_guard<std::mutex> lock(mu_);
+  return lifetime_band_scans_;
 }
 
 uint64_t SlabAllocator::WatermarkEvictions() const {

@@ -1495,8 +1495,11 @@ received by opted-in Stores, including notifications rejected for missing bindin
 changed residents, health or clock/state conditions. Its outcome/source and
 completion partitions prove internal accounting only. Neither those equalities
 nor `applied / success` independently proves that every applicable business
-request emitted exactly one notification. There is currently no independent
-production completion denominator for non-PULL requests.
+request emitted exactly one notification. The synchronous result counters
+documented above independently partition final normal returns from the two
+covered Node APIs, including TCP requests routed through them. They do not
+identify same-generation disk-copy applicability or cover the full PULL Serve
+lifecycle, and are not a complete all-transport business-read denominator.
 
 Coverage tests derive the expected count from completed request results and
 independently established source residency, not from another notification
@@ -1732,3 +1735,50 @@ Rule semantics and executable test format follow the official
 and [rule unit testing](https://prometheus.io/docs/prometheus/3.13/configuration/unit_testing_rules/)
 documentation. CI runs `promtool test rules alerts.test.yml` with the same
 digest-pinned Prometheus image used by the deployment.
+
+### Paid lifetime band checks
+
+`dfkv_slab_lifetime_band_{visits,candidates,pin_skips}_total` and
+`dfkv_slab_disk_lifetime_band_{visits,candidates,pin_skips}_total` are counters
+with bounded `path="class|background|watermark"` and `band="0..MAX_READS"`
+labels. Per-disk samples also carry the existing escaped `disk`/`disk_index`
+labels, and all samples retain optional escaped `node`/`group`. No key, request
+or size-class label is added. The class and background paths sum across size
+classes; they do not establish per-class fairness. These are scoring bands,
+not the five logical read classes.
+
+- `visits`: each actual resident check at an existing scan-budget charge point.
+  A cached watermark candidate's recheck costs another visit. Empty-band turns,
+  zero-visit version retries and calls stopped before checking add nothing.
+- `candidates`: those checks passing the selector's existing live, visibility,
+  pin, generation and scoring-state guards (and watermark band validation).
+  These are eligible checks, not unique keys, winners or successful victims.
+- `pin_skips`: checks observing `refs != 0`. Other rejected conditions can
+  coexist; `candidates + pin_skips <= visits`, not necessarily equality.
+
+Checks remain counted if later persistence fails. Budget stops, final clock
+checks and failures keep their existing behavior; counters do not grant extra
+work. In a quiescent lifetime store, summing visits across bands matches that
+path's cumulative resident visits; watermark includes cached rechecks. Class
+and background counts are disjoint, and donor selection is excluded. The
+separate Store Stats and scan snapshots are not an atomic joint observation.
+
+One allocator-lock snapshot per disk is used both for its exposition and for
+the aggregate sum. Every enabled Store emits all three paths and `MAX_READS+1`
+bands, including zero and formerly populated bands; deletion, last-resident
+extent return and rebinding do not reset these counters. Store reconstruction
+starts a new zero cohort. Legacy has no samples (slab metric headers can still
+exist); file omits the families entirely. Scraping neither scans residents nor
+samples the lifetime clock for these counters.
+
+Storage is one enabled-only vector of `3 * (MAX_READS+1)` elements, with retained
+backing equal to capacity times `sizeof(SlabAllocator::LifetimeBandScanStat)`.
+It adds a fixed vector object even in legacy/RAM allocators, but no element
+allocation or scan maintenance there; no per-resident fields, new scan locks,
+scan clock samples or per-check allocation are introduced. Existing
+`lifetime_queue_bytes` still describes only the queue vector, not this new
+counter vector. The old memory gauges do not include this new backing or
+constitute full memory/RSS/recovery-peak acceptance. No performance improvement,
+bounded wall-clock scan latency or full fairness acceptance is implied.
+Existing alert/dashboard consumers use unchanged metric names and semantics;
+these additive diagnostics do not introduce an unregistered alert threshold.

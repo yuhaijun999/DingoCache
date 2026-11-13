@@ -673,6 +673,20 @@ std::string KvNodeServer::MetricsText() const {
            "Retained residents by lifetime scoring index and band");
     header("dfkv_slab_disk_lifetime_queue_residents", "gauge",
            "Retained residents by disk lifetime scoring index and band");
+    // Counters share each disk's one snapshot, including bands now empty.
+    std::map<std::string, std::array<uint64_t, 3>> band_scan_totals;
+    const std::array<const char*, 3> scan_paths{"class", "background",
+                                                "watermark"};
+    const std::array<const char*, 3> scan_counters{"visits", "candidates",
+                                                   "pin_skips"};
+    for (const char* counter : scan_counters) {
+      for (const char* prefix :
+           {"dfkv_slab_lifetime_band_", "dfkv_slab_disk_lifetime_band_"}) {
+        const std::string name = std::string(prefix) + counter + "_total";
+        header(name.c_str(), "counter",
+               "Paid lifetime band checks by mutually exclusive scan path");
+      }
+    }
     // Preformatted sums retain exact age integers while score sums use double.
     const auto donor_histogram =
         [&](const std::string& name, const std::array<uint64_t, 8>& buckets,
@@ -1105,6 +1119,24 @@ std::string KvNodeServer::MetricsText() const {
              " " + std::to_string(queue.residents) + "\n";
         queue_totals[{queue.slot_size, queue.band}] += queue.residents;
       }
+      const std::vector<SlabAllocator::LifetimeBandScanStat> band_scans =
+          group_.DiskLifetimeBandScanStats(i);
+      for (const SlabAllocator::LifetimeBandScanStat& stat : band_scans) {
+        const std::string scan_labels =
+            std::string("path=\"") +
+            scan_paths[static_cast<size_t>(stat.path)] + "\",band=\"" +
+            std::to_string(stat.band) + "\"";
+        const std::array<uint64_t, 3> counts{stat.visits, stat.candidates,
+                                             stat.pin_skips};
+        std::array<uint64_t, 3>& total = band_scan_totals[scan_labels];
+        for (size_t counter = 0; counter < counts.size(); ++counter) {
+          s += std::string("dfkv_slab_disk_lifetime_band_") +
+               scan_counters[counter] + "_total" +
+               braces(labels + "," + scan_labels) + " " +
+               std::to_string(counts[counter]) + "\n";
+          total[counter] += counts[counter];
+        }
+      }
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
       sample("dfkv_slab_disk_lifetime_watermark_protected_victims_total",
              disk.lifetime_watermark_protected_victims);
@@ -1386,6 +1418,14 @@ std::string KvNodeServer::MetricsText() const {
       s += "dfkv_slab_lifetime_queue_residents" +
            braces(queue_labels(entry.first.first, entry.first.second)) + " " +
            std::to_string(entry.second) + "\n";
+    }
+    for (const std::map<std::string, std::array<uint64_t, 3>>::value_type&
+             entry : band_scan_totals) {
+      for (size_t counter = 0; counter < entry.second.size(); ++counter) {
+        s += std::string("dfkv_slab_lifetime_band_") + scan_counters[counter] +
+             "_total" + braces(entry.first) + " " +
+             std::to_string(entry.second[counter]) + "\n";
+      }
     }
     metric("dfkv_slab_lifetime_bucket_estimate_available", "gauge",
            "Whether all disk lifetime bucket estimates are available",

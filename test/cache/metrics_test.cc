@@ -5762,6 +5762,164 @@ TEST_F(LifetimeGhostMetricsTest,
   }
 }
 
+TEST_F(LifetimeGhostMetricsTest,
+       BandScanCountersPartitionRealPathsAndResetAcrossDisks) {
+  const ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "134217728");
+  const ScopedEnv base("DFKV_SLAB_LIFE_BASE_SEC", "100");
+  const ScopedEnv bonus("DFKV_SLAB_LIFE_READ_BONUS_SEC", "10");
+  const ScopedEnv max_reads("DFKV_SLAB_LIFE_MAX_READS", "2");
+  const ScopedEnv protect("DFKV_SLAB_PROTECT_SEC", "8");
+  const ScopedEnv slowdown("DFKV_SLAB_PROTECT_SLOWDOWN", "4");
+  const ScopedEnv boost("DFKV_SLAB_PROTECT_BOOST_SEC", "120");
+  const ScopedEnv keep("DFKV_SLAB_KEEP_SCORE_SEC", "90");
+  const ScopedEnv bucket("DFKV_SLAB_BUCKET_SEC", "32");
+  const ScopedEnv buckets("DFKV_SLAB_BUCKET_COUNT", "8");
+  const ScopedEnv low("DFKV_SLAB_EVICT_LOW_PCT", "88");
+  const ScopedEnv high("DFKV_SLAB_EVICT_HIGH_PCT", "0");
+  DiskCacheGroup::Options options = Options();
+  options.eviction_ghost_capacity_per_disk = 0;
+  ASSERT_NO_FATAL_FAILURE(Create(options));
+  using Counts = std::array<uint64_t, 3>;  // visits, candidates, pin skips.
+  using PathCounts = std::array<Counts, 3>;
+  const std::array<const char*, 3> paths{"class", "background", "watermark"};
+  const std::array<const char*, 3> fields{"visits", "candidates", "pin_skips"};
+  const auto check = [&](const std::array<PathCounts, 2>& expected) {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server_);
+    const std::string text = server_->MetricsText();
+    const std::string identity = R"(node="ghost\"node",group="ghost\\group\n")";
+    for (size_t view = 0; view < 3; ++view) {
+      const std::string prefix = view < 2 ? "dfkv_slab_disk_lifetime_band_"
+                                          : "dfkv_slab_lifetime_band_";
+      const std::string disk = view < 2 ? "disk=\"" + group.DiskPath(view) +
+                                              "\",disk_index=\"" +
+                                              std::to_string(view) + "\","
+                                        : "";
+      std::vector<SlabAllocator::LifetimeBandScanStat> stats;
+      if (view < 2) {
+        stats = group.DiskLifetimeBandScanStats(view);
+        ASSERT_EQ(stats.size(), 9U);
+      }
+      for (size_t path = 0; path < paths.size(); ++path) {
+        const Counts count =
+            view < 2 ? expected[view][path]
+                     : Counts{expected[0][path][0] + expected[1][path][0],
+                              expected[0][path][1] + expected[1][path][1],
+                              expected[0][path][2] + expected[1][path][2]};
+        for (uint32_t band = 0; band < 3; ++band) {
+          const Counts values = band == 0 ? count : Counts{};
+          if (view < 2) {
+            const SlabAllocator::LifetimeBandScanStat& stat =
+                stats[path * 3 + band];
+            EXPECT_EQ(static_cast<size_t>(stat.path), path);
+            EXPECT_EQ(stat.band, band);
+            EXPECT_EQ(stat.visits, values[0]);
+            EXPECT_EQ(stat.candidates, values[1]);
+            EXPECT_EQ(stat.pin_skips, values[2]);
+          }
+          const std::string labels = "{" + disk + "path=\"" + paths[path] +
+                                     "\",band=\"" + std::to_string(band) +
+                                     "\"," + identity + "}";
+          for (size_t field = 0; field < fields.size(); ++field) {
+            const std::string name = prefix + fields[field] + "_total";
+            const std::string type = "# TYPE " + name + " counter\n";
+            EXPECT_NE(text.find(type), std::string::npos);
+            EXPECT_EQ(text.find(type), text.rfind(type));
+            const std::string sample = "\n" + name + labels + " " +
+                                       std::to_string(values[field]) + "\n";
+            EXPECT_NE(text.find(sample), std::string::npos) << sample;
+            EXPECT_EQ(text.find(sample), text.rfind(sample));
+          }
+        }
+      }
+    }
+    // Exact sample count also rejects accidental extra key/request labels.
+    size_t samples = 0;
+    for (size_t pos = text.find("\ndfkv_slab"); pos != std::string::npos;
+         pos = text.find("\ndfkv_slab", pos + 1)) {
+      const size_t end = text.find('\n', pos + 1);
+      if (text.substr(pos, end - pos).find("_lifetime_band_") !=
+          std::string::npos) {
+        ++samples;
+      }
+    }
+    EXPECT_EQ(samples, 81U);  // 3 views * 3 paths * 3 bands * 3 counters.
+    EXPECT_TRUE(group.DiskLifetimeBandScanStats(group.DiskCount()).empty());
+  };
+  ASSERT_NO_FATAL_FAILURE(check({}));
+  std::array<std::array<ReadLease, 2>, 2> leases;
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(
+        KvNodeServerTestPeer::Group(*server_), disk);
+    for (uint64_t id = 1; id <= 8 + disk + 1; ++id) {
+      ASSERT_EQ(store.Cache({id, 0, 7}, "old", 3), Status::kOk);
+    }
+    ASSERT_EQ(store.Count(), 8U);
+    // Foreground replaced one/two oldest residents. Pin the next one/two
+    // heads without a logical read: preparation alone must not migrate bands.
+    for (size_t pin = 0; pin <= disk; ++pin) {
+      ASSERT_EQ(store.RangeDirectPrep({disk + pin + 2, 0, 7}, 0, 0, 4096,
+                                      &leases[disk][pin]),
+                Status::kOk);
+    }
+    DiskSlabStoreTestPeer::TickBackground(store);
+    ASSERT_EQ(store.Count(), 7U);
+    DiskSlabStoreTestPeer::TickWatermark(store);
+    ASSERT_EQ(store.Count(), 6U);
+  }
+  // Handwritten cohorts, not a copy of producer counters: each path sees
+  // band0 only; background/global inspect the pinned prefix before one winner.
+  const std::array<PathCounts, 2> expected{
+      PathCounts{Counts{1, 1, 0}, Counts{2, 1, 1}, Counts{2, 1, 1}},
+      PathCounts{Counts{2, 2, 0}, Counts{3, 1, 2}, Counts{3, 1, 2}}};
+  ASSERT_NO_FATAL_FAILURE(check(expected));
+  ASSERT_NO_FATAL_FAILURE(check(expected));  // Scrapes must not increment.
+  for (std::array<ReadLease, 2>& disk_leases : leases) {
+    for (ReadLease& lease : disk_leases) {
+      lease = ReadLease{};
+    }
+  }
+  server_.reset();
+  clock_ = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config_), [this] { return seconds_.load(); });
+  options.lifetime_clock = clock_;
+  ASSERT_NO_FATAL_FAILURE(Create(options));
+  ASSERT_EQ(server_->Count(), 12U);
+  ASSERT_NO_FATAL_FAILURE(check({}));
+}
+
+TEST_F(LifetimeGhostMetricsTest, BandScanCountersAreAbsentForLegacyAndFile) {
+  for (const char* engine : {"slab", "file"}) {
+    SCOPED_TRACE(engine);
+    DiskCacheGroup::Options options = Options();
+    options.engine = engine;
+    options.eviction_policy = "legacy";
+    options.eviction_ghost_capacity_per_disk = 0;
+    options.lifetime_config.reset();
+    options.lifetime_clock.reset();
+    ASSERT_NO_FATAL_FAILURE(Create(options));
+    DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server_);
+    const BlockKey key = IntervalKey(0, 99);
+    ASSERT_EQ(group.Cache(key, "old", 3), Status::kOk);
+    ASSERT_NO_FATAL_FAILURE(IntervalRead(key));
+    EXPECT_TRUE(group.DiskLifetimeBandScanStats(0).empty());
+    EXPECT_TRUE(group.DiskLifetimeBandScanStats(1).empty());
+    EXPECT_TRUE(group.DiskLifetimeBandScanStats(group.DiskCount()).empty());
+    const std::string text = server_->MetricsText();
+    for (const char* prefix :
+         {"dfkv_slab_lifetime_band_", "dfkv_slab_disk_lifetime_band_"}) {
+      for (const char* field : {"visits", "candidates", "pin_skips"}) {
+        const std::string name = std::string(prefix) + field + "_total";
+        EXPECT_EQ(text.find("\n" + name + "{"), std::string::npos);
+        if (options.engine == "file") {
+          EXPECT_EQ(text.find(name), std::string::npos);
+        }
+      }
+    }
+    server_.reset();
+    fs::remove_all(dir_);
+  }
+}
+
 TEST_F(LifetimeGhostMetricsTest, DisabledSlabsEmitZerosAndFileOmitsFamilies) {
   for (const char* policy : {"legacy", "lifetime", "file"}) {
     SCOPED_TRACE(policy);

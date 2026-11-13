@@ -315,6 +315,23 @@ class SlabAllocator {
   // Disabled storage returns empty. Cost is O(classes + active classes *
   // bands).
   std::vector<LifetimeQueueStat> LifetimeQueueStats() const;
+  enum class LifetimeScanPath : unsigned char {
+    kClass = 0,       // Foreground allocation's class-local selection.
+    kBackground = 1,  // Background class headroom reclamation.
+    kWatermark = 2    // Global watermark selection across size classes.
+  };
+  struct LifetimeBandScanStat {
+    LifetimeScanPath path = LifetimeScanPath::kClass;
+    uint32_t band = 0;    // Effective scoring band, not logical read class.
+    uint64_t visits = 0;  // Paid resident checks, including cached rechecks.
+    uint64_t candidates = 0;  // Eligible checks, not unique or freed residents.
+    uint64_t pin_skips = 0;   // Checks that observed at least one pin.
+  };
+  // One A-locked copy; no resident walk or clock read. Enabled allocators keep
+  // all three paths and M+1 bands, even after queues empty. Counts aggregate
+  // size classes and reset only with allocator reconstruction. Disabled is
+  // empty. This snapshot is independent of population and Store Stats views.
+  std::vector<LifetimeBandScanStat> LifetimeBandScanStats() const;
   uint64_t WatermarkEvictions() const;
   // Local candidate: reclaim slots in refreshed actual-read/new-write order
   // until allocated bytes reach target_bytes. A call removes at most max_victims
@@ -410,10 +427,10 @@ class SlabAllocator {
     std::array<bool, 64> done{};
     LifetimeScanResult result = LifetimeScanResult::kIdle;
   };
-  bool EvictLifetimeFromLocked(size_t cls_index, LifetimeScan& scan,
-                               std::vector<BlockKey>* evicted,
-                               bool* reclaim_denied,
-                               uint32_t max_visits = 1024);
+  bool EvictLifetimeFromLocked(
+      size_t cls_index, LifetimeScan& scan, std::vector<BlockKey>* evicted,
+      bool* reclaim_denied, uint32_t max_visits = 1024,
+      LifetimeScanPath path = LifetimeScanPath::kClass);
   struct LifetimeReclaimResult {
     size_t victims = 0;
     bool more = false;  // Release D and A before continuing this tick.
@@ -663,6 +680,8 @@ class SlabAllocator {
   std::vector<LifetimeLinks> lifetime_links_;
   // Row 0 is global; row cls+1 is class-local, each with MAX_READS+1 bands.
   std::vector<LifetimeQueue> lifetime_queues_;
+  // Enabled-only, path-major M+1 counters; never resized during scanning.
+  std::vector<LifetimeBandScanStat> lifetime_band_scans_;
   // Enabled-only physical ledger. No duplicate resident generation is needed:
   // owner validation and every token transition share A with slot reuse.
   std::vector<uint64_t> lifetime_bucket_tokens_;

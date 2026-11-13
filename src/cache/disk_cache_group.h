@@ -241,6 +241,9 @@ class DiskCacheGroup {
   // Separate metrics-only snapshot; file/out-of-range views are empty.
   std::vector<SlabAllocator::LifetimeQueueStat> DiskLifetimeQueueStats(
       size_t i) const;
+  // Cumulative band checks; disabled/file/out-of-range views are empty.
+  std::vector<SlabAllocator::LifetimeBandScanStat> DiskLifetimeBandScanStats(
+      size_t i) const;
   // Metrics-only bucket view; file/out-of-range views are unavailable.
   SlabAllocator::LifetimeBucketObservation DiskLifetimeBucketObservation(
       size_t i) const;

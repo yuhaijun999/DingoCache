@@ -499,6 +499,9 @@ class DiskSlabStore : public StoreEngine {
   // Metrics-only retained queue populations; not scores or logical read
   // classes.
   std::vector<SlabAllocator::LifetimeQueueStat> LifetimeQueueStats() const;
+  // Metrics-only cumulative paid checks by mutually exclusive path and band.
+  std::vector<SlabAllocator::LifetimeBandScanStat> LifetimeBandScanStats()
+      const;
   // Retained initialized-state logical estimates, including hidden pins, not
   // visible payload. R expiry may lag by the returned bound; unavailable is
   // not zero population. One allocator lock/sample, no resident enumeration.

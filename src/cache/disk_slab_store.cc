@@ -3056,6 +3056,12 @@ DiskSlabStore::LifetimeQueueStats() const {
   return alloc_->LifetimeQueueStats();
 }
 
+std::vector<SlabAllocator::LifetimeBandScanStat>
+DiskSlabStore::LifetimeBandScanStats() const {
+  if (!alloc_) return {};
+  return alloc_->LifetimeBandScanStats();
+}
+
 SlabAllocator::LifetimeReadClassObservation
 DiskSlabStore::ObserveLifetimeReadClasses() const {
   if (!alloc_ || !opt_.lifetime_clock) return {};
