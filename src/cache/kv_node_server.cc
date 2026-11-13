@@ -613,6 +613,13 @@ std::string KvNodeServer::MetricsText() const {
         "dfkv_slab_disk_lifetime_ghost_sync_read_entry_snapshot_age_seconds_"
         "total",
         "counter", "Sum of retained entry-snapshot ages for matched misses");
+    header("dfkv_slab_disk_lifetime_ghost_window_available", "gauge",
+           "Usable settled-prefix key-membership window, possibly empty");
+    header("dfkv_slab_disk_lifetime_ghost_window_after_sec", "gauge",
+           "Exclusive window lower clock offset, not Unix time");
+    header(
+        "dfkv_slab_disk_lifetime_ghost_window_through_sec", "gauge",
+        "Inclusive end for this settled prefix, not future same-second events");
     header("dfkv_slab_disk_lifetime_ghost_oldest_settled_at_sec", "gauge",
            "Oldest retained batch settlement clock offset, not a window");
     header("dfkv_slab_disk_lifetime_ghost_newest_settled_at_sec", "gauge",
@@ -997,6 +1004,17 @@ std::string KvNodeServer::MetricsText() const {
           "dfkv_slab_disk_lifetime_ghost_sync_read_entry_snapshot_age_seconds_"
           "total",
           ghost.sync_read_entry_snapshot_age_sec);
+      const bool window_available =
+          ghost.history.window_after_sec.has_value() &&
+          ghost.history.window_through_sec.has_value();
+      sample("dfkv_slab_disk_lifetime_ghost_window_available",
+             window_available ? 1 : 0);
+      if (window_available) {
+        sample("dfkv_slab_disk_lifetime_ghost_window_after_sec",
+               *ghost.history.window_after_sec);
+        sample("dfkv_slab_disk_lifetime_ghost_window_through_sec",
+               *ghost.history.window_through_sec);
+      }
       if (ghost.history.oldest_evicted_at_sec.has_value()) {
         sample("dfkv_slab_disk_lifetime_ghost_oldest_settled_at_sec",
                *ghost.history.oldest_evicted_at_sec);

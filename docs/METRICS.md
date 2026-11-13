@@ -1511,15 +1511,22 @@ identity labels; no key/request labels or global ghost families are added:
 | `dfkv_slab_disk_lifetime_ghost_sync_read_lookup_unavailable_total` | counter | Those misses whose pre-read witness could not establish a usable health/clock lookup. |
 | `dfkv_slab_disk_lifetime_ghost_sync_read_history_matches_total` | counter | Those misses with a retained full-tenant-key event at the pre-read snapshot. Association, not an eviction-caused-miss counter. |
 | `dfkv_slab_disk_lifetime_ghost_sync_read_entry_snapshot_age_seconds_total` | counter | Sum of snapshot-to-retained-settlement ages for matched misses, including valid zero; excludes later read latency. |
+| `dfkv_slab_disk_lifetime_ghost_window_available` | gauge | Both window endpoints are usable for this settled key-membership prefix; 1 can mean an empty interval. |
+| `dfkv_slab_disk_lifetime_ghost_window_after_sec` | gauge | Exclusive lower clock offset; omitted when unavailable. |
+| `dfkv_slab_disk_lifetime_ghost_window_through_sec` | gauge | Inclusive end offset for this snapshot's already-settled prefix, not future events in the same second; omitted when unavailable. |
 | `dfkv_slab_disk_lifetime_ghost_oldest_settled_at_sec` | gauge | Oldest retained batch-settlement clock offset; omitted if empty, valid zero emitted. |
 | `dfkv_slab_disk_lifetime_ghost_newest_settled_at_sec` | gauge | Newest retained batch-settlement clock offset; omitted if empty, valid zero emitted. |
 
 File engines omit these families. Disabled slabs emit zero capacity/population/
-events/truncation and omit both timestamp samples. One D-locked snapshot supplies
+events/truncation/window availability and omit all timestamp samples. One D-locked snapshot supplies
 all fields for a disk. Different disks are observed separately; time bounds must
-not be summed or merged into a global complete window. The ghost snapshot does
-not sample the clock, although other existing `MetricsText` observations do.
-Repeated scrapes do not record or refresh ghost evidence. Configured enabled
+not be summed or merged into a global complete window. Enabled healthy ghost
+observations now take one shared `TryDrainNow` sample under D; enabled Store
+construction also captures a start sample before recovery/publication. These
+samples advance the shared monotonic floor and can close subsequent admission,
+even if the injected clock rolls back. Disabled recording adds neither sample.
+This is additional clock/return-object work, not a zero-cost claim. Repeated
+scrapes advance the endpoint but do not record or refresh ghost evidence. Configured enabled
 state and retained history remain observable even after a clock/health failure.
 Counters and history are process-local and empty after reopening a Store.
 
@@ -1545,10 +1552,36 @@ this boundary using the **discarded** record's timestamp, not the incoming
 record. A candidate complete key-membership interval must start strictly after
 this boundary (including same-second ties); unknown-time loss remains until
 Store reconstruction. Duplicate-key refresh loses no key membership, so this is
-not complete event-history retention. These internal fields are **not exported
-metrics or a complete interval**: owner start/end and usable observation-clock
-bounds still need a separate protocol. Their absence alone does not establish
-coverage, and conservative loss markers need not imply an actually absent key.
+not complete event-history retention. These loss fields remain internal;
+conservative markers need not imply an actually absent key.
+
+The exported key-membership interval is **`(after, through]`**, where `after` is
+the maximum of the known owner-start whole second and the known loss boundary.
+The entire owner-start second is conservatively excluded, as is the last loss
+second; no boundary increment is needed. `through` is sampled in the same D-locked
+snapshot, after that owner's already-settled events. Every distinct tenant-key
+with a successful settlement in this prefix and interval still has retained
+latest-key evidence. This does **not** retain every event, prove a current
+resident/generation or establish eviction causality. The endpoint does not
+promise coverage of any **future event sharing that whole-second value**.
+This prefix covers completed Store successful-list settlements only; an unwind
+before that recorder (for example victim-list allocation after physical
+invalidation) is outside it. Availability is not complete physical-eviction
+coverage or whole-path OOM safety.
+
+Availability 1 with `after == through` is a valid **empty** interval: both zero
+endpoints must still be emitted. Empty history can also have an available
+interval (no applicable events). Disabled recording, unknown start/current time,
+unhealthy Store, sticky unknown-time loss, or an end before the start/loss/latest
+retained event produces availability 0 and **omits both endpoints**, without
+erasing raw history/counters. Failed observation is not itself a dropped eviction
+or a new sticky loss. Unknown start/loss cannot be repaired by later records;
+Store reconstruction resets evidence and captures a new start, never preboot
+coverage. Do not stitch windows across reconstructions or disks, even with the
+same labels. Unconditioned retained counts and sync-miss/history-match counters
+include evidence outside this interval; they are **not** its event population or
+an interval-conditioned business-miss rate.
+
 The container may stage one extra node/index entry, and node/bucket/allocator/peak RSS
 costs are not yet accepted. Historical key matches and repeated PUTs are not
 proof of eviction-caused business loss. These diagnostics do not establish full

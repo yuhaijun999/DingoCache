@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export per-disk ghost key-membership windows from owner-start, loss and current
+  settlement-prefix bounds. Distinguish valid empty windows from unavailable
+  time; enabled snapshots now sample the shared lifetime clock.
+
 - Track internal eviction-history loss boundaries for capacity truncation and
   failed recording, distinguishing unknown-time gaps without changing eviction
   or claiming a complete observation window.

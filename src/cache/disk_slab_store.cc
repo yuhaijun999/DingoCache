@@ -649,7 +649,16 @@ DiskSlabStore::EvictionGhostObservation DiskSlabStore::ObserveEvictionGhost()
     const {
   const std::lock_guard<std::mutex> lock(mu_);
   EvictionGhostObservation observation;
-  if (eviction_ghost_) observation.history = eviction_ghost_->GetSnapshot();
+  if (eviction_ghost_) {
+    std::optional<uint64_t> through;
+    uint32_t sampled_at = 0;
+    // Observations advance the shared clock floor but never invent a dropped
+    // eviction when time/health is unavailable. Retained evidence stays
+    // visible.
+    if (Healthy() && opt_.lifetime_clock->TryDrainNow(&sampled_at))
+      through = sampled_at;
+    observation.history = eviction_ghost_->GetSnapshot(through);
+  }
   observation.recorded = ghost_recorded_;
   observation.dropped = ghost_dropped_;
   observation.sync_read_misses = ghost_sync_read_misses_;
@@ -667,8 +676,13 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
     return;
   }
   if (opt_.eviction_ghost_capacity != 0) {
-    eviction_ghost_ =
-        std::make_unique<DiskEvictionGhost>(opt_.eviction_ghost_capacity);
+    std::optional<uint64_t> started_at;
+    uint32_t sampled_at = 0;
+    // Exclusive construction precedes recovery/publication/background work.
+    // Optional evidence failure adds no ghost-specific startup veto.
+    if (opt_.lifetime_clock->TryDrainNow(&sampled_at)) started_at = sampled_at;
+    eviction_ghost_ = std::make_unique<DiskEvictionGhost>(
+        opt_.eviction_ghost_capacity, started_at);
   }
   if (opt_.track_resident_identity) {
     resident_identity_ = std::make_unique<ResidentIdentityState>();

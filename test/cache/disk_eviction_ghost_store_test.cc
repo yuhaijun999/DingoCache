@@ -270,6 +270,8 @@ TEST_F(DiskEvictionGhostStoreTest, FailedInvalidationDoesNotInventEviction) {
   EXPECT_EQ(store_->Cache(Key(2), "new", 3), Status::kIOError);
   EXPECT_FALSE(store_->Healthy());
   EXPECT_EQ(store_->ObserveEvictionGhost().recorded, 0U);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.window_after_sec);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.window_through_sec);
   EXPECT_EQ(store_->ObserveEvictionGhost().dropped, 0U);
   EXPECT_FALSE(DiskSlabStoreTestPeer::Age(*store_, Key(1), 0));
 }
@@ -374,6 +376,8 @@ TEST_F(DiskEvictionGhostStoreTest,
   EXPECT_EQ(store_->ObserveEvictionGhost().dropped, 2U);
   EXPECT_TRUE(store_->ObserveEvictionGhost().history.loss_time_unknown);
   EXPECT_FALSE(store_->ObserveEvictionGhost().history.lost_through_sec);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.window_after_sec);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.window_through_sec);
   EXPECT_TRUE(store_->Healthy());
 }
 
@@ -431,6 +435,8 @@ TEST_F(DiskEvictionGhostStoreTest,
   EXPECT_EQ(store_->ObserveEvictionGhost().recorded, 1U);
   EXPECT_EQ(store_->ObserveEvictionGhost().history.lost_through_sec, 12U);
   EXPECT_EQ(DiskSlabStoreTestPeer::Age(*store_, Key(1), 20), 5U);
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_after_sec, 12U);
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_through_sec, 15U);
   EXPECT_TRUE(store_->Healthy());
 }
 
@@ -472,6 +478,8 @@ TEST_F(DiskEvictionGhostStoreTest,
   EXPECT_EQ(store_->ObserveEvictionGhost().dropped, 1U);
   EXPECT_TRUE(store_->ObserveEvictionGhost().history.loss_time_unknown);
   EXPECT_FALSE(store_->ObserveEvictionGhost().history.lost_through_sec);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.window_after_sec);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.window_through_sec);
   EXPECT_TRUE(store_->Healthy());
 }
 
@@ -488,6 +496,82 @@ TEST_F(DiskEvictionGhostStoreTest, RepeatedRealEvictionRefreshesSameKey) {
   EXPECT_EQ(observation.history.retained, 2U);
   EXPECT_TRUE(observation.history.capacity_limited);
   EXPECT_EQ(DiskSlabStoreTestPeer::Age(*store_, Key(1), 10), 5U);
+}
+
+TEST_F(DiskEvictionGhostStoreTest, WindowUsesCurrentTimeAndNewOwnerStart) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_after_sec, 0U);
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_through_sec, 0U);
+  seconds_ = 13;
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_after_sec, 0U);
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_through_sec, 13U);
+  store_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create());
+  seconds_ = 17;
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_after_sec, 13U);
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_through_sec, 17U);
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.retained, 0U);
+}
+
+TEST_F(DiskEvictionGhostStoreTest, DisabledWindowDoesNotSampleClock) {
+  std::atomic<unsigned> samples{0};
+  DiskSlabStore::Options options = Options();
+  options.eviction_ghost_capacity = 0;
+  options.lifetime_clock =
+      std::make_shared<DiskLifetimeClock>(DiskLifetimeHorizon(config_), [&] {
+        ++samples;
+        return 0;
+      });
+  store_ = std::make_unique<DiskSlabStore>(options);
+  ASSERT_TRUE(store_->Healthy());
+  const unsigned before = samples.load();
+  // Only clock origin and the existing option-validation admission sample.
+  EXPECT_EQ(before, 2U);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.window_after_sec);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.window_through_sec);
+  EXPECT_EQ(samples.load(), before);
+}
+
+TEST_F(DiskEvictionGhostStoreTest, UnknownStartDoesNotAddGhostStartupVeto) {
+  std::atomic<unsigned> samples{0};
+  DiskSlabStore::Options options = Options();
+  options.lifetime_clock =
+      std::make_shared<DiskLifetimeClock>(DiskLifetimeHorizon(config_), [&] {
+        // Origin and existing ValidateOptions admission succeed; only the new
+        // optional owner-start sample crosses the hard bound.
+        return ++samples == 3 ? std::numeric_limits<uint64_t>::max() : 0;
+      });
+  store_ = std::make_unique<DiskSlabStore>(options);
+  ASSERT_TRUE(store_->Healthy()) << store_->StartupError();
+  EXPECT_EQ(samples.load(), 3U);
+  const DiskSlabStore::EvictionGhostObservation observation =
+      store_->ObserveEvictionGhost();
+  EXPECT_FALSE(observation.history.window_after_sec);
+  EXPECT_FALSE(observation.history.window_through_sec);
+  EXPECT_EQ(observation.dropped, 0U);
+  EXPECT_FALSE(observation.history.loss_time_unknown);
+}
+
+TEST_F(DiskEvictionGhostStoreTest, WindowSamplingAdvancesSharedAdmissionFloor) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const uint64_t through =
+      std::numeric_limits<uint32_t>::max() - DiskLifetimeHorizon(config_) + 1;
+  seconds_ = through;
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_after_sec, 0U);
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_through_sec, through);
+  uint32_t offset = 0;
+  EXPECT_FALSE(clock_->TryNow(&offset));
+  // Observation advances the shared floor, even if the injected source rolls
+  // back. Clock-unavailable observation does not invent a dropped eviction.
+  seconds_ = 0;
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.window_through_sec, through);
+  seconds_ = std::numeric_limits<uint64_t>::max();
+  const DiskSlabStore::EvictionGhostObservation unavailable =
+      store_->ObserveEvictionGhost();
+  EXPECT_FALSE(unavailable.history.window_after_sec);
+  EXPECT_FALSE(unavailable.history.window_through_sec);
+  EXPECT_EQ(unavailable.dropped, 0U);
+  EXPECT_FALSE(unavailable.history.loss_time_unknown);
 }
 
 TEST_F(DiskEvictionGhostStoreTest, ConcurrentSnapshotsConserveCompletedEvents) {

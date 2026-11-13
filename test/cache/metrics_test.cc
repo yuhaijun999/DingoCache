@@ -5462,6 +5462,12 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
               expected.history.oldest_evicted_at_sec);
     EXPECT_EQ(actual.history.newest_evicted_at_sec,
               expected.history.newest_evicted_at_sec);
+    EXPECT_EQ(actual.history.window_after_sec,
+              expected.history.window_after_sec);
+    EXPECT_EQ(actual.history.window_through_sec,
+              expected.history.window_through_sec);
+    EXPECT_EQ(expected.history.window_after_sec.has_value(),
+              expected.history.window_through_sec.has_value());
     EXPECT_EQ(actual.recorded, expected.recorded);
     EXPECT_EQ(actual.dropped, expected.dropped);
     EXPECT_EQ(actual.sync_read_misses, expected.sync_read_misses);
@@ -5483,6 +5489,7 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
           {"capacity_entries", expected.history.capacity},
           {"retained_entries", expected.history.retained},
           {"capacity_limited", expected.history.capacity_limited},
+          {"window_available", expected.history.window_after_sec.has_value()},
           {"recorded_total", expected.recorded},
           {"dropped_total", expected.dropped},
           {"sync_read_misses_total", expected.sync_read_misses},
@@ -5500,7 +5507,8 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
     }
     for (const char* suffix :
          {"enabled", "capacity_entries", "retained_entries", "capacity_limited",
-          "oldest_settled_at_sec", "newest_settled_at_sec"}) {
+          "oldest_settled_at_sec", "newest_settled_at_sec", "window_available",
+          "window_after_sec", "window_through_sec"}) {
       EXPECT_NE(text.find("# TYPE " + prefix + suffix + " gauge\n"),
                 std::string::npos);
     }
@@ -5515,7 +5523,9 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
     for (const std::pair<const char*, std::optional<uint64_t>>& bound :
          {std::pair<const char*, std::optional<uint64_t>>{
               "oldest_settled_at_sec", expected.history.oldest_evicted_at_sec},
-          {"newest_settled_at_sec", expected.history.newest_evicted_at_sec}}) {
+          {"newest_settled_at_sec", expected.history.newest_evicted_at_sec},
+          {"window_after_sec", expected.history.window_after_sec},
+          {"window_through_sec", expected.history.window_through_sec}}) {
       const std::string sample = "\n" + prefix + bound.first + labels;
       if (bound.second.has_value()) {
         EXPECT_NE(text.find(sample + std::to_string(*bound.second) + "\n"),
@@ -5538,8 +5548,10 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
       EXPECT_NE(line.find(labels), std::string::npos) << line;
       ++samples;
     }
-    EXPECT_EQ(samples,
-              expected.history.oldest_evicted_at_sec.has_value() ? 12U : 10U);
+    const size_t expected_samples =
+        11U + (expected.history.oldest_evicted_at_sec.has_value() ? 2U : 0U) +
+        (expected.history.window_after_sec.has_value() ? 2U : 0U);
+    EXPECT_EQ(samples, expected_samples);
     EXPECT_EQ(text.find("dfkv_slab_lifetime_ghost_"), std::string::npos);
   }
   const ScopedEnv ram_{"DFKV_RAM_TIER", "0"};
@@ -5584,6 +5596,8 @@ TEST_F(LifetimeGhostMetricsTest, PerDiskEvictionsBoundHistoryAndResetOnReopen) {
   ASSERT_NO_FATAL_FAILURE(Create(options));
   DiskSlabStore::EvictionGhostObservation empty;
   empty.history.capacity = 1;
+  empty.history.window_after_sec = 0;
+  empty.history.window_through_sec = 0;
   for (size_t disk = 0; disk < 2; ++disk) {
     ASSERT_NO_FATAL_FAILURE(Check(disk, empty));
   }
@@ -5615,6 +5629,8 @@ TEST_F(LifetimeGhostMetricsTest, PerDiskEvictionsBoundHistoryAndResetOnReopen) {
   twice.history.capacity_limited = true;
   twice.history.oldest_evicted_at_sec = 17;
   twice.history.newest_evicted_at_sec = 17;
+  twice.history.window_through_sec = 17;
+  once.history.window_through_sec = 17;
   for (unsigned scrape = 0; scrape < 2; ++scrape) {
     ASSERT_NO_FATAL_FAILURE(Check(0, twice));
     ASSERT_NO_FATAL_FAILURE(Check(1, once));
@@ -5622,8 +5638,116 @@ TEST_F(LifetimeGhostMetricsTest, PerDiskEvictionsBoundHistoryAndResetOnReopen) {
   server_.reset();
   ASSERT_NO_FATAL_FAILURE(Create(options));
   EXPECT_EQ(server_->Count(), 2U);
+  empty.history.window_after_sec = 17;
+  empty.history.window_through_sec = 17;
   for (size_t disk = 0; disk < 2; ++disk) {
     ASSERT_NO_FATAL_FAILURE(Check(disk, empty));
+  }
+}
+
+TEST_F(LifetimeGhostMetricsTest,
+       CoverageWindowsUseIndependentLostKeyBoundaries) {
+  ASSERT_NO_FATAL_FAILURE(Create(Options()));
+  DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server_);
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(group, disk);
+    ASSERT_EQ(store.Cache({1, disk, 7}, "old", 3), Status::kOk);
+    ASSERT_EQ(store.Cache({2, disk, 7}, "old", 3), Status::kOk);
+  }
+  seconds_ = 5;
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStoreTestPeer::TickWatermark(
+        DiskCacheGroupTestPeer::Slab(group, disk));
+  }
+  DiskSlabStore::EvictionGhostObservation disk0;
+  disk0.history.capacity = 1;
+  disk0.history.retained = 1;
+  disk0.history.oldest_evicted_at_sec = 5;
+  disk0.history.newest_evicted_at_sec = 5;
+  disk0.history.window_after_sec = 0;
+  disk0.history.window_through_sec = 5;
+  disk0.recorded = 1;
+  DiskSlabStore::EvictionGhostObservation disk1 = disk0;
+  ASSERT_NO_FATAL_FAILURE(Check(0, disk0));
+  ASSERT_NO_FATAL_FAILURE(Check(1, disk1));
+
+  seconds_ = 11;
+  DiskSlabStore& store0 = DiskCacheGroupTestPeer::Slab(group, 0);
+  ASSERT_EQ(store0.Cache({3, 0, 7}, "new", 3), Status::kOk);
+  DiskSlabStoreTestPeer::TickWatermark(store0);
+  disk0.history.capacity_limited = true;
+  disk0.history.oldest_evicted_at_sec = 11;
+  disk0.history.newest_evicted_at_sec = 11;
+  // Discarding the evidence settled at t=5 excludes that entire second, not
+  // t=11 (the newest retained event). The other disk has discarded nothing.
+  disk0.history.window_after_sec = 5;
+  disk0.history.window_through_sec = 11;
+  disk0.recorded = 2;
+  disk1.history.window_through_sec = 11;
+  ASSERT_NO_FATAL_FAILURE(Check(0, disk0));
+  ASSERT_NO_FATAL_FAILURE(Check(1, disk1));
+
+  seconds_ = 19;
+  DiskSlabStore& store1 = DiskCacheGroupTestPeer::Slab(group, 1);
+  ASSERT_EQ(store1.Cache({3, 1, 7}, "new", 3), Status::kOk);
+  DiskSlabStoreTestPeer::TickWatermark(store1);
+  disk1.history.capacity_limited = true;
+  disk1.history.oldest_evicted_at_sec = 19;
+  disk1.history.newest_evicted_at_sec = 19;
+  disk1.history.window_after_sec = 5;
+  disk1.recorded = 2;
+  seconds_ = 23;
+  ASSERT_EQ(store0.Cache({4, 0, 7}, "new", 3), Status::kOk);
+  DiskSlabStoreTestPeer::TickWatermark(store0);
+  disk0.history.oldest_evicted_at_sec = 23;
+  disk0.history.newest_evicted_at_sec = 23;
+  disk0.history.window_after_sec = 11;
+  disk0.history.window_through_sec = 23;
+  disk0.recorded = 3;
+  disk1.history.window_through_sec = 23;
+  // Both endpoints use each disk's own loss frontier and the current shared
+  // time; independently timed histories are never merged into a global window.
+  ASSERT_NO_FATAL_FAILURE(Check(0, disk0));
+  ASSERT_NO_FATAL_FAILURE(Check(1, disk1));
+}
+
+TEST_F(LifetimeGhostMetricsTest,
+       ClockFailureOmitsWindowsWithoutErasingRetainedEvidence) {
+  ASSERT_NO_FATAL_FAILURE(Create(Options()));
+  DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server_);
+  seconds_ = 7;
+  for (size_t disk = 0; disk < 2; ++disk) {
+    DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(group, disk);
+    ASSERT_EQ(store.Cache({1, disk, 7}, "old", 3), Status::kOk);
+    ASSERT_EQ(store.Cache({2, disk, 7}, "old", 3), Status::kOk);
+    DiskSlabStoreTestPeer::TickWatermark(store);
+  }
+  DiskSlabStore::EvictionGhostObservation retained;
+  retained.history.capacity = 1;
+  retained.history.retained = 1;
+  retained.history.oldest_evicted_at_sec = 7;
+  retained.history.newest_evicted_at_sec = 7;
+  retained.history.window_after_sec = 0;
+  retained.history.window_through_sec = 7;
+  retained.recorded = 1;
+  for (size_t disk = 0; disk < 2; ++disk) {
+    ASSERT_NO_FATAL_FAILURE(Check(disk, retained));
+  }
+
+  seconds_ = std::numeric_limits<uint64_t>::max();
+  retained.history.window_after_sec.reset();
+  retained.history.window_through_sec.reset();
+  for (size_t disk = 0; disk < 2; ++disk) {
+    ASSERT_NO_FATAL_FAILURE(Check(disk, retained));
+    EXPECT_TRUE(DiskCacheGroupTestPeer::Slab(group, disk).Healthy());
+    EXPECT_FALSE(
+        group.DiskEvictionGhostObservation(disk).history.loss_time_unknown);
+  }
+  // A failed observation is not a dropped eviction, and clock rollback cannot
+  // clear the clock's sticky hard failure or fabricate an available interval.
+  seconds_ = 12;
+  for (size_t disk = 0; disk < 2; ++disk) {
+    ASSERT_NO_FATAL_FAILURE(Check(disk, retained));
   }
 }
 

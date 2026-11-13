@@ -32,13 +32,21 @@ class DiskEvictionGhost {
     // Sticky until reconstruction after a loss without a usable timestamp.
     // Successful later records cannot establish complete coverage across it.
     bool loss_time_unknown = false;
+    // Raw retained timestamps are not complete time coverage: equal-time
+    // records may already have been discarded at capacity.
     std::optional<uint64_t> oldest_evicted_at_sec;
     std::optional<uint64_t> newest_evicted_at_sec;
-    // These timestamps describe retained evidence, not complete time coverage:
-    // equal-time evictions may already have been discarded at the capacity cap.
+    // Complete key-membership evidence for this settled prefix in
+    // (window_after_sec, window_through_sec], not a complete event timeline.
+    // Both absent means unavailable; equal values mean an available EMPTY
+    // interval. The entire owner-start second is conservatively excluded.
+    std::optional<uint64_t> window_after_sec;
+    std::optional<uint64_t> window_through_sec;
   };
 
-  explicit DiskEvictionGhost(size_t capacity);
+  // Unknown start permits recording/raw snapshots, never a complete window.
+  explicit DiskEvictionGhost(
+      size_t capacity, std::optional<uint64_t> started_at_sec = std::nullopt);
   // The index borrows iterators from this owner's list.
   DiskEvictionGhost(const DiskEvictionGhost&) = delete;
   DiskEvictionGhost& operator=(const DiskEvictionGhost&) = delete;
@@ -63,7 +71,12 @@ class DiskEvictionGhost {
   // separately establish an actual request/result or recomputation association.
   std::optional<uint64_t> LookupEvictionAge(const BlockKey& key,
                                             uint64_t now_sec) const;
-  Snapshot GetSnapshot() const;
+  // A usable end must cover the latest retained event and all known losses.
+  // Unknown start/end/loss makes the window unavailable, not its raw history.
+  // The end covers only events already settled at this serialized snapshot;
+  // future events in the same whole second are NOT part of this prefix.
+  Snapshot GetSnapshot(
+      std::optional<uint64_t> through_sec = std::nullopt) const;
 
  private:
   struct Entry {
@@ -77,6 +90,7 @@ class DiskEvictionGhost {
   using Index = std::unordered_map<BlockKey, Entries::iterator, KeyHash>;
 
   const size_t capacity_;
+  const std::optional<uint64_t> started_at_sec_;
   Entries entries_;  // Oldest accepted unique eviction first.
   Index index_;
   bool capacity_limited_ = false;

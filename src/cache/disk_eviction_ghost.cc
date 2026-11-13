@@ -1,5 +1,6 @@
 #include "cache/disk_eviction_ghost.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -8,7 +9,9 @@
 
 namespace dfkv {
 
-DiskEvictionGhost::DiskEvictionGhost(size_t capacity) : capacity_(capacity) {}
+DiskEvictionGhost::DiskEvictionGhost(size_t capacity,
+                                     std::optional<uint64_t> started_at_sec)
+    : capacity_(capacity), started_at_sec_(started_at_sec) {}
 
 size_t DiskEvictionGhost::KeyHash::operator()(
     const BlockKey& key) const noexcept {
@@ -77,7 +80,8 @@ std::optional<uint64_t> DiskEvictionGhost::LookupEvictionAge(
   return now_sec - found->second->evicted_at_sec;
 }
 
-DiskEvictionGhost::Snapshot DiskEvictionGhost::GetSnapshot() const {
+DiskEvictionGhost::Snapshot DiskEvictionGhost::GetSnapshot(
+    std::optional<uint64_t> through_sec) const {
   Snapshot snapshot;
   snapshot.capacity = capacity_;
   snapshot.retained = entries_.size();
@@ -87,6 +91,18 @@ DiskEvictionGhost::Snapshot DiskEvictionGhost::GetSnapshot() const {
   if (!entries_.empty()) {
     snapshot.oldest_evicted_at_sec = entries_.front().evicted_at_sec;
     snapshot.newest_evicted_at_sec = entries_.back().evicted_at_sec;
+  }
+  if (capacity_ != 0 && started_at_sec_.has_value() &&
+      through_sec.has_value() && !loss_time_unknown_) {
+    const uint64_t after = std::max(
+        *started_at_sec_, lost_through_sec_.value_or(*started_at_sec_));
+    // An earlier end cannot reuse a later container as a historical snapshot.
+    // The exclusive lower bound handles whole-second ties and MAX without +1.
+    if (*through_sec >= after &&
+        (entries_.empty() || *through_sec >= entries_.back().evicted_at_sec)) {
+      snapshot.window_after_sec = after;
+      snapshot.window_through_sec = through_sec;
+    }
   }
   return snapshot;
 }
