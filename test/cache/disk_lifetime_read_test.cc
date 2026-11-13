@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -10,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <thread>
@@ -63,6 +65,15 @@ class DiskSlabStoreTestPeer {
 };
 namespace {
 
+uint64_t IntervalSamples(
+    const SlabAllocator::LifetimeReadIntervalStats& stats) {
+  return std::accumulate(stats.first_buckets.begin(), stats.first_buckets.end(),
+                         uint64_t{0}) +
+         std::accumulate(stats.repeat_buckets.begin(),
+                         stats.repeat_buckets.end(), uint64_t{0}) +
+         stats.recovered_first_unknown;
+}
+
 class DiskLifetimeReadTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -115,6 +126,11 @@ class DiskLifetimeReadTest : public ::testing::Test {
   DiskSlabStore::LifetimeReadCounters Counters() const {
     const DiskSlabStore::Stats stats = store_->GetStats();
     const DiskSlabStore::LifetimeReadCounters counters = stats.lifetime_reads;
+    EXPECT_EQ(IntervalSamples(stats.lifetime_read_intervals), counters.applied);
+    if (counters.applied == 0) {
+      EXPECT_EQ(stats.lifetime_read_intervals.first_total_sec, 0U);
+      EXPECT_EQ(stats.lifetime_read_intervals.repeat_total_sec, 0U);
+    }
     const DiskSlabStore::LifetimeReadTimingStats completion =
         stats.lifetime_read_completion_to_apply;
     EXPECT_EQ(counters.successful,
@@ -185,6 +201,61 @@ class DiskLifetimeReadTest : public ::testing::Test {
   std::unique_ptr<DiskSlabStore> store_;
   std::filesystem::path dir_;
 };
+
+TEST_F(DiskLifetimeReadTest,
+       ReadIntervalsFollowAppliedBytesAndResetOnRecovery) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  DiskResidentIdentity identity = Put();
+  std::string bytes;
+  ASSERT_EQ(store_->RangeWithIdentity(key_, 0, 0, &bytes, &identity),
+            Status::kOk);
+  ASSERT_EQ(bytes, "value");
+  // Storage preparation alone is not demand.
+  EXPECT_EQ(Counters().applied, 0U);
+  seconds_ = 110;
+  store_->NotifyLifetimeReadSuccess(key_, identity, bytes.size());
+  seconds_ = 115;
+  ASSERT_EQ(store_->RangeWithIdentity(key_, 0, 0, &bytes, &identity),
+            Status::kOk);
+  store_->NotifyLifetimeReadSuccess(key_, identity, bytes.size());
+  const DiskResidentIdentity valid = identity;
+  ASSERT_EQ(store_->RangeWithIdentity(key_, 5, 0, &bytes, &identity),
+            Status::kOk);
+  ASSERT_TRUE(bytes.empty());
+  store_->NotifyLifetimeReadSuccess(key_, identity, bytes.size());
+  DiskResidentIdentity wrong = valid;
+  ++wrong.generation;
+  store_->NotifyLifetimeReadSuccess(key_, wrong, 5);
+  DiskResidentIdentity missing;
+  EXPECT_EQ(store_->RangeWithIdentity({99, 0}, 0, 0, &bytes, &missing),
+            Status::kNotFound);
+  EXPECT_EQ(Counters().applied, 2U);
+  SlabAllocator::LifetimeReadIntervalStats intervals =
+      store_->GetStats().lifetime_read_intervals;
+  const std::array<uint64_t, 8> one{0, 0, 1, 0, 0, 0, 0, 0};
+  EXPECT_EQ(intervals.first_buckets, one);
+  EXPECT_EQ(intervals.repeat_buckets, one);
+  EXPECT_EQ(intervals.first_total_sec, 10U);
+  EXPECT_EQ(intervals.repeat_total_sec, 5U);
+  store_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create());
+  EXPECT_EQ(Counters().applied, 0U);
+  for (const uint64_t at : {120U, 123U}) {
+    seconds_ = at;
+    ASSERT_EQ(store_->RangeWithIdentity(key_, 0, 0, &bytes, &identity),
+              Status::kOk);
+    ASSERT_EQ(bytes, "value");
+    store_->NotifyLifetimeReadSuccess(key_, identity, bytes.size());
+  }
+  EXPECT_EQ(Counters().applied, 2U);
+  intervals = store_->GetStats().lifetime_read_intervals;
+  const std::array<uint64_t, 8> zero{};
+  EXPECT_EQ(intervals.first_buckets, zero);
+  EXPECT_EQ(intervals.repeat_buckets, one);
+  EXPECT_EQ(intervals.first_total_sec, 0U);
+  EXPECT_EQ(intervals.repeat_total_sec, 3U);
+  EXPECT_EQ(intervals.recovered_first_unknown, 1U);
+}
 
 TEST_F(DiskLifetimeReadTest,
        CompletionCoverageSeparatesMetadataAndHeatOutcomes) {
@@ -388,6 +459,24 @@ TEST_F(DiskLifetimeReadTest,
        CompletionSamplingConservesConcurrentNotifications) {
   ASSERT_NO_FATAL_FAILURE(Create());
   const DiskResidentIdentity identity = Put();
+  std::atomic<bool> done{false};
+  std::atomic<bool> valid{true};
+  std::promise<void> observed;
+  const std::shared_future<void> snapshot_seen = observed.get_future().share();
+  std::thread observer([&] {
+    bool announced = false;
+    while (!done.load()) {
+      const DiskSlabStore::Stats snapshot = store_->GetStats();
+      if (IntervalSamples(snapshot.lifetime_read_intervals) !=
+          snapshot.lifetime_reads.applied)
+        valid.store(false);
+      if (!announced && snapshot.lifetime_reads.applied != 0) {
+        observed.set_value();
+        announced = true;
+      }
+      std::this_thread::yield();
+    }
+  });
   std::vector<std::thread> notifiers;
   for (unsigned notifier = 0; notifier < 4; ++notifier) {
     notifiers.emplace_back([&] {
@@ -397,10 +486,16 @@ TEST_F(DiskLifetimeReadTest,
         store_->NotifyLifetimeReadSuccess(
             key_, identity, 5, DiskSlabStore::LifetimeReadSource::kDisk,
             PreparedRead::Source::kUnclassified, completion);
+        if (event == 0 && snapshot_seen.wait_for(std::chrono::seconds(5)) !=
+                              std::future_status::ready)
+          valid.store(false);
       }
     });
   }
   for (std::thread& notifier : notifiers) notifier.join();
+  done.store(true);
+  observer.join();
+  EXPECT_TRUE(valid.load());
   const DiskSlabStore::Stats stats = store_->GetStats();
   EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 8U);
   const DiskSlabStore::LifetimeReadCounters counters = Counters();
@@ -411,6 +506,13 @@ TEST_F(DiskLifetimeReadTest,
   EXPECT_EQ(counters.completion_not_applied, 0U);
   EXPECT_EQ(counters.completion_invalid, 0U);
   EXPECT_EQ(State().actual_reads, 3U);
+  const std::array<uint64_t, 8> first{1, 0, 0, 0, 0, 0, 0, 0};
+  const std::array<uint64_t, 8> repeat{259, 0, 0, 0, 0, 0, 0, 0};
+  EXPECT_EQ(stats.lifetime_read_intervals.first_buckets, first);
+  EXPECT_EQ(stats.lifetime_read_intervals.repeat_buckets, repeat);
+  EXPECT_EQ(stats.lifetime_read_intervals.first_total_sec, 0U);
+  EXPECT_EQ(stats.lifetime_read_intervals.repeat_total_sec, 0U);
+  EXPECT_EQ(stats.lifetime_read_intervals.recovered_first_unknown, 0U);
 }
 
 TEST_F(DiskLifetimeReadTest,
@@ -425,6 +527,7 @@ TEST_F(DiskLifetimeReadTest,
       PreparedRead::Source::kUnclassified, completion);
   EXPECT_EQ(store_->GetStats().lifetime_reads.successful, 0U);
   EXPECT_EQ(store_->GetStats().lifetime_read_completion_to_apply.samples, 0U);
+  EXPECT_EQ(Counters().applied, 0U);
   store_.reset();
   ASSERT_NO_FATAL_FAILURE(Create());
   std::string bytes;
@@ -1418,6 +1521,10 @@ TEST(LifetimeReadStateValidation, UninitializedAndFutureStateFailClosed) {
                 allocator, future, 2, config, clock, &applied_time),
             SlabAllocatorTestPeer::LifetimeReadResult::kStateUnavailable);
   EXPECT_EQ(applied_time, untouched);
+  const std::array<uint64_t, 8> zero{};
+  EXPECT_EQ(allocator.ReadIntervalStats().first_buckets, zero);
+  EXPECT_EQ(allocator.ReadIntervalStats().repeat_buckets, zero);
+  EXPECT_EQ(allocator.ReadIntervalStats().recovered_first_unknown, 0U);
   const SlabAllocatorTestPeer::LifetimeSnapshot snapshot =
       SlabAllocatorTestPeer::LifetimeSnapshotFor(allocator, future);
   if (!snapshot.second.has_value()) {
@@ -1450,6 +1557,14 @@ TEST(LifetimeReadStateValidation, UninitializedAndFutureStateFailClosed) {
                 allocator, empty, 1, config, clock, &applied_time),
             SlabAllocatorTestPeer::LifetimeReadResult::kClockHardExhausted);
   EXPECT_EQ(applied_time, untouched);
+  const SlabAllocator::LifetimeReadIntervalStats intervals =
+      allocator.ReadIntervalStats();
+  const std::array<uint64_t, 8> first{0, 1, 0, 0, 0, 0, 0, 0};
+  EXPECT_EQ(intervals.first_buckets, first);
+  EXPECT_EQ(intervals.repeat_buckets, zero);
+  EXPECT_EQ(intervals.first_total_sec, 1U);
+  EXPECT_EQ(intervals.repeat_total_sec, 0U);
+  EXPECT_EQ(intervals.recovered_first_unknown, 0U);
 }
 
 }  // namespace

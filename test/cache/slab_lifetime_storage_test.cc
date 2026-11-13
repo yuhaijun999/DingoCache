@@ -752,6 +752,115 @@ TEST(SlabLifetimeStorage, ConfiguredBandCountsCoverBothIndexesAndClasses) {
   }
 }
 
+TEST(SlabLifetimeStorage,
+     ReadIntervalsCoverLiteralBoundariesAndSaturatedRepeats) {
+  SlabAllocator allocator(LifetimeOptions());
+  const DiskLifetimeConfig config;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&] { return seconds; });
+  const std::array<uint32_t, 13> intervals{
+      0, 1, 2, 60, 61, 180, 181, 3600, 3601, 86400, 86401, 604800, 604801};
+  SlabAllocator::SlotRef ref;
+  std::vector<BlockKey> evicted;
+  uint64_t generation = 400;
+  for (const uint32_t interval : intervals) {
+    const BlockKey key{generation, 0};
+    ASSERT_TRUE(allocator.Put(key, 4096, &ref, &evicted));
+    const DiskLifetimeState state =
+        NewDiskLifetimeState(static_cast<uint32_t>(seconds));
+    SlabAllocatorTestPeer::CommitGeneration(&allocator, key, generation,
+                                            &state);
+    // The same literal interval is independently observed as a first and
+    // subsequent read; no producer bucket constant supplies the oracle.
+    for (unsigned read = 0; read < 2; ++read) {
+      seconds += interval;
+      ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(
+                    allocator, key, generation, config, clock),
+                SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+    }
+    ASSERT_EQ(allocator.Remove(key), SlabAllocator::RemoveResult::kRemoved);
+    ++generation;
+  }
+  const BlockKey saturated{generation, 0};
+  ASSERT_TRUE(allocator.Put(saturated, 4096, &ref, &evicted));
+  const DiskLifetimeState state =
+      NewDiskLifetimeState(static_cast<uint32_t>(seconds));
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, saturated, generation,
+                                          &state);
+  for (unsigned read = 0; read < 70; ++read) {
+    ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(
+                  allocator, saturated, generation, config, clock),
+              SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  }
+  const SlabAllocator::LifetimeReadIntervalStats stats =
+      allocator.ReadIntervalStats();
+  const std::array<uint64_t, 8> first{2, 1, 2, 2, 2, 2, 2, 1};
+  const std::array<uint64_t, 8> repeat{70, 1, 2, 2, 2, 2, 2, 1};
+  EXPECT_EQ(stats.first_buckets, first);
+  EXPECT_EQ(stats.repeat_buckets, repeat);
+  EXPECT_EQ(stats.first_total_sec, 1390088U);
+  EXPECT_EQ(stats.repeat_total_sec, 1390088U);
+  EXPECT_EQ(stats.recovered_first_unknown, 0U);
+  DiskLifetimeState expected = state;
+  for (unsigned read = 0; read < 70; ++read) {
+    ASSERT_TRUE(ApplyDiskLifetimeRead(config, static_cast<uint32_t>(seconds),
+                                      &expected));
+  }
+  ExpectState(allocator, saturated, expected);
+  EXPECT_EQ(expected.scoring_reads(), 63U);
+  EXPECT_EQ(expected.actual_reads, 3U);
+}
+
+TEST(SlabLifetimeStorage,
+     ReadIntervalsSeparateUnknownRecoveryAndRejectedNotifications) {
+  SlabAllocator allocator(LifetimeOptions());
+  const DiskLifetimeConfig config;
+  uint64_t seconds = 0;
+  uint64_t samples = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config), [&] {
+    ++samples;
+    return seconds;
+  });
+  const BlockKey key{500, 0};
+  SlabAllocator::SlotRef ref;
+  std::vector<BlockKey> evicted;
+  ASSERT_TRUE(allocator.Put(key, 4096, &ref, &evicted));
+  const DiskLifetimeState recovered = RecoveredDiskLifetimeState(2);
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, key, 500, &recovered);
+  const uint64_t before = samples;
+  EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, key, 501,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kGenerationMismatch);
+  EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, {501, 0}, 501,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kResidentChanged);
+  EXPECT_EQ(samples, before);
+  const std::array<uint64_t, 8> zero{};
+  EXPECT_EQ(allocator.ReadIntervalStats().first_buckets, zero);
+  EXPECT_EQ(allocator.ReadIntervalStats().repeat_buckets, zero);
+  EXPECT_EQ(allocator.ReadIntervalStats().recovered_first_unknown, 0U);
+  EXPECT_EQ(samples, before);  // Reading statistics does not sample the clock.
+  for (const uint64_t applied_at : {7U, 8U}) {
+    seconds = applied_at;
+    ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, key, 500,
+                                                       config, clock),
+              SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  }
+  seconds = uint64_t{UINT32_MAX} + 1;
+  EXPECT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, key, 500,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kClockHardExhausted);
+  const SlabAllocator::LifetimeReadIntervalStats stats =
+      allocator.ReadIntervalStats();
+  const std::array<uint64_t, 8> repeat{0, 1, 0, 0, 0, 0, 0, 0};
+  EXPECT_EQ(stats.first_buckets, zero);
+  EXPECT_EQ(stats.repeat_buckets, repeat);
+  EXPECT_EQ(stats.first_total_sec, 0U);
+  EXPECT_EQ(stats.repeat_total_sec, 1U);
+  EXPECT_EQ(stats.recovered_first_unknown, 1U);
+}
+
 TEST(SlabLifetimeStorage, EarlyReadUsesEffectiveBandAndRejectedReadKeepsOrder) {
   SlabAllocator::Options options = LifetimeOptions();
   options.lifetime_max_reads = 4;

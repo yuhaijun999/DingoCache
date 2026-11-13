@@ -193,6 +193,9 @@ class DiskSlabStore : public StoreEngine {
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
   struct Stats {
     LifetimeReadCounters lifetime_reads{};
+    // Accepted owner-application intervals, not all client read demand. Both
+    // interval partitions and applied are copied under the same D -> A order.
+    SlabAllocator::LifetimeReadIntervalStats lifetime_read_intervals{};
     LifetimeReadProcessingStats lifetime_read_processing{};
     // Producer completion to successful owner application, sampled under A.
     LifetimeReadTimingStats lifetime_read_completion_to_apply{};

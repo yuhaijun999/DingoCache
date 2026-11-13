@@ -394,7 +394,8 @@ SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
   if (!resident_state.has_value()) return LifetimeReadResult::kStateUnavailable;
   assert(opt_.lifetime_read_window_sec == 0 ||
          config.protect_sec == opt_.lifetime_read_window_sec);
-  const DiskLifetimeState& previous = *resident_state;
+  // Keep the old application/commit anchors after publishing the new state.
+  const DiskLifetimeState previous = *resident_state;
   DiskLifetimeState next_state = previous;
   if (!ApplyDiskLifetimeRead(config, applied_at, &next_state))
     return LifetimeReadResult::kStateUnavailable;
@@ -415,6 +416,25 @@ SlabAllocator::LifetimeReadResult SlabAllocator::ApplyLifetimeRead(
   AddLifetimeReadClassLocked(next_state);
   LinkLifetimeLocked(*index);
   RegisterLifetimeBucketLocked(*index, config, applied_at);
+  if (previous.actual_reads == 0 && previous.history_unknown) {
+    ++lifetime_read_intervals_.recovered_first_unknown;
+  } else {
+    const bool first = previous.actual_reads == 0;
+    // Valid states and the accepted monotonic update guarantee no underflow.
+    const uint32_t interval =
+        applied_at - (first ? previous.put_at : previous.anchor);
+    const std::array<uint32_t, 7>& bounds = kLifetimeReadIntervalBoundsSec;
+    const size_t bin = static_cast<size_t>(
+        std::lower_bound(bounds.begin(), bounds.end(), interval) -
+        bounds.begin());
+    std::array<uint64_t, 8>& buckets =
+        first ? lifetime_read_intervals_.first_buckets
+              : lifetime_read_intervals_.repeat_buckets;
+    uint64_t& total_sec = first ? lifetime_read_intervals_.first_total_sec
+                                : lifetime_read_intervals_.repeat_total_sec;
+    ++buckets[bin];
+    total_sec += interval;
+  }
   if (applied_time != nullptr) {
     *applied_time = std::chrono::steady_clock::now();
   }
@@ -2115,6 +2135,12 @@ uint64_t SlabAllocator::ColdSteals() const {
 SlabAllocator::LifetimeDonorStats SlabAllocator::DonorStats() const {
   const std::lock_guard<std::mutex> lock(mu_);
   return lifetime_donor_stats_;
+}
+
+SlabAllocator::LifetimeReadIntervalStats SlabAllocator::ReadIntervalStats()
+    const {
+  const std::lock_guard<std::mutex> lock(mu_);
+  return lifetime_read_intervals_;
 }
 
 SlabAllocator::LifetimeBucketMemory SlabAllocator::BucketMemory() const {

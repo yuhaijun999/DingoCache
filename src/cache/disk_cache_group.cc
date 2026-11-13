@@ -1277,6 +1277,19 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
 
     sum.lifetime_reads.successful += st.lifetime_reads.successful;
     sum.lifetime_reads.applied += st.lifetime_reads.applied;
+    for (size_t bin = 0; bin < st.lifetime_read_intervals.first_buckets.size();
+         ++bin) {
+      sum.lifetime_read_intervals.first_buckets[bin] +=
+          st.lifetime_read_intervals.first_buckets[bin];
+      sum.lifetime_read_intervals.repeat_buckets[bin] +=
+          st.lifetime_read_intervals.repeat_buckets[bin];
+    }
+    sum.lifetime_read_intervals.first_total_sec +=
+        st.lifetime_read_intervals.first_total_sec;
+    sum.lifetime_read_intervals.repeat_total_sec +=
+        st.lifetime_read_intervals.repeat_total_sec;
+    sum.lifetime_read_intervals.recovered_first_unknown +=
+        st.lifetime_read_intervals.recovered_first_unknown;
     sum.lifetime_reads.no_binding += st.lifetime_reads.no_binding;
     sum.lifetime_reads.race_lost += st.lifetime_reads.race_lost;
     sum.lifetime_reads.race_identity_scope +=

@@ -41,6 +41,7 @@
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
 #include "cache/kv_node_server.h"
+#include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
@@ -1691,6 +1692,14 @@ TEST_F(SharedLifetimeClockTest, LogicalReadCountersAggregateAcrossBothDisks) {
   // dispatch and per-follower accounting are verified by the wiring tests.
   group.NotifyLifetimeReadSuccess(first, a.identity, 5);
   group.NotifyLifetimeReadSuccess(second, b.identity, 5);
+  const std::array<uint64_t, 8> per_disk_first{1, 0, 0, 0, 0, 0, 0, 0};
+  const std::array<uint64_t, 8> zero{};
+  for (size_t i = 0; i < 2; ++i) {
+    const SlabAllocator::LifetimeReadIntervalStats intervals =
+        group.DiskSlabStats(i).lifetime_read_intervals;
+    EXPECT_EQ(intervals.first_buckets, per_disk_first);
+    EXPECT_EQ(intervals.repeat_buckets, zero);
+  }
   group.NotifyLifetimeReadSuccess(first, {}, 5);
   DiskResidentIdentity stale = b.identity;
   ++stale.generation;
@@ -1698,6 +1707,14 @@ TEST_F(SharedLifetimeClockTest, LogicalReadCountersAggregateAcrossBothDisks) {
   seconds.store(uint64_t{UINT32_MAX} + 101, std::memory_order_relaxed);
   group.NotifyLifetimeReadSuccess(first, a.identity, 5);
   group.NotifyLifetimeReadSuccess(second, b.identity, 5);
+  const SlabAllocator::LifetimeReadIntervalStats intervals =
+      group.SlabStats().lifetime_read_intervals;
+  const std::array<uint64_t, 8> aggregate_first{2, 0, 0, 0, 0, 0, 0, 0};
+  EXPECT_EQ(intervals.first_buckets, aggregate_first);
+  EXPECT_EQ(intervals.repeat_buckets, zero);
+  EXPECT_EQ(intervals.first_total_sec, 0U);
+  EXPECT_EQ(intervals.repeat_total_sec, 0U);
+  EXPECT_EQ(intervals.recovered_first_unknown, 0U);
   const DiskSlabStore::LifetimeReadCounters counters =
       group.SlabStats().lifetime_reads;
   EXPECT_EQ(counters.successful, 6U);
@@ -1711,11 +1728,92 @@ TEST_F(SharedLifetimeClockTest, LogicalReadCountersAggregateAcrossBothDisks) {
   EXPECT_EQ(counters.clock_hard_exhausted, 2U);
   EXPECT_EQ(counters.io_unhealthy, 0U);
   EXPECT_EQ(counters.state_unavailable, 0U);
-  for (size_t i = 0; i < 2; ++i)
-    EXPECT_EQ(DiskCacheGroupTestPeer::Slab(group, i)
-                  .GetStats()
-                  .lifetime_reads.successful,
-              3U);
+  for (size_t i = 0; i < 2; ++i) {
+    const DiskSlabStore::Stats disk = group.DiskSlabStats(i);
+    EXPECT_EQ(disk.lifetime_reads.successful, 3U);
+    EXPECT_EQ(disk.lifetime_read_intervals.first_buckets, per_disk_first);
+    EXPECT_EQ(disk.lifetime_read_intervals.repeat_buckets, zero);
+  }
+}
+
+TEST_F(SharedLifetimeClockTest,
+       ReadIntervalsAggregateKnownAndRecoveredHistories) {
+  DiskCacheGroup::Options options = Options();
+  options.lifetime_config = DiskLifetimeConfig{};
+  std::atomic<uint64_t> seconds{100};
+  options.lifetime_clock = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(*options.lifetime_config),
+      [&] { return seconds.load(); });
+  std::array<BlockKey, 2> keys{BlockKey{7800, 0}, BlockKey{7900, 0}};
+  const std::array<const char*, 2> values{"one", "two"};
+  const std::array<uint64_t, 8> zero{};
+  for (unsigned boot = 0; boot < 2; ++boot) {
+    SCOPED_TRACE(boot);
+    // Finish the previous clean close before reconstructing either store.
+    DiskCacheGroup group(options);
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    EXPECT_EQ(group.SlabStats().lifetime_reads.applied, 0U);
+    if (boot == 0) {
+      for (size_t disk = 0; disk < keys.size(); ++disk) {
+        const DiskSlabStore* const owner =
+            &DiskCacheGroupTestPeer::Slab(group, disk);
+        for (unsigned tries = 0;
+             tries < 1000 &&
+             DiskCacheGroupTestPeer::SlabForKey(&group, keys[disk]) != owner;
+             ++tries) {
+          ++keys[disk].digest_lo;
+        }
+        ASSERT_EQ(DiskCacheGroupTestPeer::SlabForKey(&group, keys[disk]),
+                  owner);
+        ASSERT_EQ(group.CacheWithResult(keys[disk], values[disk], 3).status,
+                  Status::kOk);
+      }
+    }
+    const auto read = [&](size_t disk, uint64_t at) {
+      seconds.store(at);
+      std::string bytes;
+      DiskResidentIdentity identity;
+      ASSERT_EQ(group.RangeWithIdentity(keys[disk], 0, 0, &bytes, &identity),
+                Status::kOk);
+      ASSERT_EQ(bytes, values[disk]);
+      ASSERT_TRUE(identity.valid());
+      group.NotifyLifetimeReadSuccess(keys[disk], identity, bytes.size());
+    };
+    ASSERT_NO_FATAL_FAILURE(read(0, boot == 0 ? 103 : 125));
+    ASSERT_NO_FATAL_FAILURE(read(1, boot == 0 ? 107 : 125));
+    ASSERT_NO_FATAL_FAILURE(read(0, boot == 0 ? 111 : 127));
+    ASSERT_NO_FATAL_FAILURE(read(1, boot == 0 ? 120 : 130));
+    const std::array<uint64_t, 8> first{0, 0, 1, 0, 0, 0, 0, 0};
+    const std::array<uint64_t, 2> first_sums =
+        boot == 0 ? std::array<uint64_t, 2>{3, 7}
+                  : std::array<uint64_t, 2>{0, 0};
+    const std::array<uint64_t, 2> repeat_sums =
+        boot == 0 ? std::array<uint64_t, 2>{8, 13}
+                  : std::array<uint64_t, 2>{2, 5};
+    for (size_t disk = 0; disk < keys.size(); ++disk) {
+      const DiskSlabStore::Stats stats = group.DiskSlabStats(disk);
+      const SlabAllocator::LifetimeReadIntervalStats& intervals =
+          stats.lifetime_read_intervals;
+      EXPECT_EQ(stats.lifetime_reads.applied, 2U);
+      EXPECT_EQ(intervals.first_buckets, boot == 0 ? first : zero);
+      EXPECT_EQ(intervals.repeat_buckets, first);
+      EXPECT_EQ(intervals.first_total_sec, first_sums[disk]);
+      EXPECT_EQ(intervals.repeat_total_sec, repeat_sums[disk]);
+      EXPECT_EQ(intervals.recovered_first_unknown, boot == 0 ? 0U : 1U);
+    }
+    const DiskSlabStore::Stats stats = group.SlabStats();
+    const std::array<uint64_t, 8> both{0, 0, 2, 0, 0, 0, 0, 0};
+    EXPECT_EQ(stats.lifetime_reads.applied, 4U);
+    EXPECT_EQ(stats.lifetime_read_intervals.first_buckets,
+              boot == 0 ? both : zero);
+    EXPECT_EQ(stats.lifetime_read_intervals.repeat_buckets, both);
+    EXPECT_EQ(stats.lifetime_read_intervals.first_total_sec,
+              boot == 0 ? 10U : 0U);
+    EXPECT_EQ(stats.lifetime_read_intervals.repeat_total_sec,
+              boot == 0 ? 21U : 7U);
+    EXPECT_EQ(stats.lifetime_read_intervals.recovered_first_unknown,
+              boot == 0 ? 0U : 2U);
+  }
 }
 
 TEST_F(SharedLifetimeClockTest, GhostRejectsInapplicableOwnersBeforeOpening) {

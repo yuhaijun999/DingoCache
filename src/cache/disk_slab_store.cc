@@ -3388,6 +3388,8 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.lifetime_watermark_score = lifetime_watermark_score_;
 
   st.lifetime_reads = lifetime_reads_;
+  // Keep the interval partition and applied count in the same D snapshot.
+  if (alloc_) st.lifetime_read_intervals = alloc_->ReadIntervalStats();
   st.lifetime_read_processing = lifetime_read_processing_;
   st.lifetime_read_completion_to_apply = lifetime_read_completion_to_apply_;
   st.lifetime_read_lock_wait = lifetime_read_lock_wait_;

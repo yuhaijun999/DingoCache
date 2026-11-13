@@ -217,6 +217,26 @@ class SlabAllocator {
     uint64_t unscored_victims = 0;
   };
   LifetimeDonorStats DonorStats() const;
+
+  // Fixed display bounds, independent of P, KEEP and scoring configuration.
+  static constexpr std::array<uint32_t, 7> kLifetimeReadIntervalBoundsSec = {
+      0, 1, 60, 180, 3600, 86400, 604800};
+  struct LifetimeReadIntervalStats {
+    // Noncumulative bins, ending with an unbounded bin. Known NEW commit to
+    // first accepted application; zero-second intervals are valid samples.
+    std::array<uint64_t, 8> first_buckets{};
+    uint64_t first_total_sec = 0;
+    // Previous accepted application to the next, including recovered data
+    // after its first real read and reads beyond scoring/count saturation.
+    std::array<uint64_t, 8> repeat_buckets{};
+    uint64_t repeat_total_sec = 0;
+    // First real reads of recovered residents have no known commit interval.
+    uint64_t recovered_first_unknown = 0;
+  };
+  // A-locked cumulative accepted-read snapshot; no clock sample or allocation.
+  // Uses owner application order, not client arrival/completion intervals.
+  // Disabled tracking yields zeros. Counters reset with this allocator owner.
+  LifetimeReadIntervalStats ReadIntervalStats() const;
   // Preserve the original installed return type and method ABI.
   struct LifetimeBucketMemory {
     uint64_t entries =
@@ -657,6 +677,7 @@ class SlabAllocator {
   // Fixed totals and bounded ring, guarded by A; no per-resident token. Window
   // membership is recoverable from immutable put_at and the last read anchor.
   std::array<uint64_t, 4> lifetime_actual_reads_{};
+  LifetimeReadIntervalStats lifetime_read_intervals_{};  // Guarded by A.
   std::vector<LifetimeReadWindowBucket> lifetime_read_windows_;
   uint64_t lifetime_read_quantum_sec_ = 0;
   uint32_t lifetime_next_band_ =
