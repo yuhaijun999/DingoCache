@@ -17,6 +17,13 @@ groups:
         annotations:
           summary: "dfkv server local storage is unhealthy"
           description: "{{ $labels.instance }} reports terminal disk or required RAM-tier failure."
+      - alert: DfkvRamPostAckDataLoss
+        expr: dfkv_ram_post_ack_flush_failures_total > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv lost acknowledged RAM data"
+          description: "{{ $labels.instance }} dropped acknowledged RAM data after terminal flush failure; investigate before restart."
       - alert: DfkvMdsUnavailable
         expr: (up{job="dfkv_mds"} == 0) or (dfkv_mds_ready == 0) or (absent(up{job="dfkv_mds"}) == 1)
         for: 1m

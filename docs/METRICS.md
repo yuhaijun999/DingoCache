@@ -455,6 +455,7 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_ack_backpressure_total` | counter | 正的 RAM-ACK dirty 水位触发的新 key 接纳拒绝；水位为 0 时计数强制等待落盘的请求。已有 key 先解析 owner，不因水位切换覆盖首写者 |
 | `dfkv_ram_promoted_total` | counter | 整值冷读晋升：优先让 O_DIRECT 直接读入隐藏 arena reservation，成功后以 born-durable 身份发布；staged fallback 则读后复制晋升。不进 flushq、零重复刷盘、随时可驱逐；健康冷→热运行中首次读增长，随后应转为 `dfkv_ram_hit_total` 增长且磁盘字节不再增加 |
 | `dfkv_ram_flushed_total` / `dfkv_ram_flush_dropped_total` | counter | RAM slot 落盘转 DURABLE / flush 多次失败后丢弃 |
+| `dfkv_ram_post_ack_flush_failures_total` | counter | 已向客户端 RAM-ACK、随后终局写回失败并丢弃的对象数；不是重试次数或普通未 ACK 失败。随 RAM owner 重建清零 |
 | `dfkv_ram_healthy` | gauge | RAM flusher 未发生 terminal failure 时为 1；0 会动态摘除 readiness |
 | `dfkv_ram_flush_threads` | gauge | shard 最小值调整后的实际 flusher 数（不是原始请求值） |
 | `dfkv_ram_evictions_total` | counter | RAM slot 容量压力淘汰数（含内联与后台回收两路） |
@@ -1705,3 +1706,29 @@ histogram counts/sums. These metrics are not all-path business-read demand,
 an unbiased lifetime/survival distribution, TTFT, or performance acceptance.
 Export reuses the existing snapshots and histogram renderer; it adds no
 hot-path clocks, locks or counters beyond the O5az collection.
+
+### Alerting on terminal post-ACK loss
+
+The shipped `DfkvRamPostAckDataLoss` critical rule uses
+`dfkv_ram_post_ack_flush_failures_total > 0`, with no `for` delay. This catches
+a first scrape that is already positive; an `increase()`/`rate()` rule could
+miss that first observation. It does not alert on ordinary retries or on
+terminal failures of unacknowledged disk-ACK writes. The existing generic
+`DfkvServerUnhealthy` (30s) and `DfkvServerNotReady` (1m) rules remain unchanged.
+
+“Immediate” means the first evaluation after a successful scrape, not a
+synchronous failure callback or guaranteed notification delivery. The shipped
+scrape and evaluation intervals are both 5s. A positive owner-lifetime counter
+keeps the alert firing; resetting the counter to zero on restart or losing the
+series after Prometheus staleness handling can resolve it without undoing the
+loss. RAM-disabled nodes omit the series and do not trigger this loss rule.
+Do not interpret absence as proof of health; generic health/scrape alerts still
+apply. Capture the incident and diagnostics **before restarting**; this counter
+and rule are not durable incident history. Production must configure external
+Alertmanager routing/retention; the local stack ships no notification receiver.
+
+Rule semantics and executable test format follow the official
+[Prometheus alerting rules](https://prometheus.io/docs/prometheus/3.13/configuration/alerting_rules/)
+and [rule unit testing](https://prometheus.io/docs/prometheus/3.13/configuration/unit_testing_rules/)
+documentation. CI runs `promtool test rules alerts.test.yml` with the same
+digest-pinned Prometheus image used by the deployment.

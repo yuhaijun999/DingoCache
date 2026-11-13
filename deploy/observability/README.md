@@ -100,6 +100,24 @@ deployments must route Prometheus alerts to their existing Alertmanager/on-call
 system. `promtool check config` validates both `prometheus.yml` and `alerts.yml`
 in CI.
 
+`DfkvRamPostAckDataLoss` is critical when the existing post-ACK terminal-drop
+counter is positive, including a positive first scrape. There is no extra
+`for` wait: firing starts at the next evaluation after successful scraping
+(default scrape/evaluation intervals are each 5s), not synchronously with the
+failure or as a guarantee of on-call delivery. Retries, unacknowledged failures
+and absent RAM metrics do not trigger it. Generic readiness/health alerts are
+retained. The alert can clear on owner restart/reset or series staleness;
+record diagnostics before restarting, and configure external notification and
+incident retention. A cleared alert does not mean lost data was recovered.
+
+CI also runs real rule unit tests with the pinned image. Locally, from this
+directory, use the matching Prometheus version:
+
+```bash
+promtool check rules alerts.yml
+promtool test rules alerts.test.yml
+```
+
 
 ## Dashboards
 

@@ -121,6 +121,7 @@ PUBLIC_FAMILIES = {
     "dfkv_ram_healthy",
     "dfkv_ram_large_used_bytes",
     "dfkv_ram_put_bypass_total",
+    "dfkv_ram_post_ack_flush_failures_total",
     "dfkv_ram_used_bytes",
     "dfkv_read_coalesce_leaders_total",
     "dfkv_read_coalesce_timeouts_total",
@@ -235,6 +236,53 @@ class ObservabilityContractTest(unittest.TestCase):
         for expression in expressions:
             unknown = metric_families(expression) - PUBLIC_FAMILIES
             self.assertFalse(unknown, f"alert references unknown metrics {sorted(unknown)}")
+
+    def test_post_ack_loss_alert_is_immediate_and_preserves_health_delays(self):
+        alerts = ALERTS.read_text(encoding="utf-8")
+
+        def alert_block(name: str) -> str:
+            # Shipped rules use a fixed six-space alert indentation. Stop at
+            # the next rule or group instead of matching neighboring fields.
+            matches = re.findall(
+                rf"^      - alert: {re.escape(name)}\n"
+                r"(?:(?:        .*|[ \t]*)\n)*",
+                alerts,
+                flags=re.MULTILINE,
+            )
+            self.assertEqual(len(matches), 1, name)
+            return matches[0]
+
+        loss = alert_block("DfkvRamPostAckDataLoss")
+        self.assertRegex(
+            loss,
+            r"(?m)^        expr: dfkv_ram_post_ack_flush_failures_total > 0$",
+        )
+        self.assertNotRegex(loss, r"(?m)^        for:")
+        self.assertRegex(loss, r"(?m)^          severity: critical$")
+        self.assertIn('summary: "dfkv lost acknowledged RAM data"', loss)
+        self.assertIn(
+            'description: "{{ $labels.instance }} dropped acknowledged RAM '
+            'data after terminal flush failure; investigate before restart."',
+            loss,
+        )
+        self.assertRegex(
+            alert_block("DfkvServerUnhealthy"), r"(?m)^        for: 30s$"
+        )
+        self.assertRegex(
+            alert_block("DfkvServerNotReady"), r"(?m)^        for: 1m$"
+        )
+
+    def test_promtool_rule_fixture_is_wired_into_ci(self):
+        fixture = ROOT / "deploy" / "observability" / "alerts.test.yml"
+        self.assertTrue(fixture.is_file())
+        text = fixture.read_text(encoding="utf-8")
+        self.assertRegex(text, r"(?m)^rule_files:\n  - alerts\.yml$")
+        self.assertIn("alertname: DfkvRamPostAckDataLoss", text)
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("test rules /etc/prometheus/alerts.test.yml", ci)
+        self.assertIn("--workdir /etc/prometheus", ci)
 
     def test_receive_segment_capacity_uses_hard_budget(self):
         alerts = ALERTS.read_text(encoding="utf-8")

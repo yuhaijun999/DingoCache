@@ -1,0 +1,72 @@
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 15s
+
+tests:
+  # A RAM-disabled target has no loss series; neither it nor a healthy zero
+  # counter should be mistaken for acknowledged data loss.
+  - name: zero and absent RAM loss counters do not fire
+    interval: 15s
+    input_series:
+      - series: 'dfkv_ram_post_ack_flush_failures_total{node="zero",group="cache",job="dfkv_server",instance="zero:8000"}'
+        values: '0 0 0'
+      - series: 'up{node="no-ram",group="cache",job="dfkv_server",instance="no-ram:8000"}'
+        values: '1 1 1'
+    alert_rule_test:
+      - eval_time: 0s
+        alertname: DfkvRamPostAckDataLoss
+        exp_alerts: []
+      - eval_time: 30s
+        alertname: DfkvRamPostAckDataLoss
+        exp_alerts: []
+
+  # A first scrape can already report loss. No prior zero or range-vector
+  # history is required, and a positive counter remains firing until reset.
+  - name: first positive sample fires immediately and reset clears it
+    interval: 15s
+    input_series:
+      - series: 'dfkv_ram_post_ack_flush_failures_total{node="lost",group="cache",job="dfkv_server",instance="lost:8000"}'
+        values: '2 2 0'
+    alert_rule_test:
+      - eval_time: 0s
+        alertname: DfkvRamPostAckDataLoss
+        exp_alerts: &lost_alert
+          - exp_labels:
+              node: lost
+              group: cache
+              job: dfkv_server
+              instance: lost:8000
+              severity: critical
+            exp_annotations:
+              summary: dfkv lost acknowledged RAM data
+              description: 'lost:8000 dropped acknowledged RAM data after terminal flush failure; investigate before restart.'
+      - eval_time: 15s
+        alertname: DfkvRamPostAckDataLoss
+        exp_alerts: *lost_alert
+      - eval_time: 30s
+        alertname: DfkvRamPostAckDataLoss
+        exp_alerts: []
+
+  # Only the failing instance fires at the first evaluation of its increment.
+  # Explicit staleness removes the series; a missing sample alone would not.
+  - name: increment isolates instances and stale series clears
+    interval: 15s
+    input_series:
+      - series: 'dfkv_ram_post_ack_flush_failures_total{node="lost",group="cache",job="dfkv_server",instance="lost:8000"}'
+        values: '0 1 1 stale'
+      - series: 'dfkv_ram_post_ack_flush_failures_total{node="healthy",group="cache",job="dfkv_server",instance="healthy:8000"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 0s
+        alertname: DfkvRamPostAckDataLoss
+        exp_alerts: []
+      - eval_time: 15s
+        alertname: DfkvRamPostAckDataLoss
+        exp_alerts: *lost_alert
+      - eval_time: 30s
+        alertname: DfkvRamPostAckDataLoss
+        exp_alerts: *lost_alert
+      - eval_time: 45s
+        alertname: DfkvRamPostAckDataLoss
+        exp_alerts: []

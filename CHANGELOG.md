@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a critical, no-extra-delay alert for acknowledged RAM data dropped after
+  terminal flush failure, with pinned Prometheus rule tests. Preserve generic
+  health alerts and document scrape timing, restart resets and external routing.
+
 - Export accepted lifetime read application intervals as per-disk and aggregate
   first/repeat histograms, keeping unknown recovered first reads separate.
   These are application-order observations, not read latency or total demand.
