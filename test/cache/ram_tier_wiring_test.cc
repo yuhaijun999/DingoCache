@@ -3163,6 +3163,19 @@ TEST_F(LifetimeAdmissionTest, TcpRamHitWorksAtBoundaryAndRejectsAfterIt) {
   EXPECT_EQ(tcp.Range(address, key, 0, 6, &value), Status::kIOError);
   EXPECT_TRUE(server_->Healthy());
   EXPECT_TRUE(server_->LifetimeRestartRequired());
+  std::string metrics;
+  ASSERT_EQ(tcp.Stats(address, &metrics), Status::kOk);
+  for (const std::pair<const char*, long>& result :
+       {std::pair<const char*, long>{"nonempty_success", 1},
+        {"empty_success", 0},
+        {"not_found", 0},
+        {"invalid", 0},
+        {"error", 0},
+        {"admission_refused", 1}}) {
+    EXPECT_EQ(MetricVal(metrics, std::string("dfkv_sync_read_results_") +
+                                     result.first + "_total"),
+              result.second);
+  }
 }
 
 TEST_F(LifetimeAdmissionTest, RamAckDirtyValueCanDrainAfterNewAdmissionCloses) {
@@ -3597,6 +3610,25 @@ class LifetimeSuccessReadTest : public ProductionFlushResultTest {
     ASSERT_TRUE(node_->Healthy());
     KvNodeServerWiringTestPeer::SetCoalescing(*node_, false);
   }
+  void CreateTcpScored() {
+    const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
+    const ScopedEnv base("DFKV_SLAB_LIFE_BASE_SEC", "604800");
+    const ScopedEnv bonus("DFKV_SLAB_LIFE_READ_BONUS_SEC", "302400");
+    const ScopedEnv max_reads("DFKV_SLAB_LIFE_MAX_READS", "2");
+    const ScopedEnv protect("DFKV_SLAB_PROTECT_SEC", "180");
+    const ScopedEnv slowdown("DFKV_SLAB_PROTECT_SLOWDOWN", "4");
+    const ScopedEnv boost("DFKV_SLAB_PROTECT_BOOST_SEC", "1209600");
+    const ScopedEnv keep("DFKV_SLAB_KEEP_SCORE_SEC", "475200");
+    const ScopedEnv bucket("DFKV_SLAB_BUCKET_SEC", "43200");
+    const ScopedEnv buckets("DFKV_SLAB_BUCKET_COUNT", "24");
+    const ScopedEnv low("DFKV_SLAB_EVICT_LOW_PCT", "88");
+    const ScopedEnv high("DFKV_SLAB_EVICT_HIGH_PCT", "0");
+    DiskLifetimeConfig config;
+    config.high_pct = 0;
+    ASSERT_NO_FATAL_FAILURE(CreateScored("lifetime", config));
+    ASSERT_FALSE(node_->ram_enabled());
+    ASSERT_EQ(node_->Start(0), Status::kOk);
+  }
   void CreateFallbackPolicy(uint64_t max_reads) {
     DiskLifetimeConfig config;
     config.max_reads = max_reads;
@@ -3715,6 +3747,147 @@ class LifetimeSuccessReadTest : public ProductionFlushResultTest {
     }
   }
 };
+
+TEST_F(LifetimeSuccessReadTest,
+       TcpClientResultsExposeOnlyServerLogicalReadOutcomes) {
+  ASSERT_NO_FATAL_FAILURE(CreateTcpScored());
+  const std::string address = "127.0.0.1:" + std::to_string(node_->port());
+  TcpTransport tcp;
+  tcp.set_timeouts(1000, 5000);
+  const BlockKey key{101201, 0};
+  const BlockKey missing{101202, 0};
+  ASSERT_EQ(tcp.Cache(address, key, "value", 5), Status::kOk);
+  bool exists = false;
+  uint64_t length = 0;
+  ASSERT_EQ(tcp.Exist(address, key, &exists), Status::kOk);
+  EXPECT_TRUE(exists);
+  ASSERT_EQ(tcp.Lookup(address, key, &length), Status::kOk);
+  EXPECT_EQ(length, 5U);
+  ExpectSyncReadResults(0);
+  std::string value;
+  ASSERT_EQ(tcp.Range(address, key, 0, 5, &value), Status::kOk);
+  EXPECT_EQ(value, "value");
+  char buffer[5] = {};
+  std::vector<uint64_t> lengths;
+  std::vector<Status> results =
+      tcp.RangeInto(address, {key}, {{buffer, sizeof(buffer)}}, &lengths);
+  ASSERT_EQ(results.size(), 1U);
+  ASSERT_EQ(results[0], Status::kOk);
+  EXPECT_EQ(std::string(buffer, sizeof(buffer)), "value");
+  ASSERT_EQ(lengths.size(), 1U);
+  EXPECT_EQ(lengths[0], 5U);
+  // Both client APIs send wire kRange to ProcessRequestForKey. Client-side
+  // RangeInto does not exercise the server's RangeIntoForKey entry point.
+  ASSERT_EQ(tcp.Range(address, key, 5, 1, &value), Status::kOk);
+  EXPECT_TRUE(value.empty());
+  EXPECT_EQ(tcp.Range(address, missing, 0, 5, &value), Status::kNotFound);
+  results =
+      tcp.RangeInto(address, {missing}, {{buffer, sizeof(buffer)}}, &lengths);
+  ASSERT_EQ(results.size(), 1U);
+  EXPECT_EQ(results[0], Status::kNotFound);
+  ExpectSyncReadResults(2, 1, 2);
+  // The batch API has no offset argument; only Range can express these exact
+  // end-of-value and past-end requests, without fabricating local failures.
+  EXPECT_EQ(tcp.Range(address, key, 6, 1, &value), Status::kInvalid);
+  ASSERT_EQ(tcp.Cache(address, key, "ignored", 7), Status::kOk);
+  ASSERT_EQ(tcp.Remove(address, key), Status::kOk);
+  ASSERT_EQ(tcp.Exist(address, key, &exists), Status::kOk);
+  EXPECT_FALSE(exists);
+  EXPECT_EQ(tcp.Lookup(address, key, &length), Status::kNotFound);
+  for (unsigned scrape = 0; scrape < 2; ++scrape) {
+    std::string metrics;
+    ASSERT_EQ(tcp.Stats(address, &metrics), Status::kOk);
+    for (const std::pair<const char*, long>& result :
+         {std::pair<const char*, long>{"nonempty_success", 2},
+          {"empty_success", 1},
+          {"not_found", 2},
+          {"invalid", 1},
+          {"error", 0},
+          {"admission_refused", 0}}) {
+      const std::string name =
+          std::string("dfkv_sync_read_results_") + result.first + "_total";
+      EXPECT_EQ(MetricVal(metrics, name), result.second);
+      EXPECT_NE(metrics.find("# TYPE " + name + " counter\n"),
+                std::string::npos);
+    }
+  }
+  EXPECT_EQ(Counters().applied, 2U);
+  ExpectConservation(2);
+}
+
+TEST_F(LifetimeSuccessReadTest,
+       TcpCopyFollowersCountFourLogicalReadsAndOnePayloadRead) {
+  ASSERT_NO_FATAL_FAILURE(CreateTcpScored());
+  KvNodeServerWiringTestPeer::SetCoalescing(*node_, true);
+  const std::string address = "127.0.0.1:" + std::to_string(node_->port());
+  TcpTransport control;
+  control.set_timeouts(1000, 5000);
+  const BlockKey key{101203, 0};
+  ASSERT_EQ(control.Cache(address, key, "value", 5), Status::kOk);
+  const std::shared_ptr<FlushBarrier> barrier =
+      std::make_shared<FlushBarrier>();
+  const OpenFlushOnExit release{*barrier};
+  std::atomic<unsigned> reads{0};
+  DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+  DiskSlabStoreTestPeer::SetReadHook(store, [barrier, &reads] {
+    reads.fetch_add(1, std::memory_order_relaxed);
+    barrier->Block();
+  });
+  std::vector<Status> results(4, Status::kInvalid);
+  std::vector<std::string> values(4);
+  const auto request = [&](size_t index) {
+    TcpTransport tcp;  // Each caller owns a distinct connection pool/socket.
+    tcp.set_timeouts(1000, 5000);
+    if (index % 2 == 0) {
+      results[index] = tcp.Range(address, key, 0, 5, &values[index]);
+    } else {
+      char buffer[5] = {};
+      const std::vector<Status> status =
+          tcp.RangeInto(address, {key}, {{buffer, sizeof(buffer)}}, nullptr);
+      if (status.size() == 1) {
+        results[index] = status[0];
+        if (status[0] == Status::kOk) {
+          values[index].assign(buffer, sizeof(buffer));
+        }
+      }
+    }
+  };
+  std::thread leader([&] { request(0); });
+  const bool entered = barrier->AwaitEntry();
+  std::vector<std::thread> followers;
+  if (entered) {
+    for (size_t index = 1; index < 4; ++index) {
+      followers.emplace_back([&, index] { request(index); });
+    }
+  }
+  const bool joined =
+      entered && KvNodeServerWiringTestPeer::WaitForReadFollowers(*node_, 3);
+  barrier->Open();
+  leader.join();
+  for (std::thread& follower : followers) {
+    follower.join();
+  }
+  // Stop joins serving threads too, even if a client timed out before its
+  // response. No assertion or hook teardown may abandon a blocked callback.
+  node_->Stop();
+  DiskSlabStoreTestPeer::SetReadHook(store, {});
+  ASSERT_TRUE(entered);
+  ASSERT_TRUE(joined);
+  for (size_t index = 0; index < results.size(); ++index) {
+    ASSERT_EQ(results[index], Status::kOk);
+    EXPECT_EQ(values[index], "value");
+  }
+  EXPECT_EQ(KvNodeServerWiringTestPeer::ReadTimeouts(*node_), 0U);
+  EXPECT_EQ(reads.load(std::memory_order_relaxed), 1U);
+  const DiskSlabStore::Stats stats = store.GetStats();
+  EXPECT_EQ(stats.sync_payload_reads.syscalls, 1U);
+  EXPECT_EQ(stats.sync_payload_reads.bytes, 5U);
+  EXPECT_EQ(Counters().applied, 4U);
+  EXPECT_EQ(Counters().source_copy_leader, 1U);
+  EXPECT_EQ(Counters().source_copy_follower, 3U);
+  ExpectSyncReadResults(4);
+  ExpectConservation(4);
+}
 
 TEST_F(LifetimeSuccessReadTest, RequestAndIntoCountEachLogicalSuccess) {
   const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
