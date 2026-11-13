@@ -1666,3 +1666,42 @@ final misses acquire D again to settle counters. These are real opt-in costs,
 not zero-overhead claims. Clock observations retain existing restart-floor
 semantics and do not backdate heat or change an already-established result.
 Complete resource/lock-cost and all-path demand coverage remain unaccepted.
+
+### Accepted lifetime read application intervals
+
+For slab storage, `dfkv_slab_lifetime_read_first_interval_seconds` and
+`dfkv_slab_lifetime_read_repeat_interval_seconds` are histograms; their
+`dfkv_slab_disk_lifetime_...` counterparts carry the existing `disk` and
+`disk_index` labels. Existing optional node/group labels are preserved. There
+are no key or request labels. Fixed inclusive upper bounds are **0, 1, 60, 180,
+3600, 86400, 604800 (seven days), +Inf seconds**, independent of configured
+scoring bands and protection windows. Prometheus buckets are cumulative;
+`_count` equals the `+Inf` bucket and `_sum` contains integer seconds.
+
+Only accepted nonempty lifetime heat applications contribute. A known NEW
+resident's first real read records `applied_at - put_at`. Subsequent real reads
+record `applied_at - previous_read_anchor`, including reads after scoring/read
+counters saturate. Zero-second intervals are valid samples. The first real
+read of a recovered resident has no known pre-boot put/read anchor: it adds
+only to `dfkv_slab_lifetime_read_recovered_first_interval_unknown_total`
+(and the corresponding per-disk counter). Later reads of that resident have
+a known current-boot anchor and enter the repeat histogram. Virtual recovery
+reads do not create samples. Rejected notifications, empty reads and raw disk
+preparation do not contribute.
+
+Within one Store snapshot, first count + repeat count + recovered-first unknown
+equals accepted `read_applied_total`. Metrics rendering samples per-disk and
+aggregate statistics separately, so concurrent applications can make those
+rendered views differ; do not use a cross-series equality as a scrape-level
+transaction guarantee. Counters reset with their allocator owner, including
+clean restart; they are not persisted. Disabled/legacy slabs emit zeros and
+file storage omits these families.
+
+These second-quantized differences follow shared-clock **application order**,
+not request arrival, completion, physical I/O or client latency. Queueing,
+resident-generation survival and successful heat-application selection bias
+the samples. Unknown first intervals are not zero and are not included in
+histogram counts/sums. These metrics are not all-path business-read demand,
+an unbiased lifetime/survival distribution, TTFT, or performance acceptance.
+Export reuses the existing snapshots and histogram renderer; it adds no
+hot-path clocks, locks or counters beyond the O5az collection.

@@ -693,6 +693,17 @@ std::string KvNodeServer::MetricsText() const {
           s += name + "_count" + braces(labels) + " " + std::to_string(count) +
                "\n";
         };
+    header("dfkv_slab_disk_lifetime_read_first_interval_seconds", "histogram",
+           "Known NEW put to first accepted read application interval");
+    header("dfkv_slab_lifetime_read_first_interval_seconds", "histogram",
+           "Known NEW put to first accepted read application interval");
+    header("dfkv_slab_disk_lifetime_read_repeat_interval_seconds", "histogram",
+           "Intervals between successive accepted read applications");
+    header("dfkv_slab_lifetime_read_repeat_interval_seconds", "histogram",
+           "Intervals between successive accepted read applications");
+    header(
+        "dfkv_slab_disk_lifetime_read_recovered_first_interval_unknown_total",
+        "counter", "Recovered first applications without a known interval");
     header("dfkv_slab_disk_lifetime_class_recovered_boot_age_seconds",
            "histogram",
            "Successful recovered victim pre-wipe ages in the current boot");
@@ -1191,6 +1202,19 @@ std::string KvNodeServer::MetricsText() const {
              disk.lifetime_read_lock_wait.max_ns);
       sample("dfkv_slab_disk_lifetime_read_processing_max_ns",
              disk.lifetime_read_processing.max_ns);
+      donor_histogram(
+          "dfkv_slab_disk_lifetime_read_first_interval_seconds",
+          disk.lifetime_read_intervals.first_buckets,
+          std::to_string(disk.lifetime_read_intervals.first_total_sec),
+          SlabAllocator::kLifetimeReadIntervalBoundsSec, labels);
+      donor_histogram(
+          "dfkv_slab_disk_lifetime_read_repeat_interval_seconds",
+          disk.lifetime_read_intervals.repeat_buckets,
+          std::to_string(disk.lifetime_read_intervals.repeat_total_sec),
+          SlabAllocator::kLifetimeReadIntervalBoundsSec, labels);
+      sample(
+          "dfkv_slab_disk_lifetime_read_recovered_first_interval_unknown_total",
+          disk.lifetime_read_intervals.recovered_first_unknown);
       sample("dfkv_slab_disk_lifetime_read_success_total",
              disk.lifetime_reads.successful);
       sample("dfkv_slab_disk_lifetime_read_applied_total",
@@ -1658,6 +1682,17 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_lifetime_background_no_candidate_total", "counter",
            "Background class scans with no eligible candidate",
            ss.lifetime_background_no_candidate);
+    donor_histogram("dfkv_slab_lifetime_read_first_interval_seconds",
+                    ss.lifetime_read_intervals.first_buckets,
+                    std::to_string(ss.lifetime_read_intervals.first_total_sec),
+                    SlabAllocator::kLifetimeReadIntervalBoundsSec, "");
+    donor_histogram("dfkv_slab_lifetime_read_repeat_interval_seconds",
+                    ss.lifetime_read_intervals.repeat_buckets,
+                    std::to_string(ss.lifetime_read_intervals.repeat_total_sec),
+                    SlabAllocator::kLifetimeReadIntervalBoundsSec, "");
+    metric("dfkv_slab_lifetime_read_recovered_first_interval_unknown_total",
+           "counter", "Recovered first applications without a known interval",
+           ss.lifetime_read_intervals.recovered_first_unknown);
     metric("dfkv_slab_lifetime_read_source_unclassified_total", "counter",
            "Successful notifications without a completion path",
            ss.lifetime_reads.source_unclassified);

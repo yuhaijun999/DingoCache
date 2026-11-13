@@ -5449,6 +5449,102 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
         << KvNodeServerTestPeer::Group(*server_).StartupError();
     server_->set_identity("ghost\"node", "ghost\\group\n");
   }
+  BlockKey IntervalKey(size_t disk, uint64_t ordinal) {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server_);
+    BlockKey key{ordinal, 0, 7};
+    for (unsigned attempt = 0;
+         attempt < 10000 &&
+         DiskCacheGroupTestPeer::RouteIndex(group, key) != disk;
+         ++attempt) {
+      ++key.digest_lo;
+    }
+    EXPECT_EQ(DiskCacheGroupTestPeer::RouteIndex(group, key), disk);
+    return key;
+  }
+  void IntervalRead(const BlockKey& key) {
+    std::string bytes;
+    ASSERT_EQ(
+        server_->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange), key,
+                                      0, 3, nullptr, 0, &bytes),
+        Status::kOk);
+    EXPECT_EQ(bytes, "old");
+  }
+  void CheckReadIntervals(
+      const std::array<SlabAllocator::LifetimeReadIntervalStats, 2>& expected) {
+    const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server_);
+    ASSERT_EQ(group.DiskCount(), 2U);
+    const std::string text = server_->MetricsText();
+    const std::string identity = R"(node="ghost\"node",group="ghost\\group\n")";
+    // Literal export bounds and handwritten input cohorts form the oracle,
+    // independently of both the producer bins and its aggregation helper.
+    const std::array<const char*, 8> bounds{"0",    "1",     "60",     "180",
+                                            "3600", "86400", "604800", "+Inf"};
+    SlabAllocator::LifetimeReadIntervalStats total = expected[0];
+    for (size_t bucket = 0; bucket < 8; ++bucket) {
+      total.first_buckets[bucket] += expected[1].first_buckets[bucket];
+      total.repeat_buckets[bucket] += expected[1].repeat_buckets[bucket];
+    }
+    total.first_total_sec += expected[1].first_total_sec;
+    total.repeat_total_sec += expected[1].repeat_total_sec;
+    total.recovered_first_unknown += expected[1].recovered_first_unknown;
+    for (size_t view = 0; view < 3; ++view) {
+      const SlabAllocator::LifetimeReadIntervalStats& stats =
+          view < 2 ? expected[view] : total;
+      const std::string prefix =
+          view < 2 ? "dfkv_slab_disk_lifetime_" : "dfkv_slab_lifetime_";
+      const std::string disk = view < 2 ? "disk=\"" + group.DiskPath(view) +
+                                              "\",disk_index=\"" +
+                                              std::to_string(view) + "\","
+                                        : "";
+      const auto histogram = [&](const char* kind,
+                                 const std::array<uint64_t, 8>& buckets,
+                                 uint64_t sum) {
+        const std::string name = prefix + "read_" + kind + "_interval_seconds";
+        const std::string type = "# TYPE " + name + " histogram\n";
+        EXPECT_NE(text.find(type), std::string::npos);
+        EXPECT_EQ(text.find(type), text.rfind(type));
+        uint64_t count = 0;
+        for (size_t bucket = 0; bucket < bounds.size(); ++bucket) {
+          count += buckets[bucket];
+          const std::string labels =
+              "{" + disk + "le=\"" + bounds[bucket] + "\"," + identity + "}";
+          EXPECT_NE(text.find("\n" + name + "_bucket" + labels + " " +
+                              std::to_string(count) + "\n"),
+                    std::string::npos);
+        }
+        const std::string labels = "{" + disk + identity + "}";
+        EXPECT_NE(text.find("\n" + name + "_count" + labels + " " +
+                            std::to_string(count) + "\n"),
+                  std::string::npos);
+        EXPECT_NE(text.find("\n" + name + "_sum" + labels + " " +
+                            std::to_string(sum) + "\n"),
+                  std::string::npos);
+      };
+      histogram("first", stats.first_buckets, stats.first_total_sec);
+      histogram("repeat", stats.repeat_buckets, stats.repeat_total_sec);
+      const std::string unknown =
+          prefix + "read_recovered_first_interval_unknown_total";
+      const std::string type = "# TYPE " + unknown + " counter\n";
+      EXPECT_NE(text.find(type), std::string::npos);
+      EXPECT_EQ(text.find(type), text.rfind(type));
+      EXPECT_NE(text.find("\n" + unknown + "{" + disk + identity + "} " +
+                          std::to_string(stats.recovered_first_unknown) + "\n"),
+                std::string::npos);
+    }
+    size_t samples = 0;
+    for (size_t pos = text.find("\ndfkv_slab"); pos != std::string::npos;
+         pos = text.find("\ndfkv_slab", pos + 1)) {
+      const std::string line =
+          text.substr(pos + 1, text.find('\n', pos + 1) - pos - 1);
+      if (line.find("_read_first_interval_seconds_") != std::string::npos ||
+          line.find("_read_repeat_interval_seconds_") != std::string::npos ||
+          line.find("_read_recovered_first_interval_unknown_total") !=
+              std::string::npos) {
+        ++samples;
+      }
+    }
+    EXPECT_EQ(samples, 63U);  // Three views of two ten-sample histograms + one.
+  }
   void Check(size_t disk,
              const DiskSlabStore::EvictionGhostObservation& expected) const {
     const DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server_);
@@ -5565,6 +5661,106 @@ class LifetimeGhostMetricsTest : public ::testing::Test {
   std::shared_ptr<DiskLifetimeClock> clock_;
   std::unique_ptr<KvNodeServer> server_;
 };
+
+TEST_F(LifetimeGhostMetricsTest,
+       ReadIntervalsExportBothDisksAndResetAfterCleanReopen) {
+  const ScopedEnv base("DFKV_SLAB_LIFE_BASE_SEC", "100");
+  const ScopedEnv bonus("DFKV_SLAB_LIFE_READ_BONUS_SEC", "10");
+  const ScopedEnv max_reads("DFKV_SLAB_LIFE_MAX_READS", "2");
+  const ScopedEnv protect("DFKV_SLAB_PROTECT_SEC", "8");
+  const ScopedEnv slowdown("DFKV_SLAB_PROTECT_SLOWDOWN", "4");
+  const ScopedEnv boost("DFKV_SLAB_PROTECT_BOOST_SEC", "120");
+  const ScopedEnv keep("DFKV_SLAB_KEEP_SCORE_SEC", "90");
+  const ScopedEnv bucket("DFKV_SLAB_BUCKET_SEC", "32");
+  const ScopedEnv buckets("DFKV_SLAB_BUCKET_COUNT", "8");
+  const ScopedEnv low("DFKV_SLAB_EVICT_LOW_PCT", "88");
+  const ScopedEnv high("DFKV_SLAB_EVICT_HIGH_PCT", "0");
+  DiskCacheGroup::Options options = Options();
+  options.eviction_ghost_capacity_per_disk = 0;  // Intervals do not need ghost.
+  ASSERT_NO_FATAL_FAILURE(Create(options));
+  const std::array<uint64_t, 8> delays{0,    1,     60,     180,
+                                       3600, 86400, 604800, 604801};
+  for (size_t sample = 0; sample < delays.size(); ++sample) {
+    for (size_t disk = 0; disk < 2; ++disk) {
+      const BlockKey key = IntervalKey(disk, sample + 1);
+      ASSERT_EQ(KvNodeServerTestPeer::Group(*server_).Cache(key, "old", 3),
+                Status::kOk);
+      seconds_ += delays[sample] + disk;
+      ASSERT_NO_FATAL_FAILURE(IntervalRead(key));
+      seconds_ += disk == 0 ? delays[sample] : 2 * delays[sample];
+      ASSERT_NO_FATAL_FAILURE(IntervalRead(key));
+    }
+  }
+  std::array<SlabAllocator::LifetimeReadIntervalStats, 2> expected{};
+  expected[0].first_buckets = {1, 1, 1, 1, 1, 1, 1, 1};
+  expected[0].repeat_buckets = {1, 1, 1, 1, 1, 1, 1, 1};
+  expected[0].first_total_sec = 1299842;
+  expected[0].repeat_total_sec = 1299842;
+  expected[1].first_buckets = {0, 1, 1, 1, 1, 1, 1, 2};
+  expected[1].repeat_buckets = {1, 0, 1, 1, 1, 1, 1, 2};
+  expected[1].first_total_sec = 1299850;
+  expected[1].repeat_total_sec = 2599684;
+  ASSERT_NO_FATAL_FAILURE(CheckReadIntervals(expected));
+  // Interval counters are unchanged by scrapes.
+  ASSERT_NO_FATAL_FAILURE(CheckReadIntervals(expected));
+  server_.reset();  // Clean close before a fresh owner clock, same directories.
+  clock_ = std::make_shared<DiskLifetimeClock>(
+      DiskLifetimeHorizon(config_), [this] { return seconds_.load(); });
+  options.lifetime_clock = clock_;
+  ASSERT_NO_FATAL_FAILURE(Create(options));
+  EXPECT_EQ(server_->Count(), 16U);
+  expected = {};
+  ASSERT_NO_FATAL_FAILURE(CheckReadIntervals(expected));
+  for (size_t disk = 0; disk < 2; ++disk) {
+    seconds_ += 5 + disk;
+    ASSERT_NO_FATAL_FAILURE(IntervalRead(IntervalKey(disk, 1)));
+    seconds_ += disk == 0 ? 3 : 5;
+    ASSERT_NO_FATAL_FAILURE(IntervalRead(IntervalKey(disk, 1)));
+    expected[disk].repeat_buckets = {0, 0, 1, 0, 0, 0, 0, 0};
+    expected[disk].repeat_total_sec = disk == 0 ? 3 : 5;
+    expected[disk].recovered_first_unknown = 1;
+  }
+  // Recovered first reads are unknown, never guessed from the old commit or
+  // boot origin; only their next applications contribute known repeat gaps.
+  ASSERT_NO_FATAL_FAILURE(CheckReadIntervals(expected));
+}
+
+TEST_F(LifetimeGhostMetricsTest,
+       ReadIntervalsAreZeroForLegacyAndOmittedForFile) {
+  for (const char* engine : {"slab", "file"}) {
+    SCOPED_TRACE(engine);
+    DiskCacheGroup::Options options = Options();
+    options.engine = engine;
+    options.eviction_policy = "legacy";
+    options.eviction_ghost_capacity_per_disk = 0;
+    options.lifetime_config.reset();
+    options.lifetime_clock.reset();
+    ASSERT_NO_FATAL_FAILURE(Create(options));
+    const BlockKey key = IntervalKey(0, 99);
+    ASSERT_EQ(KvNodeServerTestPeer::Group(*server_).Cache(key, "old", 3),
+              Status::kOk);
+    ASSERT_NO_FATAL_FAILURE(IntervalRead(key));
+    if (options.engine == "slab") {
+      ASSERT_NO_FATAL_FAILURE(CheckReadIntervals({}));
+    } else {
+      const std::string text = server_->MetricsText();
+      for (const char* prefix :
+           {"dfkv_slab_lifetime_", "dfkv_slab_disk_lifetime_"}) {
+        EXPECT_EQ(
+            text.find(std::string(prefix) + "read_first_interval_seconds"),
+            std::string::npos);
+        EXPECT_EQ(
+            text.find(std::string(prefix) + "read_repeat_interval_seconds"),
+            std::string::npos);
+        EXPECT_EQ(text.find(std::string(prefix) +
+                            "read_recovered_first_interval_unknown_total"),
+                  std::string::npos);
+      }
+    }
+    server_.reset();
+    fs::remove_all(dir_);
+  }
+}
 
 TEST_F(LifetimeGhostMetricsTest, DisabledSlabsEmitZerosAndFileOmitsFamilies) {
   for (const char* policy : {"legacy", "lifetime", "file"}) {

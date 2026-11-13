@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Export accepted lifetime read application intervals as per-disk and aggregate
+  first/repeat histograms, keeping unknown recovered first reads separate.
+  These are application-order observations, not read latency or total demand.
+
 - Count final results from the two synchronous Node read APIs independently of
   eviction history, separating nonempty/empty success, misses, invalid calls,
   other failures and admission refusals without claiming all-path coverage.
