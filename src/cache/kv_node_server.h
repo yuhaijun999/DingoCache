@@ -236,6 +236,15 @@ class KvNodeServer {
   std::function<void()> before_disk_remove_hook_for_test_;
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   void InitTcpListenerConfig();
+  // Final normal returns from the two synchronous Node read APIs only. These
+  // cohorts are independent of ghost/policy and are not all-path demand counts.
+  void RecordSyncReadResult(Status status, size_t returned_bytes);
+  std::atomic<uint64_t> sync_read_nonempty_success_{0};
+  std::atomic<uint64_t> sync_read_empty_success_{0};
+  std::atomic<uint64_t> sync_read_not_found_{0};
+  std::atomic<uint64_t> sync_read_invalid_{0};
+  std::atomic<uint64_t> sync_read_error_{0};
+  std::atomic<uint64_t> sync_read_admission_refused_{0};
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};

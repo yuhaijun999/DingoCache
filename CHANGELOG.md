@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Count final results from the two synchronous Node read APIs independently of
+  eviction history, separating nonempty/empty success, misses, invalid calls,
+  other failures and admission refusals without claiming all-path coverage.
+
 - Export per-disk ghost key-membership windows from owner-start, loss and current
   settlement-prefix bounds. Distinguish valid empty windows from unavailable
   time; enabled snapshots now sample the shared lifetime clock.

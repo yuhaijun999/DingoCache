@@ -8,6 +8,44 @@
 > **分布式追踪（traces）** 是独立的连接器侧能力（OTLP `/v1/traces`），
 > 见 [tracing.md](tracing.md)。本文只覆盖 metrics。
 
+## Synchronous read result cohorts
+
+The following counters cover **only** `ProcessRequestForKey(kRange)` and
+`RangeIntoForKey`, once per final normal return (including each coalesced
+caller, RAM hit and fallback). They are independent of ghost capacity and
+lifetime policy, and exist for file, legacy slab and lifetime slab engines.
+They use only the existing optional escaped `{node,group}` identity labels,
+never disk, key or request labels.
+
+| Counter | Final result |
+|---|---|
+| `dfkv_sync_read_results_nonempty_success_total` | `kOk` with returned bytes > 0 |
+| `dfkv_sync_read_results_empty_success_total` | `kOk` with zero returned bytes |
+| `dfkv_sync_read_results_not_found_total` | `kNotFound` |
+| `dfkv_sync_read_results_invalid_total` | `kInvalid` |
+| `dfkv_sync_read_results_error_total` | Other non-`kOk` results after entry admission |
+| `dfkv_sync_read_results_admission_refused_total` | Outer lifetime-restart entry gate returned `kIOError` |
+
+Classification follows final pin release/invalidation and notification, not
+physical I/O completion or successful heat application. A later/nested clock
+refusal after passing the outer gate is an `error`, not `admission_refused`.
+Failures never become successes merely because a buffer contains bytes.
+Metadata/EXIST, PUT, Remove, direct/prepared read grants, physical I/O and
+virtual reads do not increment these counters. Exceptions/non-returning calls,
+transport delivery and client-side retries outside these APIs are not covered.
+
+At quiescence the six counts partition completed calls; live scrapes read
+independent relaxed atomics, not one transactional snapshot. Nonempty success
+plus not-found counts only that completed subset: it is **not** the full
+specification's valid-logical-request denominator. Empty results and failures
+remain separate so later A/B owners can freeze exclusion rules explicitly.
+These Node-wide counters are not per-disk or ghost-window-conditioned and
+must not be used as denominators for per-disk ghost-match/loss rates. They do
+not establish eviction causality, recomputation, TTFT or all-path hit rate.
+The implementation adds six fixed atomics and one relaxed increment per
+covered return even with ghost/lifetime disabled; it adds no lock/clock sample,
+but shared-counter contention and resource/performance acceptance remain unmeasured.
+
 ## 1. 抓取端点
 
 | 进程 | 开关 | 端点 |

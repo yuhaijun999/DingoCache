@@ -461,6 +461,24 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_cache_put_total", "counter", "Cache (PUT) ops accepted", m_cache_put());
   metric("dfkv_cache_hit_total", "counter", "Range (GET) ops that hit", m_cache_hit());
   metric("dfkv_cache_miss_total", "counter", "Range (GET) ops that missed", m_cache_miss());
+  metric("dfkv_sync_read_results_nonempty_success_total", "counter",
+         "Synchronous Node read returns with nonempty success",
+         sync_read_nonempty_success_.load(std::memory_order_relaxed));
+  metric("dfkv_sync_read_results_empty_success_total", "counter",
+         "Synchronous Node read returns with empty success",
+         sync_read_empty_success_.load(std::memory_order_relaxed));
+  metric("dfkv_sync_read_results_not_found_total", "counter",
+         "Synchronous Node read returns with NotFound",
+         sync_read_not_found_.load(std::memory_order_relaxed));
+  metric("dfkv_sync_read_results_invalid_total", "counter",
+         "Synchronous Node read returns with Invalid",
+         sync_read_invalid_.load(std::memory_order_relaxed));
+  metric("dfkv_sync_read_results_error_total", "counter",
+         "Other failed synchronous Node read returns after entry admission",
+         sync_read_error_.load(std::memory_order_relaxed));
+  metric("dfkv_sync_read_results_admission_refused_total", "counter",
+         "Synchronous Node reads refused by the outer lifetime restart gate",
+         sync_read_admission_refused_.load(std::memory_order_relaxed));
   metric("dfkv_exist_hit_total", "counter", "Exist checks that hit", m_exist_hit());
   metric("dfkv_exist_miss_total", "counter", "Exist checks that missed", m_exist_miss());
   metric("dfkv_remove_ok_total", "counter", "Remove ops that dropped a block", m_remove_ok());
@@ -2105,6 +2123,20 @@ Status KvNodeServer::LookupForKey(const BlockKey& key,
   return group_.Lookup(key, out);
 }
 
+void KvNodeServer::RecordSyncReadResult(Status status, size_t returned_bytes) {
+  // Classify the final result, never infer success from possibly stale bytes.
+  // Only one counter changes per call; scrapes across counters are not atomic.
+  std::atomic<uint64_t>* counter = &sync_read_error_;
+  if (status == Status::kOk) {
+    counter = returned_bytes == 0 ? &sync_read_empty_success_
+                                  : &sync_read_nonempty_success_;
+  } else if (status == Status::kNotFound) {
+    counter = &sync_read_not_found_;
+  } else if (status == Status::kInvalid) {
+    counter = &sync_read_invalid_;
+  }
+  counter->fetch_add(1, std::memory_order_relaxed);
+}
 
 Status KvNodeServer::ProcessRequestForKey(
     uint8_t op_raw, const BlockKey& key, uint64_t offset, uint64_t length,
@@ -2118,6 +2150,9 @@ Status KvNodeServer::ProcessRequestForKey(
        op == WireOp::kLookup || op == WireOp::kRemove) &&
       LifetimeRestartRequired()) {
     if (out_data != nullptr) out_data->clear();
+    if (op == WireOp::kRange) {
+      sync_read_admission_refused_.fetch_add(1, std::memory_order_relaxed);
+    }
     return Status::kIOError;
   }
   Status st = Status::kInvalid;
@@ -2279,6 +2314,7 @@ Status KvNodeServer::ProcessRequestForKey(
             key, read_identity, out_data->size(), read_source,
             PreparedRead::Source::kUnclassified, completion);
       }
+      RecordSyncReadResult(st, st == Status::kOk ? out_data->size() : 0);
       if (samp) get_lat_.Observe(NowSec() - t0);
       break;
     }
@@ -2366,6 +2402,7 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
   if (LifetimeRestartRequired()) {
     if (out_len != nullptr) *out_len = 0;
     if (value_len != nullptr) *value_len = 0;
+    sync_read_admission_refused_.fetch_add(1, std::memory_order_relaxed);
     return Status::kIOError;
   }
   const bool track_lifetime = group_.TracksLifetimeState();
@@ -2395,6 +2432,7 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
         group_.NotifyLifetimeReadSuccess(
             key, read_identity, n, DiskSlabStore::LifetimeReadSource::kRam,
             PreparedRead::Source::kUnclassified, completion);
+      RecordSyncReadResult(Status::kOk, n);
       if (samp) get_lat_.Observe(NowSec() - t0);
       return Status::kOk;
     }
@@ -2438,6 +2476,7 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
   } else if (st == Status::kIOError) {
     get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
+  RecordSyncReadResult(st, st == Status::kOk ? *out_len : 0);
   if (samp) get_lat_.Observe(NowSec() - t0);
   return st;
 }

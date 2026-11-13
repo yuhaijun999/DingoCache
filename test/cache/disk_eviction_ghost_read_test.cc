@@ -116,7 +116,8 @@ class DiskEvictionGhostReadTest : public ::testing::Test {
     std::filesystem::remove_all(dir_);
   }
   void Create(bool coalescing = false, size_t disks = 1, size_t capacity = 2,
-              const char* policy = "lifetime", const char* engine = "slab") {
+              const char* policy = "lifetime", const char* engine = "slab",
+              bool identify = true) {
     server_.reset();
     seconds_ = 0;
     fail_clock_after_ = -1;
@@ -147,7 +148,8 @@ class DiskEvictionGhostReadTest : public ::testing::Test {
     const ScopedEnv coalesce("DFKV_READ_COALESCE", coalescing ? "1" : "0");
     server_ = std::make_unique<KvNodeServer>(options);
     ASSERT_TRUE(server_->Healthy()) << Group().StartupError();
-    server_->set_identity("ghost\"node", "ghost\\group\n");
+    identified_ = identify;
+    if (identified_) server_->set_identity("ghost\"node", "ghost\\group\n");
   }
   DiskCacheGroup& Group() { return KvNodeServerTestPeer::Group(*server_); }
   BlockKey Key(uint64_t first = 1, size_t disk = 0, uint64_t tenant = 7) {
@@ -185,6 +187,36 @@ class DiskEvictionGhostReadTest : public ::testing::Test {
     }
     if (output != nullptr) *output = bytes;
     return status;
+  }
+  void CheckSync(uint64_t nonempty, uint64_t empty, uint64_t not_found,
+                 uint64_t invalid, uint64_t error, uint64_t admission_refused) {
+    const std::string text = server_->MetricsText();
+    const std::string prefix = "dfkv_sync_read_results_";
+    const std::string labels =
+        identified_ ? R"({node="ghost\"node",group="ghost\\group\n"})" : "";
+    for (const std::pair<const char*, uint64_t>& result :
+         {std::pair<const char*, uint64_t>{"nonempty_success_total", nonempty},
+          {"empty_success_total", empty},
+          {"not_found_total", not_found},
+          {"invalid_total", invalid},
+          {"error_total", error},
+          {"admission_refused_total", admission_refused}}) {
+      const std::string name = prefix + result.first;
+      EXPECT_NE(text.find("\n" + name + labels + " " +
+                          std::to_string(result.second) + "\n"),
+                std::string::npos)
+          << name;
+      EXPECT_NE(text.find("# TYPE " + name + " counter\n"), std::string::npos)
+          << name;
+    }
+    // Exactly six node-scoped samples: no extra disk/key labels, aggregates or
+    // duplicate samples may conceal an incorrectly classified logical call.
+    size_t samples = 0;
+    for (size_t pos = text.find("\n" + prefix); pos != std::string::npos;
+         pos = text.find("\n" + prefix, pos + 1)) {
+      ++samples;
+    }
+    EXPECT_EQ(samples, 6U);
   }
   void Check(size_t disk, uint64_t misses, uint64_t matches, uint64_t age_sec,
              uint64_t unavailable = 0) {
@@ -243,7 +275,72 @@ class DiskEvictionGhostReadTest : public ::testing::Test {
   std::shared_ptr<DiskLifetimeClock> clock_;
   std::unique_ptr<KvNodeServer> server_;
   size_t instance_ = 0;
+  bool identified_ = true;
 };
+
+TEST_F(DiskEvictionGhostReadTest,
+       SyncResultCohortIsIndependentOfGhostAndPolicy) {
+  for (const char* mode : {"file", "legacy", "lifetime_disabled", "lifetime"}) {
+    for (const bool into : {false, true}) {
+      SCOPED_TRACE(mode);
+      SCOPED_TRACE(into);
+      const bool file = std::string(mode) == "file";
+      const bool legacy = std::string(mode) == "legacy";
+      const size_t capacity = std::string(mode) == "lifetime" ? 2 : 0;
+      ASSERT_NO_FATAL_FAILURE(Create(false, 1, capacity,
+                                     file || legacy ? "legacy" : "lifetime",
+                                     file ? "file" : "slab", !file));
+      ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 0, 0, 0, 0));
+      const BlockKey key = Key();
+      ASSERT_EQ(Put(key), Status::kOk);
+      std::string bytes;
+      ASSERT_EQ(Read(into, key, &bytes), Status::kOk);
+      EXPECT_EQ(bytes, "old");
+      ASSERT_NO_FATAL_FAILURE(CheckSync(1, 0, 0, 0, 0, 0));
+      ASSERT_EQ(Read(into, key, &bytes, 3), Status::kOk);
+      EXPECT_TRUE(bytes.empty());
+      ASSERT_NO_FATAL_FAILURE(CheckSync(1, 1, 0, 0, 0, 0));
+      ASSERT_EQ(Read(into, key, nullptr, 4), Status::kInvalid);
+      ASSERT_NO_FATAL_FAILURE(CheckSync(1, 1, 0, 1, 0, 0));
+      ASSERT_EQ(Operation(WireOp::kRemove, key), Status::kOk);
+      ASSERT_EQ(Read(into, key), Status::kNotFound);
+      EXPECT_EQ(Operation(WireOp::kLookup, key), Status::kNotFound);
+      EXPECT_EQ(Operation(WireOp::kExist, key), Status::kNotFound);
+      std::string ignored;
+      EXPECT_EQ(
+          server_->ProcessRequestForKey(255, key, 0, 0, nullptr, 0, &ignored),
+          Status::kInvalid);
+      ASSERT_NO_FATAL_FAILURE(CheckSync(1, 1, 1, 1, 0, 0));
+    }
+  }
+}
+
+TEST_F(DiskEvictionGhostReadTest, IntoWithoutLengthOutputUsesActualByteCount) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const BlockKey key = Key();
+  ASSERT_EQ(Put(key), Status::kOk);
+  std::array<char, 16> bytes{};
+  size_t value_len = 0;
+  EXPECT_EQ(server_->RangeIntoForKey(key, 0, 3, bytes.data(), bytes.size(),
+                                     nullptr, &value_len),
+            Status::kOk);
+  EXPECT_EQ(std::string(bytes.data(), 3), "old");
+  EXPECT_EQ(value_len, 3U);
+  ASSERT_NO_FATAL_FAILURE(CheckSync(1, 0, 0, 0, 0, 0));
+  EXPECT_EQ(server_->RangeIntoForKey(key, 3, 3, bytes.data(), bytes.size(),
+                                     nullptr, &value_len),
+            Status::kOk);
+  EXPECT_EQ(value_len, 3U);
+  ASSERT_NO_FATAL_FAILURE(CheckSync(1, 1, 0, 0, 0, 0));
+  EXPECT_EQ(
+      server_->RangeIntoForKey(key, 4, 3, bytes.data(), bytes.size(), nullptr),
+      Status::kInvalid);
+  ASSERT_NO_FATAL_FAILURE(CheckSync(1, 1, 0, 1, 0, 0));
+  EXPECT_EQ(server_->RangeIntoForKey(Key(key.digest_hi + 1), 0, 3, bytes.data(),
+                                     bytes.size(), nullptr),
+            Status::kNotFound);
+  ASSERT_NO_FATAL_FAILURE(CheckSync(1, 1, 1, 1, 0, 0));
+}
 
 TEST_F(DiskEvictionGhostReadTest, BothApisAssociateOnlyActualFinalMisses) {
   for (const bool coalescing : {false, true}) {
@@ -256,10 +353,12 @@ TEST_F(DiskEvictionGhostReadTest, BothApisAssociateOnlyActualFinalMisses) {
       ASSERT_EQ(Put(Key(key.digest_hi + 1)), Status::kOk);
       ASSERT_EQ(Read(into, key), Status::kNotFound);
       ASSERT_NO_FATAL_FAILURE(Check(0, 1, 1, 0));
+      ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 1, 0, 0, 0));
       seconds_ = 7;
       ASSERT_EQ(Read(into, key), Status::kNotFound);
       EXPECT_EQ(server_->m_cache_miss(), 2U);
       ASSERT_NO_FATAL_FAILURE(Check(0, 2, 2, 7));
+      ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 2, 0, 0, 0));
     }
   }
 }
@@ -276,6 +375,7 @@ TEST_F(DiskEvictionGhostReadTest, CompleteTenantKeyAndUnmatchedRequests) {
   ASSERT_EQ(Read(false, key), Status::kNotFound);
   EXPECT_EQ(server_->m_cache_miss(), 3U);
   ASSERT_NO_FATAL_FAILURE(Check(0, 3, 1, 0));
+  ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 3, 0, 0, 0));
 }
 
 TEST_F(DiskEvictionGhostReadTest,
@@ -301,10 +401,12 @@ TEST_F(DiskEvictionGhostReadTest,
   EXPECT_EQ(Operation(WireOp::kExist, key), Status::kOk);
   EXPECT_EQ(Operation(WireOp::kRemove, key), Status::kOk);
   ASSERT_NO_FATAL_FAILURE(Check(0, 0, 0, 0));
+  ASSERT_NO_FATAL_FAILURE(CheckSync(2, 2, 0, 2, 0, 0));
   // A subsequent real miss still matches older history, even though Remove
   // (after reinsertion) explains the current absence. Association is not cause.
   EXPECT_EQ(Read(false, key), Status::kNotFound);
   ASSERT_NO_FATAL_FAILURE(Check(0, 1, 1, 10));
+  ASSERT_NO_FATAL_FAILURE(CheckSync(2, 2, 1, 2, 0, 0));
 }
 
 TEST_F(DiskEvictionGhostReadTest,
@@ -326,6 +428,8 @@ TEST_F(DiskEvictionGhostReadTest,
       server_->PrepareReadForKey(key, 0, 3, staging.data(), staging.size());
   EXPECT_EQ(read.status(), Status::kNotFound);
   ASSERT_NO_FATAL_FAILURE(Check(0, 0, 0, 0));
+  EXPECT_EQ(server_->m_cache_miss(), 2U);
+  ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 0, 0, 0, 0));
 }
 
 TEST_F(DiskEvictionGhostReadTest, DisabledCaptureDoesNotSampleClock) {
@@ -342,6 +446,7 @@ TEST_F(DiskEvictionGhostReadTest, DisabledCaptureDoesNotSampleClock) {
     EXPECT_EQ(clock_calls_.load(), before);
     EXPECT_EQ(Read(false, Key()), Status::kNotFound);
     EXPECT_EQ(Read(true, Key()), Status::kNotFound);
+    ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 2, 0, 0, 0));
     if (file) {
       EXPECT_EQ(server_->MetricsText().find("dfkv_slab_disk_lifetime_ghost_"),
                 std::string::npos);
@@ -352,15 +457,26 @@ TEST_F(DiskEvictionGhostReadTest, DisabledCaptureDoesNotSampleClock) {
 }
 
 TEST_F(DiskEvictionGhostReadTest, LookupClockFailureAndAdmissionRefusalDiffer) {
-  for (const bool into : {false, true}) {
-    ASSERT_NO_FATAL_FAILURE(Create());
-    // One valid admission sample, then a hard failure at the entry witness.
-    // A missing Store key needs no later clock sample to establish NotFound.
-    fail_clock_after_ = 1;
-    EXPECT_EQ(Read(into, Key()), Status::kNotFound);
-    ASSERT_NO_FATAL_FAILURE(Check(0, 1, 0, 0, 1));
-    EXPECT_EQ(Read(into, Key()), Status::kIOError);
-    ASSERT_NO_FATAL_FAILURE(Check(0, 1, 0, 0, 1));
+  for (const bool coalescing : {false, true}) {
+    for (const bool into : {false, true}) {
+      SCOPED_TRACE(coalescing);
+      SCOPED_TRACE(into);
+      ASSERT_NO_FATAL_FAILURE(Create(coalescing));
+      // Admission succeeds before the witness sample hard-fails. Only the
+      // coalesced string API performs a nested Lookup admission recheck; that
+      // later refusal is an admitted-call error, not outer admission refusal.
+      fail_clock_after_ = 1;
+      const bool nested_refusal = coalescing && !into;
+      EXPECT_EQ(Read(into, Key()),
+                nested_refusal ? Status::kIOError : Status::kNotFound);
+      const uint64_t misses = nested_refusal ? 0 : 1;
+      const uint64_t errors = nested_refusal ? 1 : 0;
+      ASSERT_NO_FATAL_FAILURE(Check(0, misses, 0, 0, misses));
+      ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, misses, 0, errors, 0));
+      EXPECT_EQ(Read(into, Key()), Status::kIOError);
+      ASSERT_NO_FATAL_FAILURE(Check(0, misses, 0, 0, misses));
+      ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, misses, 0, errors, 1));
+    }
   }
 }
 
@@ -373,6 +489,7 @@ TEST_F(DiskEvictionGhostReadTest, DiskFailuresAreNotSyncMisses) {
   for (const bool into : {false, true})
     EXPECT_EQ(Read(into, key), Status::kIOError);
   ASSERT_NO_FATAL_FAILURE(Check(0, 0, 0, 0));
+  ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 0, 0, 2, 0));
 }
 
 TEST_F(DiskEvictionGhostReadTest,
@@ -389,6 +506,7 @@ TEST_F(DiskEvictionGhostReadTest,
   }
   EXPECT_EQ(server_->m_cache_miss(), 2U);
   ASSERT_NO_FATAL_FAILURE(Check(0, 1, 1, 3));
+  ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 2, 0, 0, 0));
 }
 
 TEST_F(DiskEvictionGhostReadTest,
@@ -418,6 +536,7 @@ TEST_F(DiskEvictionGhostReadTest,
               DiskSlabStore::EvictionGhostReadWitness::Result::kHistory);
     EXPECT_EQ(later.age_sec, 0U);
     ASSERT_NO_FATAL_FAILURE(Check(0, 1, 0, 0));
+    ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 1, 0, 0, 0));
   }
 }
 
@@ -461,6 +580,7 @@ TEST_F(DiskEvictionGhostReadTest, CapturedMatchSurvivesLaterHistoryTruncation) {
     // The entry snapshot saw the older event at t=0, not its later refresh or
     // the final miss at t=20. The preserved witness contributes exactly 5.
     ASSERT_NO_FATAL_FAILURE(Check(0, 1, 1, 5));
+    ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 1, 0, 0, 0));
   }
 }
 
@@ -479,9 +599,12 @@ TEST_F(DiskEvictionGhostReadTest,
     std::string output;
     ASSERT_EQ(Read(into, key, &output), Status::kOk);
     EXPECT_EQ(output, "ram");
+    EXPECT_EQ(Read(into, key, &output, 3), Status::kOk);
+    EXPECT_TRUE(output.empty());
   }
   EXPECT_EQ(server_->m_cache_miss(), 0U);
   ASSERT_NO_FATAL_FAILURE(Check(0, 0, 0, 0));
+  ASSERT_NO_FATAL_FAILURE(CheckSync(2, 2, 0, 0, 0, 0));
 }
 }  // namespace
 }  // namespace dfkv

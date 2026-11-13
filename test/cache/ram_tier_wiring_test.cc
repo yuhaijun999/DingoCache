@@ -3646,6 +3646,23 @@ class LifetimeSuccessReadTest : public ProductionFlushResultTest {
     return node_->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
                                        key, offset, length, nullptr, 0, out);
   }
+  void ExpectSyncReadResults(uint64_t nonempty, uint64_t empty = 0,
+                             uint64_t missing = 0, uint64_t errors = 0) const {
+    const std::string text = node_->MetricsText();
+    const std::pair<const char*, uint64_t> results[] = {
+        {"nonempty_success", nonempty},
+        {"empty_success", empty},
+        {"not_found", missing},
+        {"invalid", 0},
+        {"error", errors},
+        {"admission_refused", 0}};
+    for (const std::pair<const char*, uint64_t>& result : results) {
+      EXPECT_EQ(MetricVal(text, std::string("dfkv_sync_read_results_") +
+                                    result.first + "_total"),
+                static_cast<long>(result.second))
+          << result.first;
+    }
+  }
   void ExpectConservation(uint64_t successful) const {
     const DiskSlabStore::Stats stats =
         KvNodeServerWiringTestPeer::Slab(*node_).GetStats();
@@ -4236,6 +4253,9 @@ TEST_F(LifetimeSuccessReadTest, O5MixedApiConvoyCountsEveryLogicalSuccess) {
             Status::kNotFound);
         EXPECT_EQ(State(key).scoring_reads(), completed_reads);
         ExpectConservation(completed_reads);
+        // Four real API returns, not one fill; the direct Store probe above
+        // is excluded, while the empty and missing Node calls are separate.
+        ExpectSyncReadResults(completed_reads, 1, 1);
       }
     }
   }
@@ -4407,43 +4427,51 @@ TEST_F(LifetimeSuccessReadTest, TimeoutFallbackHasOnlyItsOwnSuccessEvent) {
   EXPECT_EQ(Counters().source_copy_follower, 0U);
   EXPECT_EQ(Counters().source_disk, 1U);  // Timeout executes its own fill.
   ExpectConservation(2);
+  ExpectSyncReadResults(2);
 }
 
 TEST_F(LifetimeSuccessReadTest,
        LastReleaseRemoveUsesFinalStatusAndOriginalSource) {
   const ScopedEnv ram_off("DFKV_RAM_TIER", "0");
   for (const bool fail_invalidation : {false, true}) {
-    ASSERT_NO_FATAL_FAILURE(CreateScored());
-    const BlockKey key{99918 + static_cast<uint64_t>(fail_invalidation), 0};
-    ASSERT_EQ(Seed(key).status, Status::kOk);
-    DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
-    DiskSlabStoreTestPeer::SetReadHook(store, [&] {
-      EXPECT_EQ(store.Remove(key), Status::kOk);
-      if (fail_invalidation)
-        DiskSlabStoreTestPeer::SetRecordWriteHook(&store, [] { return false; });
-    });
-    std::string value;
-    Status result = Status::kInvalid;
-    std::thread reader([&] { result = Read(key, &value); });
-    reader.join();
-    DiskSlabStoreTestPeer::SetReadHook(store, {});
-    if (fail_invalidation) {
-      EXPECT_EQ(result, Status::kIOError);
-      EXPECT_EQ(State(key).actual_reads, 0U);
-      EXPECT_EQ(Counters().completion_not_applied, 0U);
-      EXPECT_EQ(KvNodeServerWiringTestPeer::Slab(*node_)
-                    .GetStats()
-                    .lifetime_read_completion_to_apply.samples,
-                0U);
-      ExpectConservation(0);
-    } else {
-      EXPECT_EQ(result, Status::kOk);
-      EXPECT_EQ(value, "value");
-      EXPECT_EQ(Counters().race_lost, 1U);
-      EXPECT_EQ(Counters().no_binding, 0U);
-      EXPECT_EQ(Counters().completion_missing, 0U);
-      EXPECT_EQ(Counters().completion_not_applied, 1U);
-      ExpectConservation(1);
+    for (const bool into : {false, true}) {
+      SCOPED_TRACE(fail_invalidation);
+      SCOPED_TRACE(into);
+      ASSERT_NO_FATAL_FAILURE(CreateScored());
+      const BlockKey key{99918 + static_cast<uint64_t>(fail_invalidation), 0};
+      ASSERT_EQ(Seed(key).status, Status::kOk);
+      DiskSlabStore& store = KvNodeServerWiringTestPeer::Slab(*node_);
+      DiskSlabStoreTestPeer::SetReadHook(store, [&] {
+        EXPECT_EQ(store.Remove(key), Status::kOk);
+        if (fail_invalidation)
+          DiskSlabStoreTestPeer::SetRecordWriteHook(&store,
+                                                    [] { return false; });
+      });
+      std::string value;
+      Status result = Status::kInvalid;
+      std::thread reader([&] { result = ReadFiveBytes(key, into, &value); });
+      reader.join();
+      DiskSlabStoreTestPeer::SetReadHook(store, {});
+      if (fail_invalidation) {
+        EXPECT_EQ(result, Status::kIOError);
+        EXPECT_EQ(State(key).actual_reads, 0U);
+        EXPECT_EQ(Counters().completion_not_applied, 0U);
+        EXPECT_EQ(KvNodeServerWiringTestPeer::Slab(*node_)
+                      .GetStats()
+                      .lifetime_read_completion_to_apply.samples,
+                  0U);
+        ExpectConservation(0);
+        ExpectSyncReadResults(0, 0, 0, 1);
+      } else {
+        EXPECT_EQ(result, Status::kOk);
+        EXPECT_EQ(value, "value");
+        EXPECT_EQ(Counters().race_lost, 1U);
+        EXPECT_EQ(Counters().no_binding, 0U);
+        EXPECT_EQ(Counters().completion_missing, 0U);
+        EXPECT_EQ(Counters().completion_not_applied, 1U);
+        ExpectConservation(1);
+        ExpectSyncReadResults(1);
+      }
     }
   }
 }
