@@ -1538,7 +1538,18 @@ entire PUT/reclaim path OOM-safe. Disabled/empty batches add no clock sample.
 Capacity truncation and recording gaps must both be disclosed. Raw oldest/newest
 bounds, their difference and retained counts do not prove a complete effective
 observation interval; equal-time records may already have been discarded. The
-container may stage one extra node/index entry, and node/bucket/allocator/peak RSS
+internal ghost snapshot now also retains `lost_through_sec`, the maximum known
+settlement timestamp of discarded or dropped evidence, and sticky
+`loss_time_unknown` for clock-unavailable losses. Capacity truncation advances
+this boundary using the **discarded** record's timestamp, not the incoming
+record. A candidate complete key-membership interval must start strictly after
+this boundary (including same-second ties); unknown-time loss remains until
+Store reconstruction. Duplicate-key refresh loses no key membership, so this is
+not complete event-history retention. These internal fields are **not exported
+metrics or a complete interval**: owner start/end and usable observation-clock
+bounds still need a separate protocol. Their absence alone does not establish
+coverage, and conservative loss markers need not imply an actually absent key.
+The container may stage one extra node/index entry, and node/bucket/allocator/peak RSS
 costs are not yet accepted. Historical key matches and repeated PUTs are not
 proof of eviction-caused business loss. These diagnostics do not establish full
 E4 coverage or authorize new-policy

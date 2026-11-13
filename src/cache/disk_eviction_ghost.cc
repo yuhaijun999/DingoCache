@@ -46,12 +46,26 @@ bool DiskEvictionGhost::RecordEviction(const BlockKey& key,
   staged.push_back({key, evicted_at_sec});
   index_.emplace(key, staged.begin());
   if (entries_.size() == capacity_) {
+    // Only committed removal loses key membership; failed staging above does
+    // not move this boundary. Use the removed time, not the incoming time.
+    NoteDroppedEviction(entries_.front().evicted_at_sec);
     index_.erase(entries_.front().key);
     entries_.pop_front();
     capacity_limited_ = true;
   }
   entries_.splice(entries_.end(), staged);
   return true;
+}
+
+void DiskEvictionGhost::NoteDroppedEviction(
+    std::optional<uint64_t> evicted_at_sec) noexcept {
+  if (capacity_ == 0) return;
+  if (!evicted_at_sec.has_value()) {
+    loss_time_unknown_ = true;
+  } else if (!lost_through_sec_.has_value() ||
+             *evicted_at_sec > *lost_through_sec_) {
+    lost_through_sec_ = evicted_at_sec;
+  }
 }
 
 std::optional<uint64_t> DiskEvictionGhost::LookupEvictionAge(
@@ -68,6 +82,8 @@ DiskEvictionGhost::Snapshot DiskEvictionGhost::GetSnapshot() const {
   snapshot.capacity = capacity_;
   snapshot.retained = entries_.size();
   snapshot.capacity_limited = capacity_limited_;
+  snapshot.lost_through_sec = lost_through_sec_;
+  snapshot.loss_time_unknown = loss_time_unknown_;
   if (!entries_.empty()) {
     snapshot.oldest_evicted_at_sec = entries_.front().evicted_at_sec;
     snapshot.newest_evicted_at_sec = entries_.back().evicted_at_sec;

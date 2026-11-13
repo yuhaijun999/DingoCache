@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Track internal eviction-history loss boundaries for capacity truncation and
+  failed recording, distinguishing unknown-time gaps without changing eviction
+  or claiming a complete observation window.
+
 - Associate final misses from the two synchronous Node read APIs with retained
   eviction evidence captured before reading. Export per-disk cohort coverage
   and snapshot-age sums without attributing causality or including PULL setup.

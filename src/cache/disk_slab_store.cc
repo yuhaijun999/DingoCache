@@ -588,6 +588,7 @@ void DiskSlabStore::RecordEvictionGhostLocked(
   // One post-success batch sample, not the score's pre-wipe timestamp. Losing
   // clock evidence cannot undo an invalidation or skip payload cleanup.
   if (!opt_.lifetime_clock->TryDrainNow(&settled_at)) {
+    eviction_ghost_->NoteDroppedEviction(std::nullopt);
     ghost_dropped_ += evicted.size();
     return;
   }
@@ -596,12 +597,14 @@ void DiskSlabStore::RecordEvictionGhostLocked(
       if (eviction_ghost_->RecordEviction(key, settled_at)) {
         ++ghost_recorded_;
       } else {
+        eviction_ghost_->NoteDroppedEviction(settled_at);
         ++ghost_dropped_;
       }
     } catch (const std::bad_alloc&) {
       // Auxiliary-memory containment only: the container preserves its prior
       // history transactionally. Never propagate this new allocation failure
       // into already-successful authoritative eviction/cleanup.
+      eviction_ghost_->NoteDroppedEviction(settled_at);
       ++ghost_dropped_;
     }
   }

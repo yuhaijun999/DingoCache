@@ -372,6 +372,8 @@ TEST_F(DiskEvictionGhostStoreTest,
   DiskSlabStoreTestPeer::Record(*store_, batch);
   EXPECT_EQ(store_->ObserveEvictionGhost().recorded, 0U);
   EXPECT_EQ(store_->ObserveEvictionGhost().dropped, 2U);
+  EXPECT_TRUE(store_->ObserveEvictionGhost().history.loss_time_unknown);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.lost_through_sec);
   EXPECT_TRUE(store_->Healthy());
 }
 
@@ -413,6 +415,25 @@ TEST_F(DiskEvictionGhostStoreTest,
   EXPECT_GE(failures, 3U);
 }
 
+TEST_F(DiskEvictionGhostStoreTest,
+       AllocationGapRemainsAfterSuccessfulRecording) {
+  ASSERT_NO_FATAL_FAILURE(Create());
+  const std::vector<BlockKey> batch{Key(1)};
+  seconds_ = 12;
+  allocation_failed = false;
+  DiskSlabStoreTestPeer::Record(*store_, batch, 0);
+  ASSERT_TRUE(allocation_failed);
+  EXPECT_EQ(store_->ObserveEvictionGhost().dropped, 1U);
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.lost_through_sec, 12U);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.loss_time_unknown);
+  seconds_ = 15;
+  DiskSlabStoreTestPeer::Record(*store_, batch);
+  EXPECT_EQ(store_->ObserveEvictionGhost().recorded, 1U);
+  EXPECT_EQ(store_->ObserveEvictionGhost().history.lost_through_sec, 12U);
+  EXPECT_EQ(DiskSlabStoreTestPeer::Age(*store_, Key(1), 20), 5U);
+  EXPECT_TRUE(store_->Healthy());
+}
+
 TEST_F(DiskEvictionGhostStoreTest, LaterInvalidationFailureKeepsEarlierVictim) {
   ASSERT_NO_FATAL_FAILURE(Create(4));
   ASSERT_NO_FATAL_FAILURE(Seed(4));
@@ -449,6 +470,8 @@ TEST_F(DiskEvictionGhostStoreTest,
   EXPECT_EQ(store_->EvictedBytes(), 3U);
   EXPECT_EQ(store_->ObserveEvictionGhost().recorded, 0U);
   EXPECT_EQ(store_->ObserveEvictionGhost().dropped, 1U);
+  EXPECT_TRUE(store_->ObserveEvictionGhost().history.loss_time_unknown);
+  EXPECT_FALSE(store_->ObserveEvictionGhost().history.lost_through_sec);
   EXPECT_TRUE(store_->Healthy());
 }
 
@@ -478,6 +501,12 @@ TEST_F(DiskEvictionGhostStoreTest, ConcurrentSnapshotsConserveCompletedEvents) {
       EXPECT_LE(observation.history.retained, observation.history.capacity);
       EXPECT_LE(observation.history.retained, observation.recorded);
       EXPECT_EQ(observation.dropped, 0U);
+      EXPECT_FALSE(observation.history.loss_time_unknown);
+      if (observation.history.capacity_limited) {
+        EXPECT_EQ(observation.history.lost_through_sec, 0U);
+      } else {
+        EXPECT_FALSE(observation.history.lost_through_sec.has_value());
+      }
     }
   });
   // No fatal assertion while a joinable observer remains.

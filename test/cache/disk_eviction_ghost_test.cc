@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <type_traits>
 
 // Third-party headers.
@@ -100,6 +101,8 @@ TEST(DiskEvictionGhostTest, RegressingRecordDoesNotChangeHistoryOrDiscard) {
   EXPECT_FALSE(snapshot.capacity_limited);
   EXPECT_EQ(snapshot.oldest_evicted_at_sec, 20U);
   EXPECT_EQ(snapshot.newest_evicted_at_sec, 20U);
+  EXPECT_FALSE(snapshot.lost_through_sec.has_value());
+  EXPECT_FALSE(snapshot.loss_time_unknown);
 }
 
 TEST(DiskEvictionGhostTest, EqualTimesStillExposeCapacityTruncation) {
@@ -134,6 +137,86 @@ TEST(DiskEvictionGhostTest, MaximumTimeDoesNotOverflowAge) {
   EXPECT_EQ(ghost.LookupEvictionAge({2, 0}, kMax), 0U);
   EXPECT_FALSE(ghost.RecordEviction({3, 0}, kMax - 1));
   EXPECT_EQ(ghost.GetSnapshot().retained, 2U);
+}
+
+TEST(DiskEvictionGhostTest, DisabledAndFreshOwnersHaveNoLossBoundary) {
+  DiskEvictionGhost disabled(0);
+  disabled.NoteDroppedEviction(0);
+  disabled.NoteDroppedEviction(std::nullopt);
+  EXPECT_FALSE(disabled.GetSnapshot().lost_through_sec.has_value());
+  EXPECT_FALSE(disabled.GetSnapshot().loss_time_unknown);
+  DiskEvictionGhost enabled(1);
+  ASSERT_TRUE(enabled.RecordEviction({1, 0}, 0));
+  ASSERT_TRUE(enabled.RecordEviction({1, 0}, 10));
+  EXPECT_FALSE(enabled.GetSnapshot().lost_through_sec.has_value());
+  EXPECT_FALSE(enabled.GetSnapshot().loss_time_unknown);
+}
+
+TEST(DiskEvictionGhostTest, CapacityLossUsesRemovedTimeNotIncomingTime) {
+  DiskEvictionGhost ghost(2);
+  ASSERT_TRUE(ghost.RecordEviction({1, 0}, 0));
+  ASSERT_TRUE(ghost.RecordEviction({2, 0}, 5));
+  ASSERT_TRUE(ghost.RecordEviction({3, 0}, 10));
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, 0U);
+  // Refreshing a retained key loses no key-membership evidence.
+  ASSERT_TRUE(ghost.RecordEviction({2, 0}, 20));
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, 0U);
+  ASSERT_TRUE(ghost.RecordEviction({4, 0}, 30));
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, 10U);
+  EXPECT_FALSE(ghost.GetSnapshot().loss_time_unknown);
+}
+
+TEST(DiskEvictionGhostTest, EqualTimeLossBoundaryExcludesTheEntireSecond) {
+  DiskEvictionGhost ghost(1);
+  ASSERT_TRUE(ghost.RecordEviction({1, 0}, 5));
+  ASSERT_TRUE(ghost.RecordEviction({2, 0}, 5));
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, 5U);
+  EXPECT_EQ(ghost.GetSnapshot().oldest_evicted_at_sec, 5U);
+  EXPECT_FALSE(ghost.LookupEvictionAge({1, 0}, 5));
+  EXPECT_EQ(ghost.LookupEvictionAge({2, 0}, 5), 0U);
+}
+
+TEST(DiskEvictionGhostTest, KnownDropsAdvanceByMaximumWithoutChangingHistory) {
+  DiskEvictionGhost ghost(1);
+  ASSERT_TRUE(ghost.RecordEviction({1, 0}, 0));
+  ghost.NoteDroppedEviction(0);
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, 0U);
+  ghost.NoteDroppedEviction(50);
+  ghost.NoteDroppedEviction(3);
+  ASSERT_TRUE(ghost.RecordEviction({2, 0}, 10));
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, 50U);
+  ghost.NoteDroppedEviction(std::nullopt);
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, 50U);
+  EXPECT_TRUE(ghost.GetSnapshot().loss_time_unknown);
+  EXPECT_EQ(ghost.GetSnapshot().retained, 1U);
+  EXPECT_EQ(ghost.LookupEvictionAge({2, 0}, 10), 0U);
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, 50U);
+}
+
+TEST(DiskEvictionGhostTest, UnknownTimeLossStaysStickyUntilReconstruction) {
+  DiskEvictionGhost ghost(1);
+  ghost.NoteDroppedEviction(std::nullopt);
+  EXPECT_TRUE(ghost.GetSnapshot().loss_time_unknown);
+  EXPECT_FALSE(ghost.GetSnapshot().lost_through_sec.has_value());
+  ghost.NoteDroppedEviction(7);
+  ASSERT_TRUE(ghost.RecordEviction({1, 0}, 20));
+  ASSERT_TRUE(ghost.RecordEviction({2, 0}, 30));
+  EXPECT_TRUE(ghost.GetSnapshot().loss_time_unknown);
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, 20U);
+  const DiskEvictionGhost reconstructed(1);
+  EXPECT_FALSE(reconstructed.GetSnapshot().loss_time_unknown);
+  EXPECT_FALSE(reconstructed.GetSnapshot().lost_through_sec.has_value());
+}
+
+TEST(DiskEvictionGhostTest, MaximumLossTimeNeedsNoIncrementOrWrapping) {
+  DiskEvictionGhost ghost(1);
+  constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+  ASSERT_TRUE(ghost.RecordEviction({1, 0}, kMax));
+  ASSERT_TRUE(ghost.RecordEviction({2, 0}, kMax));
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, kMax);
+  ghost.NoteDroppedEviction(0);
+  EXPECT_EQ(ghost.GetSnapshot().lost_through_sec, kMax);
+  EXPECT_EQ(ghost.LookupEvictionAge({2, 0}, kMax), 0U);
 }
 
 TEST(DiskEvictionGhostTest, LongTraceRemainsBoundedAndRefreshesLatestEvidence) {
