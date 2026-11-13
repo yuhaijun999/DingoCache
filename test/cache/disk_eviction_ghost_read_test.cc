@@ -12,8 +12,10 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 // Third-party headers.
 #include <gtest/gtest.h>
@@ -21,6 +23,7 @@
 #include "cache/disk_cache_group.h"
 #include "cache/disk_lifetime_clock.h"
 #include "cache/disk_lifetime_math.h"
+#include "cache/disk_lifetime_state.h"
 #include "cache/disk_slab_store.h"
 #include "cache/kv_node_server.h"
 #include "cache/ram_tier.h"
@@ -29,6 +32,7 @@
 #include "common/kv_types.h"
 #include "common/status.h"
 #include "read_coalescer_test_peer.h"
+#include "slab_allocator_test_peer.h"
 #include "transport/wire.h"
 
 namespace dfkv {
@@ -64,6 +68,11 @@ class DiskCacheGroupTestPeer {
 
 class DiskSlabStoreTestPeer {
  public:
+  static std::optional<DiskLifetimeState> State(const DiskSlabStore& store,
+                                                const BlockKey& key) {
+    const std::lock_guard<std::mutex> lock(store.mu_);
+    return SlabAllocatorTestPeer::LifetimeState(*store.alloc_, key);
+  }
   static void FailMetadata(DiskSlabStore& store) {
     const std::lock_guard<std::mutex> lock(store.mu_);
     EXPECT_EQ(::close(store.table_fd_), 0);
@@ -117,9 +126,33 @@ class DiskEvictionGhostReadTest : public ::testing::Test {
   }
   void Create(bool coalescing = false, size_t disks = 1, size_t capacity = 2,
               const char* policy = "lifetime", const char* engine = "slab",
-              bool identify = true) {
+              bool identify = true, size_t slots = 1) {
     server_.reset();
-    seconds_ = 0;
+    ResetClock();
+    DiskCacheGroup::Options options;
+    const std::filesystem::path instance = dir_ / std::to_string(instance_++);
+    for (size_t disk = 0; disk < disks; ++disk)
+      options.cache_dirs.push_back((instance / std::to_string(disk)).string());
+    // Sparse 1-GiB slots keep payloads tiny while controlling real capacity.
+    // This is functional eviction control, not a memory/performance test.
+    options.capacity_bytes = disks * slots * (1ULL << 30);
+    options.engine = engine;
+    options.eviction_policy = policy;
+    options.eviction_ghost_capacity_per_disk = capacity;
+    if (std::string(policy) == "lifetime") {
+      options.lifetime_config = config_;
+      options.lifetime_clock = clock_;
+    }
+    options_ = options;
+    coalescing_ = coalescing;
+    const ScopedEnv coalesce("DFKV_READ_COALESCE", coalescing_ ? "1" : "0");
+    server_ = std::make_unique<KvNodeServer>(options_);
+    ASSERT_TRUE(server_->Healthy()) << Group().StartupError();
+    identified_ = identify;
+    if (identified_) server_->set_identity("ghost\"node", "ghost\\group\n");
+  }
+  void ResetClock(uint64_t epoch = 0) {
+    seconds_ = epoch;
     fail_clock_after_ = -1;
     clock_calls_ = 0;
     clock_ = std::make_shared<DiskLifetimeClock>(
@@ -131,24 +164,15 @@ class DiskEvictionGhostReadTest : public ::testing::Test {
           }
           return seconds_.load();
         });
-    DiskCacheGroup::Options options;
-    const std::filesystem::path instance = dir_ / std::to_string(instance_++);
-    for (size_t disk = 0; disk < disks; ++disk)
-      options.cache_dirs.push_back((instance / std::to_string(disk)).string());
-    // Sparse 1-GiB geometry gives one slot per disk; payloads remain 3 bytes.
-    // This is functional eviction control, not a memory/performance test.
-    options.capacity_bytes = disks * (1ULL << 30);
-    options.engine = engine;
-    options.eviction_policy = policy;
-    options.eviction_ghost_capacity_per_disk = capacity;
-    if (std::string(policy) == "lifetime") {
-      options.lifetime_config = config_;
-      options.lifetime_clock = clock_;
-    }
-    const ScopedEnv coalesce("DFKV_READ_COALESCE", coalescing ? "1" : "0");
-    server_ = std::make_unique<KvNodeServer>(options);
+  }
+  void Reopen(uint64_t epoch) {
+    // Finish the old owner's clean close before creating another clock origin.
+    server_.reset();
+    ResetClock(epoch);
+    if (options_.lifetime_clock) options_.lifetime_clock = clock_;
+    const ScopedEnv coalesce("DFKV_READ_COALESCE", coalescing_ ? "1" : "0");
+    server_ = std::make_unique<KvNodeServer>(options_);
     ASSERT_TRUE(server_->Healthy()) << Group().StartupError();
-    identified_ = identify;
     if (identified_) server_->set_identity("ghost\"node", "ghost\\group\n");
   }
   DiskCacheGroup& Group() { return KvNodeServerTestPeer::Group(*server_); }
@@ -274,9 +298,168 @@ class DiskEvictionGhostReadTest : public ::testing::Test {
   std::atomic<uint64_t> clock_calls_{0};
   std::shared_ptr<DiskLifetimeClock> clock_;
   std::unique_ptr<KvNodeServer> server_;
+  DiskCacheGroup::Options options_;
   size_t instance_ = 0;
   bool identified_ = true;
+  bool coalescing_ = false;
 };
+
+TEST_F(DiskEvictionGhostReadTest,
+       CleanRestartForegroundTraceKeepsColdMajorityAndOwnerBoundaries) {
+  // Formal lifetime startup overlays numeric environment values on Options.
+  // Keep this functional oracle independent of the invoking shell's settings.
+  const ScopedEnv base("DFKV_SLAB_LIFE_BASE_SEC", "100");
+  const ScopedEnv bonus("DFKV_SLAB_LIFE_READ_BONUS_SEC", "10");
+  const ScopedEnv max_reads("DFKV_SLAB_LIFE_MAX_READS", "2");
+  const ScopedEnv protect("DFKV_SLAB_PROTECT_SEC", "8");
+  const ScopedEnv slowdown("DFKV_SLAB_PROTECT_SLOWDOWN", "4");
+  const ScopedEnv boost("DFKV_SLAB_PROTECT_BOOST_SEC", "120");
+  const ScopedEnv keep("DFKV_SLAB_KEEP_SCORE_SEC", "90");
+  const ScopedEnv bucket("DFKV_SLAB_BUCKET_SEC", "16");
+  const ScopedEnv buckets("DFKV_SLAB_BUCKET_COUNT", "8");
+  const ScopedEnv low("DFKV_SLAB_EVICT_LOW_PCT", "88");
+  const ScopedEnv high("DFKV_SLAB_EVICT_HIGH_PCT", "0");
+  config_.max_reads = 2;
+  config_.boost_sec = 120;
+  ASSERT_NO_FATAL_FAILURE(Create(false, 1, 2, "lifetime", "slab", true, 8));
+  const std::string directory = Group().DiskPath(0);
+  struct Resident {
+    BlockKey key;
+    std::string value;
+  };
+  std::vector<Resident> live;
+  std::vector<BlockKey> gone;
+  for (uint64_t id = 1; id <= 8; ++id) {
+    const Resident resident{
+        Key(id), std::string(id <= 2 ? "h0" : "o0") + std::to_string(id)};
+    ASSERT_EQ(Put(resident.key, resident.value.c_str()), Status::kOk);
+    live.push_back(resident);
+  }
+  for (size_t round = 0; round < 3; ++round) {
+    SCOPED_TRACE(round);
+    const uint64_t epoch = (round + 1) * 1000;
+    ASSERT_NO_FATAL_FAILURE(Reopen(epoch));
+    EXPECT_EQ(Group().DiskPath(0), directory);
+    ASSERT_EQ(server_->Count(), 8U);
+    ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 0, 0, 0, 0));
+    ASSERT_NO_FATAL_FAILURE(Check(0, 0, 0, 0));
+    const DiskSlabStore::Stats rebuilt = Group().DiskSlabStats(0);
+    EXPECT_EQ(rebuilt.table_rebuilt, 8U);
+    EXPECT_EQ(rebuilt.unclean_resets, 0U);
+    EXPECT_EQ(rebuilt.lifetime_reads.successful, 0U);
+    EXPECT_EQ(rebuilt.lifetime_reads.applied, 0U);
+    const DiskSlabStore::EvictionGhostObservation empty =
+        Group().DiskEvictionGhostObservation(0);
+    EXPECT_EQ(empty.recorded, 0U);
+    EXPECT_EQ(empty.dropped, 0U);
+    EXPECT_EQ(empty.history.retained, 0U);
+    EXPECT_FALSE(empty.history.capacity_limited);
+    EXPECT_FALSE(empty.history.lost_through_sec.has_value());
+    EXPECT_FALSE(empty.history.loss_time_unknown);
+    EXPECT_EQ(empty.history.window_after_sec, std::optional<uint64_t>(0));
+    EXPECT_EQ(empty.history.window_through_sec, std::optional<uint64_t>(0));
+    const DiskSlabStore& store = DiskCacheGroupTestPeer::Slab(Group(), 0);
+    for (const Resident& resident : live) {
+      const std::optional<DiskLifetimeState> state =
+          DiskSlabStoreTestPeer::State(store, resident.key);
+      if (!state.has_value()) {
+        ADD_FAILURE() << "Committed resident has no lifetime state";
+        return;
+      }
+      EXPECT_TRUE(state->history_unknown);
+      EXPECT_EQ(state->scoring_reads(), 2U);
+      EXPECT_EQ(state->actual_reads, 0U);
+    }
+    for (const BlockKey& key : gone) {
+      EXPECT_EQ(Read(false, key), Status::kNotFound);
+    }
+    seconds_ = epoch + 30;
+    for (size_t hot = 0; hot < 2; ++hot) {
+      for (const bool into : {false, true}) {
+        std::string bytes;
+        ASSERT_EQ(Read(into, live[hot].key, &bytes), Status::kOk);
+        EXPECT_EQ(bytes, live[hot].value);
+      }
+    }
+    seconds_ = epoch + 40;
+    for (size_t index = 0; index < live.size(); ++index) {
+      const std::optional<DiskLifetimeState> state =
+          DiskSlabStoreTestPeer::State(store, live[index].key);
+      if (!state.has_value()) {
+        ADD_FAILURE() << "Committed resident has no lifetime state";
+        return;
+      }
+      EXPECT_EQ(state->actual_reads, index < 2 ? 2U : 0U);
+      EXPECT_EQ(DiskLifetimeScore(
+                    config_, state->anchor, state->scoring_reads(),
+                    state->first_early_read(), state->write_armed(), 40),
+                index < 2 ? 110 : 80);
+    }
+    const Resident added{Key(9 + round), "n0" + std::to_string(round)};
+    ASSERT_EQ(Put(added.key, added.value.c_str()), Status::kOk);
+    EXPECT_EQ(server_->Count(), 8U);
+    // These post-selection reads validate bytes only; the next clean reopen
+    // resets their heat before another pressure decision.
+    std::vector<Resident> survivors;
+    for (size_t index = 0; index < live.size(); ++index) {
+      std::string bytes;
+      const Status status = Read(index % 2 != 0, live[index].key, &bytes);
+      if (status == Status::kNotFound) {
+        ASSERT_GE(index, 2U);  // A cold member, never a particular tied key.
+        gone.push_back(live[index].key);
+      } else {
+        ASSERT_EQ(status, Status::kOk);
+        EXPECT_EQ(bytes, live[index].value);
+        survivors.push_back(live[index]);
+      }
+    }
+    ASSERT_EQ(gone.size(), round + 1);
+    ASSERT_EQ(survivors.size(), 7U);
+    std::string bytes;
+    ASSERT_EQ(Read(false, added.key, &bytes), Status::kOk);
+    EXPECT_EQ(bytes, added.value);
+    survivors.push_back(added);
+    live = std::move(survivors);
+    ASSERT_NO_FATAL_FAILURE(CheckSync(12, 0, round + 1, 0, 0, 0));
+    ASSERT_NO_FATAL_FAILURE(Check(0, round + 1, 1, 0));
+    const DiskSlabStore::Stats completed = Group().DiskSlabStats(0);
+    EXPECT_EQ(completed.lifetime_class_victims, 1U);
+    EXPECT_EQ(completed.lifetime_reads.successful, 12U);
+    EXPECT_EQ(completed.lifetime_reads.applied, 12U);
+    const DiskSlabStore::EvictionGhostObservation settled =
+        Group().DiskEvictionGhostObservation(0);
+    EXPECT_EQ(settled.recorded, 1U);
+    EXPECT_EQ(settled.history.retained, 1U);
+    EXPECT_EQ(settled.history.oldest_evicted_at_sec,
+              std::optional<uint64_t>(40));
+    EXPECT_EQ(settled.history.newest_evicted_at_sec,
+              std::optional<uint64_t>(40));
+    EXPECT_EQ(settled.history.window_after_sec, std::optional<uint64_t>(0));
+    EXPECT_EQ(settled.history.window_through_sec, std::optional<uint64_t>(40));
+  }
+  // A fourth clean reopen only validates the last victim and surviving bytes;
+  // the three pressure rounds above do not splice time across owner clocks.
+  ASSERT_NO_FATAL_FAILURE(Reopen(4000));
+  EXPECT_EQ(Group().DiskPath(0), directory);
+  EXPECT_EQ(server_->Count(), 8U);
+  const DiskSlabStore::EvictionGhostObservation final_empty =
+      Group().DiskEvictionGhostObservation(0);
+  EXPECT_EQ(final_empty.recorded, 0U);
+  EXPECT_EQ(final_empty.history.retained, 0U);
+  EXPECT_EQ(final_empty.history.window_after_sec, std::optional<uint64_t>(0));
+  EXPECT_EQ(final_empty.history.window_through_sec, std::optional<uint64_t>(0));
+  ASSERT_NO_FATAL_FAILURE(CheckSync(0, 0, 0, 0, 0, 0));
+  for (const BlockKey& key : gone) {
+    EXPECT_EQ(Read(true, key), Status::kNotFound);
+  }
+  for (const Resident& resident : live) {
+    std::string bytes;
+    ASSERT_EQ(Read(false, resident.key, &bytes), Status::kOk);
+    EXPECT_EQ(bytes, resident.value);
+  }
+  ASSERT_NO_FATAL_FAILURE(CheckSync(8, 0, 3, 0, 0, 0));
+  ASSERT_NO_FATAL_FAILURE(Check(0, 3, 0, 0));
+}
 
 TEST_F(DiskEvictionGhostReadTest,
        SyncResultCohortIsIndependentOfGhostAndPolicy) {
