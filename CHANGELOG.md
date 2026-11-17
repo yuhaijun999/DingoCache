@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Consolidate lifetime operation and compatibility guidance: dual score indexes,
+  numeric bounds, ACK migration, budget backpressure, controlled restart and
+  explicit-legacy rollback. Keep hardware and formal acceptance gates open.
+
 - Track decoded PULL requests through sync/async Serve with once-only logical
   outcomes and separate decided-but-unposted responses. Keep grant success
   independent of READY delivery and retain existing cleanup and wire behavior.

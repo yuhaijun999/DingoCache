@@ -617,7 +617,11 @@ RAM-ACK 和显式 RAM-ACK 不受 lifetime 的 disk-ACK 新闸门影响。
 
 file 显式 lifetime 在开盘前拒绝。显式开放不等于默认翻转，也不代表性能或
 RDMA/RXE＋io_uring 验收完成。参数默认值、约束和恢复语义见
-[R45 操作说明](DISK_LIFETIME_R45.md)。
+[集中操作说明](DISK_LIFETIME_R45.md)。其中包含双索引/五类观测、桶覆盖、全部盘只读
+预检、ACK 迁移、预算背压、运行时间上界及受控重启/显式 legacy 回滚清单。
+策略回滚必须重启；非零 ghost 容量须先归零，不能承诺在线无损或任意旧二进制格式兼容。
+[验收索引](DISK_LIFETIME_ACCEPTANCE.md)列出的真实硬件、资源/业务及数值冻结条件
+仍未关闭，不因操作说明齐备而允许性能试跑、默认翻转或部署。
 
 #### b. RDMA 传输面（server/client 读取方见各项说明）
 
@@ -657,7 +661,7 @@ RDMA/RXE＋io_uring 验收完成。参数默认值、约束和恢复语义见
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `DFKV_SLAB_EVICT_HIGH_PCT` / `DFKV_SLAB_EVICT_LOW_PCT` | `92` / `88`, high=0 关 | high crossing latch，后台持续 drain 到 low |
+| `DFKV_SLAB_EVICT_HIGH_PCT` / `DFKV_SLAB_EVICT_LOW_PCT` | `92` / `88`, high=0 关 | 高水位触发、低水位目标；legacy 用原全局 cursor，显式 lifetime 用 M+1 全局评分档；pin/预算可让单 tick 未达目标 |
 | `DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK` | `256` | 每盘每 tick 最多移除的 slot 数；最多扫描该值的 4 倍，不能据此保证尾延迟不变 |
 | `DFKV_SLAB_COLD_STEAL_WINDOW` | — | 小受害者选择窗口（跨 size class 强占） |
 | `DFKV_SLAB_URING_WRITE` | — | slab io_uring 异步 PUT（需要 `-DDFKV_WITH_URING`） |

@@ -8,6 +8,18 @@
 > **分布式追踪（traces）** 是独立的连接器侧能力（OTLP `/v1/traces`），
 > 见 [tracing.md](tracing.md)。本文只覆盖 metrics。
 
+## Development-branch lifetime handoff
+
+Lifetime policy operation, numeric constraints, ACK migration and restart/rollback
+are consolidated in [the operation guide](DISK_LIFETIME_R45.md). Five logical read
+classes are not the dynamic `M+1` physical score queues. Allocator-retained counts
+can include hidden pinned residents, and per-cell snapshots are not atomic
+cross-disk transactions. Sync Node reads, decoded/dispatched PULL, RAM settlements,
+RAM waiters and Store PUT followers have separate scopes; do not add them to
+invent an all-transport denominator. See [open acceptance gates](DISK_LIFETIME_ACCEPTANCE.md)
+for hardware, full resources and business data still missing. Historical metric
+version wording above does not certify these development additions for release.
+
 ## Synchronous read result cohorts
 
 The following counters cover **only** `ProcessRequestForKey(kRange)` and

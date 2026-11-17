@@ -26,7 +26,8 @@ available. **The default has not switched:** unspecified slab policy still
 reports `requested=lifetime`, `effective=legacy`, `staged=true`. Explicit lifetime
 is rejected for the file backend. Lifetime RAM write-back requires explicit
 `DFKV_PUT_ACK_MODE=disk` before storage opens.
-See [R45 configuration and recovery](docs/DISK_LIFETIME_R45.md) and
+See the [operation, ACK migration and restart/rollback guide](docs/DISK_LIFETIME_R45.md),
+[open acceptance gates](docs/DISK_LIFETIME_ACCEPTANCE.md) and
 [deployment configuration](docs/DEPLOY.md#当前磁盘淘汰策略请求值不等于生效值).
 This describes the development branch, not the pinned quickstart release below.
 

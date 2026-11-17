@@ -279,14 +279,15 @@ size-class lattice and carves them into uniform slots:
   cold-reset rather than risking stale resurrection. Torn/invalid records are
   rejected and cleared durably; metadata I/O failure fails the store closed.
   Format/geometry mismatches are refused without rewriting existing data.
-- **Watermark eviction:** above-high occupancy starts bounded global slot
+- **Legacy watermark eviction:** above-high occupancy starts bounded global slot
   reclamation toward low. New objects and successful GET/Pin operations move
   behind the global scan cursor; class-local scans use the same admission/read
   ordering. EXISTS and duplicate PUT do not refresh that ordering. A pinned
   slot cannot be removed. Each victim's metadata is invalidated before its
   slot and committed payload accounting are released; only a last resident
   uses the whole-extent clear callback.
-- **Pressure lifetime:** successful new commits renew a recent pressure episode.
+- **Pressure-episode history (not the lifetime scoring policy):** successful new
+  commits renew a recent pressure episode.
   They may restart draining above low even without another high crossing.
   Required active drain (including pinned blockers) is retained; inactive
   history expires after 128 completed observations with no successful new
@@ -295,6 +296,34 @@ size-class lattice and carves them into uniform slots:
   process-local history. A tick removes at most 256 slots and visits at most
   1,024 positions by default. This trades smaller victims for more metadata
   writes; bounded work does not guarantee unchanged PUT tail latency.
+
+
+#### Explicit lifetime policy (development branch)
+
+The default still executes staged legacy. Explicit slab `lifetime` uses two
+indexes over the same residents: `M+1` class-local score queues per size class
+and `M+1` global score queues across classes, with separate intrusive links.
+W/R/O1/O2/O3 are five logical business-read observations, **not** five physical
+queues; O3 means three or more real reads independently of M. Success updates
+both indexes only after resident identity validation; pins remain ineligible.
+
+Scores use `min(n+fw,M)` with aging and temporary NEW-write BOOST. First early
+read reward requires age `<P`; the logical R observation includes age `==P`.
+Protection-expiry buckets use G/B and the validated H horizon; the separate R
+observation ring uses `ceil(P/(B-1))` when enabled. Neither replaces exact
+candidate evaluation. Donor selection coarse-scans the full extent pool before
+bounded complete exact candidates, falling back to the coarse winner only if
+no complete exact candidate is available. This is not a global exact minimum;
+selected-extent invalidation/sync remains
+outside the exact-scan budget. Scan counts therefore do not bound wall time.
+
+All lifetime disks share a bounded monotonic origin. New admission closes past
+`UINT32_MAX-H`; admitted work has representable drain headroom, not a timeout
+guarantee. Clean recovery seeds virtual scoring reads `n=2`, never business
+reads or the original write window; dirty startup retains cold-reset behavior.
+See the [operation and compatibility guide](DISK_LIFETIME_R45.md) for validation,
+ACK migration, restart and explicit-legacy rollback. No on-disk format change or
+default flip is implied; [acceptance remains open](DISK_LIFETIME_ACCEPTANCE.md).
 
 
 Payload I/O uses resident extent descriptors and O_DIRECT by default; a
