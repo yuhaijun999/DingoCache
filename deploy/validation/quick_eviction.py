@@ -19,6 +19,8 @@ import urllib.request
 import uuid
 
 COUNT = 6452
+# Two 32-key namespaces: two warmups plus 116 cold-batch probes.
+HOT_READS = 7552
 PORTS = (12000, 12001, 12010)
 METRICS_URL = 'http://127.0.0.1:12010/metrics'
 
@@ -51,7 +53,8 @@ def check_result(text, client, policy='lifetime'):
     if any(type(value) is not int or value < 0 for value in counts):
         raise RuntimeError('invalid client read counts')
     hits, misses, hot_hits, hot_misses, hot_reads = counts
-    if hits + misses != COUNT * 2 or hot_reads != hot_hits + hot_misses or not hot_hits:
+    if (hits + misses != COUNT * 2 or hot_reads != HOT_READS or
+            hot_reads != hot_hits + hot_misses or not hot_hits):
         raise RuntimeError('client read denominator mismatch')
     for name in ('dfkv_storage_healthy', 'dfkv_slab_healthy'):
         if total(text, name) != 1:
@@ -129,7 +132,14 @@ def parse_args(argv=None):
     parser.add_argument('--data-root', type=Path, action='append', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--policy', choices=('legacy', 'lifetime'), default='lifetime')
+    parser.add_argument('--pressure-delay-sec', type=int, default=0,
+                        help='wait after hot warmup before cold writes (0..300)')
+    parser.add_argument('--data-name', help='new child name shared across all data roots')
     args = parser.parse_args(argv)
+    if not 0 <= args.pressure_delay_sec <= 300:
+        parser.error('pressure delay must be in 0..300 seconds')
+    if args.data_name is not None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', args.data_name):
+        parser.error('data name must be a safe ASCII component of 1..80 characters')
     args.build, args.output = args.build.resolve(), args.output.resolve()
     args.data_root = [path.resolve() for path in args.data_root]
     if len(args.data_root) != 3 or len(set(args.data_root)) != 3:
@@ -150,7 +160,8 @@ def run(args):
     server = None
     try:
         check_ports()
-        dirs = [root / ('quick-' + uuid.uuid4().hex) for root in args.data_root]
+        dirs = [root / (args.data_name or ('quick-' + uuid.uuid4().hex))
+                for root in args.data_root]
         for path in dirs:
             path.mkdir(exist_ok=False)
         source = Path(__file__).resolve().parents[2]
@@ -165,7 +176,15 @@ def run(args):
                    '--slab-eviction-policy', args.policy, '--port', '12000', '--rdma-port', '12001',
                    '--rdma-dev', 'rxe0', '--max-msg', '2097152', '--metrics-port', '12010',
                    '--metrics-bind', '127.0.0.1']
+        client_command = [sys.executable, str(source / 'deploy/validation/disk_scenarios.py'),
+                          '--lib', str(args.build / 'libdfkv.so'), '--members', 'n=127.0.0.1:12001',
+                          '--scenario', 'quick-pressure', '--count', str(COUNT),
+                          '--pressure-delay-sec', str(args.pressure_delay_sec),
+                          '--metrics-url', METRICS_URL, '--output', str(args.output / 'trace')]
+        client_timeout_sec = 120 + args.pressure_delay_sec
         (args.output / 'case.json').write_text(json.dumps({'command': command, 'data_dirs': list(map(str, dirs)),
+            'client_command': client_command, 'client_timeout_sec': client_timeout_sec,
+            'pressure_delay_sec': args.pressure_delay_sec,
             'environment': {k: v for k, v in env.items() if k.startswith('DFKV_') or k == 'PYTHONPATH'}}, indent=2) + '\n')
         with (args.output / 'server.log').open('w') as server_log:
             server = subprocess.Popen(command, env=env, stdout=server_log, stderr=subprocess.STDOUT)
@@ -193,13 +212,9 @@ def run(args):
                                        for expected in expected_labels):
                 raise RuntimeError('metrics do not belong to this fresh server')
             (args.output / 'before.prom').write_text(before)
-            client_command = [sys.executable, str(source / 'deploy/validation/disk_scenarios.py'),
-                              '--lib', str(args.build / 'libdfkv.so'), '--members', 'n=127.0.0.1:12001',
-                              '--scenario', 'quick-pressure', '--count', str(COUNT),
-                              '--output', str(args.output / 'trace')]
             with (args.output / 'client.log').open('w') as log:
                 subprocess.run(client_command, env={**env, 'DFKV_RDMA': '1'}, stdout=log,
-                               stderr=subprocess.STDOUT, timeout=120, check=True)
+                               stderr=subprocess.STDOUT, timeout=client_timeout_sec, check=True)
             client = json.loads((args.output / 'trace/result.json').read_text())
             after = scrape()
             (args.output / 'after.prom').write_text(after)

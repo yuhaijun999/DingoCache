@@ -218,6 +218,52 @@ class DiskValidationTest(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(SystemExit):
                 self.args(Path("unused"), "quick-pressure", extra)
 
+    def test_quick_pressure_waits_after_warmup_and_captures_phases(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(driver, "QUICK_PREFILL", 16), \
+                mock.patch.object(driver, "QUICK_HOT", 2):
+            args = self.args(Path(temp) / "aged", "quick-pressure",
+                             ("--count", "20", "--pressure-delay-sec", "185",
+                              "--metrics-url", "http://127.0.0.1:12010/metrics"))
+            def sleep(seconds):
+                self.assertEqual(seconds, 185)
+                phases = json.loads((args.output / "phases.json").read_text())
+                self.assertEqual([row["name"] for row in phases], ["prefill", "warm"])
+                self.assertEqual(phases[-1]["hot_hits"], 8)
+
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = b"sample 1\n"
+            with mock.patch.object(driver.time, "sleep", side_effect=sleep) as wait, \
+                    mock.patch.object(driver.urllib.request, "urlopen", return_value=response) as fetch:
+                result = driver.run(args, library_loader=lambda _: {}, client_factory=MemoryClient)
+            wait.assert_called_once_with(185)
+            self.assertEqual(fetch.call_count, 5)
+            expected = ["prefill", "warm", "before-pressure", "after-pressure", "after-scan"]
+            self.assertEqual([row["name"] for row in result["phases"]], expected)
+            for name in expected:
+                self.assertEqual((args.output / ("phase-" + name + ".prom")).read_text(), "sample 1\n")
+            trace = json.loads((args.output / "trace.json").read_text())
+            self.assertEqual(trace["config"]["pressure_delay_sec"], 185)
+
+    def test_phase_capture_failure_is_failed_not_silently_skipped(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(driver, "QUICK_PREFILL", 16), \
+                mock.patch.object(driver, "QUICK_HOT", 2):
+            args = self.args(Path(temp) / "bad-metrics", "quick-pressure",
+                             ("--count", "20", "--metrics-url", "http://127.0.0.1:12010/metrics"))
+            with mock.patch.object(driver.urllib.request, "urlopen", side_effect=TimeoutError("metrics timed out")):
+                with self.assertRaisesRegex(TimeoutError, "metrics timed out"):
+                    driver.run(args, library_loader=lambda _: {}, client_factory=MemoryClient)
+            self.assertEqual(json.loads((args.output / "result.json").read_text())["status"], "failed")
+
+    def test_pressure_delay_is_bounded_and_quick_only(self):
+        for scenario, extra in (("quick-pressure", ("--pressure-delay-sec", "-1")),
+                                ("quick-pressure", ("--pressure-delay-sec", "301")),
+                                ("pressure", ("--pressure-delay-sec", "1")),
+                                ("roundtrip", ("--metrics-url", "http://127.0.0.1/metrics"))):
+            with self.subTest(scenario=scenario, extra=extra), self.assertRaises(SystemExit):
+                self.args(Path("unused"), scenario, extra)
+
     def test_missing_key_oracle_rejects_all_false_hits_including_empty(self):
         class FakeLib:
             status = 0

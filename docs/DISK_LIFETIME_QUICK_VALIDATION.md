@@ -102,3 +102,112 @@ lifetime的15343次成功读与热度通知/应用一致，kernel读/完成15343
 `/data/disk1/results/quick-20261117t082057z-3c64fd1-{lifetime,legacy,tests}`。
 六个新数据目录的准确UUID路径见各case.json；全部位于既有授权虚拟盘，应用已退出，
 VM及样本保留。以后每轮须重新生成输出和数据目录，不能覆盖本轮证据。
+
+## 5. 固定初态的180秒BOOST窗口对照
+
+`--pressure-delay-sec 185` 在严格预热后真实等待185秒，再执行同一冷写/热点探测轨迹；
+范围0–300，默认0。工具按等待时长延长客户端总超时，不改系统时钟或寿命参数。
+**180秒是新写BOOST窗口，不是所有KEEP软保护到期，也不是TTL。**
+
+默认评分中，新写未读住户在窗口内可能比已读热点分数更高；跨窗会撤掉该批未读住户
+的BOOST。这提供一个待检验的解释，不预设热点保留必然改善。既有数学单测验证179/
+180边界；本轮用真实185秒等待，只证明跨窗，不冒充精确边界测量。
+
+### 5.1 四组设计与复跑
+
+四组：lifetime/legacy，各执行即时施压与等待185秒后施压。保持同一固定目录字符串、
+磁盘顺序/权重、seed、key、容量及负载；每组必须从全新空目录启动，不能恢复上一组。
+`--data-name` 可指定安全的单个目录名；仍拒绝复用已有目录。正常退出后，只归档本轮
+新建目录、重新创建相同路径，才能固定以路径建环的路由。不能只用不同UUID目录声称
+路由一致，也不能删除不明来源的数据。
+
+建立配方A环境已就绪后，可在guest执行下列流程；这是复跑配方，不是新的通过记录。
+它保留四组原始数据，不执行删除。完整阶段审计仍须满足5.2，不能仅看四个退出码：
+
+```bash
+vmssh 'sudo bash -se' <<'GUEST'
+set -euo pipefail
+ulimit -l unlimited
+RUN_ID=$(date -u +%Y%m%dT%H%M%S)-$$
+FIXED=age-$RUN_ID-active
+mkdir -p /data/disk{1,2,3}/cases /data/disk1/results
+for label in lifetime-early legacy-early legacy-aged lifetime-aged; do
+  policy=${label%-*}; delay=0
+  [[ $label != *-aged ]] || delay=185
+  OUT=/data/disk1/results/age-$RUN_ID-$label
+  python3 /opt/dfkv/deploy/validation/quick_eviction.py \
+    --build /opt/dfkv-build --policy "$policy" --pressure-delay-sec "$delay" \
+    --data-root /data/disk1/cases --data-root /data/disk2/cases \
+    --data-root /data/disk3/cases --data-name "$FIXED" --output "$OUT"
+  python3 - "$OUT" "$FIXED" "$label" <<'ARCHIVE'
+import json,pathlib,sys
+out=pathlib.Path(sys.argv[1]);name,label=sys.argv[2:]
+r=json.loads((out/'result.json').read_text());case=json.loads((out/'case.json').read_text())
+if r['status']!='passed' or r['server_exit']!=0:raise RuntimeError('not cleanly stopped')
+expected=[pathlib.Path(f'/data/disk{i}/cases')/name for i in (1,2,3)]
+if case['data_dirs']!=list(map(str,expected)):raise RuntimeError('unexpected store paths')
+for p in expected:
+    archive=p.with_name(name+'--'+label)
+    if p.is_symlink() or not p.is_dir() or archive.exists():raise RuntimeError('unsafe archive')
+    p.rename(archive)
+ARCHIVE
+done
+GUEST
+```
+
+### 5.2 需要核对的阶段证据
+
+客户端保存五份 `trace/phase-{prefill,warm,before-pressure,after-pressure,after-scan}.prom`
+及 `phases.json`，采集失败会使测试失败。HTTP指标读取不是业务GET，不给住户加热。
+
+- early组施压前的客户端累计时间必须小于180秒，它是最早预填充写入年龄的上界。
+- aged组实测等待至少185秒，施压前与预填充完成阶段的间隔也至少185秒；
+  不能把“参数传了185”当成实际等待完成。
+- 四组prefill/warm/before-pressure均9216个对象、淘汰0；逐盘对象数和slot占用字节一致。
+  若不成立，应判实验初态无效，不可选择性忽略。
+- warm和before-pressure的PULL派发/终局均128；lifetime逻辑成功/应用也保持128，
+  排除等待期额外读热。默认keepalive允许继续，但它不能被计成业务读取。
+- 每组严格7552次热点探测、20456次业务GET；命中字节、错误终局、健康、ring和退出
+  继续按冒烟门禁核对。热点命中/缺失按阶段展示，不预设胜负。
+
+延后施压组不是早期组在原地等待后的“热点恢复”：四组独立初始化，已被淘汰的对象
+不会因时间经过而自动回来。
+
+这是单轮2×2“初始未读住户跨窗”诊断。等待时热点是静默的，不代表持续热读或持续冷写
+负载；不证明每个victim的因果、断电持久化或正式性能A/B。后续持续业务负载与交替重复
+轮次需要另行设计，不能拿该短轨迹宣称线上收益。
+
+### 5.3 固定路由的首次四组实测（2026-11-17）
+
+基线 `0577e6f` 加本轮工具增量，仍用同一私有RXE＋kernel ring guest。四组施压前
+逐盘对象数均3079/3079/3058，总9216；对应slot字节也完全一致，淘汰0。
+本几何每个4KiB对象占用1MiB slot；水位按分配占用计算，不能按payload总量推算。
+
+| 模式/施压时机 | 真实等待 | 总耗时 | 热点探测命中/缺失 | 最终扫描命中/缺失 | 水位淘汰 |
+|---|---:|---:|---:|---:|---:|
+| lifetime，即时 | 0秒 | 18.45秒 | 4380 / 3172 | 10812 / 2092 | 2092 |
+| legacy，即时 | 0秒 | 18.75秒 | 7552 / 0 | 10812 / 2092 | 2092 |
+| legacy，跨窗 | 185.0003秒 | 201.79秒 | 7552 / 0 | 10812 / 2092 | 2092 |
+| lifetime，跨窗 | 185.0003秒 | 202.55秒 | 7552 / 0 | 10812 / 2092 | 2092 |
+
+热点数字是**探测请求数，不是不同对象数**；热点集合只有64个对象。
+两组即时施压时的客户端累计时间分别约2.95/2.90秒，小于180；两组跨窗从最后预填充
+完成到施压前均超过185秒。warm与before-pressure的业务读均保持128，等待期间没有
+额外读热。四组共20份阶段快照通过健康、错误、ring和分母审计，各20456次业务GET，
+命中字节全部正确、服务退出0；原始数据仅在退出后归档，没有复用恢复初态。
+
+**观察结论：本轨迹中，延后施压的lifetime组不再出现热点探测缺失。** 结合生产评分
+和已有边界单测，证据支持初始冷住户BOOST状态变化会影响该现象的解释，但没有追踪
+每个victim，不作唯一因果断言。它不抹掉即时施压组的真实缺失，也不证明持续在线
+流量、长期收益或默认策略应该切换。每格只有一轮，不满足正式交替A/B验收。
+
+本轮无硬件单测15＋13＝28通过，已有评分默认/179–180边界单测2通过；host OFF与
+guest ON构建成功（Ninja无待编译工作），各两个CTest入口通过。没有全量CTest/
+sanitizer或新C++静态检查执行；本轮没有生产C++修改。原有7552次热点轨迹计数检查
+也已纳入运行时门禁，不再仅依赖事后审计。
+
+证据：`.omx/evidence/age-window/20261117t084028z-0577e6f/`，含阶段指标、实际等待、
+固定路径/参数/源码SHA、四组supervisor、XML及独立审查。guest结果：
+`/data/disk1/results/age-window-20261117t084028z-0577e6f/`。归档数据位于各盘
+`/data/diskN/cases/age-20261117t084028z-0577e6f-active--{policy}-{early,aged}`，准确路径
+见summary.json；四组均已退出，VM与样本保留。底层仍仅使用原授权宿主虚拟盘文件。

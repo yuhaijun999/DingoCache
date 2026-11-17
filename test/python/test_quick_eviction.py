@@ -19,7 +19,7 @@ SPEC.loader.exec_module(runner)
 
 def good_client():
     return {'status': 'passed', 'wrong_bytes': 0, 'transport_mode': ['rdma', 'rdma'],
-            'hits': 12000, 'misses': 904, 'hot_hits': 128, 'hot_misses': 2, 'hot_reads': 130}
+            'hits': 12000, 'misses': 904, 'hot_hits': 128, 'hot_misses': 7424, 'hot_reads': 7552}
 
 
 def good_metrics():
@@ -34,9 +34,9 @@ def good_metrics():
         'dfkv_uring_completions_total 12128',
         'dfkv_disk_objects{disk="a"} 1', 'dfkv_disk_objects{disk="b"} 1',
         'dfkv_disk_objects{disk="c"} 1',
-        'dfkv_rdma_pull_requests_dispatched_total 13034',
+        'dfkv_rdma_pull_requests_dispatched_total 20456',
         'dfkv_rdma_pull_requests_terminal_total{path="async",result="success_nonempty"} 12128',
-        'dfkv_rdma_pull_requests_terminal_total{path="async",result="not_found"} 906',
+        'dfkv_rdma_pull_requests_terminal_total{path="async",result="not_found"} 8328',
         'dfkv_rdma_pull_requests_terminal_total{path="sync",result="io_error"} 0')) + '\n'
 
 
@@ -62,10 +62,10 @@ class QuickEvictionTest(unittest.TestCase):
             ('dfkv_uring_inflight 0', 'dfkv_uring_inflight 1'),
             ('dfkv_uring_reads_total 12128', 'dfkv_uring_reads_total 0'),
             ('dfkv_uring_completions_total 12128', 'dfkv_uring_completions_total 0'),
-            ('dfkv_rdma_pull_requests_dispatched_total 13034',
-             'dfkv_rdma_pull_requests_dispatched_total 13035'),
+            ('dfkv_rdma_pull_requests_dispatched_total 20456',
+             'dfkv_rdma_pull_requests_dispatched_total 20457'),
             ('result="io_error"} 0', 'result="io_error"} 1'),
-            ('result="not_found"} 906', 'result="not_found"} 905'),
+            ('result="not_found"} 8328', 'result="not_found"} 8327'),
             ('result="success_nonempty"} 12128', 'result="success_nonempty"} 12127'),
             ('dfkv_disk_objects{disk="c"} 1', 'dfkv_disk_objects{disk="c"} 0'),
             ('dfkv_disk_objects{disk="c"} 1', 'dfkv_disk_objects{disk="a"} 1'),
@@ -98,6 +98,13 @@ class QuickEvictionTest(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(RuntimeError):
                 runner.check_result(good_metrics(), {**good_client(), field: value})
 
+    def test_fixed_hot_probe_count_required_even_if_counters_reconcile(self):
+        client = {**good_client(), 'hot_misses': 7423, 'hot_reads': 7551}
+        metrics = good_metrics().replace('dispatched_total 20456', 'dispatched_total 20455')
+        metrics = metrics.replace('result="not_found"} 8328', 'result="not_found"} 8327')
+        with self.assertRaisesRegex(RuntimeError, 'read denominator'):
+            runner.check_result(metrics, client)
+
     def arguments(self, root):
         build = root / 'build'
         build.mkdir()
@@ -124,6 +131,78 @@ class QuickEvictionTest(unittest.TestCase):
             (root / 'output').mkdir()
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 runner.parse_args(argv)
+
+    def test_delay_and_data_name_arguments_are_bounded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp))
+            args = runner.parse_args(argv + ['--pressure-delay-sec', '185',
+                                             '--data-name', 'age-study.1_early'])
+            self.assertEqual(args.pressure_delay_sec, 185)
+            self.assertEqual(args.data_name, 'age-study.1_early')
+            for value in ('0', '300'):
+                self.assertEqual(runner.parse_args(argv + ['--pressure-delay-sec', value]).pressure_delay_sec,
+                                 int(value))
+            invalid = [('--pressure-delay-sec', value) for value in ('-1', '301', '1.5')]
+            invalid += [('--data-name', value) for value in
+                        ('', '.', '..', '../outside', 'a/b', 'a,b', 'a b', '中文', 'a' * 81)]
+            for flag, value in invalid:
+                with self.subTest(flag=flag, value=value), \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    runner.parse_args(argv + [flag, value])
+
+    def test_existing_fixed_data_name_is_not_reused_or_removed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = runner.parse_args(self.arguments(Path(temp)) + ['--data-name', 'fixed'])
+            existing = args.data_root[0] / 'fixed'
+            existing.mkdir()
+            sentinel = existing / 'keep'
+            sentinel.write_text('existing data')
+            with mock.patch.object(runner, 'check_ports'), \
+                    mock.patch.object(runner.subprocess, 'Popen') as popen:
+                result = runner.run(args)
+            self.assertEqual(result['status'], 'failed')
+            popen.assert_not_called()
+            self.assertEqual(sentinel.read_text(), 'existing data')
+            self.assertEqual(list(args.data_root[1].iterdir()), [])
+            self.assertEqual(list(args.data_root[2].iterdir()), [])
+
+    def test_delay_and_metrics_are_passed_to_client_with_extended_timeout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = runner.parse_args(self.arguments(Path(temp)) +
+                                     ['--data-name', 'fixed', '--pressure-delay-sec', '185'])
+            server = mock.Mock()
+            server.poll.return_value = None
+            server.wait.return_value = 0
+            server.returncode = 0
+            response = mock.MagicMock()
+            response.__enter__.return_value.status = 200
+            text = good_metrics()
+            for label, root in zip(('a', 'b', 'c'), args.data_root):
+                text = text.replace('disk="' + label + '"', 'disk=' + json.dumps(str(root / 'fixed')))
+            response.__enter__.return_value.read.return_value = text.encode()
+
+            def complete_client(command, **kwargs):
+                trace = args.output / 'trace'
+                trace.mkdir()
+                (trace / 'result.json').write_text(json.dumps(good_client()))
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(runner, 'check_ports'), \
+                    mock.patch.object(runner.subprocess, 'Popen', return_value=server), \
+                    mock.patch.object(runner.subprocess, 'run', side_effect=complete_client) as client_run, \
+                    mock.patch.object(runner.urllib.request, 'urlopen', return_value=response):
+                result = runner.run(args)
+            self.assertEqual(result['status'], 'passed')
+            command = client_run.call_args.args[0]
+            self.assertEqual(command[command.index('--pressure-delay-sec') + 1], '185')
+            self.assertEqual(command[command.index('--metrics-url') + 1], runner.METRICS_URL)
+            self.assertEqual(client_run.call_args.kwargs['timeout'], 305)
+            case = json.loads((args.output / 'case.json').read_text())
+            self.assertEqual(case['pressure_delay_sec'], 185)
+            self.assertEqual(case['client_command'], command)
+            self.assertEqual(case['client_timeout_sec'], 305)
+            self.assertEqual(case['data_dirs'], [str(root / 'fixed') for root in args.data_root])
+            server.terminate.assert_called_once()
 
     def test_start_failure_records_result_and_clears_inherited_disk_settings(self):
         with tempfile.TemporaryDirectory() as temp:

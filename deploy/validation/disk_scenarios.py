@@ -15,6 +15,8 @@ import ctypes as ct
 import hashlib
 import json
 from pathlib import Path
+import time
+import urllib.request
 
 from dfkv_common.cabi import (
     DfkvClientOptionsV2, make_client_options_v2, make_key_array, make_key_buffer,
@@ -167,6 +169,9 @@ def parse_args(argv=None):
     parser.add_argument("--count", type=int, help="objects PER namespace")
     parser.add_argument("--readers", type=int, choices=(0, 8), default=0,
                         help="optional stable roundtrip readers")
+    parser.add_argument("--pressure-delay-sec", type=int, default=0,
+                        help="quick-pressure: real wait after warmup (0..300 seconds)")
+    parser.add_argument("--metrics-url", help="quick-pressure: optional phase metrics endpoint")
     args = parser.parse_args(argv)
     if not 0 <= args.seed < 2**64:
         parser.error("seed must fit uint64")
@@ -177,12 +182,27 @@ def parse_args(argv=None):
         parser.error("count must be positive and cover all nine length boundaries")
     if args.scenario == "quick-pressure" and args.count <= QUICK_PREFILL:
         parser.error("quick-pressure count must exceed prefill (4608 per namespace)")
+    if not 0 <= args.pressure_delay_sec <= 300:
+        parser.error("pressure-delay-sec must be in 0..300")
+    if (args.pressure_delay_sec or args.metrics_url) and args.scenario != "quick-pressure":
+        parser.error("delay and phase metrics require quick-pressure")
     if args.readers and args.scenario != "roundtrip":
         parser.error("readers require roundtrip")
     return args
 
 
-def quick_pressure(args, clients, dataset, result):
+def record_phase(args, result, name, started):
+    """Capture phase counters before moving on; HTTP metrics never heat keys."""
+    row = {"name": name, "elapsed_sec": time.monotonic() - started,
+           "hot_hits": result["hot_hits"], "hot_misses": result["hot_misses"]}
+    if args.metrics_url:
+        with urllib.request.urlopen(args.metrics_url, timeout=3) as response:
+            (args.output / ("phase-" + name + ".prom")).write_bytes(response.read())
+    result.setdefault("phases", []).append(row)
+    (args.output / "phases.json").write_text(json.dumps(result["phases"], indent=2) + "\n")
+
+
+def quick_pressure(args, clients, dataset, result, started):
     """Prefill one size class, warm a small hot set, then interleave cold writes.
 
     Protection is soft: an early read removes write BOOST, so hot survival is
@@ -200,17 +220,25 @@ def quick_pressure(args, clients, dataset, result):
         for start in range(0, QUICK_PREFILL, BATCH_SIZE):
             client.put(*dataset(namespace, start,
                                 min(start + BATCH_SIZE, QUICK_PREFILL)))
+    record_phase(args, result, "prefill", started)
     for _ in range(2):
         hot_reads(False)
+    record_phase(args, result, "warm", started)
+    wait_started = time.monotonic()
+    time.sleep(args.pressure_delay_sec)
+    result["pressure_wait_elapsed_sec"] = time.monotonic() - wait_started
+    record_phase(args, result, "before-pressure", started)
     for start in range(QUICK_PREFILL, args.count, BATCH_SIZE):
         for client, namespace in zip(clients, NAMESPACES):
             client.put(*dataset(namespace, start, min(start + BATCH_SIZE, args.count)))
         hot_reads(True)
     result["hot_reads"] = result["hot_hits"] + result["hot_misses"]
+    record_phase(args, result, "after-pressure", started)
 
 
 def run(args, *, library_loader=load_library, client_factory=Client):
     args.output.mkdir(parents=True, exist_ok=False)
+    started = time.monotonic()
     pressure = args.scenario in ("pressure", "quick-pressure")
     config = {"schema": 1, "lib": args.lib, "members": args.members,
               "scenario": args.scenario, "seed": args.seed, "count": args.count,
@@ -218,7 +246,8 @@ def run(args, *, library_loader=load_library, client_factory=Client):
               "lengths": [4096] if pressure else list(LENGTHS),
               "batch_size": BATCH_SIZE, "generator": "shake256-disk-synthetic-v1"}
     if args.scenario == "quick-pressure":
-        config.update(prefill=QUICK_PREFILL, hot=QUICK_HOT, warmup_rounds=2)
+        config.update(prefill=QUICK_PREFILL, hot=QUICK_HOT, warmup_rounds=2,
+                      pressure_delay_sec=args.pressure_delay_sec, metrics_url=args.metrics_url)
     encoded = json.dumps(config, sort_keys=True).encode()
     config_hash = hashlib.sha256(encoded).hexdigest()
     # A compact replay trace describes every index/generation before any C ABI call.
@@ -261,7 +290,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                 for client in clients:
                     client.expect_missing(b"never-written\x00" + key_for(args.seed, 0))
             if args.scenario == "quick-pressure":
-                quick_pressure(args, clients, dataset, result)
+                quick_pressure(args, clients, dataset, result, started)
             elif args.scenario != "verify":
                 for client, namespace in zip(clients, NAMESPACES):
                     for start in range(0, args.count, BATCH_SIZE):
@@ -290,6 +319,8 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                         futures = [pool.submit(read_all, clients[i % 2], NAMESPACES[i % 2], True)
                                    for i in range(args.readers)]
                         result["concurrent_reader_hits"] = sum(f.result() for f in futures)
+            if args.scenario == "quick-pressure":
+                record_phase(args, result, "after-scan", started)
             result["status"] = "passed"
     except Exception as error:
         result["error"] = str(error)
