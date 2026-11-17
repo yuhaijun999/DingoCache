@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a bounded quick-eviction smoke with prefill, interleaved hot/cold reads,
+  byte-exact validation and actual eviction/terminal checks, without shortening
+  lifetime timing defaults or treating synthetic results as performance A/B.
+
 - Enforce RDMA connection idle deadlines while pending receives or reply SENDs
   require short CQ waits. Preserve disabled idle reclamation and disk-read drain
   ownership; cover real stalled SENDs and FIFO-close recovery.

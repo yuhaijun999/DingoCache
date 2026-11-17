@@ -242,6 +242,10 @@ if(DFKV_BUILD_TESTS)
               -p test_disk_validation.py)
     set_tests_properties(python_disk_validation PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_quick_eviction
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
+              -p test_quick_eviction.py)
     add_test(NAME python_client_metrics
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/integration/common/tests

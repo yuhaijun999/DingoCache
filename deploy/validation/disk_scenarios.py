@@ -3,7 +3,8 @@
 
 Run each case with a fresh --output directory. write/verify share a deterministic
 initial dataset for clean-restart checks. pressure permits eviction misses only
-AFTER all writes; it is not a persistence, performance, or transport-backend proof.
+AFTER all writes; quick-pressure also probes hot keys during cold writes, after
+a strict warmup. Neither is a persistence, performance, or transport-backend proof.
 Requires the repository's dfkv_common on PYTHONPATH (no third-party dependencies).
 """
 
@@ -23,6 +24,8 @@ NAMESPACES = (b"disk-validation\x00A\xff", b"disk-validation\x00B\xfe")
 LENGTHS = (4095, 4096, 4097, 65535, 65536, 65537,
            1048575, 1048576, 1048577)
 BATCH_SIZE = 16
+QUICK_PREFILL = 4608
+QUICK_HOT = 32
 
 
 def key_for(seed, index):
@@ -159,7 +162,7 @@ def parse_args(argv=None):
     parser.add_argument("--members", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scenario", required=True,
-                        choices=("roundtrip", "write", "verify", "pressure"))
+                        choices=("roundtrip", "write", "verify", "pressure", "quick-pressure"))
     parser.add_argument("--seed", type=lambda s: int(s, 0), default=0xD1A60001)
     parser.add_argument("--count", type=int, help="objects PER namespace")
     parser.add_argument("--readers", type=int, choices=(0, 8), default=0,
@@ -168,21 +171,54 @@ def parse_args(argv=None):
     if not 0 <= args.seed < 2**64:
         parser.error("seed must fit uint64")
     if args.count is None:
-        args.count = 26000 if args.scenario == "pressure" else len(LENGTHS)
+        args.count = (6452 if args.scenario == "quick-pressure" else
+                      26000 if args.scenario == "pressure" else len(LENGTHS))
     if args.count < (1 if args.scenario == "pressure" else len(LENGTHS)):
         parser.error("count must be positive and cover all nine length boundaries")
+    if args.scenario == "quick-pressure" and args.count <= QUICK_PREFILL:
+        parser.error("quick-pressure count must exceed prefill (4608 per namespace)")
     if args.readers and args.scenario != "roundtrip":
         parser.error("readers require roundtrip")
     return args
 
 
+def quick_pressure(args, clients, dataset, result):
+    """Prefill one size class, warm a small hot set, then interleave cold writes.
+
+    Protection is soft: an early read removes write BOOST, so hot survival is
+    measured, not asserted. Every returned value must still match exact bytes.
+    """
+    def hot_reads(allow_miss):
+        for client, namespace in zip(clients, NAMESPACES):
+            hits = client.read(*dataset(namespace, 0, QUICK_HOT),
+                               allow_miss=allow_miss)
+            result["hot_hits"] += hits
+            result["hot_misses"] += QUICK_HOT - hits
+
+    result.update(hot_hits=0, hot_misses=0)
+    for client, namespace in zip(clients, NAMESPACES):
+        for start in range(0, QUICK_PREFILL, BATCH_SIZE):
+            client.put(*dataset(namespace, start,
+                                min(start + BATCH_SIZE, QUICK_PREFILL)))
+    for _ in range(2):
+        hot_reads(False)
+    for start in range(QUICK_PREFILL, args.count, BATCH_SIZE):
+        for client, namespace in zip(clients, NAMESPACES):
+            client.put(*dataset(namespace, start, min(start + BATCH_SIZE, args.count)))
+        hot_reads(True)
+    result["hot_reads"] = result["hot_hits"] + result["hot_misses"]
+
+
 def run(args, *, library_loader=load_library, client_factory=Client):
     args.output.mkdir(parents=True, exist_ok=False)
+    pressure = args.scenario in ("pressure", "quick-pressure")
     config = {"schema": 1, "lib": args.lib, "members": args.members,
               "scenario": args.scenario, "seed": args.seed, "count": args.count,
               "readers": args.readers, "namespaces_hex": [n.hex() for n in NAMESPACES],
-              "lengths": [4096] if args.scenario == "pressure" else list(LENGTHS),
+              "lengths": [4096] if pressure else list(LENGTHS),
               "batch_size": BATCH_SIZE, "generator": "shake256-disk-synthetic-v1"}
+    if args.scenario == "quick-pressure":
+        config.update(prefill=QUICK_PREFILL, hot=QUICK_HOT, warmup_rounds=2)
     encoded = json.dumps(config, sort_keys=True).encode()
     config_hash = hashlib.sha256(encoded).hexdigest()
     # A compact replay trace describes every index/generation before any C ABI call.
@@ -191,7 +227,9 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                             "write unless verify; read unless write",
                             "roundtrip: never-written key must miss; duplicate gen1 PUT keeps gen0",
                             "roundtrip: remove index0, assert miss, reinsert gen1",
-                            "pressure: only post-write reads allow misses"]}
+                            "pressure: only post-write reads allow misses",
+                            "quick-pressure: prefill both namespaces; two strict hot warmups; "
+                            "interleave cold batches and hot probes; final full scan"]}
     (args.output / "trace.json").write_text(json.dumps(trace, indent=2) + "\n")
     result = {"config_sha256": config_hash, "status": "failed", "hits": 0,
               "misses": 0, "wrong_bytes": 0, "transport_mode": []}
@@ -199,7 +237,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
     def dataset(namespace, start, stop, changed=False):
         keys = [key_for(args.seed, i) for i in range(start, stop)]
         values = [payload(args.seed, namespace, key, int(changed and i == 0),
-                          4096 if args.scenario == "pressure" else LENGTHS[i % len(LENGTHS)])
+                          4096 if pressure else LENGTHS[i % len(LENGTHS)])
                   for i, key in zip(range(start, stop), keys)]
         return keys, values
 
@@ -207,7 +245,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
         hits = 0
         for start in range(0, args.count, BATCH_SIZE):
             keys, values = dataset(namespace, start, min(start + BATCH_SIZE, args.count), changed)
-            hits += client.read(keys, values, allow_miss=args.scenario == "pressure")
+            hits += client.read(keys, values, allow_miss=pressure)
         return hits
 
     try:
@@ -222,7 +260,9 @@ def run(args, *, library_loader=load_library, client_factory=Client):
             if args.scenario == "roundtrip":
                 for client in clients:
                     client.expect_missing(b"never-written\x00" + key_for(args.seed, 0))
-            if args.scenario != "verify":
+            if args.scenario == "quick-pressure":
+                quick_pressure(args, clients, dataset, result)
+            elif args.scenario != "verify":
                 for client, namespace in zip(clients, NAMESPACES):
                     for start in range(0, args.count, BATCH_SIZE):
                         client.put(*dataset(namespace, start, min(start + BATCH_SIZE, args.count)))
@@ -231,7 +271,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                     hits = read_all(client, namespace)
                     result["hits"] += hits
                     result["misses"] += args.count - hits
-                if args.scenario == "pressure" and result["hits"] == 0:
+                if pressure and result["hits"] == 0:
                     raise RuntimeError("pressure had no successful reads; unavailable is not eviction proof")
             if args.scenario == "roundtrip":
                 for client, namespace in zip(clients, NAMESPACES):

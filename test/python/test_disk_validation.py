@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "integration/common/src"))
@@ -155,6 +156,67 @@ class DiskValidationTest(unittest.TestCase):
             args.output = Path(temp) / "unavailable"
             with self.assertRaisesRegex(RuntimeError, "no successful reads"):
                 driver.run(args, library_loader=lambda _: {}, client_factory=EvictingClient)
+
+    def test_quick_pressure_prefills_before_hot_reads_and_checks_evicted_bytes(self):
+        events = []
+
+        class EvictHotClient(MemoryClient):
+            def put(self, keys, values):
+                super().put(keys, values)
+                events.append("put")
+                if int.from_bytes(keys[0][-8:], "big") >= driver.QUICK_PREFILL:
+                    for index in range(driver.QUICK_HOT):
+                        self.storage.pop(driver.key_for(0xD1A60001, index), None)
+
+            def read(self, keys, values, *, allow_miss=False):
+                events.append("read")
+                return super().read(keys, values, allow_miss=allow_miss)
+
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(driver, "QUICK_PREFILL", 16), \
+                mock.patch.object(driver, "QUICK_HOT", 2):
+            args = self.args(Path(temp) / "quick", "quick-pressure", ("--count", "20"))
+            result = driver.run(args, library_loader=lambda _: {},
+                                client_factory=EvictHotClient)
+            self.assertEqual(events[:3], ["put", "put", "read"])
+            self.assertEqual((result["hits"], result["misses"]), (36, 4))
+            self.assertEqual((result["hot_hits"], result["hot_misses"]), (8, 4))
+            self.assertEqual(result["hot_reads"], 12)
+            trace = json.loads((args.output / "trace.json").read_text())["config"]
+            self.assertEqual((trace["prefill"], trace["hot"], trace["lengths"]),
+                             (16, 2, [4096]))
+
+    def test_quick_pressure_rejects_warmup_miss_and_hot_corruption(self):
+        class MissingWarmClient(MemoryClient):
+            def put(self, keys, values):
+                super().put(keys, values)
+                self.storage.pop(keys[0], None)
+
+        class CorruptHotClient(MemoryClient):
+            def read(self, keys, values, *, allow_miss=False):
+                if allow_miss:
+                    self.storage[keys[0]] = b"x" * len(values[0])
+                return super().read(keys, values, allow_miss=allow_miss)
+
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(driver, "QUICK_PREFILL", 16), \
+                mock.patch.object(driver, "QUICK_HOT", 2):
+            for client, message in ((MissingWarmClient, "below-capacity miss"),
+                                    (CorruptHotClient, "wrong bytes/length")):
+                with self.subTest(client=client.__name__):
+                    args = self.args(Path(temp) / client.__name__, "quick-pressure",
+                                     ("--count", "20"))
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        driver.run(args, library_loader=lambda _: {}, client_factory=client)
+                    result = json.loads((args.output / "result.json").read_text())
+                    self.assertEqual(result["status"], "failed")
+                    self.assertEqual(result["wrong_bytes"], int(client is CorruptHotClient))
+
+    def test_quick_pressure_arguments(self):
+        self.assertEqual(self.args(Path("unused"), "quick-pressure").count, 6452)
+        for extra in (("--count", "4608"), ("--readers", "8")):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                self.args(Path("unused"), "quick-pressure", extra)
 
     def test_missing_key_oracle_rejects_all_false_hits_including_empty(self):
         class FakeLib:
