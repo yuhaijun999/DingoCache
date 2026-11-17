@@ -264,6 +264,99 @@ class DiskValidationTest(unittest.TestCase):
             with self.subTest(scenario=scenario, extra=extra), self.assertRaises(SystemExit):
                 self.args(Path("unused"), scenario, extra)
 
+    def test_sustained_trace_is_paced_and_does_not_catch_up_after_stalls(self):
+        class Clock:
+            now = 0.0
+            def monotonic(self):
+                return self.now
+            def sleep(self, seconds):
+                self.assert_nonnegative(seconds)
+                self.now += seconds
+            def assert_nonnegative(self, seconds):
+                if seconds < 0:
+                    raise RuntimeError("negative sleep")
+
+        for stall in (False, True):
+            clock = Clock()
+            delayed = []
+            class SlowClient(MemoryClient):
+                def put(self, keys, values):
+                    super().put(keys, values)
+                    if stall and not delayed and int.from_bytes(keys[0][-8:], "big") >= 16:
+                        clock.now += 3
+                        delayed.append(True)
+
+            with self.subTest(stall=stall), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.object(driver, "QUICK_PREFILL", 16), \
+                    mock.patch.object(driver, "QUICK_HOT", 2), \
+                    mock.patch.object(driver, "SUSTAIN_STEPS", 3), \
+                    mock.patch.object(driver.time, "monotonic", side_effect=clock.monotonic), \
+                    mock.patch.object(driver.time, "sleep", side_effect=clock.sleep):
+                args = self.args(Path(temp) / "sustained", "sustained-pressure")
+                result = driver.run(args, library_loader=lambda _: {}, client_factory=SlowClient)
+                self.assertEqual(args.count, 64)
+                self.assertEqual((result["hits"], result["misses"]), (128, 0))
+                self.assertEqual((result["hot_hits"], result["hot_misses"], result["hot_reads"]),
+                                 (20, 0, 20))
+                rows = result["steps"]
+                self.assertEqual([row["step"] for row in rows], [0, 1, 2])
+                self.assertEqual([row["start_sec"] for row in rows], [0, 3, 4] if stall else [0, 1, 2])
+                self.assertTrue(all(row["cold_written"] == 32 for row in rows))
+                self.assertEqual([json.loads(line) for line in (args.output / "steps.jsonl").read_text().splitlines()], rows)
+                self.assertEqual(result["pressure_schedule_elapsed_sec"], 4 if stall else 2)
+                trace = json.loads((args.output / "trace.json").read_text())["config"]
+                self.assertEqual((trace["steps"], trace["step_interval_sec"], trace["refill_on_miss"]),
+                                 (3, 1, False))
+
+    def test_sustained_full_schedule_captures_window_checkpoints(self):
+        now = [0.0]
+        def sleep(seconds):
+            now[0] += seconds
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"sample 1\n"
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(driver, "QUICK_PREFILL", 16), \
+                mock.patch.object(driver, "QUICK_HOT", 2), \
+                mock.patch.object(driver.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(driver.time, "sleep", side_effect=sleep), \
+                mock.patch.object(driver.urllib.request, "urlopen", return_value=response) as fetch:
+            args = self.args(Path(temp) / "checkpoints", "sustained-pressure",
+                             ("--metrics-url", "http://127.0.0.1:12010/metrics"))
+            result = driver.run(args, library_loader=lambda _: {}, client_factory=MemoryClient)
+            self.assertEqual(result["pressure_schedule_elapsed_sec"], 199)
+            self.assertEqual(result["hot_reads"], 808)
+            self.assertEqual(fetch.call_count, 11)
+            self.assertEqual([row["name"] for row in result["phases"]],
+                             ["prefill", "warm", "before-pressure", "step-040", "step-080",
+                              "step-120", "step-160", "step-180", "step-200",
+                              "after-pressure", "after-scan"])
+
+    def test_sustained_hot_corruption_fails_and_preserves_partial_trace(self):
+        class CorruptClient(MemoryClient):
+            def read(self, keys, values, *, allow_miss=False):
+                if allow_miss:
+                    self.storage[keys[0]] = b"x" * len(values[0])
+                return super().read(keys, values, allow_miss=allow_miss)
+
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(driver, "QUICK_PREFILL", 16), \
+                mock.patch.object(driver, "QUICK_HOT", 2), \
+                mock.patch.object(driver, "SUSTAIN_STEPS", 3):
+            args = self.args(Path(temp) / "bad-hot", "sustained-pressure")
+            with self.assertRaisesRegex(RuntimeError, "wrong bytes/length"):
+                driver.run(args, library_loader=lambda _: {}, client_factory=CorruptClient)
+            result = json.loads((args.output / "result.json").read_text())
+            self.assertEqual((result["status"], result["wrong_bytes"]), ("failed", 1))
+            self.assertEqual(result["steps"], [])
+            self.assertTrue((args.output / "steps.jsonl").exists())
+
+    def test_sustained_arguments_fix_trace_and_disallow_quiet_delay(self):
+        args = self.args(Path("unused"), "sustained-pressure")
+        self.assertEqual((args.count, args.pressure_delay_sec), (7808, 0))
+        for extra in (("--count", "6452"), ("--pressure-delay-sec", "1"), ("--readers", "8")):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                self.args(Path("unused"), "sustained-pressure", extra)
+
     def test_missing_key_oracle_rejects_all_false_hits_including_empty(self):
         class FakeLib:
             status = 0

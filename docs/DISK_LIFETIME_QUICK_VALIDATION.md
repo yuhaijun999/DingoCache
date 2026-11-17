@@ -211,3 +211,119 @@ sanitizer或新C++静态检查执行；本轮没有生产C++修改。原有7552�
 `/data/disk1/results/age-window-20261117t084028z-0577e6f/`。归档数据位于各盘
 `/data/diskN/cases/age-20261117t084028z-0577e6f-active--{policy}-{early,aged}`，准确路径
 见summary.json；四组均已退出，VM与样本保留。底层仍仅使用原授权宿主虚拟盘文件。
+
+## 6. 持续交错热点/冷写的三轮成对重复
+
+`--scenario sustained-pressure` 复用启动和数据正确性门禁，默认仍为quick-pressure。
+这一场景不是独立并发读线程压测，也没有自动回填；热点丢失后继续探测缺失，不将
+同key重新PUT。它用于观察保留行为，不能代表真实推理业务的重算/回填效果。
+
+### 6.1 冻结轨迹与实验有效性
+
+- 默认时间/评分/水位不变，RAM关闭、disk ACK、12GiB三盘单档、4KiB载荷。
+- 两namespace各预填4608个对象、各32个热点严格读取两轮；之后200步，每步先给
+  两namespace各写16个全新冷key，再各读取32个热点；最终扫描每namespace7808个key。
+- 下一步以实际步骤起点加1秒安排，不在暂停后密集追赶。每组12928次热点读（含128次
+  预热）、15616次最终扫描，共28544次业务GET，冷写key不与热点重叠。
+- 实测节拍至少覆盖199秒；相邻步骤起点间隔须在1–5秒内（浮点误差允许1微秒）。
+  5秒是本轮预先冻结的连续性有效门槛，不是性能发布阈值；超出即场景节拍无效，
+  不把暂停后的结果归因于算法。记录最大间隔、超期和步骤耗时，不当作GET/PUT分位延迟。
+- 按实际时间选取距末次预填充ACK至少185秒后的完整步骤，至少10步，单列命中/缺失
+  分母。过渡步骤不能伪装为精确180秒边界样本。
+- prefills无淘汰，逐盘初态一致；固定路径、顺序、权重、seed、负载和ACK，每组
+  从空目录/新进程开始。服务正常退出后只归档本轮数据，不复用恢复状态。
+
+三轮顺序预先固定为：legacy→lifetime、lifetime→legacy、legacy→lifetime，共六组。
+这只是交替先后的固定轨迹保留性重复，不因轮数达到三就成为正式性能A/B。
+完整六组约20分钟；不能缩短默认180秒窗口来冒充跨窗持续流量。
+
+### 6.2 执行与证据
+
+在建立配方A的guest中执行（端口空闲、源码已含本轮工具）；下面保留六组数据，
+不会删除既有目录。只跑一组时把label列表改成 `p1-lifetime` 即可：
+
+```bash
+vmssh 'sudo bash -se' <<'GUEST'
+set -euo pipefail
+ulimit -l unlimited
+RUN_ID=$(date -u +%Y%m%dT%H%M%S)-$$
+FIXED=sustain-$RUN_ID-active
+mkdir -p /data/disk{1,2,3}/cases /data/disk1/results
+for label in p1-legacy p1-lifetime p2-lifetime p2-legacy p3-legacy p3-lifetime; do
+  policy=${label#*-}
+  OUT=/data/disk1/results/sustain-$RUN_ID-$label
+  python3 /opt/dfkv/deploy/validation/quick_eviction.py \
+    --build /opt/dfkv-build --scenario sustained-pressure --policy "$policy" \
+    --data-root /data/disk1/cases --data-root /data/disk2/cases \
+    --data-root /data/disk3/cases --data-name "$FIXED" --output "$OUT"
+  python3 - "$OUT" "$FIXED" "$label" <<'ARCHIVE'
+import json,pathlib,sys
+out=pathlib.Path(sys.argv[1]);name,label=sys.argv[2:]
+r=json.loads((out/'result.json').read_text());case=json.loads((out/'case.json').read_text())
+if r['status']!='passed' or r['server_exit']!=0:raise RuntimeError('not cleanly stopped')
+expected=[pathlib.Path(f'/data/disk{i}/cases')/name for i in (1,2,3)]
+if case['data_dirs']!=list(map(str,expected)):raise RuntimeError('unexpected store paths')
+for p in expected:
+    archive=p.with_name(name+'--'+label)
+    if p.is_symlink() or not p.is_dir() or archive.exists():raise RuntimeError('unsafe archive')
+    p.rename(archive)
+ARCHIVE
+done
+GUEST
+```
+
+持续模式拒绝额外pressure-delay，负载子进程上限320秒（另有启动30秒/退出15秒），
+不能为了延长运行而吞掉超时。完整阶段审计仍须满足6.1：六个退出码不能替代初态一致
+和完整post185样本的核对。实际六组supervisor、冻结run.json与完整命令另存本轮证据包，
+再次运行必须使用新的RUN_ID，不能覆盖已保留结果。
+
+每步 `trace/steps.jsonl` 及时落盘，result.json保留同一轨迹；11份阶段快照为prefill、
+warm、before-pressure、step-040/080/120/160/180/200、after-pressure、after-scan。
+持续探测在阶段边界前完成，HTTP指标采集不增加业务热度。仍需核对每次命中字节、
+终局、ring、健康、实际淘汰及退出码；缺失不单凭C ABI返回值认定为合法驱逐。
+
+### 6.3 三轮实测结果（2026-11-17）
+
+基线 `80793be` 加本轮工具增量，真实RXE/kernel ring，同一固定路由及默认时间参数。
+三轮六组全部完成，**正确性门禁通过不等于lifetime保留效果通过**：
+
+| 轮次 | 先后顺序 | legacy热点命中/缺失 | lifetime热点命中/缺失 | lifetime热点缺失率 |
+|---|---|---:|---:|---:|
+| 1 | legacy→lifetime | 12928 / 0 | 4537 / 8391 | 64.91% |
+| 2 | lifetime→legacy | 12928 / 0 | 4519 / 8409 | 65.04% |
+| 3 | legacy→lifetime | 12928 / 0 | 4523 / 8405 | 65.01% |
+
+分母为每组12928次热点探测，含128次严格预热，不是不同对象数。lifetime三轮平均
+缺失率64.99%，范围64.91%–65.04%，只是该轨迹的三轮描述，不是置信区间或线上收益。
+三轮首次出现热点缺失的步骤均为step52（从0开始），该步骤起点距预填充完成约52.2秒；
+这是步骤级定位，不冒充单个GET或victim的精确时刻。
+
+每组185秒后均有15个完整步骤、960次探测：legacy三轮分别960命中/0缺失，
+lifetime三轮分别0命中/960缺失。窗口分类相对末次预填充ACK，并非逐key精确年龄；
+跨边界的5个步骤单列，不混入post185。等待窗口不是一个暂停：200步持续交错，
+实测节拍跨度199.0685–199.0847秒，最大相邻步间隔1.001462秒，小于预先冻结的5秒门槛。
+每组总耗时212.19–213.60秒；这些数字只验证运行/节拍，不是GET/PUT分位或吞吐收益。
+
+六组施压前逐盘对象均3181/3122/2913，slot字节一致、淘汰0；每组最终扫描10812命中/
+4804缺失，实际水位淘汰4804，后台class回收/extent steal均0。共1200步、66份阶段
+指标、171264次业务GET；命中字节、终局分母、对象守恒、健康、ring与正常退出均通过。
+没有把合法缺失混成I/O错误，也没有把热点缺失当成数据损坏或把它从结果中删去。
+
+**当前默认参数在这类“持续新冷写、热点不回填”的轨迹下，热点保留明显弱于legacy，
+且三轮重复出现。** 默认新写BOOST与首次读撤BOOST提供合理解释，但未逐victim追踪
+唯一原因，不改规格或调参来掩盖结果。后续应先讨论这种取舍是否符合目标业务，再
+决定是否测试参数候选；不能仅凭功能门禁通过推进默认切换。
+
+这与5.3不矛盾：5.3是在压力开始前静默等待185秒，热点尚未丢失；本节在约52秒即
+开始出现缺失，且不回填，故时间跨窗不会令已丢失热点自动复活。本节不覆盖真实业务
+回填/重算、高并发独立读线程、多尺寸或正式性能A/B。
+
+工具单测19＋16＝35通过，host OFF与guest ON构建及各两个CTest入口通过（Ninja
+无待编译工作）。审计还正确拒绝伪造跨窗原点、已淘汰的prefill和缺少第六组的三类
+反例；这不是额外产品用例数。未重跑全量CTest/sanitizer，本轮无生产C++修改。
+
+证据：`.omx/evidence/sustained-retention/20261117t090611z-80793be/`，包括冻结run.json、
+逐步JSONL/66份指标、完整supervisor、源码SHA、XML、原始结果包、audit与negative证据。
+guest结果在 `/data/disk1/results/sustained-20261117t090611z-80793be/`；各盘数据归档为
+`/data/diskN/cases/sustain-20261117t090611z-80793be-active--p{1,2,3}-{legacy,lifetime}`，
+准确路径见summary.json。六组均已退出，VM和样本保留，仍只使用原授权宿主虚拟盘文件。

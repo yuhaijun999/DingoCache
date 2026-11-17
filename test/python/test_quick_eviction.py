@@ -40,6 +40,19 @@ def good_metrics():
         'dfkv_rdma_pull_requests_terminal_total{path="sync",result="io_error"} 0')) + '\n'
 
 
+def sustained_client():
+    return {**good_client(), 'hits': 14712, 'misses': 904,
+            'hot_hits': 12928, 'hot_misses': 0, 'hot_reads': 12928,
+            'pressure_schedule_origin_sec': 3.0, 'pressure_schedule_elapsed_sec': 199.02,
+            'steps': [{'step': index, 'start_sec': index + .001, 'end_sec': index + .01,
+                       'cold_written': 32, 'hot_hits': 64, 'hot_misses': 0}
+                      for index in range(200)]}
+
+
+def sustained_metrics():
+    return good_metrics().replace('12128', '27640').replace('20456', '28544').replace('8328', '904')
+
+
 class QuickEvictionTest(unittest.TestCase):
     def test_metric_presence_finiteness_and_label_sums(self):
         self.assertEqual(runner.total('counter{disk="a"} 2\ncounter{disk="b"} 3', 'counter'), 5)
@@ -105,6 +118,58 @@ class QuickEvictionTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'read denominator'):
             runner.check_result(metrics, client)
 
+    def test_sustained_trace_requires_real_duration_and_exact_cohorts(self):
+        result = runner.check_result(sustained_metrics(), sustained_client(),
+                                     scenario='sustained-pressure')
+        self.assertEqual(result['sustained_steps'], 200)
+        self.assertEqual(result['schedule_elapsed_sec'], 199.02)
+        self.assertAlmostEqual(result['max_step_gap_sec'], 1)
+        self.assertAlmostEqual(result['max_step_lateness_sec'], .001)
+        self.assertAlmostEqual(result['max_step_duration_sec'], .009)
+        with self.assertRaisesRegex(RuntimeError, 'unknown scenario'):
+            runner.check_result(good_metrics(), good_client(), scenario='unknown')
+        with self.assertRaisesRegex(RuntimeError, 'read denominator'):
+            runner.check_result(good_metrics(), good_client(), scenario='sustained-pressure')
+
+    def test_sustained_trace_rejects_missing_steps_bad_clocks_and_operations(self):
+        invalid_rows = (
+            ('step', 1), ('step', True), ('cold_written', 31), ('cold_written', True),
+            ('hot_hits', 63), ('hot_misses', -1), ('start_sec', float('nan')),
+            ('start_sec', -.1), ('start_sec', True), ('start_sec', 6),
+            ('end_sec', float('inf')), ('end_sec', 0),
+        )
+        for field, value in invalid_rows:
+            with self.subTest(field=field, value=value), self.assertRaises(RuntimeError):
+                client = sustained_client()
+                client['steps'][0][field] = value
+                runner.check_steps(client)
+        for steps in (None, [], sustained_client()['steps'][:-1]):
+            with self.subTest(steps_count=None if steps is None else len(steps)), self.assertRaises(RuntimeError):
+                runner.check_steps({**sustained_client(), 'steps': steps})
+        for field, value in (('pressure_schedule_elapsed_sec', 198),
+                             ('pressure_schedule_elapsed_sec', float('nan')),
+                             ('pressure_schedule_origin_sec', -1)):
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                runner.check_steps({**sustained_client(), field: value})
+        for index, start in ((1, .5), (1, 6.1), (199, 198.99)):
+            with self.subTest(index=index, start=start), self.assertRaises(RuntimeError):
+                client = sustained_client()
+                client['steps'][index]['start_sec'] = start
+                client['steps'][index]['end_sec'] = start + .01
+                runner.check_steps(client)
+        with self.assertRaisesRegex(RuntimeError, 'hot cohort'):
+            runner.check_steps({**sustained_client(), 'hot_hits': 12927, 'hot_misses': 1})
+
+    def test_sustained_pressure_options_reject_delay_and_unknown_scenario(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp))
+            args = runner.parse_args(argv + ['--scenario', 'sustained-pressure'])
+            self.assertEqual(args.scenario, 'sustained-pressure')
+            for invalid in (['--scenario', 'sustained-pressure', '--pressure-delay-sec', '1'],
+                            ['--scenario', 'unknown']):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    runner.parse_args(argv + invalid)
+
     def arguments(self, root):
         build = root / 'build'
         build.mkdir()
@@ -167,42 +232,49 @@ class QuickEvictionTest(unittest.TestCase):
             self.assertEqual(list(args.data_root[2].iterdir()), [])
 
     def test_delay_and_metrics_are_passed_to_client_with_extended_timeout(self):
-        with tempfile.TemporaryDirectory() as temp:
-            args = runner.parse_args(self.arguments(Path(temp)) +
-                                     ['--data-name', 'fixed', '--pressure-delay-sec', '185'])
-            server = mock.Mock()
-            server.poll.return_value = None
-            server.wait.return_value = 0
-            server.returncode = 0
-            response = mock.MagicMock()
-            response.__enter__.return_value.status = 200
-            text = good_metrics()
-            for label, root in zip(('a', 'b', 'c'), args.data_root):
-                text = text.replace('disk="' + label + '"', 'disk=' + json.dumps(str(root / 'fixed')))
-            response.__enter__.return_value.read.return_value = text.encode()
+        for scenario, delay, count, timeout, client, metrics in (
+                ('quick-pressure', 185, 6452, 305, good_client(), good_metrics()),
+                ('sustained-pressure', 0, 7808, 320, sustained_client(), sustained_metrics())):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
+                args = runner.parse_args(self.arguments(Path(temp)) +
+                                         ['--data-name', 'fixed', '--scenario', scenario,
+                                          '--pressure-delay-sec', str(delay)])
+                server = mock.Mock()
+                server.poll.return_value = None
+                server.wait.return_value = 0
+                server.returncode = 0
+                response = mock.MagicMock()
+                response.__enter__.return_value.status = 200
+                text = metrics
+                for label, root in zip(('a', 'b', 'c'), args.data_root):
+                    text = text.replace('disk="' + label + '"', 'disk=' + json.dumps(str(root / 'fixed')))
+                response.__enter__.return_value.read.return_value = text.encode()
 
-            def complete_client(command, **kwargs):
-                trace = args.output / 'trace'
-                trace.mkdir()
-                (trace / 'result.json').write_text(json.dumps(good_client()))
-                return subprocess.CompletedProcess(command, 0)
+                def complete_client(command, **kwargs):
+                    trace = args.output / 'trace'
+                    trace.mkdir()
+                    (trace / 'result.json').write_text(json.dumps(client))
+                    return subprocess.CompletedProcess(command, 0)
 
-            with mock.patch.object(runner, 'check_ports'), \
-                    mock.patch.object(runner.subprocess, 'Popen', return_value=server), \
-                    mock.patch.object(runner.subprocess, 'run', side_effect=complete_client) as client_run, \
-                    mock.patch.object(runner.urllib.request, 'urlopen', return_value=response):
-                result = runner.run(args)
-            self.assertEqual(result['status'], 'passed')
-            command = client_run.call_args.args[0]
-            self.assertEqual(command[command.index('--pressure-delay-sec') + 1], '185')
-            self.assertEqual(command[command.index('--metrics-url') + 1], runner.METRICS_URL)
-            self.assertEqual(client_run.call_args.kwargs['timeout'], 305)
-            case = json.loads((args.output / 'case.json').read_text())
-            self.assertEqual(case['pressure_delay_sec'], 185)
-            self.assertEqual(case['client_command'], command)
-            self.assertEqual(case['client_timeout_sec'], 305)
-            self.assertEqual(case['data_dirs'], [str(root / 'fixed') for root in args.data_root])
-            server.terminate.assert_called_once()
+                with mock.patch.object(runner, 'check_ports'), \
+                        mock.patch.object(runner.subprocess, 'Popen', return_value=server), \
+                        mock.patch.object(runner.subprocess, 'run', side_effect=complete_client) as client_run, \
+                        mock.patch.object(runner.urllib.request, 'urlopen', return_value=response):
+                    result = runner.run(args)
+                self.assertEqual(result['status'], 'passed')
+                command = client_run.call_args.args[0]
+                self.assertEqual(command[command.index('--scenario') + 1], scenario)
+                self.assertEqual(command[command.index('--count') + 1], str(count))
+                self.assertEqual(command[command.index('--pressure-delay-sec') + 1], str(delay))
+                self.assertEqual(command[command.index('--metrics-url') + 1], runner.METRICS_URL)
+                self.assertEqual(client_run.call_args.kwargs['timeout'], timeout)
+                case = json.loads((args.output / 'case.json').read_text())
+                self.assertEqual(case['pressure_delay_sec'], delay)
+                self.assertEqual(case['scenario'], scenario)
+                self.assertEqual(case['client_command'], command)
+                self.assertEqual(case['client_timeout_sec'], timeout)
+                self.assertEqual(case['data_dirs'], [str(root / 'fixed') for root in args.data_root])
+                server.terminate.assert_called_once()
 
     def test_start_failure_records_result_and_clears_inherited_disk_settings(self):
         with tempfile.TemporaryDirectory() as temp:

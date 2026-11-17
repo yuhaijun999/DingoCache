@@ -4,7 +4,8 @@
 Run each case with a fresh --output directory. write/verify share a deterministic
 initial dataset for clean-restart checks. pressure permits eviction misses only
 AFTER all writes; quick-pressure also probes hot keys during cold writes, after
-a strict warmup. Neither is a persistence, performance, or transport-backend proof.
+a strict warmup. sustained-pressure adds paced interleaving without catch-up or
+miss refill. These are not persistence, performance, or transport-backend proof.
 Requires the repository's dfkv_common on PYTHONPATH (no third-party dependencies).
 """
 
@@ -28,6 +29,8 @@ LENGTHS = (4095, 4096, 4097, 65535, 65536, 65537,
 BATCH_SIZE = 16
 QUICK_PREFILL = 4608
 QUICK_HOT = 32
+SUSTAIN_STEPS = 200
+SUSTAIN_INTERVAL_SEC = 1
 
 
 def key_for(seed, index):
@@ -164,7 +167,7 @@ def parse_args(argv=None):
     parser.add_argument("--members", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scenario", required=True,
-                        choices=("roundtrip", "write", "verify", "pressure", "quick-pressure"))
+                        choices=("roundtrip", "write", "verify", "pressure", "quick-pressure", "sustained-pressure"))
     parser.add_argument("--seed", type=lambda s: int(s, 0), default=0xD1A60001)
     parser.add_argument("--count", type=int, help="objects PER namespace")
     parser.add_argument("--readers", type=int, choices=(0, 8), default=0,
@@ -176,7 +179,9 @@ def parse_args(argv=None):
     if not 0 <= args.seed < 2**64:
         parser.error("seed must fit uint64")
     if args.count is None:
-        args.count = (6452 if args.scenario == "quick-pressure" else
+        args.count = (QUICK_PREFILL + SUSTAIN_STEPS * BATCH_SIZE
+                      if args.scenario == "sustained-pressure" else
+                      6452 if args.scenario == "quick-pressure" else
                       26000 if args.scenario == "pressure" else len(LENGTHS))
     if args.count < (1 if args.scenario == "pressure" else len(LENGTHS)):
         parser.error("count must be positive and cover all nine length boundaries")
@@ -184,7 +189,10 @@ def parse_args(argv=None):
         parser.error("quick-pressure count must exceed prefill (4608 per namespace)")
     if not 0 <= args.pressure_delay_sec <= 300:
         parser.error("pressure-delay-sec must be in 0..300")
-    if (args.pressure_delay_sec or args.metrics_url) and args.scenario != "quick-pressure":
+    if args.scenario == "sustained-pressure" and (
+            args.pressure_delay_sec or args.count != QUICK_PREFILL + SUSTAIN_STEPS * BATCH_SIZE):
+        parser.error("sustained-pressure requires fixed count and zero pressure delay")
+    if (args.pressure_delay_sec or args.metrics_url) and args.scenario not in ("quick-pressure", "sustained-pressure"):
         parser.error("delay and phase metrics require quick-pressure")
     if args.readers and args.scenario != "roundtrip":
         parser.error("readers require roundtrip")
@@ -200,6 +208,39 @@ def record_phase(args, result, name, started):
             (args.output / ("phase-" + name + ".prom")).write_bytes(response.read())
     result.setdefault("phases", []).append(row)
     (args.output / "phases.json").write_text(json.dumps(result["phases"], indent=2) + "\n")
+
+
+def sustained_writes(args, clients, dataset, hot_reads, result, started):
+    """Fixed-order read/write interleaving, paced without catch-up bursts.
+
+    Missed hot objects are not reinserted. This measures retention, not an
+    application's recomputation/refill policy or independently concurrent IO.
+    """
+    origin = time.monotonic()
+    result["pressure_schedule_origin_sec"] = origin - started
+    result["steps"] = []
+    next_at = origin
+    with (args.output / "steps.jsonl").open("x") as log:
+        for step in range(SUSTAIN_STEPS):
+            time.sleep(max(0, next_at - time.monotonic()))
+            step_start = time.monotonic()
+            next_at = step_start + SUSTAIN_INTERVAL_SEC
+            before_hits, before_misses = result["hot_hits"], result["hot_misses"]
+            start = QUICK_PREFILL + step * BATCH_SIZE
+            for client, namespace in zip(clients, NAMESPACES):
+                client.put(*dataset(namespace, start, start + BATCH_SIZE))
+            hot_reads(True)
+            row = {"step": step, "start_sec": step_start - origin,
+                   "end_sec": time.monotonic() - origin,
+                   "cold_written": len(NAMESPACES) * BATCH_SIZE,
+                   "hot_hits": result["hot_hits"] - before_hits,
+                   "hot_misses": result["hot_misses"] - before_misses}
+            result["steps"].append(row)
+            log.write(json.dumps(row) + "\n")
+            log.flush()
+            if (step + 1) % 40 == 0 or step + 1 == 180:
+                record_phase(args, result, "step-" + str(step + 1).zfill(3), started)
+    result["pressure_schedule_elapsed_sec"] = time.monotonic() - origin
 
 
 def quick_pressure(args, clients, dataset, result, started):
@@ -228,10 +269,13 @@ def quick_pressure(args, clients, dataset, result, started):
     time.sleep(args.pressure_delay_sec)
     result["pressure_wait_elapsed_sec"] = time.monotonic() - wait_started
     record_phase(args, result, "before-pressure", started)
-    for start in range(QUICK_PREFILL, args.count, BATCH_SIZE):
-        for client, namespace in zip(clients, NAMESPACES):
-            client.put(*dataset(namespace, start, min(start + BATCH_SIZE, args.count)))
-        hot_reads(True)
+    if args.scenario == "sustained-pressure":
+        sustained_writes(args, clients, dataset, hot_reads, result, started)
+    else:
+        for start in range(QUICK_PREFILL, args.count, BATCH_SIZE):
+            for client, namespace in zip(clients, NAMESPACES):
+                client.put(*dataset(namespace, start, min(start + BATCH_SIZE, args.count)))
+            hot_reads(True)
     result["hot_reads"] = result["hot_hits"] + result["hot_misses"]
     record_phase(args, result, "after-pressure", started)
 
@@ -239,15 +283,18 @@ def quick_pressure(args, clients, dataset, result, started):
 def run(args, *, library_loader=load_library, client_factory=Client):
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    pressure = args.scenario in ("pressure", "quick-pressure")
+    pressure = args.scenario in ("pressure", "quick-pressure", "sustained-pressure")
     config = {"schema": 1, "lib": args.lib, "members": args.members,
               "scenario": args.scenario, "seed": args.seed, "count": args.count,
               "readers": args.readers, "namespaces_hex": [n.hex() for n in NAMESPACES],
               "lengths": [4096] if pressure else list(LENGTHS),
               "batch_size": BATCH_SIZE, "generator": "shake256-disk-synthetic-v1"}
-    if args.scenario == "quick-pressure":
+    if args.scenario in ("quick-pressure", "sustained-pressure"):
         config.update(prefill=QUICK_PREFILL, hot=QUICK_HOT, warmup_rounds=2,
                       pressure_delay_sec=args.pressure_delay_sec, metrics_url=args.metrics_url)
+    if args.scenario == "sustained-pressure":
+        config.update(steps=SUSTAIN_STEPS, step_interval_sec=SUSTAIN_INTERVAL_SEC,
+                      refill_on_miss=False, independent_read_threads=False)
     encoded = json.dumps(config, sort_keys=True).encode()
     config_hash = hashlib.sha256(encoded).hexdigest()
     # A compact replay trace describes every index/generation before any C ABI call.
@@ -258,7 +305,8 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                             "roundtrip: remove index0, assert miss, reinsert gen1",
                             "pressure: only post-write reads allow misses",
                             "quick-pressure: prefill both namespaces; two strict hot warmups; "
-                            "interleave cold batches and hot probes; final full scan"]}
+                            "interleave cold batches and hot probes; final full scan",
+                            "sustained-pressure: fixed paced cold/hot steps; no catch-up or refill"]}
     (args.output / "trace.json").write_text(json.dumps(trace, indent=2) + "\n")
     result = {"config_sha256": config_hash, "status": "failed", "hits": 0,
               "misses": 0, "wrong_bytes": 0, "transport_mode": []}
@@ -289,7 +337,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
             if args.scenario == "roundtrip":
                 for client in clients:
                     client.expect_missing(b"never-written\x00" + key_for(args.seed, 0))
-            if args.scenario == "quick-pressure":
+            if args.scenario in ("quick-pressure", "sustained-pressure"):
                 quick_pressure(args, clients, dataset, result, started)
             elif args.scenario != "verify":
                 for client, namespace in zip(clients, NAMESPACES):
@@ -319,7 +367,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                         futures = [pool.submit(read_all, clients[i % 2], NAMESPACES[i % 2], True)
                                    for i in range(args.readers)]
                         result["concurrent_reader_hits"] = sum(f.result() for f in futures)
-            if args.scenario == "quick-pressure":
+            if args.scenario in ("quick-pressure", "sustained-pressure"):
                 record_phase(args, result, "after-scan", started)
             result["status"] = "passed"
     except Exception as error:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded RXE/io_uring eviction smoke; not a performance A/B or aging test.
+"""Bounded RXE/io_uring eviction smoke; not performance A/B or long-term aging acceptance.
 
 Run in the disposable validation guest with unlimited memlock. Data is written
 only to fresh children of the three supplied directories and is never deleted.
@@ -21,6 +21,11 @@ import uuid
 COUNT = 6452
 # Two 32-key namespaces: two warmups plus 116 cold-batch probes.
 HOT_READS = 7552
+SUSTAINED_COUNT = 7808
+SUSTAINED_HOT_READS = 12928
+SUSTAINED_STEPS = 200
+# Frozen diagnostic continuity eligibility, not a release performance threshold.
+MAX_STEP_GAP_SEC = 5
 PORTS = (12000, 12001, 12010)
 METRICS_URL = 'http://127.0.0.1:12010/metrics'
 
@@ -44,7 +49,58 @@ def total(text, name):
     return sum(value for _, value in samples(text, name))
 
 
-def check_result(text, client, policy='lifetime'):
+def check_steps(client):
+    steps = client.get('steps')
+    if not isinstance(steps, list) or len(steps) != SUSTAINED_STEPS:
+        raise RuntimeError('sustained step count mismatch')
+    previous_end = 0
+    previous_start = None
+    gaps = []
+    hot_hits = 128  # The two strict warmups precede all pressure steps.
+    hot_misses = 0
+    lateness = []
+    durations = []
+    for index, row in enumerate(steps):
+        if not isinstance(row, dict) or type(row.get('step')) is not int or row['step'] != index:
+            raise RuntimeError('sustained step index mismatch')
+        values = [row.get(name) for name in ('cold_written', 'hot_hits', 'hot_misses')]
+        if (any(type(value) is not int or value < 0 for value in values) or
+                values[0] != 32 or values[1] + values[2] != 64):
+            raise RuntimeError('sustained step operation mismatch')
+        start, end = row.get('start_sec'), row.get('end_sec')
+        if (any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                for value in (start, end)) or start < previous_end or end < start or start + 1e-6 < index):
+            raise RuntimeError('sustained step timing mismatch')
+        if previous_start is None:
+            if start > MAX_STEP_GAP_SEC:
+                raise RuntimeError('sustained pressure started too late')
+        else:
+            gap = start - previous_start
+            if gap < 1 - 1e-6 or gap > MAX_STEP_GAP_SEC:
+                raise RuntimeError('sustained continuity gap outside 1..5 seconds')
+            gaps.append(gap)
+        previous_start = start
+        previous_end = end
+        hot_hits += values[1]
+        hot_misses += values[2]
+        lateness.append(max(0, start - index))
+        durations.append(end - start)
+    origin = client.get('pressure_schedule_origin_sec')
+    elapsed = client.get('pressure_schedule_elapsed_sec')
+    if (any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+            for value in (origin, elapsed)) or elapsed < previous_end or elapsed < 199):
+        raise RuntimeError('sustained schedule duration mismatch')
+    if hot_hits != client['hot_hits'] or hot_misses != client['hot_misses']:
+        raise RuntimeError('sustained hot cohort mismatch')
+    return {'sustained_steps': len(steps), 'schedule_elapsed_sec': elapsed, 'max_step_gap_sec': max(gaps),
+            'max_step_lateness_sec': max(lateness), 'max_step_duration_sec': max(durations)}
+
+
+def check_result(text, client, policy='lifetime', scenario='quick-pressure'):
+    if scenario not in ('quick-pressure', 'sustained-pressure'):
+        raise RuntimeError('unknown scenario')
+    expected_count = SUSTAINED_COUNT if scenario == 'sustained-pressure' else COUNT
+    expected_hot_reads = SUSTAINED_HOT_READS if scenario == 'sustained-pressure' else HOT_READS
     if client.get('status') != 'passed' or client.get('wrong_bytes') != 0:
         raise RuntimeError('client correctness failure')
     if client.get('transport_mode') != ['rdma', 'rdma']:
@@ -53,9 +109,10 @@ def check_result(text, client, policy='lifetime'):
     if any(type(value) is not int or value < 0 for value in counts):
         raise RuntimeError('invalid client read counts')
     hits, misses, hot_hits, hot_misses, hot_reads = counts
-    if (hits + misses != COUNT * 2 or hot_reads != HOT_READS or
+    if (hits + misses != expected_count * 2 or hot_reads != expected_hot_reads or
             hot_reads != hot_hits + hot_misses or not hot_hits):
         raise RuntimeError('client read denominator mismatch')
+    schedule = check_steps(client) if scenario == 'sustained-pressure' else {}
     for name in ('dfkv_storage_healthy', 'dfkv_slab_healthy'):
         if total(text, name) != 1:
             raise RuntimeError('unhealthy: ' + name)
@@ -92,7 +149,7 @@ def check_result(text, client, policy='lifetime'):
             raise RuntimeError('lifetime heat denominator mismatch')
         # Pressure can reclaim the original resident before its heat notification.
         heat = {'read_success': success, 'read_applied': applied}
-    return {**heat, 'watermark_evictions': total(text, 'dfkv_slab_watermark_evictions_total'),
+    return {**schedule, **heat, 'watermark_evictions': total(text, 'dfkv_slab_watermark_evictions_total'),
             'background_reclaimed': total(text, 'dfkv_slab_reclaimed_total'),
             'extent_steals': total(text, 'dfkv_slab_extent_steals_total'),
             'evictions': total(text, 'dfkv_evictions_total'), 'terminal_results': terminal,
@@ -132,12 +189,16 @@ def parse_args(argv=None):
     parser.add_argument('--data-root', type=Path, action='append', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--policy', choices=('legacy', 'lifetime'), default='lifetime')
+    parser.add_argument('--scenario', choices=('quick-pressure', 'sustained-pressure'),
+                        default='quick-pressure')
     parser.add_argument('--pressure-delay-sec', type=int, default=0,
                         help='wait after hot warmup before cold writes (0..300)')
     parser.add_argument('--data-name', help='new child name shared across all data roots')
     args = parser.parse_args(argv)
     if not 0 <= args.pressure_delay_sec <= 300:
         parser.error('pressure delay must be in 0..300 seconds')
+    if args.scenario == 'sustained-pressure' and args.pressure_delay_sec:
+        parser.error('sustained-pressure does not accept a pre-pressure delay')
     if args.data_name is not None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', args.data_name):
         parser.error('data name must be a safe ASCII component of 1..80 characters')
     args.build, args.output = args.build.resolve(), args.output.resolve()
@@ -156,7 +217,7 @@ def parse_args(argv=None):
 def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    result = {'status': 'failed', 'policy': args.policy}
+    result = {'status': 'failed', 'policy': args.policy, 'scenario': args.scenario}
     server = None
     try:
         check_ports()
@@ -176,15 +237,17 @@ def run(args):
                    '--slab-eviction-policy', args.policy, '--port', '12000', '--rdma-port', '12001',
                    '--rdma-dev', 'rxe0', '--max-msg', '2097152', '--metrics-port', '12010',
                    '--metrics-bind', '127.0.0.1']
+        count = SUSTAINED_COUNT if args.scenario == 'sustained-pressure' else COUNT
         client_command = [sys.executable, str(source / 'deploy/validation/disk_scenarios.py'),
                           '--lib', str(args.build / 'libdfkv.so'), '--members', 'n=127.0.0.1:12001',
-                          '--scenario', 'quick-pressure', '--count', str(COUNT),
+                          '--scenario', args.scenario, '--count', str(count),
                           '--pressure-delay-sec', str(args.pressure_delay_sec),
                           '--metrics-url', METRICS_URL, '--output', str(args.output / 'trace')]
-        client_timeout_sec = 120 + args.pressure_delay_sec
+        client_timeout_sec = (320 if args.scenario == 'sustained-pressure' else
+                              120 + args.pressure_delay_sec)
         (args.output / 'case.json').write_text(json.dumps({'command': command, 'data_dirs': list(map(str, dirs)),
             'client_command': client_command, 'client_timeout_sec': client_timeout_sec,
-            'pressure_delay_sec': args.pressure_delay_sec,
+            'pressure_delay_sec': args.pressure_delay_sec, 'scenario': args.scenario,
             'environment': {k: v for k, v in env.items() if k.startswith('DFKV_') or k == 'PYTHONPATH'}}, indent=2) + '\n')
         with (args.output / 'server.log').open('w') as server_log:
             server = subprocess.Popen(command, env=env, stdout=server_log, stderr=subprocess.STDOUT)
@@ -218,7 +281,7 @@ def run(args):
             client = json.loads((args.output / 'trace/result.json').read_text())
             after = scrape()
             (args.output / 'after.prom').write_text(after)
-            result.update(check_result(after, client, args.policy), client=client, status='passed')
+            result.update(check_result(after, client, args.policy, args.scenario), client=client, status='passed')
     except Exception as error:
         result.update(status='failed', error=str(error))
     finally:

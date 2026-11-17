@@ -6,7 +6,8 @@
   byte-exact validation and actual eviction/terminal checks, without shortening
   lifetime timing defaults or treating synthetic results as performance A/B.
   Support bounded pre-pressure waits, phase evidence and fixed fresh store paths
-  for default-BOOST-window diagnostics.
+  for default-BOOST-window diagnostics. Add a fixed paced hot/cold retention
+  scenario with real continuity gates and per-step evidence for repeated comparisons.
 
 - Enforce RDMA connection idle deadlines while pending receives or reply SENDs
   require short CQ waits. Preserve disabled idle reclamation and disk-read drain
