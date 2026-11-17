@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Expose final RAM flush settlements, foreground RAM waiter returns and Store
+  PUT follower completion counters as separate bounded cohorts. Preserve retry,
+  ACK and write behavior; do not treat attempts as completed writes.
+
 - Expose lifetime scan checks, eligible candidates and pin skips by scoring
   band and foreground/background/watermark path, per disk and in aggregate.
   Preserve eviction order, budgets and existing queue-population metrics.

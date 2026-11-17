@@ -42,6 +42,7 @@
  * hermetically testable without libibverbs. */
 #ifndef DFKV_RAM_TIER_H_
 #define DFKV_RAM_TIER_H_
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -208,6 +209,32 @@ class RamTier {
     // Disk write outcome for the accepted owner; read promotions use Unknown.
     DiskWriteOutcome outcome = DiskWriteOutcome::kUnknown;
   };
+
+  // Background worker settlements and foreground API waits are different
+  // cohorts. Neither includes retry attempts or pre-admission rejections.
+  enum class FlushSettlement : unsigned char {
+    kCompleted = 0,  // Final callback result after any retries.
+    kCancelled = 1,  // Remove won; the public completion is an I/O error.
+    kRetained = 2    // RAM-ACK copy remains dirty after budget/clock shutdown.
+  };
+  struct FlushTerminalStat {
+    bool batch = false;  // Callback selection, not the dequeue's item count.
+    FlushSettlement settlement = FlushSettlement::kCompleted;
+    DiskWriteTerminalCounts results{};
+  };
+  enum class PutWaitApi : unsigned char {
+    kCommitted = 0,   // PutCommitted disk-ACK wait.
+    kWriteBack = 1,   // PutWriteBack synchronous or duplicate wait.
+    kDirectBatch = 2  // PrepareDirectPut joined an existing owner.
+  };
+  struct PutWaitTerminalStat {
+    PutWaitApi api = PutWaitApi::kCommitted;
+    bool duplicate = false;  // Admission joined an existing shared completion.
+    DiskWriteTerminalCounts results{};
+  };
+  // Relaxed per-cell snapshots, not an atomic transaction across cohorts.
+  std::array<FlushTerminalStat, 6> FlushTerminalStats() const;
+  std::array<PutWaitTerminalStat, 6> PutWaitTerminalStats() const;
 
   // Disk-ACK contract: wait for the admitted key's actual flush result.
   // Bool-sink failures and cancellations return kIOError. Typed sinks preserve
@@ -426,6 +453,11 @@ class RamTier {
   static PutResult WaitPutResult(
       const std::shared_ptr<PutCompletion>& completion);
   static Status WaitPut(const std::shared_ptr<PutCompletion>& completion);
+  PutResult WaitPutTerminal(const std::shared_ptr<PutCompletion>& completion,
+                            PutWaitApi api, Admission admission);
+  void RecordFlushTerminal(bool batch, FlushSettlement settlement,
+                           Status status,
+                           DiskWriteReason reason = DiskWriteReason::kNone);
   bool CommitReservation(DurableReservation* reservation,
                          const DiskResidentIdentity& identity) noexcept;
   void AbortReservation(DurableReservation* reservation) noexcept;
@@ -484,6 +516,12 @@ class RamTier {
   std::atomic<uint64_t> ram_acks_{0}, ack_backpressure_{0};
   std::atomic<uint64_t> post_ack_flush_failures_{0};
   std::atomic<uint64_t> shutdown_drain_timeouts_{0};
+  // Rows are callback-mode * 3 + settlement, and API * 2 + duplicate.
+  // Fixed storage: no allocation, extra lock or clock read on publication.
+  std::array<std::array<std::atomic<uint64_t>, kDiskWriteTerminalCount>, 6>
+      flush_terminals_{};
+  std::array<std::array<std::atomic<uint64_t>, kDiskWriteTerminalCount>, 6>
+      put_wait_terminals_{};
   LatencyHist ack_to_durable_latency_;
 };
 

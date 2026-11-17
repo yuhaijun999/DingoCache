@@ -1859,6 +1859,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       auto existing = put_flights_.find(fn);
       if (existing != put_flights_.end()) {
         flight = existing->second;  // follower of the in-flight PUT
+        put_followers_attached_[0].fetch_add(1, std::memory_order_relaxed);
         break;
       }
       if (deferred_remove_.count(fn) != 0) {
@@ -1902,6 +1903,10 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
   }
   if (!leader) {
     const DiskWriteResult result = WaitPut(flight);
+    const size_t terminal = static_cast<size_t>(
+        ClassifyDiskWriteTerminal(result.status, result.reason));
+    put_followers_completed_[0][terminal].fetch_add(1,
+                                                    std::memory_order_relaxed);
     if (details != nullptr) *details = result;
     return result.status;
   }
@@ -2037,6 +2042,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
     std::shared_ptr<PutFlight> flight;
     uint64_t generation = 0;
     bool active = false;
+    bool follower = false;
     bool io_ok = false;
     bool direct = false;
   };
@@ -2067,6 +2073,8 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
         auto existing = put_flights_.find(st[i].fn);
         if (existing != put_flights_.end()) {
           st[i].flight = existing->second;  // follower: wait after leader L2
+          st[i].follower = true;
+          put_followers_attached_[1].fetch_add(1, std::memory_order_relaxed);
           break;
         }
         if (deferred_remove_.count(st[i].fn) != 0) {
@@ -2273,6 +2281,14 @@ std::vector<Status> DiskSlabStore::CacheDirectBatchImpl(
   for (size_t i = 0; i < N; ++i) {
     if (!st[i].active && st[i].flight) {
       const DiskWriteResult result = WaitPut(st[i].flight);
+      // Allocation-failed owners also reach this wait; only an actual join
+      // belongs to the follower cohort.
+      if (st[i].follower) {
+        const size_t terminal = static_cast<size_t>(
+            ClassifyDiskWriteTerminal(result.status, result.reason));
+        put_followers_completed_[1][terminal].fetch_add(
+            1, std::memory_order_relaxed);
+      }
       out[i] = result.status;
       if (details != nullptr) (*details)[i] = result;
     }
@@ -3260,6 +3276,20 @@ void DiskSlabStore::NotifyLifetimeReadSuccess(
       ++lifetime_reads_.state_unavailable;
       break;
   }
+}
+
+DiskSlabStore::PutFollowerStats DiskSlabStore::GetPutFollowerStats() const {
+  PutFollowerStats result;
+  for (size_t mode = 0; mode < result.attached.size(); ++mode) {
+    result.attached[mode] =
+        put_followers_attached_[mode].load(std::memory_order_relaxed);
+    for (size_t terminal = 0; terminal < kDiskWriteTerminalCount; ++terminal) {
+      result.completed[mode][terminal] =
+          put_followers_completed_[mode][terminal].load(
+              std::memory_order_relaxed);
+    }
+  }
+  return result;
 }
 
 DiskSlabStore::Stats DiskSlabStore::GetStats() const {

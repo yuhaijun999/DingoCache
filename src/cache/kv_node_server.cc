@@ -25,6 +25,7 @@
 #include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
+#include "cache/disk_write_result.h"
 #include "cache/ram_tier.h"
 #include "cache/read_coalescer.h"
 #include "cache/slab_allocator.h"
@@ -584,6 +585,56 @@ std::string KvNodeServer::MetricsText() const {
   // unchanged. The dio_*_fallback counters are the "page cache silently crept
   // back in" alarm for direct-mode deployments.
   if (group_.EngineName() == "slab") {
+    // Store followers are not RAM waiters or write owners. Sum the same
+    // independently sampled per-disk counters used by the disk exposition.
+    DiskSlabStore::PutFollowerStats follower_totals;
+    s += "# HELP dfkv_slab_put_follower_attached_total Store PUT flight "
+         "attachments\n";
+    s += "# TYPE dfkv_slab_put_follower_attached_total counter\n";
+    s += "# HELP dfkv_slab_put_follower_completed_total Store PUT follower "
+         "returns\n";
+    s += "# TYPE dfkv_slab_put_follower_completed_total counter\n";
+    s += "# HELP dfkv_slab_disk_put_follower_attached_total Store PUT flight "
+         "attachments by disk\n";
+    s += "# TYPE dfkv_slab_disk_put_follower_attached_total counter\n";
+    s += "# HELP dfkv_slab_disk_put_follower_completed_total Store PUT "
+         "follower returns by disk\n";
+    s += "# TYPE dfkv_slab_disk_put_follower_completed_total counter\n";
+    const std::array<const char*, 2> write_modes{"single", "batch"};
+    for (size_t disk = 0; disk < group_.DiskCount(); ++disk) {
+      const DiskSlabStore::PutFollowerStats stats =
+          group_.DiskPutFollowerStats(disk);
+      for (size_t mode = 0; mode < write_modes.size(); ++mode) {
+        const std::string labels = "disk=\"" +
+                                   PromLabelEscape(group_.DiskPath(disk)) +
+                                   "\",disk_index=\"" + std::to_string(disk) +
+                                   "\",mode=\"" + write_modes[mode] + "\"";
+        s += "dfkv_slab_disk_put_follower_attached_total" + braces(labels) +
+             " " + std::to_string(stats.attached[mode]) + "\n";
+        follower_totals.attached[mode] += stats.attached[mode];
+        for (size_t result = 0; result < kDiskWriteTerminalCount; ++result) {
+          s += "dfkv_slab_disk_put_follower_completed_total" +
+               braces(labels + ",result=\"" + kDiskWriteTerminalNames[result] +
+                      "\"") +
+               " " + std::to_string(stats.completed[mode][result]) + "\n";
+          follower_totals.completed[mode][result] +=
+              stats.completed[mode][result];
+        }
+      }
+    }
+    for (size_t mode = 0; mode < write_modes.size(); ++mode) {
+      const std::string labels =
+          std::string("mode=\"") + write_modes[mode] + "\"";
+      s += "dfkv_slab_put_follower_attached_total" + braces(labels) + " " +
+           std::to_string(follower_totals.attached[mode]) + "\n";
+      for (size_t result = 0; result < kDiskWriteTerminalCount; ++result) {
+        s += "dfkv_slab_put_follower_completed_total" +
+             braces(labels + ",result=\"" + kDiskWriteTerminalNames[result] +
+                    "\"") +
+             " " + std::to_string(follower_totals.completed[mode][result]) +
+             "\n";
+      }
+    }
     // Per-disk observations must not conflate independent high-water crossings.
     auto header = [&](const char* name, const char* type, const char* help) {
       s += "# HELP "; s += name; s += " "; s += help; s += "\n";
@@ -2072,6 +2123,41 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_post_ack_flush_failures_total", "counter",
            "Acknowledged RAM PUTs whose background disk flush later failed",
            ram_->PostAckFlushFailures());
+    // Worker settlements and foreground waiter returns have different
+    // denominators. Never add these two families to obtain logical PUTs.
+    s += "# HELP dfkv_ram_flush_terminal_total Final dispatched RAM flush item "
+         "settlements\n";
+    s += "# TYPE dfkv_ram_flush_terminal_total counter\n";
+    const std::array<const char*, 3> settlements{"completed", "cancelled",
+                                                 "retained"};
+    for (const RamTier::FlushTerminalStat& stat : ram_->FlushTerminalStats()) {
+      const std::string labels =
+          std::string("mode=\"") + (stat.batch ? "batch" : "single") +
+          "\",settlement=\"" +
+          settlements[static_cast<size_t>(stat.settlement)] + "\"";
+      for (size_t result = 0; result < stat.results.size(); ++result) {
+        s += "dfkv_ram_flush_terminal_total" +
+             braces(labels + ",result=\"" + kDiskWriteTerminalNames[result] +
+                    "\"") +
+             " " + std::to_string(stat.results[result]) + "\n";
+      }
+    }
+    s += "# HELP dfkv_ram_put_wait_terminal_total RAM PUT API waiter returns\n";
+    s += "# TYPE dfkv_ram_put_wait_terminal_total counter\n";
+    const std::array<const char*, 3> wait_apis{"committed", "write_back",
+                                               "direct_batch"};
+    for (const RamTier::PutWaitTerminalStat& stat :
+         ram_->PutWaitTerminalStats()) {
+      const std::string labels =
+          std::string("api=\"") + wait_apis[static_cast<size_t>(stat.api)] +
+          "\",role=\"" + (stat.duplicate ? "duplicate" : "owner") + "\"";
+      for (size_t result = 0; result < stat.results.size(); ++result) {
+        s += "dfkv_ram_put_wait_terminal_total" +
+             braces(labels + ",result=\"" + kDiskWriteTerminalNames[result] +
+                    "\"") +
+             " " + std::to_string(stat.results[result]) + "\n";
+      }
+    }
     s += ram_->AckToDurableLatencyMetrics(idlabels);
     metric("dfkv_ram_budget_bytes", "gauge",
            "Hard total RAM-tier budget across arena and dedicated values",

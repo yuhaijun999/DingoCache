@@ -39,6 +39,7 @@
 #include "cache/disk_resident_identity.h"
 #include "cache/disk_slab_store.h"
 #include "cache/disk_write_result.h"
+#include "cache/ram_tier.h"
 #include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
@@ -50,6 +51,7 @@ namespace dfkv {
 class KvNodeServerTestPeer {
  public:
   static DiskCacheGroup& Group(KvNodeServer& server) { return server.group_; }
+  static RamTier& Ram(KvNodeServer& server) { return *server.ram_; }
 };
 
 class DiskCacheGroupTestPeer {
@@ -6131,3 +6133,190 @@ TEST_F(LifetimeGhostMetricsTest, ClockDropPreservesSuccessfulPhysicalEviction) {
   ASSERT_NO_FATAL_FAILURE(Check(0, dropped));
 }
 }  // namespace
+
+TEST(Metrics, RamWriteTerminalsSeparateWorkerItemsFromForegroundWaiters) {
+  const ScopedEnv enabled("DFKV_RAM_TIER", "1");
+  const ScopedEnv bytes("DFKV_RAM_TIER_BYTES", "16777216");
+  const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+  const ScopedEnv workers("DFKV_RAM_FLUSH_THREADS", "1");
+  const ScopedEnv reclaim("DFKV_RAM_RECLAIM_MS", "0");
+  const ScopedEnv policy("DFKV_RAM_WRITE_MODE", "writeback");
+  const ScopedEnv ack("DFKV_PUT_ACK_MODE", "disk");
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_metrics_ram_write_terminals";
+  fs::remove_all(dir);
+  DiskCacheGroup::Options options;
+  options.engine = "file";
+  options.eviction_policy = "legacy";
+  options.cache_dirs = {dir.string()};
+  options.capacity_bytes = 16ULL << 20;
+  {
+    KvNodeServer node(options);
+    ASSERT_TRUE(node.Healthy());
+    node.set_identity("write\"node", "write\\group\n");
+    const BlockKey key{987654321, 0};
+    for (unsigned call = 0; call < 2; ++call) {
+      ASSERT_EQ(node.ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                          key, 0, 3, "old", 3, nullptr),
+                Status::kOk);
+      if (call == 0) {
+        // A real completed-owner RAM duplicate. The next Node call retires
+        // that durable RAM copy and takes the excluded persisted-hit path.
+        EXPECT_EQ(KvNodeServerTestPeer::Ram(node)
+                      .PutCommitted(key, "different", 9)
+                      .status,
+                  Status::kOk);
+      }
+    }
+    const std::string text = node.MetricsText();
+    const std::string identity = R"(node="write\"node",group="write\\group\n")";
+    const std::array<const char*, 8> results{"ok",
+                                             "cache_full",
+                                             "scan_budget",
+                                             "identity_exhausted",
+                                             "clock_exhausted",
+                                             "io_error",
+                                             "invalid",
+                                             "other"};
+    for (const char* mode : {"single", "batch"}) {
+      for (const char* settlement : {"completed", "cancelled", "retained"}) {
+        for (const char* result : results) {
+          const bool completed = std::string(mode) == "batch" &&
+                                 std::string(settlement) == "completed" &&
+                                 std::string(result) == "ok";
+          const std::string sample =
+              std::string("\ndfkv_ram_flush_terminal_total{mode=\"") + mode +
+              "\",settlement=\"" + settlement + "\",result=\"" + result +
+              "\"," + identity + "} " + (completed ? "1\n" : "0\n");
+          EXPECT_NE(text.find(sample), std::string::npos) << sample;
+        }
+      }
+    }
+    for (const char* api : {"committed", "write_back", "direct_batch"}) {
+      for (const char* role : {"owner", "duplicate"}) {
+        for (const char* result : results) {
+          const bool returned =
+              std::string(api) == "committed" && std::string(result) == "ok";
+          const std::string sample =
+              std::string("\ndfkv_ram_put_wait_terminal_total{api=\"") + api +
+              "\",role=\"" + role + "\",result=\"" + result + "\"," + identity +
+              "} " + (returned ? "1\n" : "0\n");
+          EXPECT_NE(text.find(sample), std::string::npos) << sample;
+        }
+      }
+    }
+    EXPECT_EQ(text.find("dfkv_slab_put_follower_"), std::string::npos);
+    const std::string repeated = node.MetricsText();
+    const size_t begin = text.find("# HELP dfkv_ram_flush_terminal_total");
+    const size_t end =
+        text.find("# HELP dfkv_ram_ack_to_durable_latency_seconds", begin);
+    const size_t repeated_begin =
+        repeated.find("# HELP dfkv_ram_flush_terminal_total");
+    ASSERT_NE(end, std::string::npos);
+    ASSERT_NE(repeated_begin, std::string::npos);
+    EXPECT_EQ(
+        repeated.substr(repeated_begin, end - begin),
+        text.substr(begin, end - begin));  // Scraping does not settle work.
+  }
+  {
+    const KvNodeServer fresh(options);
+    ASSERT_TRUE(fresh.Healthy());
+    EXPECT_NE(
+        fresh.MetricsText().find("dfkv_ram_flush_terminal_total{mode=\"batch\","
+                                 "settlement=\"completed\",result=\"ok\"} 0\n"),
+        std::string::npos);
+  }
+  fs::remove_all(dir);
+  const ScopedEnv disabled("DFKV_RAM_TIER", "0");
+  const KvNodeServer no_ram(options);
+  ASSERT_TRUE(no_ram.Healthy());
+  EXPECT_EQ(no_ram.MetricsText().find("dfkv_ram_flush_terminal_total"),
+            std::string::npos);
+  EXPECT_EQ(no_ram.MetricsText().find("dfkv_ram_put_wait_terminal_total"),
+            std::string::npos);
+}
+
+TEST_F(LifetimeGhostMetricsTest,
+       PutFollowerTerminalsAggregateRealBatchDuplicatesAndReset) {
+  const DiskCacheGroup::Options options = Options();
+  ASSERT_NO_FATAL_FAILURE(Create(options));
+  DiskCacheGroup& group = KvNodeServerTestPeer::Group(*server_);
+  char data[] = "old";
+  for (size_t disk = 0; disk < 2; ++disk) {
+    const BlockKey key = IntervalKey(disk, 70000);
+    const std::vector<StoreEngine::CacheBatchItem> batch(
+        disk == 0 ? 3 : 2, {key, data, 3, sizeof(data)});
+    const std::vector<DiskWriteResult> results =
+        group.CacheDirectBatchWithResults(batch);
+    ASSERT_EQ(results.size(), batch.size());
+    for (const DiskWriteResult& result : results) {
+      EXPECT_EQ(result.status, Status::kOk);
+    }
+    // A later keep-first call is not a flight attachment.
+    EXPECT_EQ(group.Cache(key, data, 3), Status::kOk);
+  }
+  const std::string identity = R"(node="ghost\"node",group="ghost\\group\n")";
+  const auto check = [&](bool recovered) {
+    const std::string text = server_->MetricsText();
+    for (size_t view = 0; view < 3; ++view) {
+      const std::string prefix = view < 2 ? "dfkv_slab_disk_" : "dfkv_slab_";
+      const std::string disk_labels =
+          view < 2 ? "disk=\"" +
+                         KvNodeServerTestPeer::Group(*server_).DiskPath(view) +
+                         "\",disk_index=\"" + std::to_string(view) + "\","
+                   : "";
+      for (const char* mode : {"single", "batch"}) {
+        constexpr std::array<uint64_t, 3> kExpected{2, 1, 3};
+        const uint64_t expected =
+            recovered || std::string(mode) == "single" ? 0 : kExpected[view];
+        const std::string labels =
+            disk_labels + "mode=\"" + mode + "\"," + identity;
+        EXPECT_NE(text.find("\n" + prefix + "put_follower_attached_total{" +
+                            labels + "} " + std::to_string(expected) + "\n"),
+                  std::string::npos);
+        const std::array<const char*, 8> results{"ok",
+                                                 "cache_full",
+                                                 "scan_budget",
+                                                 "identity_exhausted",
+                                                 "clock_exhausted",
+                                                 "io_error",
+                                                 "invalid",
+                                                 "other"};
+        for (const char* result : results) {
+          EXPECT_NE(text.find("\n" + prefix + "put_follower_completed_total{" +
+                              disk_labels + "mode=\"" + mode + "\",result=\"" +
+                              result + "\"," + identity + "} " +
+                              std::to_string(
+                                  std::string(result) == "ok" ? expected : 0) +
+                              "\n"),
+                    std::string::npos);
+        }
+      }
+    }
+    for (const char* name : {"dfkv_slab_put_follower_attached_total",
+                             "dfkv_slab_put_follower_completed_total",
+                             "dfkv_slab_disk_put_follower_attached_total",
+                             "dfkv_slab_disk_put_follower_completed_total"}) {
+      const std::string declaration =
+          std::string("# TYPE ") + name + " counter\n";
+      EXPECT_NE(text.find(declaration), std::string::npos);
+      EXPECT_EQ(text.find(declaration), text.rfind(declaration));
+    }
+  };
+  ASSERT_NO_FATAL_FAILURE(check(false));
+  ASSERT_NO_FATAL_FAILURE(check(false));
+  EXPECT_EQ(group.DiskPutFollowerStats(99).attached,
+            (std::array<uint64_t, 2>{}));
+  server_.reset();
+  ASSERT_NO_FATAL_FAILURE(Create(options));
+  EXPECT_EQ(server_->Count(), 2U);
+  ASSERT_NO_FATAL_FAILURE(check(true));
+  const DiskCacheGroup& fresh_group = KvNodeServerTestPeer::Group(*server_);
+  for (size_t disk = 0; disk < 2; ++disk) {
+    const DiskSlabStore::PutFollowerStats stats =
+        fresh_group.DiskPutFollowerStats(disk);
+    EXPECT_EQ(stats.attached, (std::array<uint64_t, 2>{}));
+    EXPECT_EQ(stats.completed[0], DiskWriteTerminalCounts{});
+    EXPECT_EQ(stats.completed[1], DiskWriteTerminalCounts{});
+  }
+}

@@ -1,6 +1,7 @@
 #include "cache/ram_tier.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -515,6 +516,26 @@ RamTier::PutResult RamTier::WaitPutResult(
   return {completion->success ? Status::kOk : Status::kIOError};
 }
 
+RamTier::PutResult RamTier::WaitPutTerminal(
+    const std::shared_ptr<PutCompletion>& completion, PutWaitApi api,
+    Admission admission) {
+  const PutResult result = WaitPutResult(completion);
+  const size_t row = static_cast<size_t>(api) * 2 +
+                     (admission == Admission::kDuplicate ? 1 : 0);
+  const size_t terminal = static_cast<size_t>(
+      ClassifyDiskWriteTerminal(result.status, result.reason));
+  put_wait_terminals_[row][terminal].fetch_add(1, std::memory_order_relaxed);
+  return result;
+}
+
+void RamTier::RecordFlushTerminal(bool batch, FlushSettlement settlement,
+                                  Status status, DiskWriteReason reason) {
+  const size_t row = (batch ? 3 : 0) + static_cast<size_t>(settlement);
+  const size_t terminal =
+      static_cast<size_t>(ClassifyDiskWriteTerminal(status, reason));
+  flush_terminals_[row][terminal].fetch_add(1, std::memory_order_relaxed);
+}
+
 RamTier::Admission RamTier::Admit(
     const BlockKey& key, const void* data, size_t len, bool client_ack,
     std::shared_ptr<PutCompletion>* out_completion, bool admit_new) {
@@ -751,7 +772,7 @@ RamTier::PutResult RamTier::PutCommitted(
   if (admission == Admission::kBypass)
     return {Status::kCacheFull, PutDisposition::kBypass};
   if (admission == Admission::kRejected) return {Status::kIOError};
-  return WaitPutResult(completion);
+  return WaitPutTerminal(completion, PutWaitApi::kCommitted, admission);
 }
 
 RamTier::PutResult RamTier::PrepareDirectPut(const BlockKey& key,
@@ -762,7 +783,7 @@ RamTier::PutResult RamTier::PrepareDirectPut(const BlockKey& key,
   if (admission == Admission::kBypass)
     return {Status::kCacheFull, PutDisposition::kBypass};
   if (admission == Admission::kRejected) return {Status::kIOError};
-  return WaitPutResult(completion);
+  return WaitPutTerminal(completion, PutWaitApi::kDirectBatch, admission);
 }
 
 bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
@@ -930,7 +951,7 @@ RamTier::PutResult RamTier::PutWriteBack(
   if (admission == Admission::kRejected) return {Status::kIOError};
   if (synchronous || admission == Admission::kDuplicate) {
     if (synchronous) ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
-    return WaitPutResult(completion);
+    return WaitPutTerminal(completion, PutWaitApi::kWriteBack, admission);
   }
   ram_acks_.fetch_add(1, std::memory_order_relaxed);
   return {Status::kOk};
@@ -1290,6 +1311,8 @@ void RamTier::FlushLoop(Shard& s) {
     // else the per-item sink. Every item is owned until this batch completes.
     const bool typed = static_cast<bool>(flush_result_) ||
                        static_cast<bool>(flush_batch_results_);
+    const bool batch_callback = typed ? static_cast<bool>(flush_batch_results_)
+                                      : static_cast<bool>(flush_batch_);
     std::vector<DiskWriteResult> disk_results;
     std::vector<char> ok(B, 0);
     if (typed) {
@@ -1334,6 +1357,11 @@ void RamTier::FlushLoop(Shard& s) {
             disk_results[i].reason == DiskWriteReason::kScanBudgetExhausted;
         const bool permanent_admission_failure =
             identity_exhausted || clock_stopped;
+        const Status bool_status = ok[i] ? Status::kOk : Status::kIOError;
+        const Status terminal_status =
+            typed ? disk_results[i].status : bool_status;
+        const DiskWriteReason terminal_reason =
+            typed ? disk_results[i].reason : DiskWriteReason::kNone;
         entry.flushing = false;
         if (entry.remove_pending) {
           if (entry.flush_pin) {
@@ -1341,6 +1369,8 @@ void RamTier::FlushLoop(Shard& s) {
               s.alloc->Unpin(entry.key, entry.slot_handle);
             entry.flush_pin = false;
           }
+          RecordFlushTerminal(batch_callback, FlushSettlement::kCancelled,
+                              Status::kIOError);
           CompletePut(entry.completion, false);
           if (entry.send_pins == 0) DropLocked(s, batch[i].key);
         } else if (ok[i]) {
@@ -1375,6 +1405,8 @@ void RamTier::FlushLoop(Shard& s) {
             DropLocked(s, batch[i].key);
           }
           flushed_.fetch_add(1, std::memory_order_relaxed);
+          RecordFlushTerminal(batch_callback, FlushSettlement::kCompleted,
+                              terminal_status, terminal_reason);
           if (typed)
             CompletePut(completion, disk_results[i]);
           else
@@ -1386,6 +1418,8 @@ void RamTier::FlushLoop(Shard& s) {
           // New lifetime write-back must require disk-ACK before activation.
           // Waiters terminate, but drain remains incomplete until removal or a
           // supported persistence path resolves the retained flush pin.
+          RecordFlushTerminal(batch_callback, FlushSettlement::kRetained,
+                              terminal_status, terminal_reason);
           CompletePut(entry.completion, disk_results[i]);
         } else if (!permanent_admission_failure &&
                    ++batch[i].tries < opt_.flush_retries) {
@@ -1410,6 +1444,8 @@ void RamTier::FlushLoop(Shard& s) {
               client_acked)
             healthy_.store(false, std::memory_order_release);
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
+          RecordFlushTerminal(batch_callback, FlushSettlement::kCompleted,
+                              terminal_status, terminal_reason);
           // Publish every terminal side effect before waking PutCommitted()
           // leaders and duplicate followers.
           if (typed)
@@ -1421,6 +1457,33 @@ void RamTier::FlushLoop(Shard& s) {
       s.flush_inflight -= B;
     }
   }
+}
+
+std::array<RamTier::FlushTerminalStat, 6> RamTier::FlushTerminalStats() const {
+  std::array<FlushTerminalStat, 6> result{};
+  for (size_t row = 0; row < result.size(); ++row) {
+    result[row].batch = row >= 3;
+    result[row].settlement = static_cast<FlushSettlement>(row % 3);
+    for (size_t terminal = 0; terminal < kDiskWriteTerminalCount; ++terminal) {
+      result[row].results[terminal] =
+          flush_terminals_[row][terminal].load(std::memory_order_relaxed);
+    }
+  }
+  return result;
+}
+
+std::array<RamTier::PutWaitTerminalStat, 6> RamTier::PutWaitTerminalStats()
+    const {
+  std::array<PutWaitTerminalStat, 6> result{};
+  for (size_t row = 0; row < result.size(); ++row) {
+    result[row].api = static_cast<PutWaitApi>(row / 2);
+    result[row].duplicate = row % 2 != 0;
+    for (size_t terminal = 0; terminal < kDiskWriteTerminalCount; ++terminal) {
+      result[row].results[terminal] =
+          put_wait_terminals_[row][terminal].load(std::memory_order_relaxed);
+    }
+  }
+  return result;
 }
 
 uint64_t RamTier::Evictions() const {

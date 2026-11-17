@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -39,6 +40,7 @@
 #endif
 
 #include "cache/disk_resident_identity.h"
+#include "cache/disk_write_result.h"
 #include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
@@ -3627,4 +3629,157 @@ TEST_F(DiskSlabTest, CleanShutdownVetoIsStickyWithoutIoIsolation) {
   ASSERT_TRUE(reopened.Healthy());
   EXPECT_EQ(reopened.GetStats().unclean_resets, 1U);
   EXPECT_FALSE(reopened.IsCached(key));
+}
+
+TEST_F(DiskSlabTest,
+       FollowerTerminalCountersClassifyActualScalarAndBatchReturns) {
+  for (const bool batch : {false, true}) {
+    for (const bool typed : {false, true}) {
+      for (const bool success : {false, true}) {
+        SCOPED_TRACE(batch);
+        SCOPED_TRACE(typed);
+        SCOPED_TRACE(success);
+        fs::remove_all(dir_);
+        DiskSlabStore::Options options = Opts(2 * 4096, 2 * 4096, 4096);
+        options.table_sync_ms = options.reclaim_interval_ms = 0;
+        DiskSlabStore store(options);
+        ASSERT_TRUE(store.Healthy());
+        HookGate gate;
+        dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(
+            &store, [&gate] { return gate.Run(); });
+        Status owner_result = Status::kInvalid;
+        Status follower_result = Status::kInvalid;
+        std::thread owner(
+            [&] { owner_result = store.Cache(K(99800), "owner", 5); });
+        if (!gate.WaitEnteredFor()) {
+          gate.Release(false);
+          owner.join();
+          FAIL() << "owner did not enter the payload gate";
+        }
+        std::thread follower([&] {
+          if (batch) {
+            char bytes[] = "different";
+            if (typed) {
+              const std::vector<dfkv::DiskWriteResult> results =
+                  store.CacheDirectBatchWithResults(
+                      {{K(99800), bytes, 9, sizeof(bytes)}});
+              follower_result = results.at(0).status;
+            } else {
+              const std::vector<Status> results =
+                  store.CacheDirectBatch({{K(99800), bytes, 9, sizeof(bytes)}});
+              follower_result = results.at(0);
+            }
+          } else if (typed) {
+            follower_result =
+                store.CacheWithResult(K(99800), "different", 9).status;
+          } else {
+            follower_result = store.Cache(K(99800), "different", 9);
+          }
+        });
+        const std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!dfkv::DiskSlabStoreTestPeer::HasPutFollower(store, K(99800)) &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::yield();
+        }
+        const bool attached =
+            dfkv::DiskSlabStoreTestPeer::HasPutFollower(store, K(99800));
+        const DiskSlabStore::PutFollowerStats blocked =
+            store.GetPutFollowerStats();
+        gate.Release(success);
+        owner.join();
+        follower.join();
+        ASSERT_TRUE(attached);
+        EXPECT_EQ(blocked.attached,
+                  (std::array<uint64_t, 2>{batch ? 0U : 1U, batch ? 1U : 0U}));
+        EXPECT_EQ(blocked.completed[0], (dfkv::DiskWriteTerminalCounts{}));
+        EXPECT_EQ(blocked.completed[1], (dfkv::DiskWriteTerminalCounts{}));
+        EXPECT_EQ(owner_result, success ? Status::kOk : Status::kIOError);
+        EXPECT_EQ(follower_result, owner_result);
+        dfkv::DiskWriteTerminalCounts expected{};
+        // Literal category indexes: success=0, IOError=5. Do not derive the
+        // expected classification by calling the production classifier.
+        expected[success ? 0 : 5] = 1;
+        const DiskSlabStore::PutFollowerStats completed =
+            store.GetPutFollowerStats();
+        EXPECT_EQ(completed.attached, blocked.attached);
+        EXPECT_EQ(completed.completed[batch ? 1 : 0], expected);
+        EXPECT_EQ(completed.completed[batch ? 0 : 1],
+                  (dfkv::DiskWriteTerminalCounts{}));
+        // Repeated observation is neutral; no reset or drain-on-read.
+        EXPECT_EQ(store.GetPutFollowerStats().completed, completed.completed);
+      }
+    }
+  }
+}
+
+TEST_F(DiskSlabTest, BatchAllocationFailureDoesNotBecomeFollowerTerminal) {
+  DiskSlabStore::Options options = Opts(4096, 4096, 4096);
+  options.table_sync_ms = options.reclaim_interval_ms = 0;
+  DiskSlabStore store(options);
+  ASSERT_TRUE(store.Healthy());
+  ASSERT_EQ(store.Cache(K(99801), "pinned", 6), Status::kOk);
+  dfkv::ReadLease lease;
+  ASSERT_EQ(store.RangeDirectPrep(K(99801), 0, 0, 4096, &lease), Status::kOk);
+  char bytes[] = "new";
+  const std::vector<dfkv::DiskWriteResult> results =
+      store.CacheDirectBatchWithResults({{K(99802), bytes, 3, sizeof(bytes)}});
+  ASSERT_EQ(results.size(), 1U);
+  // Legacy allocation failure keeps its existing IOError contract.
+  EXPECT_EQ(results[0].status, Status::kIOError);
+  // This failed owner also passes through the batch's final WaitPut loop.
+  // It did not join another owner and must not be counted as a follower.
+  const DiskSlabStore::PutFollowerStats stats = store.GetPutFollowerStats();
+  EXPECT_EQ(stats.attached, (std::array<uint64_t, 2>{0, 0}));
+  EXPECT_EQ(stats.completed[0], (dfkv::DiskWriteTerminalCounts{}));
+  EXPECT_EQ(stats.completed[1], (dfkv::DiskWriteTerminalCounts{}));
+  EXPECT_TRUE(store.Healthy());
+  lease = dfkv::ReadLease{};
+}
+
+TEST_F(DiskSlabTest,
+       BatchDuplicatesCountEachAttachedRowOnceAndResetOnRecovery) {
+  DiskSlabStore::Options options = Opts(2 * 4096, 2 * 4096, 4096);
+  options.table_sync_ms = options.reclaim_interval_ms = 0;
+  {
+    DiskSlabStore store(options);
+    ASSERT_TRUE(store.Healthy());
+    char first[] = "first";
+    char other[] = "other";
+    const std::vector<dfkv::DiskWriteResult> results =
+        store.CacheDirectBatchWithResults(
+            {{K(99803), first, 5, sizeof(first)},
+             {K(99803), other, 5, sizeof(other)},
+             {K(99803), other, 5, sizeof(other)},
+             {K(99804), first, 5, sizeof(first)},
+             {K(99804), other, 5, sizeof(other)}});
+    ASSERT_EQ(results.size(), 5U);
+    for (const dfkv::DiskWriteResult& result : results) {
+      EXPECT_EQ(result.status, Status::kOk);
+    }
+    EXPECT_EQ(results[1].outcome, dfkv::DiskWriteOutcome::kKeptExisting);
+    EXPECT_EQ(results[2].outcome, dfkv::DiskWriteOutcome::kKeptExisting);
+    EXPECT_EQ(results[4].outcome, dfkv::DiskWriteOutcome::kKeptExisting);
+    const DiskSlabStore::PutFollowerStats stats = store.GetPutFollowerStats();
+    EXPECT_EQ(stats.attached, (std::array<uint64_t, 2>{0, 3}));
+    EXPECT_EQ(stats.completed[0], (dfkv::DiskWriteTerminalCounts{}));
+    EXPECT_EQ(stats.completed[1],
+              (dfkv::DiskWriteTerminalCounts{3, 0, 0, 0, 0, 0, 0, 0}));
+    ASSERT_EQ(store.Cache(K(99803), other, 5), Status::kOk);
+    ASSERT_EQ(store.CacheDirectBatch({{K(99804), other, 5, sizeof(other)}}),
+              (std::vector<Status>{Status::kOk}));
+    // Committed keep-first hits are not in-flight attachments.
+    EXPECT_EQ(store.GetPutFollowerStats().attached, stats.attached);
+    EXPECT_EQ(store.GetPutFollowerStats().completed, stats.completed);
+    std::string bytes;
+    ASSERT_EQ(store.Range(K(99803), 0, 0, &bytes), Status::kOk);
+    EXPECT_EQ(bytes, "first");
+  }
+  const DiskSlabStore reopened(options);
+  ASSERT_TRUE(reopened.Healthy());
+  EXPECT_EQ(reopened.Count(), 2U);
+  const DiskSlabStore::PutFollowerStats reset = reopened.GetPutFollowerStats();
+  EXPECT_EQ(reset.attached, (std::array<uint64_t, 2>{0, 0}));
+  EXPECT_EQ(reset.completed[0], (dfkv::DiskWriteTerminalCounts{}));
+  EXPECT_EQ(reset.completed[1], (dfkv::DiskWriteTerminalCounts{}));
 }

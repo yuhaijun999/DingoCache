@@ -241,6 +241,9 @@ class DiskCacheGroup {
   // Separate metrics-only snapshot; file/out-of-range views are empty.
   std::vector<SlabAllocator::LifetimeQueueStat> DiskLifetimeQueueStats(
       size_t i) const;
+  // Attached Store PUT followers, independent of foreground/background origin.
+  // File/out-of-range observations are zero; owners reset on reconstruction.
+  DiskSlabStore::PutFollowerStats DiskPutFollowerStats(size_t i) const;
   // Cumulative band checks; disabled/file/out-of-range views are empty.
   std::vector<SlabAllocator::LifetimeBandScanStat> DiskLifetimeBandScanStats(
       size_t i) const;

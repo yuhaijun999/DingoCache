@@ -1367,6 +1367,12 @@ DiskCacheGroup::DiskLifetimeQueueStats(size_t i) const {
   return slabs_[i]->LifetimeQueueStats();
 }
 
+DiskSlabStore::PutFollowerStats DiskCacheGroup::DiskPutFollowerStats(
+    size_t i) const {
+  if (i >= slabs_.size()) return {};
+  return slabs_[i]->GetPutFollowerStats();
+}
+
 std::vector<SlabAllocator::LifetimeBandScanStat>
 DiskCacheGroup::DiskLifetimeBandScanStats(size_t i) const {
   if (i >= slabs_.size()) return {};

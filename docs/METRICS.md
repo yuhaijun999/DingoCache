@@ -1782,3 +1782,50 @@ constitute full memory/RSS/recovery-peak acceptance. No performance improvement,
 bounded wall-clock scan latency or full fairness acceptance is implied.
 Existing alert/dashboard consumers use unchanged metric names and semantics;
 these additive diagnostics do not introduce an unregistered alert threshold.
+
+### RAM write settlements and Store PUT followers
+
+These bounded counters expose three **different cohorts**, not three terms of
+one logical PUT total. They add no key/request/slot-size labels. Existing
+node/group identity labels are escaped normally; Store per-disk samples also
+carry disk/disk_index. All counters reset when their owning RAM tier or Store
+is reconstructed, including clean recovery. Snapshot loads are relaxed, so a
+concurrent scrape is not a transaction across attachment/completion fields.
+
+| Metric | Labels | Exact event |
+|---|---|---|
+| `dfkv_ram_flush_terminal_total` | `mode`, `settlement`, `result` | One dispatched RAM flush item's final settlement, after its existing retries. `mode=single|batch` names the installed callback path, not batch size: a one-item batch remains batch. |
+| `dfkv_ram_put_wait_terminal_total` | `api`, `role`, `result` | One actual public RAM waiting API return. `api=committed|write_back|direct_batch`; `role=owner|duplicate` follows admission. A duplicate can join an already completed owner, not only an in-flight write. |
+| `dfkv_slab_put_follower_attached_total` / `dfkv_slab_disk_put_follower_attached_total` | `mode` | One actual existing Store PutFlight attachment, scalar or batch. Committed keep-first hits and newly created owners are excluded. |
+| `dfkv_slab_put_follower_completed_total` / `dfkv_slab_disk_put_follower_completed_total` | `mode`, `result` | One attached Store follower's final WaitPut return. Allocation-failed batch owners also wait internally but are not followers. Aggregate samples sum the same per-disk snapshots used for disk samples. |
+
+`result` is an exclusive partition: `ok`, ordinary `cache_full`, exact
+CacheFull `scan_budget`, `identity_exhausted`, `clock_exhausted`, `io_error`,
+`invalid`, or `other`. Reasons refine CacheFull only: IOError carrying a stale
+budget/clock/identity reason still counts as io_error. Success does not promise
+that the same resident still exists, or that a duplicate wrote its own bytes.
+
+The RAM worker runs in the **background even when a foreground caller waits
+for disk ACK**. Its `settlement=completed` includes success or final failure;
+`cancelled` means Remove was observed for an already dispatched item (its
+waiter contract is IOError, regardless of callback success). `retained` means
+an already-RAM-ACKed budget/clock failure completed waiters but kept the dirty
+flush-pinned value. Retained is neither durable completion nor data loss.
+Removal before dispatch creates no worker settlement; retries, empty dequeues
+and later removal of a retained item add no additional worker settlement.
+
+The foreground waiter family excludes immediate persisted hits, capacity
+bypass, pre-admission rejection, asynchronous RAM ACK returns, boolean Put,
+internal Remove waits, read promotions and completion helper calls. A retained
+background owner and each foreground duplicate return are counted separately.
+These families therefore cannot be added, divided blindly, or used as a full
+Node/all-transport PUT denominator. Writearound/no-RAM/gate rejects and direct
+fallbacks outside these named cohorts remain outside that denominator.
+
+RAM families are omitted when RAM is disabled. Store families are emitted for
+slab (legacy as well as lifetime) and omitted for file. Every bounded row is
+emitted, including zero rows; Store attachments/completions retain history
+when residents disappear. Existing flush attempt/batch/byte/failure/latency
+metrics keep their original meaning and alerts/queries are unchanged. These
+new counters do not replace the post-ACK data-loss alert, classify retries as
+corruption, or alter admission, retry count, persistence, ACK or policy defaults.

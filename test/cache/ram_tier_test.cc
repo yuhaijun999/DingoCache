@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -77,6 +78,12 @@ class RamTierTestPeer {
   static Status Wait(const Completion& completion) {
     return RamTier::WaitPut(completion);
   }
+  static Completion IndexedCompletion(RamTier& tier, const BlockKey& key) {
+    RamTier::Shard& shard = tier.ShardFor(key);
+    const std::lock_guard<std::mutex> lock(shard.mu);
+    return shard.index.count(key) == 0 ? Completion{}
+                                       : shard.index.at(key).completion;
+  }
   static bool FlushPinned(RamTier& tier, const BlockKey& key) {
     RamTier::Shard& shard = tier.ShardFor(key);
     const std::lock_guard<std::mutex> lock(shard.mu);
@@ -136,6 +143,28 @@ bool WaitFor(F pred) {
     std::this_thread::sleep_for(1ms);
   }
   return pred();
+}
+
+void ExpectFlushTerminals(const RamTier& tier, bool batch,
+                          RamTier::FlushSettlement settlement,
+                          const dfkv::DiskWriteTerminalCounts& expected) {
+  const std::array<RamTier::FlushTerminalStat, 6> stats =
+      tier.FlushTerminalStats();
+  for (const RamTier::FlushTerminalStat& stat : stats) {
+    EXPECT_EQ(stat.results, stat.batch == batch && stat.settlement == settlement
+                                ? expected
+                                : dfkv::DiskWriteTerminalCounts{});
+  }
+}
+
+uint64_t PutWaitTerminals(const RamTier& tier) {
+  uint64_t result = 0;
+  for (const RamTier::PutWaitTerminalStat& stat : tier.PutWaitTerminalStats()) {
+    for (const uint64_t count : stat.results) {
+      result += count;
+    }
+  }
+  return result;
 }
 
 RamTier::Options Opts(uint64_t bytes, uint32_t gran = 4096) {
@@ -2027,6 +2056,11 @@ TEST(RamTier, TypedBatchKeepsRowsAndDefaultsMissingResultsToIoError) {
   EXPECT_EQ(std::string(hit.ptr, hit.len), "value");
   EXPECT_EQ(scalar_calls.load(), 0U);
   EXPECT_EQ(sizes, (std::vector<size_t>{1, 3}));
+  // Four items settle once; a one-item callback is still batch mode.
+  ExpectFlushTerminals(tier, true, RamTier::FlushSettlement::kCompleted,
+                       {2, 0, 0, 1, 0, 1, 0, 0});
+  EXPECT_EQ(PutWaitTerminals(tier),
+            0U);  // Peer waits are not public API waits.
 }
 
 TEST(RamTier, TypedExhaustionCompletesAttachedFollowersWithoutRetry) {
@@ -2417,6 +2451,10 @@ TEST(RamTier, ScanBudgetMixedBatchKeepsResultsAndRealIoIsolation) {
   EXPECT_TRUE(tier.Contains(K(80315)));
   EXPECT_EQ(tier.FlushDropped(), 2U);
   EXPECT_EQ(tier.DirtyObjects(), 0U);
+  // The budget and I/O items each attempted three times, but settle once.
+  ExpectFlushTerminals(tier, true, RamTier::FlushSettlement::kCompleted,
+                       {2, 0, 1, 0, 0, 1, 0, 0});
+  EXPECT_EQ(PutWaitTerminals(tier), 0U);
 }
 
 TEST(RamTier, TypedRetryPublishesFinalSuccessAndIgnoresExtraBatchRows) {
@@ -2473,4 +2511,354 @@ TEST(RamTier, FinalShutdownRejectsUnhealthyEvenWithoutDirtyObjects) {
   EXPECT_FALSE(tier.healthy());
   EXPECT_FALSE(RamTierTestPeer::Shutdown(tier));
   EXPECT_FALSE(RamTierTestPeer::Shutdown(tier));
+}
+
+TEST(RamTier, FlushTerminalCategoriesExcludeAttemptsAndPreserveFinalReasons) {
+  struct Case {
+    dfkv::DiskWriteResult result;
+    dfkv::DiskWriteTerminal terminal;
+    unsigned attempts;
+  };
+  const std::array<Case, 9> cases = {{
+      {{Status::kOk}, dfkv::DiskWriteTerminal::kOk, 1},
+      {{Status::kCacheFull}, dfkv::DiskWriteTerminal::kCacheFull, 3},
+      {{Status::kCacheFull, dfkv::DiskWriteReason::kScanBudgetExhausted},
+       dfkv::DiskWriteTerminal::kScanBudget,
+       3},
+      {{Status::kCacheFull, dfkv::DiskWriteReason::kIdentityExhausted},
+       dfkv::DiskWriteTerminal::kIdentityExhausted,
+       1},
+      {{Status::kCacheFull, dfkv::DiskWriteReason::kLifetimeClockExhausted},
+       dfkv::DiskWriteTerminal::kClockExhausted,
+       1},
+      {{Status::kIOError}, dfkv::DiskWriteTerminal::kIOError, 3},
+      {{Status::kInvalid}, dfkv::DiskWriteTerminal::kInvalid, 3},
+      {{Status::kNotFound}, dfkv::DiskWriteTerminal::kOther, 3},
+      {{Status::kIOError, dfkv::DiskWriteReason::kScanBudgetExhausted},
+       dfkv::DiskWriteTerminal::kIOError,
+       3},
+  }};
+  for (const bool batch : {false, true}) {
+    for (const Case& test : cases) {
+      SCOPED_TRACE(batch);
+      SCOPED_TRACE(static_cast<int>(test.terminal));
+      EXPECT_EQ(dfkv::ClassifyDiskWriteTerminal(test.result.status,
+                                                test.result.reason),
+                test.terminal);
+      RamTier::Options options = Opts(64 * 4096);
+      options.reclaim_interval_ms = 0;
+      options.flush_retries = 3;
+      std::atomic<unsigned> attempts{0};
+      RamTier tier(options, nullptr);
+      ExpectFlushTerminals(tier, batch, RamTier::FlushSettlement::kCompleted,
+                           {});
+      EXPECT_EQ(PutWaitTerminals(tier), 0U);
+      if (batch) {
+        tier.set_flush_results(
+            {}, [&](const std::vector<RamTier::FlushItem>& items) {
+              EXPECT_EQ(items.size(), 1U);
+              ++attempts;
+              return std::vector<dfkv::DiskWriteResult>{test.result};
+            });
+      } else {
+        tier.set_flush_results([&](const BlockKey&, char*, size_t, size_t) {
+          ++attempts;
+          return test.result;
+        });
+      }
+      const RamTier::PutResult result = tier.PutCommitted(K(80500), "value", 5);
+      EXPECT_EQ(result.status, test.result.status);
+      EXPECT_EQ(result.reason, test.result.reason);
+      EXPECT_EQ(attempts.load(), test.attempts);
+      dfkv::DiskWriteTerminalCounts expected{};
+      expected[static_cast<size_t>(test.terminal)] = 1;
+      ExpectFlushTerminals(tier, batch, RamTier::FlushSettlement::kCompleted,
+                           expected);
+      const std::array<RamTier::PutWaitTerminalStat, 6> waits =
+          tier.PutWaitTerminalStats();
+      EXPECT_EQ(waits[0].api, RamTier::PutWaitApi::kCommitted);
+      EXPECT_FALSE(waits[0].duplicate);
+      EXPECT_EQ(waits[0].results, expected);
+      EXPECT_EQ(PutWaitTerminals(tier), 1U);
+      // Getters and internal shutdown/drain checks cannot add observations.
+      EXPECT_TRUE(tier.WaitForDrain(std::chrono::milliseconds(0)));
+      EXPECT_EQ(PutWaitTerminals(tier), 1U);
+    }
+  }
+}
+
+TEST(RamTier, BoolFlushTerminalsCountOnlyFinalResultAndCallbackMode) {
+  for (const bool batch : {false, true}) {
+    for (const bool success : {false, true}) {
+      SCOPED_TRACE(batch);
+      SCOPED_TRACE(success);
+      RamTier::Options options = Opts(64 * 4096);
+      options.reclaim_interval_ms = 0;
+      options.flush_retries = 3;
+      std::atomic<unsigned> attempts{0};
+      RamTier tier(options, [&](const BlockKey&, char*, size_t, size_t) {
+        const unsigned attempt = ++attempts;
+        return success && attempt == 3;
+      });
+      if (batch) {
+        tier.set_flush_batch([&](const std::vector<RamTier::FlushItem>& items) {
+          EXPECT_EQ(items.size(), 1U);
+          const unsigned attempt = ++attempts;
+          return std::vector<bool>{success && attempt == 3};
+        });
+      }
+      EXPECT_EQ(tier.PutCommitted(K(80501), "value", 5).status,
+                success ? Status::kOk : Status::kIOError);
+      EXPECT_EQ(attempts.load(), 3U);
+      ExpectFlushTerminals(
+          tier, batch, RamTier::FlushSettlement::kCompleted,
+          success ? dfkv::DiskWriteTerminalCounts{1, 0, 0, 0, 0, 0, 0, 0}
+                  : dfkv::DiskWriteTerminalCounts{0, 0, 0, 0, 0, 1, 0, 0});
+      EXPECT_EQ(PutWaitTerminals(tier), 1U);
+    }
+  }
+}
+
+TEST(RamTier, PutWaitTerminalsSeparateOwnersAndPublicDuplicateApis) {
+  for (const bool budget_failure : {false, true}) {
+    SCOPED_TRACE(budget_failure);
+    FlushSink gate;
+    gate.close();
+    RamTier::Options options = Opts(64 * 4096);
+    options.reclaim_interval_ms = 0;
+    options.flush_retries = 3;
+    RamTier tier(options, nullptr);
+    const OpenFlushOnExit release{gate};
+    tier.set_flush_results([&](const BlockKey& key, char* data, size_t len,
+                               size_t cap) {
+      gate.fn()(key, data, len, cap);
+      return budget_failure ? dfkv::DiskWriteResult{Status::kCacheFull,
+                                                    dfkv::DiskWriteReason::
+                                                        kScanBudgetExhausted}
+                            : dfkv::DiskWriteResult{Status::kOk};
+    });
+    std::array<Status, 4> results{Status::kInvalid, Status::kInvalid,
+                                  Status::kInvalid, Status::kInvalid};
+    std::thread owner(
+        [&] { results[0] = tier.PutCommitted(K(80502), "owner", 5).status; });
+    const bool entered = gate.await_calls(1);
+    const RamTierTestPeer::Completion completion =
+        RamTierTestPeer::IndexedCompletion(tier, K(80502));
+    std::thread committed(
+        [&] { results[1] = tier.PutCommitted(K(80502), "other", 5).status; });
+    std::thread write_back(
+        [&] { results[2] = tier.PutWriteBack(K(80502), "other", 5).status; });
+    std::thread direct([&] {
+      results[3] = tier.PrepareDirectPut(K(80502), "other", 5).status;
+    });
+    // Entry + owner + this witness + three actual public API callers.
+    // Positive ownership evidence, not a sleep or a "thread started" promise.
+    const bool attached =
+        WaitFor([&] { return completion && completion.use_count() >= 6; });
+    EXPECT_EQ(PutWaitTerminals(tier), 0U);
+    ExpectFlushTerminals(tier, false, RamTier::FlushSettlement::kCompleted, {});
+    std::atomic<bool> stop_observing{false};
+    std::promise<void> observing;
+    const std::future<void> observed = observing.get_future();
+    std::thread observer([&] {
+      std::array<RamTier::FlushTerminalStat, 6> previous_flush{};
+      std::array<RamTier::PutWaitTerminalStat, 6> previous_wait{};
+      bool first = true;
+      while (!stop_observing.load(std::memory_order_relaxed)) {
+        const std::array<RamTier::FlushTerminalStat, 6> flush =
+            tier.FlushTerminalStats();
+        const std::array<RamTier::PutWaitTerminalStat, 6> wait =
+            tier.PutWaitTerminalStats();
+        for (size_t row = 0; row < flush.size(); ++row) {
+          for (size_t category = 0; category < dfkv::kDiskWriteTerminalCount;
+               ++category) {
+            EXPECT_GE(flush[row].results[category],
+                      previous_flush[row].results[category]);
+            EXPECT_GE(wait[row].results[category],
+                      previous_wait[row].results[category]);
+          }
+        }
+        previous_flush = flush;
+        previous_wait = wait;
+        if (first) {
+          observing.set_value();
+          first = false;
+        }
+        std::this_thread::yield();
+      }
+    });
+    const bool sampled = observed.wait_for(2s) == std::future_status::ready;
+    gate.open();
+    owner.join();
+    committed.join();
+    write_back.join();
+    direct.join();
+    stop_observing.store(true, std::memory_order_relaxed);
+    observer.join();
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(attached);
+    ASSERT_TRUE(sampled);
+    const Status expected = budget_failure ? Status::kCacheFull : Status::kOk;
+    for (const Status result : results) {
+      EXPECT_EQ(result, expected);
+    }
+    const dfkv::DiskWriteTerminalCounts counts =
+        budget_failure ? dfkv::DiskWriteTerminalCounts{0, 0, 1, 0, 0, 0, 0, 0}
+                       : dfkv::DiskWriteTerminalCounts{1, 0, 0, 0, 0, 0, 0, 0};
+    const std::array<RamTier::PutWaitTerminalStat, 6> waits =
+        tier.PutWaitTerminalStats();
+    EXPECT_EQ(waits[0].results, counts);  // committed owner
+    EXPECT_EQ(waits[1].results, counts);  // committed duplicate
+    EXPECT_EQ(waits[2].results, dfkv::DiskWriteTerminalCounts{});
+    EXPECT_EQ(waits[3].results, counts);  // write-back duplicate
+    EXPECT_EQ(waits[4].results, dfkv::DiskWriteTerminalCounts{});
+    EXPECT_EQ(waits[5].results, counts);  // direct-batch duplicate
+    EXPECT_EQ(PutWaitTerminals(tier), 4U);
+    ExpectFlushTerminals(tier, false, RamTier::FlushSettlement::kCompleted,
+                         counts);
+    EXPECT_EQ(gate.calls, budget_failure ? 3 : 1);
+  }
+}
+
+TEST(RamTier, FlushTerminalsDistinguishRetainedRamAckFromCompletion) {
+  for (const bool batch : {false, true}) {
+    for (const dfkv::DiskWriteReason reason :
+         {dfkv::DiskWriteReason::kScanBudgetExhausted,
+          dfkv::DiskWriteReason::kLifetimeClockExhausted}) {
+      SCOPED_TRACE(batch);
+      SCOPED_TRACE(static_cast<int>(reason));
+      FlushSink gate;
+      gate.close();
+      RamTier::Options options = Opts(64 * 4096);
+      options.reclaim_interval_ms = 0;
+      RamTier tier(options, nullptr);
+      const OpenFlushOnExit release{gate};
+      const auto flush = [&](const BlockKey& key, char* data, size_t len,
+                             size_t cap) {
+        gate.fn()(key, data, len, cap);
+        return dfkv::DiskWriteResult{Status::kCacheFull, reason};
+      };
+      if (batch) {
+        tier.set_flush_results(
+            {}, [&](const std::vector<RamTier::FlushItem>& items) {
+              EXPECT_EQ(items.size(), 1U);
+              return std::vector<dfkv::DiskWriteResult>{flush(
+                  items[0].key, items[0].data, items[0].len, items[0].cap)};
+            });
+      } else {
+        tier.set_flush_results(flush);
+      }
+      ASSERT_EQ(tier.PutWriteBack(K(80503), "owner", 5).status, Status::kOk);
+      ASSERT_TRUE(gate.await_calls(1));
+      gate.open();
+      const RamTier::PutResult duplicate =
+          tier.PutCommitted(K(80503), "other", 5);
+      EXPECT_EQ(duplicate.status, Status::kCacheFull);
+      dfkv::DiskWriteTerminalCounts expected{};
+      expected[reason == dfkv::DiskWriteReason::kScanBudgetExhausted ? 2 : 4] =
+          1;
+      ExpectFlushTerminals(tier, batch, RamTier::FlushSettlement::kRetained,
+                           expected);
+      EXPECT_EQ(PutWaitTerminals(tier), 1U);  // Initial RAM ACK did not wait.
+      EXPECT_TRUE(tier.healthy());
+      EXPECT_EQ(tier.PostAckFlushFailures(), 0U);
+      EXPECT_EQ(tier.DirtyObjects(), 1U);
+      EXPECT_FALSE(tier.WaitForDrain(std::chrono::milliseconds(0)));
+      EXPECT_TRUE(tier.Remove(K(80503)));
+      EXPECT_EQ(tier.DirtyObjects(), 0U);
+      ExpectFlushTerminals(tier, batch, RamTier::FlushSettlement::kRetained,
+                           expected);
+      EXPECT_EQ(PutWaitTerminals(tier),
+                1U);  // Remove's internal wait excluded.
+    }
+  }
+}
+
+TEST(RamTier, FlushTerminalsSeparateDispatchedAndQueuedCancellation) {
+  for (const bool batch : {false, true}) {
+    SCOPED_TRACE(batch);
+    FlushSink gate;
+    gate.close();
+    RamTier::Options options = Opts(64 * 4096);
+    options.reclaim_interval_ms = 0;
+    RamTier tier(options, nullptr);
+    const OpenFlushOnExit release{gate};
+    const auto flush = [&](const BlockKey& key, char* data, size_t len,
+                           size_t cap) {
+      gate.fn()(key, data, len, cap);
+      return dfkv::DiskWriteResult{Status::kOk};
+    };
+    if (batch) {
+      tier.set_flush_results(
+          {}, [&](const std::vector<RamTier::FlushItem>& items) {
+            EXPECT_EQ(items.size(), 1U);
+            return std::vector<dfkv::DiskWriteResult>{
+                flush(items[0].key, items[0].data, items[0].len, items[0].cap)};
+          });
+    } else {
+      tier.set_flush_results(flush);
+    }
+    Status owner_result = Status::kInvalid;
+    std::thread owner(
+        [&] { owner_result = tier.PutCommitted(K(80504), "owner", 5).status; });
+    const bool entered = gate.await_calls(1);
+    RamTierTestPeer::Completion queued;
+    const RamTierTestPeer::Admission queued_admission =
+        RamTierTestPeer::Admit(tier, K(80505), "queued", &queued);
+    const bool queued_removed = tier.Remove(K(80505));
+    bool dispatched_removed = false;
+    std::thread remover([&] { dispatched_removed = tier.Remove(K(80504)); });
+    const bool hidden = WaitFor([&] { return !tier.Contains(K(80504)); });
+    gate.open();
+    owner.join();
+    remover.join();
+    ASSERT_TRUE(entered);
+    ASSERT_EQ(queued_admission, RamTierTestPeer::Admission::kAccepted);
+    ASSERT_TRUE(queued_removed);
+    ASSERT_TRUE(hidden);
+    ASSERT_TRUE(dispatched_removed);
+    EXPECT_EQ(owner_result, Status::kIOError);
+    EXPECT_EQ(RamTierTestPeer::Result(queued).status, Status::kIOError);
+    ExpectFlushTerminals(tier, batch, RamTier::FlushSettlement::kCancelled,
+                         {0, 0, 0, 0, 0, 1, 0, 0});
+    EXPECT_EQ(PutWaitTerminals(tier), 1U);
+    EXPECT_EQ(gate.calls, 1);
+    EXPECT_TRUE(tier.healthy());
+  }
+}
+
+TEST(RamTier, PutWaitTerminalsExcludeAdmissionAndAsyncAckAndResetWithOwner) {
+  RamTier::Options options = Opts(64 * 4096);
+  options.reclaim_interval_ms = 0;
+  options.is_persisted = [](const BlockKey& key) { return key == K(80506); };
+  {
+    RamTier tier(options,
+                 [](const BlockKey&, char*, size_t, size_t) { return true; });
+    EXPECT_EQ(tier.PutCommitted(K(80506), "disk", 4).status, Status::kOk);
+    EXPECT_EQ(tier.PutWriteBack(K(80506), "disk", 4).status, Status::kOk);
+    EXPECT_EQ(tier.PutCommitted(K(80507), nullptr, 0).disposition,
+              RamTier::PutDisposition::kBypass);
+    EXPECT_EQ(tier.PrepareDirectPut(K(80507), "new", 3).disposition,
+              RamTier::PutDisposition::kBypass);
+    EXPECT_EQ(PutWaitTerminals(tier), 0U);
+    EXPECT_EQ(tier.PutWriteBack(K(80508), "async", 5).status, Status::kOk);
+    EXPECT_TRUE(tier.WaitForDrain(std::chrono::seconds(2)));
+    EXPECT_EQ(PutWaitTerminals(tier), 0U);
+    ExpectFlushTerminals(tier, false, RamTier::FlushSettlement::kCompleted,
+                         {1, 0, 0, 0, 0, 0, 0, 0});
+  }
+  options.ack_high_watermark_pct = 0;
+  RamTier reopened(options,
+                   [](const BlockKey&, char*, size_t, size_t) { return true; });
+  ExpectFlushTerminals(reopened, false, RamTier::FlushSettlement::kCompleted,
+                       {});
+  EXPECT_EQ(PutWaitTerminals(reopened), 0U);
+  EXPECT_EQ(reopened.PutWriteBack(K(80509), "sync", 4).status, Status::kOk);
+  const std::array<RamTier::PutWaitTerminalStat, 6> waits =
+      reopened.PutWaitTerminalStats();
+  EXPECT_EQ(waits[2].api, RamTier::PutWaitApi::kWriteBack);
+  EXPECT_FALSE(waits[2].duplicate);
+  EXPECT_EQ(waits[2].results,
+            (dfkv::DiskWriteTerminalCounts{1, 0, 0, 0, 0, 0, 0, 0}));
+  EXPECT_EQ(PutWaitTerminals(reopened), 1U);
 }

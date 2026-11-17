@@ -15,6 +15,7 @@
 #ifndef DFKV_DISK_SLAB_STORE_H_
 #define DFKV_DISK_SLAB_STORE_H_
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -494,6 +495,15 @@ class DiskSlabStore : public StoreEngine {
       PreparedRead::Source transport_source =
           PreparedRead::Source::kUnclassified,
       const DiskLifetimeReadCompletion& completion = {});
+  // True PutFlight joins, not committed keep-first hits. Mode 0 is scalar
+  // Cache/CacheDirect; mode 1 is CacheDirectBatch, even with only one item.
+  // Relaxed runtime observations are not a transactional in-flight snapshot.
+  struct PutFollowerStats {
+    std::array<uint64_t, 2> attached{};
+    std::array<DiskWriteTerminalCounts, 2> completed{};
+  };
+  PutFollowerStats GetPutFollowerStats() const;
+
   Stats GetStats() const;
   std::vector<SlabAllocator::ClassStat> ClassStats() const;
   // Metrics-only retained queue populations; not scores or logical read
@@ -707,6 +717,11 @@ class DiskSlabStore : public StoreEngine {
   // A reserved-but-uncommitted key has exactly one leader. Scalar and batch
   // duplicates join this flight and observe its real commit result.
   std::unordered_map<std::string, std::shared_ptr<PutFlight>> put_flights_;
+  // A follower increments attachment under mu_, completion after WaitPut.
+  // Observation never takes a flight lock or changes its lifetime.
+  std::array<std::atomic<uint64_t>, 2> put_followers_attached_{};
+  std::array<std::array<std::atomic<uint64_t>, kDiskWriteTerminalCount>, 2>
+      put_followers_completed_{};
   // Guards the in-memory maps and the allocate/lookup+pin step ONLY -- never
   // held across payload I/O (a pin protects the slot from eviction in the
   // unlocked window, inflight_/deferred_remove_ protect it from Remove;

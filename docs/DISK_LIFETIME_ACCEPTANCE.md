@@ -35,7 +35,7 @@ DOC6、AB7、FLIP7 不能由本文代为完成，生产部署另需授权。
 | O04 类内片/单请求累计/后台整轮/水位/全 E donor 扫描 | allocator 预算、Store PUT owner/后台循环；`slab_lifetime_background_test.cc` 的 `EntireAllocatorLockHoldVisitsAtMost1024`、`FourTimesTickCapPersistsAcrossAllocatorCalls` | 已有预算测试；扫描上限不是 I/O 墙钟上限，锁成本和持续压力分布尚未验收。 |
 | O05 水位跨档公平、pin、双索引/游标 | `slab_lifetime_watermark_test.cc` 的 `LongPinnedBandDoesNotStarveAnotherBand`、`WinnerIsReplenishedBeforeNextCrossBandChoice`、`HeatMigrationRepairsBothIndexesBetweenTicks`，类内队列测试 | O5be补充path×band visits/candidates/pin_skips公开账，按现有付费检查点计数，跨class聚合；新 `slab_lifetime_band_scan_test.cc` 和真实双盘metrics用例验证。仍不证明逐class公平或持续压力进度分布；最多256件不是每tick必达量。 |
 | O06 真实 W/R/O1/O2/3+ 与 R 到期滞后 | allocator read-class ledger、Store 观察时排空；`slab_lifetime_read_class_test.cc`、`disk_lifetime_read_class_test.cc`；METRICS 的 Logical read-class observations | 已有功能；R 逻辑截止含等号，桶宽导致有界观测滞后，不物理迁评分链。恢复虚拟读不算实际读，饱和分类不能证明无重复应用。 |
-| O07 budget→前台 CacheFull / 同key完成、fallback/零进展 | typed Cache/flush 结果，Store PutFlight，RAM retry；`ram_tier_test.cc`、`ram_tier_wiring_test.cc`、`disk_cache_group_test.cc` | **部分实现/确定缺口**：typed结果及终局回归已有；公开flush指标主要是batches/objects/bytes/failures/latency，未覆盖前后台×single/batch×最终CacheFull/IOError完整分区及follower完成账。内部结果不是公开终局观测；先定界再补，正式分母/阈值仍未登记。 |
+| O07 budget→前台 CacheFull / 同key完成、fallback/零进展 | typed Cache/flush 结果，Store PutFlight，RAM retry；`ram_tier_test.cc`、`ram_tier_wiring_test.cc`、`disk_cache_group_test.cc` | **O5bf命名观测接缝**：后台RAM已dispatch item的single/batch终局（completed/cancelled/retained）、前台三个RAM等待API的owner/duplicate返回、Store真实flight follower attached/completed公开账分别分区，保留CacheFull细因与IOError。三者分母不可相加；不是完整Node PUT或所有传输分母，正式分母/阈值仍未登记。 |
 | O08 跨class整条、受保护损失、归还完整extent | donor/bucket/reclaim 统计；`slab_lifetime_donor_test.cc`、`slab_lifetime_background_test.cc`；精确选择最多8条/8192 resident | 已有有界选择/失败不释放测试；全 E 粗扫、选中后整条清表与sync成本仍需分别测量，不能藏入8192预算。 |
 | O09 元数据I/O/回收耗时/锁等待与持有 | Store table I/O、allocator 路径统计；Node notification wait/body/held 与 sampled completion；METRICS 对应小节 | **部分实现/需定界**：已有record_writes/table_syncs/bind_wipes/metadata_io_errors及部分路径耗时，不是所有互斥路径完整syscall/byte/lock账，也不代表成本验收。采样/嵌套口径不能累加为总耗时；GET/PUT p99、全 E/整条sync锁成本仍 open。 |
 | O10 RAM前台/后台、单/批预算与真实IO、ACK/最终丢弃 | `src/cache/ram_tier.cc` typed flush；Node `dfkv_ram_post_ack_flush_failures_total`；`RamTier.TypedFlushFailureReasonsControlRetryAndHealth`、`WriteBackFlushFailureIsPostAckAndUnhealthy` | 已有真实 publisher/健康回归；预算失败不是IO故障、未ACK失败不是ACK后丢失。新模式 RAM write-back 必须显式disk ACK，告警不能替代闸门。 |
@@ -112,7 +112,7 @@ DOC6、AB7、FLIP7 不能由本文代为完成，生产部署另需授权。
    - **O5be：逐评分档检查机会/候选/跳pin账（本包实现）。** 复用现有M+1档与有界扫描，
      不创建另一套链；以长pin前缀和tiny budget正向握手证明轮转，公开账与总量一致。
      这是功能观测缺口，不是要求本轮先跑性能。类内/水位字段作用域须在实施前明确。
-   - **随后：typed flush与follower终局公开账。** 区分前后台、single/batch、CacheFull/IOError，
+   - **O5bf：typed flush与follower终局公开账（本包实现）。** 区分前后台、single/batch、CacheFull/IOError，
      只在真实终局处计数，重试/提交不算完成，混批与同key等待者各自守恒。
      已有typed语义不重写，避免将观测修复扩大成写回算法重构。
    - **再处理：PULL Serve 独立请求终局账。** 先列同步/异步完成、队列取消、gate拒绝、MR失败、
@@ -158,4 +158,4 @@ git diff --check
 Store/Group只转发快照，Node同一per-disk样本导出并聚合。不改变淘汰选择/预算/默认。
 O5bd“本轮纯文档/无新C++测试”等仅描述此前清单包；O5be新增真实单测与构建证据
 单独保存在 `.omx/evidence/o5be-band-scans/`，未完成验证前不宣称通过。
-O07 flush/follower与O12 PULL终局账仍open；后续优先flush/follower，硬件继续后置。
+O07命名flush/follower账由O5bf补充，完整Node分母不在该范围；O12 PULL终局账仍open，硬件继续后置。
