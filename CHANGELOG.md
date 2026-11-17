@@ -9,7 +9,8 @@
   for default-BOOST-window diagnostics. Add a fixed paced hot/cold retention
   scenario with real continuity gates and per-step evidence for repeated comparisons.
   Allow explicit lifetime-only P presets for isolated window screening; keep
-  production defaults and scoring unchanged.
+  production defaults and scoring unchanged. Add delayed first-reuse cohorts
+  with filler-only warmup, actual write-to-probe ages and complete read denominators.
 
 - Enforce RDMA connection idle deadlines while pending receives or reply SENDs
   require short CQ waits. Preserve disabled idle reclamation and disk-read drain

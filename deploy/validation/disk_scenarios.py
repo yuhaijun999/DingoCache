@@ -5,7 +5,8 @@ Run each case with a fresh --output directory. write/verify share a deterministi
 initial dataset for clean-restart checks. pressure permits eviction misses only
 AFTER all writes; quick-pressure also probes hot keys during cold writes, after
 a strict warmup. sustained-pressure adds paced interleaving without catch-up or
-miss refill. These are not persistence, performance, or transport-backend proof.
+miss refill; delayed first reuse warms only the non-cohort filler. These are not
+persistence, performance, or transport-backend proof.
 Requires the repository's dfkv_common on PYTHONPATH (no third-party dependencies).
 """
 
@@ -175,6 +176,8 @@ def parse_args(argv=None):
     parser.add_argument("--pressure-delay-sec", type=int, default=0,
                         help="quick-pressure: real wait after warmup (0..300 seconds)")
     parser.add_argument("--metrics-url", help="quick-pressure: optional phase metrics endpoint")
+    parser.add_argument("--first-reuse-sec", type=int, choices=(0, 45, 90, 185), default=0,
+                        help="sustained-pressure: defer the cohort first GET from pressure origin")
     args = parser.parse_args(argv)
     if not 0 <= args.seed < 2**64:
         parser.error("seed must fit uint64")
@@ -194,6 +197,8 @@ def parse_args(argv=None):
         parser.error("sustained-pressure requires fixed count and zero pressure delay")
     if (args.pressure_delay_sec or args.metrics_url) and args.scenario not in ("quick-pressure", "sustained-pressure"):
         parser.error("delay and phase metrics require quick-pressure")
+    if args.first_reuse_sec and args.scenario != "sustained-pressure":
+        parser.error("first-reuse-sec requires sustained-pressure")
     if args.readers and args.scenario != "roundtrip":
         parser.error("readers require roundtrip")
     return args
@@ -202,7 +207,8 @@ def parse_args(argv=None):
 def record_phase(args, result, name, started):
     """Capture phase counters before moving on; HTTP metrics never heat keys."""
     row = {"name": name, "elapsed_sec": time.monotonic() - started,
-           "hot_hits": result["hot_hits"], "hot_misses": result["hot_misses"]}
+           "hot_hits": result["hot_hits"], "hot_misses": result["hot_misses"],
+           "filler_warmup_reads": result["filler_warmup_reads"]}
     if args.metrics_url:
         with urllib.request.urlopen(args.metrics_url, timeout=3) as response:
             (args.output / ("phase-" + name + ".prom")).write_bytes(response.read())
@@ -229,10 +235,14 @@ def sustained_writes(args, clients, dataset, hot_reads, result, started):
             start = QUICK_PREFILL + step * BATCH_SIZE
             for client, namespace in zip(clients, NAMESPACES):
                 client.put(*dataset(namespace, start, start + BATCH_SIZE))
-            hot_reads(True)
+            probe_at = time.monotonic() - origin
+            probe_started = probe_at if probe_at >= args.first_reuse_sec else None
+            if probe_started is not None:
+                hot_reads(True)
             row = {"step": step, "start_sec": step_start - origin,
                    "end_sec": time.monotonic() - origin,
                    "cold_written": len(NAMESPACES) * BATCH_SIZE,
+                   "hot_probe_started_sec": probe_started,
                    "hot_hits": result["hot_hits"] - before_hits,
                    "hot_misses": result["hot_misses"] - before_misses}
             result["steps"].append(row)
@@ -250,20 +260,42 @@ def quick_pressure(args, clients, dataset, result, started):
     measured, not asserted. Every returned value must still match exact bytes.
     """
     def hot_reads(allow_miss):
-        for client, namespace in zip(clients, NAMESPACES):
-            hits = client.read(*dataset(namespace, 0, QUICK_HOT),
-                               allow_miss=allow_miss)
+        for index, (client, namespace) in enumerate(zip(clients, NAMESPACES)):
+            keys, values = dataset(namespace, 0, QUICK_HOT)
+            probe_started = time.monotonic() - started
+            hits = client.read(keys, values, allow_miss=allow_miss)
+            if args.first_reuse_sec and len(result["first_reuse"]) == index:
+                result["first_reuse"].append({
+                    "namespace_hex": namespace.hex(),
+                    "probe_started_sec": probe_started,
+                    "write_to_probe_sec": probe_started - result["hot_cohort_write_completed_sec"][index],
+                    "hits": hits, "misses": QUICK_HOT - hits})
             result["hot_hits"] += hits
             result["hot_misses"] += QUICK_HOT - hits
 
-    result.update(hot_hits=0, hot_misses=0)
+    result.update(hot_hits=0, hot_misses=0, filler_warmup_reads=0,
+                  first_reuse_sec=args.first_reuse_sec, first_reuse=[],
+                  hot_cohort_write_completed_sec=[])
     for client, namespace in zip(clients, NAMESPACES):
         for start in range(0, QUICK_PREFILL, BATCH_SIZE):
             client.put(*dataset(namespace, start,
                                 min(start + BATCH_SIZE, QUICK_PREFILL)))
+            # The cohort spans two production batches; timestamp its last ACK.
+            if start < QUICK_HOT <= start + BATCH_SIZE:
+                result["hot_cohort_write_completed_sec"].append(time.monotonic() - started)
     record_phase(args, result, "prefill", started)
-    for _ in range(2):
-        hot_reads(False)
+    if args.first_reuse_sec:
+        # Warm competitors, never the pending first-reuse cohort. A missing
+        # filler here invalidates the initial state rather than counting as heat.
+        for _ in range(2):
+            for client, namespace in zip(clients, NAMESPACES):
+                for start in range(QUICK_HOT, QUICK_PREFILL, BATCH_SIZE):
+                    stop = min(start + BATCH_SIZE, QUICK_PREFILL)
+                    result["filler_warmup_reads"] += client.read(
+                        *dataset(namespace, start, stop), allow_miss=False)
+    else:
+        for _ in range(2):
+            hot_reads(False)
     record_phase(args, result, "warm", started)
     wait_started = time.monotonic()
     time.sleep(args.pressure_delay_sec)
@@ -290,7 +322,10 @@ def run(args, *, library_loader=load_library, client_factory=Client):
               "lengths": [4096] if pressure else list(LENGTHS),
               "batch_size": BATCH_SIZE, "generator": "shake256-disk-synthetic-v1"}
     if args.scenario in ("quick-pressure", "sustained-pressure"):
-        config.update(prefill=QUICK_PREFILL, hot=QUICK_HOT, warmup_rounds=2,
+        config.update(prefill=QUICK_PREFILL, hot=QUICK_HOT,
+                      warmup_rounds=0 if args.first_reuse_sec else 2,
+                      filler_warmup_rounds=2 if args.first_reuse_sec else 0,
+                      first_reuse_sec=args.first_reuse_sec,
                       pressure_delay_sec=args.pressure_delay_sec, metrics_url=args.metrics_url)
     if args.scenario == "sustained-pressure":
         config.update(steps=SUSTAIN_STEPS, step_interval_sec=SUSTAIN_INTERVAL_SEC,
@@ -306,7 +341,9 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                             "pressure: only post-write reads allow misses",
                             "quick-pressure: prefill both namespaces; two strict hot warmups; "
                             "interleave cold batches and hot probes; final full scan",
-                            "sustained-pressure: fixed paced cold/hot steps; no catch-up or refill"]}
+                            "sustained-pressure: fixed paced cold/hot steps; no catch-up or refill",
+                            "first-reuse-sec>0: warm only filler [hot,prefill) twice; "
+                            "cohort [0,hot) gets no GET before the requested pressure-origin delay"]}
     (args.output / "trace.json").write_text(json.dumps(trace, indent=2) + "\n")
     result = {"config_sha256": config_hash, "status": "failed", "hits": 0,
               "misses": 0, "wrong_bytes": 0, "transport_mode": []}

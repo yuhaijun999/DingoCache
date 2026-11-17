@@ -53,7 +53,96 @@ def sustained_metrics():
     return good_metrics().replace('12128', '27640').replace('20456', '28544').replace('8328', '904')
 
 
+def delayed_client(delay=90, all_miss=False):
+    client = sustained_client()
+    client.update(first_reuse_sec=delay, filler_warmup_reads=18304,
+                  hot_cohort_write_completed_sec=[1.0, 2.0])
+    for row in client['steps']:
+        active = row['start_sec'] >= delay
+        row.update(hot_probe_started_sec=row['start_sec'] + .001 if active else None,
+                   hot_hits=64 if active and not all_miss else 0,
+                   hot_misses=64 if active and all_miss else 0)
+    client['hot_hits'] = sum(row['hot_hits'] for row in client['steps'])
+    client['hot_misses'] = sum(row['hot_misses'] for row in client['steps'])
+    client['hot_reads'] = client['hot_hits'] + client['hot_misses']
+    at = 3 + delay + .002
+    client['first_reuse'] = [
+        {'namespace_hex': ns.hex(), 'probe_started_sec': at,
+         'write_to_probe_sec': at - written,
+         'hits': 0 if all_miss else 32, 'misses': 32 if all_miss else 0}
+        for ns, written in zip((b'disk-validation\x00A\xff', b'disk-validation\x00B\xfe'), (1, 2))]
+    return client
+
+
+def delayed_metrics(client):
+    hits = client['hits'] + client['hot_hits'] + 18304
+    misses = client['misses'] + client['hot_misses']
+    return good_metrics().replace('12128', str(hits)).replace('20456', str(hits + misses)).replace('8328', str(misses))
+
+
 class QuickEvictionTest(unittest.TestCase):
+    def test_delayed_first_reuse_counts_and_all_miss_are_valid_observations(self):
+        for delay in (45, 90, 185):
+            for all_miss in (False, True):
+                client = delayed_client(delay, all_miss)
+                checked = runner.check_result(delayed_metrics(client), client,
+                    scenario='sustained-pressure', first_reuse_sec=delay)
+                self.assertEqual(checked['sustained_steps'], 200)
+                self.assertEqual(client['hot_reads'], (200 - delay) * 64)
+
+    def test_skipped_step_can_finish_after_delay_without_an_early_probe(self):
+        client = delayed_client()
+        client['steps'][89]['end_sec'] = 90.01
+        for row in client['steps'][90:]:
+            row['start_sec'] += .1
+            row['end_sec'] += .1
+            row['hot_probe_started_sec'] += .1
+        client['pressure_schedule_elapsed_sec'] += .1
+        for probe in client['first_reuse']:
+            probe['probe_started_sec'] += .1
+            probe['write_to_probe_sec'] += .1
+        self.assertEqual(runner.check_steps(client, 90)['sustained_steps'], 200)
+
+    def test_delayed_first_reuse_rejects_early_reads_skips_and_forged_ages(self):
+        for mutation in ('early', 'skip', 'age', 'cohort', 'warmup', 'first_hits', 'missing_probe'):
+            client = delayed_client()
+            if mutation == 'early':
+                client['steps'][89].update(hot_hits=64, hot_probe_started_sec=89.002)
+            elif mutation == 'skip':
+                client['steps'][91].update(hot_hits=0, hot_probe_started_sec=None)
+            elif mutation == 'age':
+                client['first_reuse'][0]['write_to_probe_sec'] += 1
+            elif mutation == 'cohort':
+                client['first_reuse'][0]['namespace_hex'] = 'wrong'
+            elif mutation == 'warmup':
+                client['filler_warmup_reads'] -= 1
+            elif mutation == 'first_hits':
+                client['first_reuse'][0].update(hits=31, misses=1)
+            else:
+                del client['steps'][90]['hot_probe_started_sec']
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                runner.check_steps(client, 90)
+
+    def test_first_reuse_options_and_actual_client_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp))
+            for delay in (0, 45, 90, 185):
+                args = runner.parse_args(argv + ['--scenario', 'sustained-pressure',
+                                                '--first-reuse-sec', str(delay)])
+                self.assertEqual(args.first_reuse_sec, delay)
+            for extra in (['--first-reuse-sec', '90'], ['--first-reuse-sec', '1'],
+                          ['--first-reuse-sec', '-1'], ['--first-reuse-sec', '90.0']):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    runner.parse_args(argv + extra)
+            args = runner.parse_args(argv + ['--scenario', 'sustained-pressure', '--first-reuse-sec', '90'])
+            with mock.patch.object(runner, 'check_ports'), mock.patch.object(
+                    runner.subprocess, 'Popen', side_effect=OSError('stop before startup')):
+                self.assertEqual(runner.run(args)['status'], 'failed')
+            case = json.loads((args.output / 'case.json').read_text())
+            self.assertEqual(case['first_reuse_sec'], 90)
+            command = case['client_command']
+            self.assertEqual(command[command.index('--first-reuse-sec') + 1], '90')
+
     def test_metric_presence_finiteness_and_label_sums(self):
         self.assertEqual(runner.total('counter{disk="a"} 2\ncounter{disk="b"} 3', 'counter'), 5)
         for text in ('', '# counter 0', 'other 0', 'counter NaN', 'counter inf',
@@ -232,13 +321,14 @@ class QuickEvictionTest(unittest.TestCase):
             self.assertEqual(list(args.data_root[2].iterdir()), [])
 
     def test_delay_and_metrics_are_passed_to_client_with_extended_timeout(self):
-        for scenario, delay, count, timeout, client, metrics in (
-                ('quick-pressure', 185, 6452, 305, good_client(), good_metrics()),
-                ('sustained-pressure', 0, 7808, 320, sustained_client(), sustained_metrics())):
+        for scenario, delay, reuse, count, timeout, client, metrics in (
+                ('quick-pressure', 185, 0, 6452, 305, good_client(), good_metrics()),
+                ('sustained-pressure', 0, 0, 7808, 320, sustained_client(), sustained_metrics()),
+                ('sustained-pressure', 0, 90, 7808, 320, delayed_client(), delayed_metrics(delayed_client()))):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
                 args = runner.parse_args(self.arguments(Path(temp)) +
                                          ['--data-name', 'fixed', '--scenario', scenario,
-                                          '--pressure-delay-sec', str(delay)])
+                                          '--pressure-delay-sec', str(delay), '--first-reuse-sec', str(reuse)])
                 server = mock.Mock()
                 server.poll.return_value = None
                 server.wait.return_value = 0
@@ -270,6 +360,8 @@ class QuickEvictionTest(unittest.TestCase):
                 self.assertEqual(client_run.call_args.kwargs['timeout'], timeout)
                 case = json.loads((args.output / 'case.json').read_text())
                 self.assertEqual(case['pressure_delay_sec'], delay)
+                self.assertEqual(case['first_reuse_sec'], reuse)
+                self.assertEqual(command[command.index('--first-reuse-sec') + 1], str(reuse))
                 self.assertEqual(case['scenario'], scenario)
                 self.assertEqual(case['client_command'], command)
                 self.assertEqual(case['client_timeout_sec'], timeout)

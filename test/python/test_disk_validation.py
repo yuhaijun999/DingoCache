@@ -357,6 +357,144 @@ class DiskValidationTest(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(SystemExit):
                 self.args(Path("unused"), "sustained-pressure", extra)
 
+    def test_delayed_first_reuse_warms_only_filler_and_records_actual_ages(self):
+        for delay in (45, 90, 185):
+            now = [0.0]
+            events = []
+            def sleep(seconds):
+                self.assertGreaterEqual(seconds, 0)
+                now[0] += seconds
+
+            class TrackingClient(MemoryClient):
+                def __init__(self, storage, members, namespace):
+                    super().__init__(storage, members, namespace)
+                    self.namespace = namespace
+
+                def put(self, keys, values):
+                    super().put(keys, values)
+                    start = int.from_bytes(keys[0][-8:], "big")
+                    if start == 16:
+                        now[0] += 0.25
+                    if start >= 64:
+                        self.storage.pop(driver.key_for(0xD1A60001, 0), None)
+
+                def read(self, keys, values, *, allow_miss=False):
+                    events.append((self.namespace, now[0],
+                                   [int.from_bytes(key[-8:], "big") for key in keys],
+                                   allow_miss))
+                    return super().read(keys, values, allow_miss=allow_miss)
+
+            with self.subTest(delay=delay), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.object(driver, "QUICK_PREFILL", 64), \
+                    mock.patch.object(driver.time, "monotonic", side_effect=lambda: now[0]), \
+                    mock.patch.object(driver.time, "sleep", side_effect=sleep):
+                args = self.args(Path(temp) / "delayed", "sustained-pressure",
+                                 ("--first-reuse-sec", str(delay)))
+                result = driver.run(args, library_loader=lambda _: {}, client_factory=TrackingClient)
+                self.assertEqual(result["filler_warmup_reads"], 128)
+                warm = [event for event in events if not event[3]]
+                self.assertEqual(len(warm), 8)
+                self.assertEqual(set(i for event in warm for i in event[2]), set(range(32, 64)))
+                probes = [event for event in events if len(event[2]) == 32]
+                self.assertEqual(len(probes), 2 * (200 - delay))
+                self.assertTrue(all(event[1] >= 0.5 + delay for event in probes))
+                self.assertEqual(result["hot_cohort_write_completed_sec"], [0.25, 0.5])
+                self.assertEqual(result["first_reuse_sec"], delay)
+                self.assertEqual([row["write_to_probe_sec"] for row in result["first_reuse"]],
+                                 [delay + 0.25, delay])
+                self.assertEqual([row["namespace_hex"] for row in result["first_reuse"]],
+                                 [ns.hex() for ns in driver.NAMESPACES])
+                self.assertTrue(all((row["hits"], row["misses"]) == (31, 1)
+                                    for row in result["first_reuse"]))
+                self.assertEqual(result["hot_hits"], 62 * (200 - delay))
+                self.assertEqual(result["hot_misses"], 2 * (200 - delay))
+                self.assertEqual(result["hot_reads"], 64 * (200 - delay))
+                self.assertEqual(result["misses"], 2)
+                for row in result["steps"]:
+                    due = row["step"] >= delay
+                    self.assertEqual(row["hot_probe_started_sec"], row["step"] if due else None)
+                    self.assertEqual(row["hot_hits"] + row["hot_misses"], 64 if due else 0)
+                for phase in result["phases"][:3]:
+                    self.assertEqual((phase["hot_hits"], phase["hot_misses"]), (0, 0))
+                self.assertEqual(result["phases"][1]["filler_warmup_reads"], 128)
+                config = json.loads((args.output / "trace.json").read_text())["config"]
+                self.assertEqual((config["first_reuse_sec"], config["warmup_rounds"],
+                                  config["filler_warmup_rounds"]), (delay, 0, 2))
+
+    def test_delayed_probe_uses_actual_elapsed_after_cold_write_stall(self):
+        now = [0.0]
+        def sleep(seconds):
+            now[0] += seconds
+
+        class StallingClient(MemoryClient):
+            def put(self, keys, values):
+                super().put(keys, values)
+                if now[0] == 44:
+                    now[0] += 3
+
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(driver, "QUICK_PREFILL", 64), \
+                mock.patch.object(driver, "SUSTAIN_STEPS", 47), \
+                mock.patch.object(driver.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(driver.time, "sleep", side_effect=sleep):
+            args = self.args(Path(temp) / "stall", "sustained-pressure",
+                             ("--first-reuse-sec", "45"))
+            result = driver.run(args, library_loader=lambda _: {}, client_factory=StallingClient)
+            self.assertEqual(result["steps"][44]["start_sec"], 44)
+            self.assertEqual(result["steps"][44]["hot_probe_started_sec"], 47)
+            self.assertEqual(result["steps"][45]["start_sec"], 47)
+            self.assertEqual(result["steps"][46]["start_sec"], 48)
+            self.assertEqual(result["hot_reads"], 3 * 64)
+            self.assertEqual([row["probe_started_sec"] for row in result["first_reuse"]], [47, 47])
+
+    def test_delayed_first_reuse_failures_preserve_failed_result(self):
+        for failure in ("filler-missing", "hot-corrupt", "hot-io"):
+            now = [0.0]
+            def sleep(seconds):
+                now[0] += seconds
+
+            class FailingClient(MemoryClient):
+                def read(self, keys, values, *, allow_miss=False):
+                    if not allow_miss and failure == "filler-missing":
+                        self.storage.pop(keys[0], None)
+                    if allow_miss and failure == "hot-corrupt":
+                        self.storage[keys[0]] = b"x" * len(values[0])
+                    if allow_miss and failure == "hot-io":
+                        raise RuntimeError("GET failed")
+                    return super().read(keys, values, allow_miss=allow_miss)
+
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.object(driver, "QUICK_PREFILL", 64), \
+                    mock.patch.object(driver, "SUSTAIN_STEPS", 46), \
+                    mock.patch.object(driver.time, "monotonic", side_effect=lambda: now[0]), \
+                    mock.patch.object(driver.time, "sleep", side_effect=sleep):
+                args = self.args(Path(temp) / failure, "sustained-pressure",
+                                 ("--first-reuse-sec", "45"))
+                with self.assertRaisesRegex(RuntimeError,
+                        {"filler-missing": "below-capacity miss", "hot-corrupt": "wrong bytes/length",
+                         "hot-io": "GET failed"}[failure]):
+                    driver.run(args, library_loader=lambda _: {}, client_factory=FailingClient)
+                result = json.loads((args.output / "result.json").read_text())
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["wrong_bytes"], int(failure == "hot-corrupt"))
+                self.assertEqual(result["hot_hits"], 0)
+                self.assertEqual(result["first_reuse"], [])
+                if failure != "filler-missing":
+                    self.assertEqual(len(result["steps"]), 45)
+                    self.assertTrue(all(row["hot_probe_started_sec"] is None for row in result["steps"]))
+
+    def test_first_reuse_arguments_are_bounded_and_sustained_only(self):
+        self.assertEqual(self.args(Path("unused"), "sustained-pressure").first_reuse_sec, 0)
+        for value in (0, 45, 90, 185):
+            self.assertEqual(self.args(Path("unused"), "sustained-pressure",
+                                       ("--first-reuse-sec", str(value))).first_reuse_sec, value)
+        for scenario, value in (("quick-pressure", "45"), ("roundtrip", "90"),
+                                ("pressure", "185"), ("sustained-pressure", "1"),
+                                ("sustained-pressure", "-1"), ("sustained-pressure", "186"),
+                                ("sustained-pressure", "nan")):
+            with self.subTest(scenario=scenario, value=value), self.assertRaises(SystemExit):
+                self.args(Path("unused"), scenario, ("--first-reuse-sec", value))
+
     def test_missing_key_oracle_rejects_all_false_hits_including_empty(self):
         class FakeLib:
             status = 0
