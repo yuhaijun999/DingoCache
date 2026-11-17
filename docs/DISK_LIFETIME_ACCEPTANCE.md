@@ -174,3 +174,17 @@ O07命名flush/follower账由O5bf补充，完整Node分母不在该范围；O12�
 接下来需要落实 §5 的职责、隔离与旧 baseline 准备条件，以及真实硬件/完整资源/
 业务数据；没有条件不自动试跑。然后旧 baseline→冻结→独立交替 AB7→单独 FLIP7。
 操作文档收口不改变这条顺序，不提供生产部署授权。
+
+### AB7-prep1：确定性功能回放（非正式 A/B）
+
+`test/cache/eviction_workload_test.cc` 在真实 Store 上复用固定小轨迹，分别运行
+legacy 与 lifetime M=1/2/4/63：跨 tenant/partial/empty/missing/invalid 读、
+keep-first 与 Remove 后新值、全 pin 拒绝后释放一份 lease 再重试，以及两轮冷写
+压力下热点逻辑读。逐项断言字面量 status/bytes/驻留数/驱逐数和实际成功应用数；
+不复制淘汰算法作为 oracle，不用预期结果计算实测计数。
+
+这是批准计划中回放入口的 CPU 功能准备，不是正式 AB7 开始或完成。直接 Store
+调用在非空成功读后用返回的 identity 通知生产接缝，不替代 Node/RAM/传输/ACK
+路径测试；prep/pin 本身不计热。不给命中率/TTFT/性能或策略优劣结论，不记录
+吞吐/耗时/资源样本，不绕过人员隔离、旧 baseline、冻结阈值与硬件后置约定。
+本包证据单列 `.omx/evidence/ab7-prep1-replay/`；正式验收门禁保持不变。
