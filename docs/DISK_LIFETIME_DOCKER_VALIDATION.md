@@ -287,3 +287,65 @@ ctest --test-dir /opt/dfkv-cpu --output-on-failure --timeout 120
 
 本轮未重新跑全部36+6合成矩阵，不能将首轮矩阵追溯为新版本实跑；也未新增物理HCA、
 GPU、硬件路径sanitizer或正式性能AB通过记录。本次缺陷收敛完成，不关闭正式业务门禁。
+
+
+## 10. 修复后端到端复跑：36＋6 场景（2026-11-17）
+
+源码基线 `d5025f3`。本轮没有修改生产代码、参数默认值或测试预期；在同一私有
+Ubuntu guest（kernel 6.8.0-147、RXE rxe0、io_uring 可用）中重新执行全部合成功能
+场景，而非沿用第8节历史结果。135个构建/运行相关源码文件的 SHA256 与工作树一致，
+`cmake --build /opt/dfkv-build -j4` 成功（Ninja 无待编译工作，不冒充重新编译）。
+
+| 本轮实际执行 | 结果 |
+|---|---|
+| 36组应用矩阵 | 36通过、0失败、0跳过；24个 M×RAM×coalesce、4同步、6压力、legacy、direct |
+| 6组生命周期 | 6通过、0失败、0跳过；M=1/2/4/63各1260次读、clean三次重启、dirty SIGKILL重启 |
+| 额外结果审计 | 外层退出0；36个服务退出0；PULL终局与缺失分母一致；25份生命周期快照健康、无错误/fallback/遗留在途 |
+| 审计器反例 | 5/5正确拒绝：外层非零、服务非零、缺失零值指标、隐藏IO终局、错误场景集合；不是产品功能测试数 |
+
+四种 M 的全局队列数分别2/3/5/64，18个住户均到顶档；clean校验17个存活对象、
+两个更新代际和一个删除对象，恢复虚拟读不计实际热度。dirty重启三盘冷重置，
+18次缺失均为 `not_found` 终局，不以 C ABI 的 miss 独自推断无 I/O 错误。
+无驱逐基线保持实际驱逐0；所有成功读仍核对预期字节。六组压力的实测如下，数量
+按每个 namespace 计，两个 namespace 合计施压；缺失属于预期驱逐，不代表错误字节可接受。
+
+| 压力场景 | 驱逐数 | 命中 / 缺失 |
+|---|---:|---:|
+| M2，每namespace 4608对象 | 0 | 9216 / 0 |
+| M2，每namespace 6452对象 | 2092 | 10812 / 2092 |
+| M2，每namespace 12288对象 | 13764 | 10812 / 13764 |
+| M1/M4/M63，各每namespace 12288对象 | 各13764 | 各10812 / 13764 |
+
+使用全新目录，不覆盖原失败记录。沿用已验证的显式8MiB RXE接收分块，避免长期
+运行guest的高阶页分配问题；这是诊断环境配置，不改变生产默认。生命周期 supervisor
+只额外保存每阶段退出前的指标快照，原有正确性断言没有放宽。不同case目录参与路由，
+因此结果不能当作严格配对性能 A/B。退出后无应用服务/本轮测试进程，guest的uring设置仍为0。
+
+### 10.1 命令与证据
+
+同一root身份、memlock unlimited，在配方A的私有guest内顺序执行：
+
+```bash
+ulimit -l unlimited
+cmake --build /opt/dfkv-build -j4
+PYTHONUNBUFFERED=1 python3 /opt/dfkv-rerun/matrix.py
+PYTHONUNBUFFERED=1 python3 /opt/dfkv-rerun/lifecycle.py
+```
+
+这两个脚本是本轮证据副本，不是安装产物；再次执行必须先按新 RUN_ID 改写结果及
+三个盘的case路径，否则其拒绝复用目录。完整脚本、逐case参数/环境、客户端字节校验
+结果、原始metrics、源SHA、执行命令、外层退出码和审计器保存在：
+`.omx/evidence/post-fix-matrix/20261117t075643z-d5025f3/`。
+`results-summary.json` 为汇总入口，`run.log`/`run.exit` 为真实执行结果，
+`guest-results.tgz` 为原始结果包，`audit.log`/`audit-negative.log` 为结果审计。
+这些本地证据通常不随Git分发；缺少证据包不能仅凭本文确认通过。
+
+新落盘数据仍限于原授权的三个宿主专用目录：
+`/mnt/diskN/dfkv-validation/20261117t035613z-d69e126/`（N=1/2/3）的虚拟盘文件内。
+guest新case路径为 `/data/diskN/cases/{matrix,lifecycle}-20261117t075643z-d5025f3/`，
+结果在 `/data/disk1/results/` 下的同名目录；不直接操作宿主块设备。保留样本和空闲VM
+供复跑，各guest数据盘目前约剩16GiB，下一轮应先检查空间，不能无限新增完整矩阵。
+
+本轮没有重新执行全量CTest或sanitizer；第9节的ON/OFF结果仍为同代码历史证据。
+也未覆盖物理HCA/GPU、真实业务TTFT、正式性能A/B或断电持久化。修复后的合成功能
+回归已完成，**不据此关闭O5正式验收、翻转默认或部署**。
