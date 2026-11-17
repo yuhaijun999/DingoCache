@@ -206,7 +206,7 @@ ring fallback=0，PULL dispatch/terminal=98/98（94 非空、4 missing），热�
 RAM 命中读不能虚报成物理磁盘读。不同 case 数据目录参与一致性哈希路由，因此这里是
 功能诊断，不是配对性能 A/B。应用压力数量指每 namespace，二者合计后计算占槽压力。
 
-### 8.1 尚未解决的真实失败
+### 8.1 首轮发现的真实失败（后续修复见第9节）
 
 `RdmaLoopback.RealFifoQueuedConnectionCloseSync`、
 `RdmaLoopback.RealFifoQueuedConnectionCloseUring` 均未在 10 秒内回收连接
@@ -214,7 +214,7 @@ RAM 命中读不能虚报成物理磁盘读。不同 case 数据目录参与一�
 初步静态定位是等待 CQ/在途 SEND 的短轮询可能绕过 elapsed idle budget；这仍是待验证假设，
 不能仅凭 RXE 特定行为断言根因。下一小步建议先加状态快照与无 hook 的 stalled-SEND 回归，
 再最小修复连接关闭/空闲超时，并重跑两个配置及 QP/pin 生命周期回归。
-**本轮整体不是全绿，不可据此关闭 O5/O12、翻默认或部署。**
+**该首轮诊断不是全绿。后续修复结果单列于第9节，仍不构成 O5/O12、翻默认或部署放行。**
 
 ### 8.2 失败试验与覆盖缺口
 
@@ -248,3 +248,42 @@ RAM 命中读不能虚报成物理磁盘读。不同 case 数据目录参与一�
 私钥仅保留 disk1/seed，未提交或打入结果证据包。复跑选配方 A+D，用新的 case 目录；
 全量矩阵 supervisor 及原命令保存在证据包，固定目录须改为新的 run/case，不能覆写旧结果。
 清理按第7节先关闭 VM，再核 ID/标签/ownership 后仅删除本轮三个子目录。
+
+## 9. 后续小迭代：修复 RDMA 空闲期限绕过（2026-11-17）
+
+基线 `c15682f`，只修复第8.1节连接回收，不修改磁盘评分/参数、协议或重试次数。
+原两项失败再次复现；原 FIFO 的失败现场为 held=0、queued=0、free=0，uring 两次
+reply posted 仅一次 SEND fence，说明 B 已出队、回复 SEND 尚未完成。同步测试的 CQ
+重排钩子和生产异步路径分别使短轮询绕过空闲期限；生产同步路径有 pending receive
+时也存在相同的无限豁免。
+
+修复只在空 verbs CQ 等待后，用已有 `last_active_us_` 判断实际经过的空闲期限。
+继续使用 **RDMA CQ 活动**时间，不声称磁盘 CQ 会重置此时钟；不在磁盘读 in-flight
+阶段新增超时，不改变 ring drain、QP先销毁再释放 MR/pin 的顺序。idle<=0仍关闭回收。
+
+新增四项不使用 CQ 钩子的真实 RXE 回归：不投递对端接收缓冲，使回复 SEND 真正
+停在 RNR；覆盖 sync/uring 的200ms回收、lease归零/新连接，以及 idle=0 时保持连接
+并在补接收后收到原回复。修复前六项组合为3通过/3失败；修复后最终7项（含原FIFO
+两项及keepalive）连续三轮通过，零skip。仅guest内临时禁用uring验证不支持环境：
+sync两项通过、uring两项显式skip，随后恢复原值0；这不是uring路径通过证据。
+
+最终 ON/OFF 源码构建成功。最终 XML 对齐 CTest discovery：ON总1692，**1651通过、
+0失败、41跳过**；OFF总1435，**1401通过、0失败、34跳过**。跳过主要涉及缺少的
+GPU/多rail/etcd等条件，不算通过。生产文件的差异行 clang-tidy 无新增诊断、exit0；
+大测试文件的全检查超300秒预算后停止，只有编译诊断及有限检查完成，不能宣称其
+全检查已通过。差异行 clang-format 和 diff whitespace 检查通过。
+
+证据：仓库 `.omx/evidence/rdma-idle-close/20261117t072000z-c15682f/`，包括 red/green、
+最终全量XML、原始日志、逐文件SHA和独立审查。实际构建目录为guest `/opt/dfkv-build`
+和 `/opt/dfkv-cpu`；新结果目录由每份日志的 `E=` 指明。复跑使用建立配方A进入同一
+私有VM，在guest以同一UID/独立TMPDIR执行：
+
+```bash
+cmake --build /opt/dfkv-build -j4
+DFKV_RDMA_DEV=rxe0 DFKV_RDMA_RECV_CHUNK_BYTES=8388608   /opt/dfkv-build/rdma_loopback_test   --gtest_filter='RdmaLoopback.StalledReplyIdle*:RdmaLoopback.RealFifoQueuedConnectionClose*:RdmaLoopback.KeepalivePreservesIdleDataConnection'
+ctest --test-dir /opt/dfkv-build --output-on-failure --timeout 120
+ctest --test-dir /opt/dfkv-cpu --output-on-failure --timeout 120
+```
+
+本轮未重新跑全部36+6合成矩阵，不能将首轮矩阵追溯为新版本实跑；也未新增物理HCA、
+GPU、硬件路径sanitizer或正式性能AB通过记录。本次缺陷收敛完成，不关闭正式业务门禁。

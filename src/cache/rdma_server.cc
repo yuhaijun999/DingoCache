@@ -1644,6 +1644,17 @@ void RdmaServer::Serve(int boot_fd) {
   };
   bool fail = false;
   const int idle_ms = ServerIdleMs();
+  // A short CQ wait is only a progress probe, not a new idle interval. Pending
+  // receives or SENDs must not exempt a silent peer from the configured limit.
+  // Check only empty verbs waits; in-flight disk reads retain their drain path.
+  const auto idle_expired = [&] {
+    if (idle_ms <= 0) return false;
+    const uint64_t last_active =
+        ep.last_active_us_.load(std::memory_order_relaxed);
+    const uint64_t now = SteadyUs();
+    return now >= last_active &&
+           now - last_active >= static_cast<uint64_t>(idle_ms) * 1000;
+  };
   active_conns_.fetch_add(1, std::memory_order_relaxed);
   rail_stats.active_conns.fetch_add(1, std::memory_order_relaxed);
   // Failed WCs do not guarantee a meaningful opcode. Retain the raw provider
@@ -2093,7 +2104,7 @@ void RdmaServer::Serve(int boot_fd) {
       if (g >= 0 && reorder_cq_for_test_)
         reorder_cq_for_test_(wcs.data(), &g, K);
       if (g == 0) {
-        if (posted_sends != 0) continue;
+        if (!idle_expired()) continue;
         idle_reclaims_.fetch_add(1, std::memory_order_relaxed);
         break;
       }
@@ -2164,7 +2175,7 @@ sync_serve_loop:;
     if (g > 0)
       ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
     if (g == 0) {
-      if (pending_recv_count != 0 || deferred_for_test) continue;
+      if (!idle_expired()) continue;
       idle_reclaims_.fetch_add(1, std::memory_order_relaxed);
       break;
     }

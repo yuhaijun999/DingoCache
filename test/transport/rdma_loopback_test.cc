@@ -4763,6 +4763,110 @@ TEST(RdmaLoopback, RealFifoOrderWrapSync) {
   ExerciseFifoOrderAndWrap();
 }
 
+// No CQ hooks: a peer without a posted receive stalls the real reply SEND in
+// RNR retry. An outstanding SEND must not disable the configured idle policy.
+static void ExerciseStalledReplyIdle(bool use_uring, bool disable_idle) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", disable_idle ? "0" : "200");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  RdmaNode node("stalled-reply-idle", kMaxMsg, false, use_uring);
+  ASSERT_EQ(node.rsrv->UseUringPath(), use_uring);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  const BlockKey absent{9733, 0};
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kExist, absent,
+                   0, 0, 0);
+  // Do not post a receive: the request completes, but its reply cannot.
+  ASSERT_TRUE(peer.ep.PostSend(0, kReqPrefix));
+  ibv_wc sent{};
+  ASSERT_EQ(peer.ep.WaitComp(&sent, 1, 5000), 1);
+  ASSERT_EQ(sent.status, IBV_WC_SUCCESS);
+  ASSERT_EQ(sent.opcode, IBV_WC_SEND);
+  const std::chrono::steady_clock::time_point decoded_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (node.rsrv->Completions() == 0 &&
+         std::chrono::steady_clock::now() < decoded_deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_EQ(node.rsrv->Completions(), 1u);
+  if (use_uring) {
+    if (CounterVal(node.rsrv->MetricsText(),
+                   "dfkv_uring_init_fallbacks_total") != 0)
+      GTEST_SKIP() << "io_uring unavailable at runtime";
+    while (CounterVal(node.rsrv->MetricsText(),
+                      "dfkv_uring_replies_posted_total") == 0 &&
+           std::chrono::steady_clock::now() < decoded_deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    ASSERT_EQ(
+        CounterVal(node.rsrv->MetricsText(), "dfkv_uring_replies_posted_total"),
+        1);
+    EXPECT_EQ(
+        CounterVal(node.rsrv->MetricsText(), "dfkv_uring_send_fences_total"),
+        0);
+    ASSERT_EQ(
+        CounterVal(node.rsrv->MetricsText(), "dfkv_uring_init_fallbacks_total"),
+        0);
+  }
+  if (disable_idle) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    ASSERT_EQ(node.rsrv->ActiveConns(), 1u) << node.rsrv->MetricsText();
+    EXPECT_EQ(node.rsrv->IdleReclaims(), 0u);
+    // Releasing RNR must deliver the original reply, not require reconnect.
+    ASSERT_TRUE(peer.ep.PostRecv(0));
+    ibv_wc received{};
+    ASSERT_EQ(peer.ep.WaitComp(&received, 1, 5000), 1);
+    ASSERT_EQ(received.status, IBV_WC_SUCCESS);
+    ASSERT_EQ(received.opcode, IBV_WC_RECV);
+    Status status = Status::kIOError;
+    uint64_t bytes = 0;
+    ASSERT_TRUE(DecodeRespVersion(peer.ep.rbuf(0), kNativeProtoRdmaV2, &status,
+                                  &bytes));
+    EXPECT_EQ(status, Status::kNotFound);
+    EXPECT_EQ(bytes, 0u);
+    return;
+  }
+  const std::chrono::steady_clock::time_point reclaim_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (node.rsrv->ActiveConns() != 0 &&
+         std::chrono::steady_clock::now() < reclaim_deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_EQ(node.rsrv->ActiveConns(), 0u) << node.rsrv->MetricsText();
+  EXPECT_EQ(node.rsrv->IdleReclaims(), 1u);
+  // ActiveConns drops before endpoint/lease RAII finishes; wait for that fence.
+  while (CounterVal(node.rsrv->MetricsText(),
+                    "dfkv_rdma_recv_segment_used_bytes") != 0 &&
+         std::chrono::steady_clock::now() < reclaim_deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_EQ(
+      CounterVal(node.rsrv->MetricsText(), "dfkv_rdma_recv_segment_used_bytes"),
+      0);
+  PinnedPullPeer fresh;
+  ASSERT_TRUE(fresh.Open(node));
+  EncodeReqVersion(fresh.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kExist, absent,
+                   0, 0, 0);
+  Status status = Status::kIOError;
+  uint64_t bytes = 0;
+  ASSERT_TRUE(fresh.Exchange(kReqPrefix, &status, &bytes));
+  EXPECT_EQ(status, Status::kNotFound);
+  EXPECT_EQ(bytes, 0u);
+}
+
+TEST(RdmaLoopback, StalledReplyIdleReclaimsSync) {
+  ExerciseStalledReplyIdle(false, false);
+}
+TEST(RdmaLoopback, StalledReplyIdleReclaimsUring) {
+  ExerciseStalledReplyIdle(true, false);
+}
+TEST(RdmaLoopback, StalledReplyIdleDisabledSync) {
+  ExerciseStalledReplyIdle(false, true);
+}
+TEST(RdmaLoopback, StalledReplyIdleDisabledUring) {
+  ExerciseStalledReplyIdle(true, true);
+}
 
 static void ExerciseQueuedReceiveConnectionClose(bool use_uring) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
@@ -4834,7 +4938,15 @@ static void ExerciseQueuedReceiveConnectionClose(bool use_uring) {
   while (node.rsrv->ActiveConns() != 0 &&
          std::chrono::steady_clock::now() < deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  ASSERT_EQ(node.rsrv->ActiveConns(), 0u);
+  std::string fifo_state;
+  {
+    std::lock_guard<std::mutex> lock(reorder.mu);
+    fifo_state = "held=" + std::to_string(reorder.held.size()) +
+                 " queued=" + std::to_string(reorder.queued) +
+                 " free=" + std::to_string(reorder.free_slots);
+  }
+  ASSERT_EQ(node.rsrv->ActiveConns(), 0u) << fifo_state << "\n"
+                                          << node.rsrv->MetricsText();
   double receive_used = 0;
   double exact_mrs = 0;
   do {

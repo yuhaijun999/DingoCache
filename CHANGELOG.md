@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Enforce RDMA connection idle deadlines while pending receives or reply SENDs
+  require short CQ waits. Preserve disabled idle reclamation and disk-read drain
+  ownership; cover real stalled SENDs and FIFO-close recovery.
+
 - Add isolated Docker/QEMU disk diagnostics with deterministic byte-exact
   synthetic workloads and explicit real-RXE, kernel-io_uring and controlled-CQE
   validation boundaries. Keep formal acceptance and deployment separate.
