@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add isolated Docker/QEMU disk diagnostics with deterministic byte-exact
+  synthetic workloads and explicit real-RXE, kernel-io_uring and controlled-CQE
+  validation boundaries. Keep formal acceptance and deployment separate.
+
 - Consolidate lifetime operation and compatibility guidance: dual score indexes,
   numeric bounds, ACK migration, budget backpressure, controlled restart and
   explicit-legacy rollback. Keep hardware and formal acceptance gates open.
