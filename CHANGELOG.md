@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Track decoded PULL requests through sync/async Serve with once-only logical
+  outcomes and separate decided-but-unposted responses. Keep grant success
+  independent of READY delivery and retain existing cleanup and wire behavior.
+
 - Expose final RAM flush settlements, foreground RAM waiter returns and Store
   PUT follower completion counters as separate bounded cohorts. Preserve retry,
   ACK and write behavior; do not treat attempts as completed writes.

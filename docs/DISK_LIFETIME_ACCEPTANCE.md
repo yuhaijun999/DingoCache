@@ -40,7 +40,7 @@ DOC6、AB7、FLIP7 不能由本文代为完成，生产部署另需授权。
 | O09 元数据I/O/回收耗时/锁等待与持有 | Store table I/O、allocator 路径统计；Node notification wait/body/held 与 sampled completion；METRICS 对应小节 | **部分实现/需定界**：已有record_writes/table_syncs/bind_wipes/metadata_io_errors及部分路径耗时，不是所有互斥路径完整syscall/byte/lock账，也不代表成本验收。采样/嵌套口径不能累加为总耗时；GET/PUT p99、全 E/整条sync锁成本仍 open。 |
 | O10 RAM前台/后台、单/批预算与真实IO、ACK/最终丢弃 | `src/cache/ram_tier.cc` typed flush；Node `dfkv_ram_post_ack_flush_failures_total`；`RamTier.TypedFlushFailureReasonsControlRetryAndHealth`、`WriteBackFlushFailureIsPostAckAndUnhealthy` | 已有真实 publisher/健康回归；预算失败不是IO故障、未ACK失败不是ACK后丢失。新模式 RAM write-back 必须显式disk ACK，告警不能替代闸门。 |
 | O11 ACK后丢失立即可见且保留通用告警 | `deploy/observability/alerts.yml` 的 `DfkvRamPostAckDataLoss`：counter>0、无for；`alerts.test.yml` 与 Python contract，O5bc 原始日志 | 已有专用规则与真实promtool测试；“立即”是成功scrape后的首次匹配eval。外部Alertmanager通知/事件留存未验收，reset/stale不等于丢失恢复。 |
-| O12 RAM/disk、合并leader/follower、传输完成路径的逻辑读 | Node `RecordSyncReadResult` 两API终局6分类；真实TCP两新case及refusal增强见O5bb；PreparedSource/PULL grant子分区，物理pread/uring独立统计 | **实现缺口**：现有6分类不覆盖完整PULL Serve终局/排队取消；grant/通知内部等式不能充当独立请求分母。CPU helper也不能证明实际Serve。该边界必须独立闭合，实施顺序见§6，不用可选微字段替代。 |
+| O12 RAM/disk、合并leader/follower、传输完成路径的逻辑读 | Node `RecordSyncReadResult` 两API终局6分类；真实TCP两新case及refusal增强见O5bb；PreparedSource/PULL grant子分区，物理pread/uring独立统计 | **O5bg实现已解码/进入Serve调度的PULL独立终局账，整体验收仍未关闭**：sync/uring分区，授权成功/最终错误/未决定取消一次结算，决定后未PostSend独立注记。排除未解码原始WC FIFO/非法frame/RELEASE/客户端完成；不是所有传输分母。CPU生产账本测试不证明实际Serve；真实Serve回归硬件后置，不将skip或grant helper计为通过，见METRICS终局表。 |
 | O13 通知接受/无副本/未绑定/错代/race_lost/重复 | Store `NotifyLifetimeReadSuccess` 相关核验/原因分区；`disk_lifetime_read_test.cc`、`ram_tier_wiring_test.cc`、`prepared_read_test.cc`、CPU PULL测试 | 已有身份/时序回归；unbound不证明无副本，applied/success不证明所有适用请求都发通知。需独立完成账+同代来源资格联核，真实PULL硬件仍后置。 |
 | O14 completed→applied、通知锁成本 | `disk_lifetime_read_completion_test.cc`、wiring；METRICS 的 Logical completion to lifetime application / Sampled notification processing cost | 已有采样及排除原因；没有形成通知开销的性能放行结论。锁耗时与该延迟不是同一变量，禁止拼接均值/max。 |
 | O15 恢复数量、真实零读W、评分档、连续重启存活 | `disk_lifetime_public_test.cc` 的 `ConsecutiveCleanRestartsResetOnlyVirtualHistory`、`ImmediateWatermarkCannotResurrectRecoveredKeys`、`ImmediateDonorRebindDoesNotResurrectOldClass`；O5ax/O5ay回放与恢复boot-age | 已有状态/短轨迹验证；boot-age不是跨进程连续生存年龄。没有全负载连续存活/过度保留业务验收，虚拟两读绝不加入真实读数。 |
@@ -115,7 +115,7 @@ DOC6、AB7、FLIP7 不能由本文代为完成，生产部署另需授权。
    - **O5bf：typed flush与follower终局公开账（本包实现）。** 区分前后台、single/batch、CacheFull/IOError，
      只在真实终局处计数，重试/提交不算完成，混批与同key等待者各自守恒。
      已有typed语义不重写，避免将观测修复扩大成写回算法重构。
-   - **再处理：PULL Serve 独立请求终局账。** 先列同步/异步完成、队列取消、gate拒绝、MR失败、
+   - **O5bg：已解码PULL Serve 独立请求终局账（本包实现）。** 先列同步/异步完成、队列取消、gate拒绝、MR失败、
      授权后取消的终局表；统一一次性终局接缝，不复用grant通知计数冒充请求分母。
      新增真实Serve路径回归；硬件后置时明确未执行部分，不能用只调用helper的CPU测试
      宣称整包PULL完成。若需拆包，按可证明的完整终局分区拆，不按“新增一个字段”拆。
@@ -158,4 +158,4 @@ git diff --check
 Store/Group只转发快照，Node同一per-disk样本导出并聚合。不改变淘汰选择/预算/默认。
 O5bd“本轮纯文档/无新C++测试”等仅描述此前清单包；O5be新增真实单测与构建证据
 单独保存在 `.omx/evidence/o5be-band-scans/`，未完成验证前不宣称通过。
-O07命名flush/follower账由O5bf补充，完整Node分母不在该范围；O12 PULL终局账仍open，硬件继续后置。
+O07命名flush/follower账由O5bf补充，完整Node分母不在该范围；O12由O5bg补充decoded/dispatched账，但实际Serve硬件与原始接收/全传输边界仍open，硬件继续后置。

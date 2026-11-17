@@ -18,6 +18,7 @@
 #include "cache/disk_write_result.h"
 #include "cache/kv_node_server.h"
 #include "cache/ram_tier.h"
+#include "cache/rdma_pull_request_accounting.h"
 #include "cache/rdma_server.h"
 #include "cache/store_engine.h"
 #include "common/config_dump.h"
@@ -459,6 +460,55 @@ class RdmaPullAdmissionTest : public ::testing::Test {
   char value_[6] = "value";
   alignas(4096) char staging_[4096] = {};
 };
+
+void ExpectPullRequestStats(const RdmaServer& server,
+                            const std::array<uint64_t, 2>& dispatched,
+                            const std::array<uint64_t, 9>& sync,
+                            const std::array<uint64_t, 9>& uring,
+                            const std::array<uint64_t, 2>& unposted = {}) {
+  const RdmaPullRequestCounters::Snapshot actual = server.PullRequestStats();
+  EXPECT_EQ(actual.dispatched, dispatched);
+  EXPECT_EQ(actual.terminal[0], sync);
+  EXPECT_EQ(actual.terminal[1], uring);
+  EXPECT_EQ(actual.decided_unposted, unposted);
+}
+
+TEST_F(RdmaPullAdmissionTest, HelpersDoNotCreateDecodedRequestCohort) {
+  PreparedRead read = Prepare();
+  ASSERT_EQ(read.status(), Status::kOk);
+  EXPECT_TRUE(RdmaServerTestPeer::AdmitPullGrant(transport_, read));
+  bool recorded = false;
+  RdmaServerTestPeer::RecordPullGrant(transport_, key_, {}, 5, recorded);
+  RdmaServerTestPeer::RecordPullGrant(transport_, key_, {}, 5, recorded);
+  EXPECT_TRUE(recorded);
+  EXPECT_TRUE(read.Abort());
+  // These real helper calls are deliberately not a dispatched Serve request.
+  // Notification metrics changing must not populate its independent cohort.
+  ExpectPullRequestStats(transport_, {}, {}, {});
+  const std::string text = transport_.MetricsText();
+  const std::array<const char*, 9> results{
+      "success_nonempty",  "success_empty", "not_found",
+      "invalid",           "cache_full",    "io_error",
+      "admission_refused", "cancelled",     "other"};
+  for (const char* path : {"sync", "uring"}) {
+    const std::string labels = std::string("{path=\"") + path + "\"";
+    EXPECT_NE(text.find("dfkv_rdma_pull_requests_dispatched_total" + labels +
+                        "} 0\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("dfkv_rdma_pull_decided_responses_unposted_total" +
+                        labels + "} 0\n"),
+              std::string::npos);
+    for (const char* result : results) {
+      EXPECT_NE(text.find("dfkv_rdma_pull_requests_terminal_total" + labels +
+                          ",result=\"" + result + "\"} 0\n"),
+                std::string::npos);
+    }
+  }
+  EXPECT_NE(text.find("dfkv_rdma_pull_read_notification_no_observer_total 1\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("dfkv_rdma_pull_read_notification_duplicate_total 1\n"),
+            std::string::npos);
+}
 
 TEST_F(RdmaPullAdmissionTest, EmptyPredicateKeepsPreparationActive) {
   PreparedRead read = Prepare();
@@ -1724,7 +1774,8 @@ struct RdmaNode {
                     std::function<void()> after_reply_post = {},
                     std::function<void(ibv_wc*, int*, size_t)> reorder = {},
                     std::function<void(size_t, size_t, size_t)> observe = {},
-                    std::function<void(size_t)> after_rearm = {}) {
+                    std::function<void(size_t)> after_rearm = {},
+                    const std::function<void(RdmaServer&)>& configure = {}) {
     ConfigureTestRecvSegment();
     dir = fs::temp_directory_path() / ("dfkv_rdma_" + tag);
     fs::remove_all(dir);
@@ -1793,6 +1844,7 @@ struct RdmaNode {
             return srv->RamPinnedHitForKey(key, off, len, out);
           });
     }
+    if (configure) configure(*rsrv);
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
   }
@@ -3572,6 +3624,64 @@ bool PinnedExists(PinnedPullPeer& peer, const BlockKey& key) {
          status == Status::kOk;
 }
 
+TEST(RdmaPullTerminalServeTest, SyncDecisionsPartitionDecodedPulls) {
+  if (!HaveRdma()) {
+    GTEST_SKIP() << "real Serve requires an RDMA device";
+  }
+  const ScopedEnv uring("DFKV_SERVER_URING", "0");
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  std::atomic<bool> refuse{false};
+  RdmaNode node("pull-terminals-sync", kMaxMsg, false, false, {}, {}, {}, {},
+                [&](RdmaServer& server) {
+                  server.SetRestartRequiredHandler(
+                      [&] { return refuse.load(std::memory_order_acquire); });
+                });
+  const BlockKey key{99831, 0}, absent{99832, 0};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                           key, 0, 0, "value", 5, &ignored),
+            Status::kOk);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  ExpectPullRequestStats(*node.rsrv, {}, {}, {});
+  const auto request = [&](const BlockKey& requested, size_t offset,
+                           size_t length, uint64_t release_generation) {
+    EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kPullRange,
+                     requested, offset, length, rdma::kPullPrepareBytes);
+    rdma::PullPrepareControl control;
+    control.release_generation = release_generation;
+    rdma::EncodePullPrepareControl(control, peer.ep.sbuf(0) + kReqPrefix);
+    Status status = Status::kInvalid;
+    uint64_t bytes = 0;
+    EXPECT_TRUE(
+        peer.Exchange(kReqPrefix + rdma::kPullPrepareBytes, &status, &bytes));
+    EXPECT_EQ(bytes, 0U);
+    return status;
+  };
+  rdma::DynamicPullReady ready;
+  ASSERT_TRUE(peer.Prepare(key, 0, 5, &ready));
+  std::string output;
+  ASSERT_TRUE(peer.Read(ready, &output));
+  EXPECT_EQ(output, "value");
+  EXPECT_EQ(request(key, 0, 5, 0), Status::kCacheFull);
+  ASSERT_TRUE(peer.Release(key, ready));
+  ASSERT_TRUE(peer.Prepare(key, 5, 0, &ready));
+  EXPECT_EQ(ready.data_len, 0U);
+  ASSERT_TRUE(peer.Release(key, ready));
+  EXPECT_EQ(request(absent, 0, 5, 0), Status::kNotFound);
+  EXPECT_EQ(request(key, 0, 5, 1), Status::kInvalid);
+  refuse.store(true, std::memory_order_release);
+  EXPECT_EQ(request(key, 0, 5, 0), Status::kIOError);
+  node.rsrv->Stop();  // Join before asserting complete relaxed snapshots.
+  ExpectPullRequestStats(*node.rsrv, {6, 0}, {1, 1, 1, 1, 1, 0, 1, 0, 0}, {});
+  // No success observer was installed. This ledger is not an alias of the
+  // old notification family, and successful RELEASEs were not new PULLs.
+  EXPECT_NE(node.rsrv->MetricsText().find(
+                "dfkv_rdma_pull_read_notification_no_observer_total 1\n"),
+            std::string::npos);
+}
+
 TEST(RdmaLoopback, LegacyDynamicHandshakeReadReleaseAndLiveProof) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv uring("DFKV_SERVER_URING", "0");
@@ -4807,6 +4917,7 @@ TEST(RdmaLoopback, DynamicPullPinSurvivesRemoveAndEvictionUntilRelease) {
 
 TEST(RdmaLoopback, DynamicPullTeardownAbortsAccountingAndReleasesPin) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const ScopedEnv uring("DFKV_SERVER_URING", "0");
   ScopedEnv ram_on("DFKV_RAM_TIER", "1");
   ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "268435456");
   RdmaNode node("pull-pin-teardown");
@@ -4828,6 +4939,9 @@ TEST(RdmaLoopback, DynamicPullTeardownAbortsAccountingAndReleasesPin) {
   EXPECT_EQ(ram.Hits(), 0u);
   EXPECT_EQ(KvNodeServerTestPeer::GetLatencyCount(*node.srv), 0u);
   EXPECT_EQ(node.srv->m_cache_hit(), hits);
+  // A granted response is a logical success even when the client never READs
+  // or RELEASEs it; Stop aborts storage accounting, not the prior decision.
+  ExpectPullRequestStats(*node.rsrv, {1, 0}, {1, 0, 0, 0, 0, 0, 0, 0, 0}, {});
 }
 
 TEST(RdmaLoopback, DynamicPullExactGrantRejectsReadPastRequestedRange) {
@@ -4867,6 +4981,7 @@ TEST(RdmaLoopback, DynamicPullExactGrantRejectsReadPastRequestedRange) {
 
 TEST(RdmaLoopback, DynamicPullFallbackAccountsOneAccess) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const ScopedEnv uring("DFKV_SERVER_URING", "0");
   ScopedEnv ram_on("DFKV_RAM_TIER", "1");
   ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
   ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
@@ -4923,6 +5038,9 @@ TEST(RdmaLoopback, DynamicPullFallbackAccountsOneAccess) {
                                 {{out.data(), out.size()}}, nullptr),
             std::vector<Status>({Status::kNotFound}));
   EXPECT_EQ(ram.Misses(), misses + 1);
+  node.rsrv->Stop();
+  // Failed pinned registration followed by staging is still one request.
+  ExpectPullRequestStats(*node.rsrv, {4, 0}, {3, 0, 1, 0, 0, 0, 0, 0, 0}, {});
 }
 
 // B5-3 zero-copy pull GET: an arena-resident value must answer a dynamic
@@ -6408,6 +6526,10 @@ class ControlledRdmaUringBackend final : public UringReader::Backend {
 
   int WaitCqe(io_uring*, io_uring_cqe** cqe, int timeout_ms) override {
     std::unique_lock<std::mutex> lock(mu_);
+    if (timeout_ms != 1) {
+      drain_waiting_ = true;
+      cv_.notify_all();
+    }
     const auto ready = [&] { return !ready_.empty() || exited_; };
     if (timeout_ms < 0) {
       cv_.wait(lock, ready);
@@ -6438,6 +6560,12 @@ class ControlledRdmaUringBackend final : public UringReader::Backend {
   void SetSubmitResults(std::deque<int> results) {
     std::lock_guard<std::mutex> lock(mu_);
     submit_results_ = std::move(results);
+  }
+
+  bool WaitForDrain(int timeout_ms = 5000) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                        [&] { return drain_waiting_; });
   }
 
   bool WaitForSubmitted(size_t count, int timeout_ms = 5000) {
@@ -6525,6 +6653,7 @@ class ControlledRdmaUringBackend final : public UringReader::Backend {
   size_t seen_ = 0;
   size_t max_inflight_ = 0;
   bool exited_ = false;
+  bool drain_waiting_ = false;
   bool bad_state_ = false;
   std::list<io_uring_sqe> sqes_;
   std::map<io_uring_sqe*, Request> prepared_;
@@ -6704,6 +6833,205 @@ struct RdmaUringNode {
     return found == range_calls.end() ? 0 : found->second;
   }
 };
+
+#ifdef DFKV_WITH_URING
+namespace {
+void CheckPullTerminalQueueTeardown() {
+  const ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
+  const ScopedEnv buffered("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv disk_reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const ScopedEnv uring("DFKV_SERVER_URING", "1");
+  const ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  const ScopedEnv ram("DFKV_RAM_TIER", "1");
+  const ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
+  const ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  const ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
+  const ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+  const ScopedEnv reclaim("DFKV_RAM_RECLAIM_MS", "0");
+  const ScopedEnv writearound("DFKV_RAM_WRITE_MODE", "writearound");
+  std::atomic<bool> all_dispatched{false};
+  RdmaUringNode node("pull-terminals-queue-stop", kMaxMsg,
+                     [](ControlledRdmaUringBackend*) {});
+  const BlockKey cold{99841, 0}, warm{99842, 0};
+  const std::string value(4096, 'c');
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                           cold, 0, 0, value.data(),
+                                           value.size(), &ignored),
+            Status::kOk);
+  ASSERT_TRUE(KvNodeServerTestPeer::Ram(*node.srv).PutDurable(warm, "warm", 4));
+  RdmaServerTestPeer::SetCqHooks(
+      *node.rsrv, {}, [&](size_t pending, size_t free, size_t) {
+        if (pending == 0 && free == 0) {
+          all_dispatched.store(true, std::memory_order_release);
+        }
+      });
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node, 4));
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kPullRange,
+                   cold, 0, value.size(), rdma::kPullPrepareBytes);
+  rdma::EncodePullPrepareControl({}, peer.ep.sbuf(0) + kReqPrefix);
+  ASSERT_TRUE(peer.ep.PostRecv(0));
+  ASSERT_TRUE(peer.ep.PostSend(0, kReqPrefix + rdma::kPullPrepareBytes));
+  ControlledRdmaUringBackend* backend = node.WaitForBackendWithSubmitted(1);
+  ASSERT_NE(backend, nullptr);
+  const std::vector<ControlledRdmaUringBackend::Request> requests =
+      backend->History();
+  ASSERT_EQ(requests.size(), 1U);
+  struct CompleteOnExit {
+    ControlledRdmaUringBackend& backend;
+    UringReader::Token token;
+    ~CompleteOnExit() { backend.Complete(token, -ECANCELED); }
+  };
+  const CompleteOnExit release{*backend, requests[0].token};
+  // B becomes a real RAM-backed grant but cannot emit before A's disk read.
+  // C defers a mutation, so D is an admitted PULL still waiting for execution
+  // within the async scheduler. Raw pending-receive FIFO is not this cohort.
+  EncodeReqVersion(peer.ep.sbuf(1), kNativeProtoRdmaV2, WireOp::kPullRange,
+                   warm, 0, 4, rdma::kPullPrepareBytes);
+  rdma::PullPrepareControl warm_control;
+  warm_control.slot_index = 1;
+  rdma::EncodePullPrepareControl(warm_control, peer.ep.sbuf(1) + kReqPrefix);
+  EncodeReqVersion(peer.ep.sbuf(2), kNativeProtoRdmaV2, WireOp::kRemove, cold,
+                   0, 0, 0);
+  EncodeReqVersion(peer.ep.sbuf(3), kNativeProtoRdmaV2, WireOp::kPullRange,
+                   cold, 0, value.size(), rdma::kPullPrepareBytes);
+  rdma::PullPrepareControl deferred_control;
+  deferred_control.slot_index = 2;
+  rdma::EncodePullPrepareControl(deferred_control,
+                                 peer.ep.sbuf(3) + kReqPrefix);
+  for (size_t slot = 1; slot < 4; ++slot) {
+    ASSERT_TRUE(peer.ep.PostRecv(slot));
+    ASSERT_TRUE(peer.ep.PostSend(
+        slot, kReqPrefix + (slot == 2 ? 0 : rdma::kPullPrepareBytes)));
+  }
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!all_dispatched.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(all_dispatched.load(std::memory_order_acquire));
+  ExpectPullRequestStats(*node.rsrv, {0, 3}, {}, {1, 0, 0, 0, 0, 0, 0, 0, 0});
+  std::thread stopping([&] { node.rsrv->Stop(); });
+  // Wait for actual Drain entry, not merely a Stop-thread-started flag. A disk
+  // CQE supplied earlier could still turn A into a grant before loop exit.
+  const bool draining = backend->WaitForDrain();
+  const bool completed = backend->CompleteRead(requests[0].token);
+  stopping.join();
+  EXPECT_TRUE(draining);
+  EXPECT_TRUE(completed);
+  EXPECT_TRUE(backend->Exited());
+  EXPECT_EQ(backend->AcceptedCount(), 0U);
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0U);
+  ExpectPullRequestStats(*node.rsrv, {0, 3}, {}, {1, 0, 0, 0, 0, 0, 0, 2, 0},
+                         {0, 1});
+}
+}  // namespace
+
+TEST(RdmaPullTerminalServeTest,
+     UringTeardownSeparatesUndecidedAndGrantedQueuedPulls) {
+  if (!HaveRdma()) {
+    GTEST_SKIP() << "real Serve requires an RDMA device";
+  }
+  ASSERT_EXIT(
+      {
+        ::alarm(20);
+        CheckPullTerminalQueueTeardown();
+        ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+}
+
+namespace {
+void CheckPullTerminalShortRead() {
+  const ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
+  const ScopedEnv buffered("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv disk_reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv table_sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const ScopedEnv uring("DFKV_SERVER_URING", "1");
+  const ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  RdmaUringNode node("pull-terminals-short", kMaxMsg,
+                     [](ControlledRdmaUringBackend*) {});
+  const BlockKey key{99843, 0};
+  const std::string value(4096, 's');
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                           key, 0, 0, value.data(),
+                                           value.size(), &ignored),
+            Status::kOk);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kPullRange, key,
+                   0, value.size(), rdma::kPullPrepareBytes);
+  rdma::EncodePullPrepareControl({}, peer.ep.sbuf(0) + kReqPrefix);
+  ASSERT_TRUE(peer.ep.PostRecv(0));
+  ASSERT_TRUE(peer.ep.PostSend(0, kReqPrefix + rdma::kPullPrepareBytes));
+  ControlledRdmaUringBackend* backend = node.WaitForBackendWithSubmitted(1);
+  ASSERT_NE(backend, nullptr);
+  const std::vector<ControlledRdmaUringBackend::Request> initial =
+      backend->History();
+  ASSERT_EQ(initial.size(), 1U);
+  struct CompleteOnExit {
+    ControlledRdmaUringBackend& backend;
+    UringReader::Token token;
+    ~CompleteOnExit() { backend.Complete(token, -ECANCELED); }
+  };
+  const CompleteOnExit release{*backend, initial[0].token};
+  ASSERT_GT(initial[0].len, 1U);
+  ASSERT_TRUE(backend->Complete(initial[0].token, initial[0].len - 1));
+  ASSERT_TRUE(backend->WaitForSubmitted(2));
+  const std::vector<ControlledRdmaUringBackend::Request> residual =
+      backend->History();
+  ASSERT_EQ(residual.size(), 2U);
+  EXPECT_EQ(residual[1].token, initial[0].token);
+  EXPECT_EQ(residual[1].len, 1U);
+  // A real residual submission proves Serve consumed the short CQE. It is
+  // still one admitted request with no terminal until the following EOF.
+  ExpectPullRequestStats(*node.rsrv, {0, 1}, {}, {});
+  ASSERT_TRUE(backend->Complete(residual[1].token, 0));
+  bool sent = false, received = false;
+  while (!sent || !received) {
+    ibv_wc wc{};
+    ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 5000), 1);
+    ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+    if (wc.opcode == IBV_WC_SEND) {
+      sent = true;
+    } else {
+      ASSERT_EQ(wc.opcode, IBV_WC_RECV);
+      ASSERT_EQ(wc.byte_len, kRespPrefix);
+      Status status = Status::kInvalid;
+      uint64_t bytes = 0;
+      ASSERT_TRUE(DecodeRespVersion(peer.ep.rbuf(0), kNativeProtoRdmaV2,
+                                    &status, &bytes));
+      EXPECT_EQ(status, Status::kIOError);
+      EXPECT_EQ(bytes, 0U);
+      received = true;
+    }
+  }
+  node.rsrv->Stop();
+  ExpectPullRequestStats(*node.rsrv, {0, 1}, {}, {0, 0, 0, 0, 0, 1, 0, 0, 0});
+}
+}  // namespace
+
+TEST(RdmaPullTerminalServeTest, UringShortReadWaitsForEofBeforeIoTerminal) {
+  if (!HaveRdma()) {
+    GTEST_SKIP() << "real Serve requires an RDMA device";
+  }
+  // Bound teardown even if a regression stalls between a short CQE and the
+  // residual submission: a best-effort cleanup completion can miss that gap.
+  ASSERT_EXIT(
+      {
+        ::alarm(20);
+        CheckPullTerminalShortRead();
+        ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+}
+
+#endif
 
 #ifdef DFKV_WITH_URING
 TEST(RdmaLoopback, PressurePreservesSubmittedUringRead) {
@@ -7111,6 +7439,13 @@ void CheckAsyncMutationOrder(AsyncReadResult read_result,
   EXPECT_EQ(output, new_value) << "the later PULL must observe Remove then PUT";
   ASSERT_TRUE(peer.Release(key, ready[3]));
   EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  node.rsrv->Stop();
+  const std::array<uint64_t, 9> terminal =
+      fail_read ? std::array<uint64_t, 9>{1, 0, 0, 0, 0, 1, 0, 0, 0}
+                : std::array<uint64_t, 9>{2, 0, 0, 0, 0, 0, 0, 0, 0};
+  // A positive short read plus EOF is one failed logical request, not two
+  // terminals. Successful grant RELEASEs and queued mutations add none.
+  ExpectPullRequestStats(*node.rsrv, {0, 2}, {}, terminal);
 }
 
 TEST(RdmaLoopback, AsyncReservedReadDefersRemoveAndLaterPut) {

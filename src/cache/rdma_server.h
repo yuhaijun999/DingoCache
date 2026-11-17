@@ -29,6 +29,7 @@
 #include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
 #include "cache/ram_tier.h"
+#include "cache/rdma_pull_request_accounting.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -265,6 +266,11 @@ class RdmaServer {
   // requests hit receiver-not-ready retries and degrade SILENTLY (measured 3-4x
   // on pipelined GETs) and cause PUT batch failures during burst writes.
   size_t PipelineDepth() const;
+  // Successfully decoded/dispatched PULL requests only, not all received WCs,
+  // notification calls, transport delivery or client READ completion.
+  RdmaPullRequestCounters::Snapshot PullRequestStats() const {
+    return pull_request_counters_.Read();
+  }
   std::string MetricsText() const;  // Prometheus text (dfkv_rdma_*)
   // Whether the io_uring async-GET serve path should be used for new conns.
   // Default ON when built with DFKV_WITH_URING and the prepared-read handler is
@@ -376,6 +382,7 @@ class RdmaServer {
   std::atomic<uint64_t> dynamic_get_active_{0};
   std::atomic<uint64_t> dynamic_get_bytes_active_{0};
   std::atomic<uint64_t> pull_zerocopy_served_{0};
+  RdmaPullRequestCounters pull_request_counters_;
   // Mutually exclusive outcomes of RecordPullGrant calls, not heat results.
   std::atomic<uint64_t> pull_read_notification_notified_{0};
   std::atomic<uint64_t> pull_read_notification_duplicate_{0};

@@ -1829,3 +1829,64 @@ when residents disappear. Existing flush attempt/batch/byte/failure/latency
 metrics keep their original meaning and alerts/queries are unchanged. These
 new counters do not replace the post-ACK data-loss alert, classify retries as
 corruption, or alter admission, retry count, persistence, ACK or policy defaults.
+
+### Decoded/dispatched PULL request accounting
+
+`dfkv_rdma_pull_requests_dispatched_total{path="sync|uring"}` starts a cohort
+only after real Serve successfully decodes a PULL request and claims its SEND
+slot. It is independent of optional heat observers and existing grant helper
+call counts. Ring initialization fallback belongs to sync; successfully
+initialized async Serve belongs to uring, including its synchronous fallback
+work. Counts reset with the RdmaServer owner, not with each connection.
+
+`dfkv_rdma_pull_requests_terminal_total{path,result}` has nine exclusive results:
+`success_nonempty`, `success_empty`, `not_found`, `invalid`, `cache_full`,
+`io_error`, `admission_refused`, `cancelled`, `other`. Successful grant ownership
+(MR, exact bytes and release identity) is the logical success point, **before**
+notification, READY encoding and PostSend. A later send failure cannot undo the
+grant or add a second logical result. This is not client receipt, READ/RELEASE
+completion, a live-residency promise or proof of applied heat.
+
+`dfkv_rdma_pull_decided_responses_unposted_total{path}` is a separate teardown
+annotation: a logical decision already existed but its response was never
+successfully PostSend'ed. It does not add another logical terminal. A successful
+PostSend closes that annotation, not the SEND CQE or client-delivery contract.
+
+| Actual Serve branch | Logical decision |
+|---|---|
+| Decoded PULL with invalid control/range or returned byte geometry | invalid |
+| Grant slot busy or staging allocation refused | cache_full |
+| Synchronous handler/prepared read final miss or other failure | actual final Status classification |
+| Final storage-pin release/commit failure, short/error disk CQE | io_error, never an earlier pread success |
+| Exact lifetime grant-admission refusal (wire IOError) | admission_refused |
+| First pinned MR registration fails, staging fallback remains possible | no terminal yet |
+| Final MR registration fails | io_error |
+| Empty/nonempty grant is established | success_empty/success_nonempty |
+| Async waiting, inflight, deferred fallback or sync dispatched request exits before a decision | cancelled, once at connection ledger destruction after existing ring drain/queue cleanup |
+| Already decided request exits before response PostSend succeeds | retain original logical terminal; independent unposted annotation |
+| PostSend succeeds, then SEND CQE/connection fails; RELEASE/cleanup repeats | no new logical terminal or unposted annotation |
+
+The ledger is bounded by connection pipeline depth and reuses SEND-slot
+identity, not key identity or `Queued::request` (immediate async paths do not all
+store that Request). It owns no MR, QP, pin, buffer or disk-ring cleanup; existing
+DMA/revocation/drain order is unchanged. Counter snapshots use relaxed loads,
+not a cross-field transaction. After all admitted requests are settled,
+dispatched equals the sum of terminal categories per path; during concurrency
+an independently loaded difference is not a reliable inflight gauge.
+
+Only bounded path/result labels are added, no key, request, device or node label.
+As with existing RdmaServer metrics these families are emitted by its metrics
+extension when the RDMA server exists. All 22 bounded samples include zeros;
+a non-RDMA build has no RdmaServer extension. No policy/default/ACK/retry,
+notification, payload preparation or wire behavior changes.
+
+**Coverage boundary:** bootstrap/capability probes, malformed frames rejected
+before decoding, raw pending-receive WC FIFO entries not yet dispatched,
+RELEASE, SEND completions, non-PULL requests and client-side operations are not
+members of this cohort. In particular async queued-request cancellation is
+covered, but this is not a complete raw-ingress/all-transport denominator.
+Existing grant/helper CPU tests are not Serve integration tests. New production
+ledger CPU tests and hardware-gated real Serve regressions are separate evidence
+layers; hardware-deferred/skipped cases do not establish actual Serve runtime
+coverage or close O12 acceptance. Real RDMA/RXE+io_uring validation remains a
+later gate; no performance or default-flip acceptance follows from these metrics.

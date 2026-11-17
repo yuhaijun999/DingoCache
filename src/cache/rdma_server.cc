@@ -23,6 +23,7 @@
 
 #include "cache/disk_lifetime_read_completion.h"
 #include "cache/disk_resident_identity.h"
+#include "cache/rdma_pull_request_accounting.h"
 #include "cache/rdma_request_order.h"
 #include "cache/store_engine.h"
 #include "cache/uring_reader.h"  // io_uring async-GET path (DFKV_WITH_URING only)
@@ -1021,6 +1022,11 @@ void RdmaServer::Serve(int boot_fd) {
   free_send.reserve(K);
   for (size_t i = 0; i < K; ++i) free_send.push_back(i);
 
+  // Independent of payload/MR cleanup and grant notifications. Async ring
+  // drain and queued-read destruction precede this ledger's abandonment pass.
+  // Raw pending-receive WCs have not entered the decoded request cohort.
+  RdmaPullRequestLedger pull_requests(pull_request_counters_, K);
+
   auto direct_buffer = [&](size_t slot) -> char* {
     return recv_lease.data() + slot * slot_size + rdma::kV2DataOffset;
   };
@@ -1222,12 +1228,13 @@ void RdmaServer::Serve(int boot_fd) {
                           PreparedRead::Source fallback_source,
                           double elapsed_sec, Reply* reply) -> bool {
     PullSlotState& state = pull_slots[slot];
-    auto error_reply = [&](Status status) {
+    auto error_reply = [&](Status status, bool admission_refused = false) {
       // Revoke access before Abort can release registered RAM/staging storage.
       ep.ReleaseLeaseReadRegion(state.mr);
       state.mr = nullptr;
       prepared.Abort();
       state.Reset();
+      pull_requests.Finish(send_slot, status, 0, admission_refused);
       EncodeRespVersion(ep.sbuf(send_slot), wire_epoch, status, 0, value_len);
       reply->first_len = response_prefix;
       return true;
@@ -1250,12 +1257,12 @@ void RdmaServer::Serve(int boot_fd) {
     // Empty results retain a revocable release identity, but authorize no
     // payload READ. The one registered sentinel byte is not a wire request.
     if (output_len == 0) output = state.lease.data();
-    if (!AdmitPullGrant(prepared)) return error_reply(Status::kIOError);
+    if (!AdmitPullGrant(prepared)) return error_reply(Status::kIOError, true);
     state.mr = ep.RegisterLeaseReadRegion(
         const_cast<char*>(output), std::max<size_t>(output_len, 1));
     if (!state.mr && prepared.source_registered() && prepared.Stage()) {
       output = prepared.data();
-      if (!AdmitPullGrant(prepared)) return error_reply(Status::kIOError);
+      if (!AdmitPullGrant(prepared)) return error_reply(Status::kIOError, true);
       state.mr = ep.RegisterLeaseReadRegion(
           const_cast<char*>(output), std::max<size_t>(output_len, 1));
     }
@@ -1279,6 +1286,9 @@ void RdmaServer::Serve(int boot_fd) {
     state.busy = true;
     state.data_len = output_len;
     state.value_len = value_len;
+    // Logical success is irrevocable once the grant owns its MR and bytes,
+    // even if READY is never posted. It is not notification/delivery success.
+    pull_requests.Finish(send_slot, Status::kOk, output_len);
     RecordPullGrant(request.fields.Key(), identity, output_len,
                     state.grant_recorded, source);
     const rdma::DynamicPullReady ready{
@@ -1311,6 +1321,7 @@ void RdmaServer::Serve(int boot_fd) {
     PullSlotState& state = pull_slots[slot];
     if (!AdmitPullGrant(pinned)) {
       state.Reset();
+      pull_requests.Finish(send_slot, Status::kIOError, 0, true);
       EncodeRespVersion(ep.sbuf(send_slot), wire_epoch, Status::kIOError, 0,
                         pinned.value_len());
       reply->first_len = response_prefix;
@@ -1325,6 +1336,7 @@ void RdmaServer::Serve(int boot_fd) {
     state.busy = true;
     state.data_len = state.arena_read.payload_len();
     state.value_len = state.arena_read.value_len();
+    pull_requests.Finish(send_slot, Status::kOk, state.data_len);
     RecordPullGrant(request.fields.Key(), state.arena_read.source_identity(),
                     state.data_len, state.grant_recorded,
                     state.arena_read.source());
@@ -1349,6 +1361,7 @@ void RdmaServer::Serve(int boot_fd) {
     char* send_buffer = ep.sbuf(send_slot);
     auto encode_status = [&](Status status, uint64_t data_len,
                              uint64_t value_len = 0) {
+      pull_requests.Finish(send_slot, status);
       EncodeRespVersion(send_buffer, wire_epoch, status, data_len, value_len);
     };
     auto invalid_reply = [&] {
@@ -1575,7 +1588,9 @@ void RdmaServer::Serve(int boot_fd) {
   };
 
   auto post_reply = [&](size_t send_slot, const Reply& reply) -> bool {
-    return ep.PostSend(send_slot, reply.first_len);
+    const bool posted = ep.PostSend(send_slot, reply.first_len);
+    if (posted) pull_requests.ResponsePosted(send_slot);
+    return posted;
   };
 
   // Replies preserve receive order because the client binds destinations by
@@ -1735,6 +1750,7 @@ void RdmaServer::Serve(int boot_fd) {
         EncodeRespVersion(ep.sbuf(qd.send_slot), wire_epoch,
                           Status::kIOError, 0);
         qd.reply.first_len = response_prefix;
+        pull_requests.Finish(qd.send_slot, Status::kIOError);
       } else {
         const char* data = qd.read.data();
         const size_t bytes = qd.read.payload_len();
@@ -1781,6 +1797,10 @@ void RdmaServer::Serve(int boot_fd) {
       free_send.pop_back();
       qd.recv_slot = request.recv_slot;
       const ReqFields& fields = request.fields;
+      if (fields.op == static_cast<uint8_t>(WireOp::kPullRange)) {
+        pull_requests.Begin(qd.send_slot,
+                            RdmaPullRequestCounters::Path::kUring);
+      }
 
       const bool pending_disk_reads =
           std::any_of(queue.begin(), queue.end(), [](const Queued& earlier) {
@@ -1862,6 +1882,7 @@ void RdmaServer::Serve(int boot_fd) {
               EncodeRespVersion(ep.sbuf(qd.send_slot), wire_epoch, status, 0,
                                 value_len);
               qd.reply.first_len = response_prefix;
+              pull_requests.Finish(qd.send_slot, status);
               handled = true;
               qd.ready = true;
             } else {
@@ -2122,6 +2143,9 @@ sync_serve_loop:;
     const size_t r = request.recv_slot;
     const size_t s = free_send.back();
     free_send.pop_back();
+    if (request.fields.op == static_cast<uint8_t>(WireOp::kPullRange)) {
+      pull_requests.Begin(s, RdmaPullRequestCounters::Path::kSync);
+    }
     Reply reply;
     if (!build_reply(s, request, &reply)) return false;
     if (!post_request_recv(r)) return false;
@@ -2256,6 +2280,7 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_leaseput_bytes_active", "gauge",
     "Receive-pool bytes held by in-flight leased-PUT staging",
     lease_put_bytes_active_);
+  s += pull_request_counters_.MetricsText();
   m(s, "dfkv_rdma_pull_zerocopy_served_total", "counter",
     "Dynamic-pull GETs served directly from the pinned RAM arena without a staging copy",
     pull_zerocopy_served_);
