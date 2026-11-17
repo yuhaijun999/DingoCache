@@ -194,7 +194,11 @@ def parse_args(argv=None):
     parser.add_argument('--pressure-delay-sec', type=int, default=0,
                         help='wait after hot warmup before cold writes (0..300)')
     parser.add_argument('--data-name', help='new child name shared across all data roots')
+    parser.add_argument('--protect-sec', type=int, choices=(30, 60, 180),
+                        help='explicit lifetime P preset for isolated diagnostics only')
     args = parser.parse_args(argv)
+    if args.protect_sec is not None and args.policy != 'lifetime':
+        parser.error('protect-sec requires lifetime policy')
     if not 0 <= args.pressure_delay_sec <= 300:
         parser.error('pressure delay must be in 0..300 seconds')
     if args.scenario == 'sustained-pressure' and args.pressure_delay_sec:
@@ -232,6 +236,8 @@ def run(args):
                    DFKV_RDMA_RECV_CHUNK_BYTES='8388608', DFKV_RDMA_MAX_PAYLOAD_BYTES='2097152',
                    DFKV_RDMA_MAX_BLOCK_BYTES='2097152', DFKV_SERVER_URING='1',
                    PYTHONPATH=str(source / 'integration/common/src'))
+        if args.protect_sec is not None:
+            env['DFKV_SLAB_PROTECT_SEC'] = str(args.protect_sec)
         command = [str(args.build / 'dfkv_server'), '--dir', ','.join(map(str, dirs)),
                    '--cap', '12884901888', '--store-engine', 'slab', '--slab-write', 'buffered',
                    '--slab-eviction-policy', args.policy, '--port', '12000', '--rdma-port', '12001',
@@ -248,6 +254,7 @@ def run(args):
         (args.output / 'case.json').write_text(json.dumps({'command': command, 'data_dirs': list(map(str, dirs)),
             'client_command': client_command, 'client_timeout_sec': client_timeout_sec,
             'pressure_delay_sec': args.pressure_delay_sec, 'scenario': args.scenario,
+            'protect_sec_override': args.protect_sec,
             'environment': {k: v for k, v in env.items() if k.startswith('DFKV_') or k == 'PYTHONPATH'}}, indent=2) + '\n')
         with (args.output / 'server.log').open('w') as server_log:
             server = subprocess.Popen(command, env=env, stdout=server_log, stderr=subprocess.STDOUT)

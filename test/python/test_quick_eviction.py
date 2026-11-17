@@ -276,6 +276,36 @@ class QuickEvictionTest(unittest.TestCase):
                 self.assertEqual(case['data_dirs'], [str(root / 'fixed') for root in args.data_root])
                 server.terminate.assert_called_once()
 
+    def test_protect_presets_are_explicit_and_lifetime_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp))
+            self.assertIsNone(runner.parse_args(argv).protect_sec)
+            for value in (30, 60, 180):
+                self.assertEqual(runner.parse_args(argv + ['--protect-sec', str(value)]).protect_sec, value)
+            for extra in (['--protect-sec', '0'], ['--protect-sec', '-1'],
+                          ['--protect-sec', '31'], ['--protect-sec', '1.5'],
+                          ['--policy', 'legacy', '--protect-sec', '30']):
+                with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit):
+                    runner.parse_args(argv + extra)
+
+    def test_only_explicit_protect_preset_reaches_server_environment(self):
+        for value in (None, 30, 60, 180):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp:
+                argv = self.arguments(Path(temp))
+                args = runner.parse_args(argv + ([] if value is None else ['--protect-sec', str(value)]))
+                with mock.patch.object(runner, 'check_ports'), \
+                        mock.patch.dict(runner.os.environ, {'DFKV_SLAB_PROTECT_SEC': '999',
+                                                           'DFKV_SLAB_PROTECT_BOOST_SEC': '1'}), \
+                        mock.patch.object(runner.subprocess, 'Popen', side_effect=OSError('stop before startup')) as popen:
+                    result = runner.run(args)
+                env = popen.call_args.kwargs['env']
+                self.assertEqual(env.get('DFKV_SLAB_PROTECT_SEC'), None if value is None else str(value))
+                self.assertNotIn('DFKV_SLAB_PROTECT_BOOST_SEC', env)
+                case = json.loads((args.output / 'case.json').read_text())
+                self.assertEqual(case['protect_sec_override'], value)
+                self.assertEqual(result['status'], 'failed')
+
     def test_start_failure_records_result_and_clears_inherited_disk_settings(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

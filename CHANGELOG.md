@@ -8,6 +8,8 @@
   Support bounded pre-pressure waits, phase evidence and fixed fresh store paths
   for default-BOOST-window diagnostics. Add a fixed paced hot/cold retention
   scenario with real continuity gates and per-step evidence for repeated comparisons.
+  Allow explicit lifetime-only P presets for isolated window screening; keep
+  production defaults and scoring unchanged.
 
 - Enforce RDMA connection idle deadlines while pending receives or reply SENDs
   require short CQ waits. Preserve disabled idle reclamation and disk-read drain
