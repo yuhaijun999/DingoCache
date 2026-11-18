@@ -132,13 +132,78 @@ def check_steps(client, first_reuse_sec=0):
             'max_step_lateness_sec': max(lateness), 'max_step_duration_sec': max(durations)}
 
 
+def check_mixed(client):
+    """Validate separate repeated-hot and once-only first-reuse cohorts."""
+    schedule = check_steps(client)
+    if client.get('filler_warmup_reads') != 18112:
+        raise RuntimeError('mixed filler warmup mismatch')
+    cohorts = client.get('reuse_cohorts')
+    if not isinstance(cohorts, list) or len(cohorts) != 3:
+        raise RuntimeError('mixed reuse cohort count mismatch')
+    events = {}
+    for row in client['steps']:
+        probes = row.get('reuse_probes')
+        if not isinstance(probes, list):
+            raise RuntimeError('mixed reuse step probes missing')
+        previous = row['start_sec']
+        for probe in probes:
+            if not isinstance(probe, dict):
+                raise RuntimeError('invalid mixed reuse event')
+            delay, at = probe.get('delay_sec'), probe.get('probe_started_sec')
+            if (type(delay) is not int or delay not in (45, 90, 185) or delay in events or
+                    type(at) not in (int, float) or not math.isfinite(at) or
+                    not previous <= at <= row['end_sec'] or at < delay or
+                    any(type(probe.get(k)) is not int or probe[k] < 0 for k in ('hits', 'misses')) or
+                    probe['hits'] + probe['misses'] != 32):
+                raise RuntimeError('mixed reuse event timing/count mismatch')
+            previous = at
+            events[delay] = (probe, row['end_sec'])
+        # A skipped decision may precede a row end that crosses the deadline.
+        if any(row['start_sec'] >= delay and delay not in events for delay in (45, 90, 185)):
+            raise RuntimeError('mixed reuse cohort was not probed when due')
+    if set(events) != {45, 90, 185}:
+        raise RuntimeError('mixed reuse event missing')
+    hits, misses = 0, 0
+    origin = client['pressure_schedule_origin_sec']
+    for index, (cohort, delay) in enumerate(zip(cohorts, (45, 90, 185))):
+        if (not isinstance(cohort, dict) or cohort.get('delay_sec') != delay or
+                cohort.get('start_index') != 32 + index * 16 or cohort.get('count_per_namespace') != 16):
+            raise RuntimeError('mixed reuse cohort layout mismatch')
+        writes, outcomes = cohort.get('write_completed_sec'), cohort.get('first_reuse')
+        if (not isinstance(writes, list) or len(writes) != 2 or
+                not isinstance(outcomes, list) or len(outcomes) != 2):
+            raise RuntimeError('mixed reuse namespace cohort mismatch')
+        event, end = events[delay]
+        previous = origin + event['probe_started_sec']
+        for ns, written, outcome in zip((b'disk-validation\x00A\xff', b'disk-validation\x00B\xfe'), writes, outcomes):
+            if not isinstance(outcome, dict):
+                raise RuntimeError('invalid mixed reuse outcome')
+            at, age = outcome.get('probe_started_sec'), outcome.get('write_to_probe_sec')
+            if (any(type(v) not in (int, float) or not math.isfinite(v) or v < 0
+                    for v in (written, at, age)) or written > origin or
+                    not previous - 1e-6 <= at <= origin + end or abs(at - written - age) > 1e-6 or
+                    outcome.get('namespace_hex') != ns.hex() or
+                    any(type(outcome.get(k)) is not int or outcome[k] < 0 for k in ('hits', 'misses')) or
+                    outcome['hits'] + outcome['misses'] != 16):
+                raise RuntimeError('mixed reuse namespace age/outcome mismatch')
+            previous = at
+        if any(sum(o[k] for o in outcomes) != event[k] for k in ('hits', 'misses')):
+            raise RuntimeError('mixed reuse outcomes disagree with step')
+        hits += event['hits']
+        misses += event['misses']
+    for field, expected in (('reuse_hits', hits), ('reuse_misses', misses), ('reuse_reads', 96)):
+        if type(client.get(field)) is not int or client[field] != expected:
+            raise RuntimeError('mixed reuse denominator mismatch')
+    return {**schedule, 'reuse_hits': hits, 'reuse_misses': misses, 'reuse_reads': 96}
+
+
 def check_result(text, client, policy='lifetime', scenario='quick-pressure', first_reuse_sec=0):
-    if scenario not in ('quick-pressure', 'sustained-pressure'):
+    if scenario not in ('quick-pressure', 'sustained-pressure', 'mixed-pressure'):
         raise RuntimeError('unknown scenario')
     if first_reuse_sec not in (0, 45, 90, 185) or (first_reuse_sec and scenario != 'sustained-pressure'):
         raise RuntimeError('invalid first reuse scenario')
-    expected_count = SUSTAINED_COUNT if scenario == 'sustained-pressure' else COUNT
-    expected_hot_reads = SUSTAINED_HOT_READS if scenario == 'sustained-pressure' else HOT_READS
+    expected_count = SUSTAINED_COUNT if scenario in ('sustained-pressure', 'mixed-pressure') else COUNT
+    expected_hot_reads = SUSTAINED_HOT_READS if scenario in ('sustained-pressure', 'mixed-pressure') else HOT_READS
     if client.get('status') != 'passed' or client.get('wrong_bytes') != 0:
         raise RuntimeError('client correctness failure')
     if client.get('transport_mode') != ['rdma', 'rdma']:
@@ -151,7 +216,10 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
             (not first_reuse_sec and hot_reads != expected_hot_reads) or
             hot_reads != hot_hits + hot_misses or (not first_reuse_sec and not hot_hits)):
         raise RuntimeError('client read denominator mismatch')
-    schedule = check_steps(client, first_reuse_sec) if scenario == 'sustained-pressure' else {}
+    schedule = (check_mixed(client) if scenario == 'mixed-pressure' else
+                check_steps(client, first_reuse_sec) if scenario == 'sustained-pressure' else {})
+    reuse_hits = client['reuse_hits'] if scenario == 'mixed-pressure' else 0
+    reuse_misses = client['reuse_misses'] if scenario == 'mixed-pressure' else 0
     for name in ('dfkv_storage_healthy', 'dfkv_slab_healthy'):
         if total(text, name) != 1:
             raise RuntimeError('unhealthy: ' + name)
@@ -164,7 +232,7 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
     objects = samples(text, 'dfkv_disk_objects')
     if len(objects) != 3 or len({labels for labels, _ in objects}) != 3 or any(value <= 0 for _, value in objects):
         raise RuntimeError('all three disks must contain objects')
-    filler_reads = 18304 if first_reuse_sec else 0
+    filler_reads = 18112 if scenario == 'mixed-pressure' else 18304 if first_reuse_sec else 0
     terminal = {}
     for labels, value in samples(text, 'dfkv_rdma_pull_requests_terminal_total'):
         match = re.search(r'(?:\{|,)result="([^"]+)"(?:,|\})', labels)
@@ -174,18 +242,18 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
         terminal[key] = terminal.get(key, 0) + value
         if key not in ('success_nonempty', 'not_found') and value:
             raise RuntimeError('unexpected PULL terminal: ' + key)
-    if terminal.get('success_nonempty', 0) != hits + hot_hits + filler_reads:
+    if terminal.get('success_nonempty', 0) != hits + hot_hits + filler_reads + reuse_hits:
         raise RuntimeError('success denominator mismatch')
-    if terminal.get('not_found', 0) != misses + hot_misses:
+    if terminal.get('not_found', 0) != misses + hot_misses + reuse_misses:
         raise RuntimeError('missing denominator mismatch')
     dispatched = total(text, 'dfkv_rdma_pull_requests_dispatched_total')
-    if dispatched != total(text, 'dfkv_rdma_pull_requests_terminal_total') or dispatched != sum(counts[:4]) + filler_reads:
+    if dispatched != total(text, 'dfkv_rdma_pull_requests_terminal_total') or dispatched != sum(counts[:4]) + filler_reads + reuse_hits + reuse_misses:
         raise RuntimeError('PULL requests not settled')
     heat = {}
     if policy == 'lifetime':
         success = total(text, 'dfkv_slab_lifetime_read_success_total')
         applied = total(text, 'dfkv_slab_lifetime_read_applied_total')
-        if success != hits + hot_hits + filler_reads or applied > success:
+        if success != hits + hot_hits + filler_reads + reuse_hits or applied > success:
             raise RuntimeError('lifetime heat denominator mismatch')
         # Pressure can reclaim the original resident before its heat notification.
         heat = {'read_success': success, 'read_applied': applied}
@@ -229,7 +297,7 @@ def parse_args(argv=None):
     parser.add_argument('--data-root', type=Path, action='append', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--policy', choices=('legacy', 'lifetime'), default='lifetime')
-    parser.add_argument('--scenario', choices=('quick-pressure', 'sustained-pressure'),
+    parser.add_argument('--scenario', choices=('quick-pressure', 'sustained-pressure', 'mixed-pressure'),
                         default='quick-pressure')
     parser.add_argument('--pressure-delay-sec', type=int, default=0,
                         help='wait after hot warmup before cold writes (0..300)')
@@ -245,8 +313,8 @@ def parse_args(argv=None):
         parser.error('protect-sec requires lifetime policy')
     if not 0 <= args.pressure_delay_sec <= 300:
         parser.error('pressure delay must be in 0..300 seconds')
-    if args.scenario == 'sustained-pressure' and args.pressure_delay_sec:
-        parser.error('sustained-pressure does not accept a pre-pressure delay')
+    if args.scenario in ('sustained-pressure', 'mixed-pressure') and args.pressure_delay_sec:
+        parser.error('paced pressure scenarios do not accept a pre-pressure delay')
     if args.data_name is not None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', args.data_name):
         parser.error('data name must be a safe ASCII component of 1..80 characters')
     args.build, args.output = args.build.resolve(), args.output.resolve()
@@ -287,14 +355,14 @@ def run(args):
                    '--slab-eviction-policy', args.policy, '--port', '12000', '--rdma-port', '12001',
                    '--rdma-dev', 'rxe0', '--max-msg', '2097152', '--metrics-port', '12010',
                    '--metrics-bind', '127.0.0.1']
-        count = SUSTAINED_COUNT if args.scenario == 'sustained-pressure' else COUNT
+        count = SUSTAINED_COUNT if args.scenario in ('sustained-pressure', 'mixed-pressure') else COUNT
         client_command = [sys.executable, str(source / 'deploy/validation/disk_scenarios.py'),
                           '--lib', str(args.build / 'libdfkv.so'), '--members', 'n=127.0.0.1:12001',
                           '--scenario', args.scenario, '--count', str(count),
                           '--pressure-delay-sec', str(args.pressure_delay_sec),
                           '--first-reuse-sec', str(args.first_reuse_sec),
                           '--metrics-url', METRICS_URL, '--output', str(args.output / 'trace')]
-        client_timeout_sec = (320 if args.scenario == 'sustained-pressure' else
+        client_timeout_sec = (320 if args.scenario in ('sustained-pressure', 'mixed-pressure') else
                               120 + args.pressure_delay_sec)
         (args.output / 'case.json').write_text(json.dumps({'command': command, 'data_dirs': list(map(str, dirs)),
             'client_command': client_command, 'client_timeout_sec': client_timeout_sec,

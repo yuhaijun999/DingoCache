@@ -495,6 +495,189 @@ class DiskValidationTest(unittest.TestCase):
             with self.subTest(scenario=scenario, value=value), self.assertRaises(SystemExit):
                 self.args(Path("unused"), scenario, ("--first-reuse-sec", value))
 
+    def test_mixed_pressure_keeps_hot_and_once_only_delayed_cohorts_separate(self):
+        now = [0.0]
+        events, writes = [], []
+        def sleep(seconds):
+            self.assertGreaterEqual(seconds, 0)
+            now[0] += seconds
+
+        class TrackingClient(MemoryClient):
+            def __init__(self, storage, members, namespace):
+                super().__init__(storage, members, namespace)
+                self.namespace = namespace
+
+            def put(self, keys, values):
+                super().put(keys, values)
+                indices = [int.from_bytes(key[-8:], "big") for key in keys]
+                writes.append((self.namespace, indices))
+                if indices[0] in (32, 48, 64):
+                    now[0] += .25
+                if indices[0] >= 96:
+                    # Simulate eviction without reinserting either kind of miss.
+                    for index in (0, 32, 48, 64):
+                        self.storage.pop(driver.key_for(0xD1A60001, index), None)
+
+            def read(self, keys, values, *, allow_miss=False):
+                events.append((self.namespace, now[0],
+                               [int.from_bytes(key[-8:], "big") for key in keys], allow_miss))
+                return super().read(keys, values, allow_miss=allow_miss)
+
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(driver, "QUICK_PREFILL", 96), \
+                mock.patch.object(driver.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(driver.time, "sleep", side_effect=sleep):
+            args = self.args(Path(temp) / "mixed", "mixed-pressure")
+            result = driver.run(args, library_loader=lambda _: {}, client_factory=TrackingClient)
+            self.assertEqual(result["filler_warmup_reads"], 64)
+            self.assertEqual((result["hot_hits"], result["hot_misses"], result["hot_reads"]),
+                             (12528, 400, 12928))
+            self.assertEqual((result["reuse_hits"], result["reuse_misses"], result["reuse_reads"]),
+                             (90, 6, 96))
+            self.assertEqual((result["hits"], result["misses"]), (6584, 8))
+            strict = [event for event in events if not event[3]]
+            self.assertEqual([event[2] for event in strict[:4]], [list(range(32))] * 4)
+            self.assertEqual([event[2] for event in strict[4:]], [list(range(80, 96))] * 4)
+            origin = result["pressure_schedule_origin_sec"]
+            self.assertEqual(origin, 1.5)
+            self.assertEqual(len(result["steps"]), 200)
+            for row in result["steps"]:
+                self.assertEqual(row["hot_hits"] + row["hot_misses"], 64)
+                self.assertEqual(row["cold_written"], 32)
+                expected = [row["step"]] if row["step"] in (45, 90, 185) else []
+                self.assertEqual([probe["delay_sec"] for probe in row["reuse_probes"]], expected)
+                for probe in row["reuse_probes"]:
+                    self.assertEqual((probe["hits"], probe["misses"]), (30, 2))
+                    self.assertEqual(probe["probe_started_sec"], row["step"])
+            for group, starts in zip(result["reuse_cohorts"], ((.25, 1.0), (.5, 1.25), (.75, 1.5))):
+                delay, first = group["delay_sec"], group["start_index"]
+                self.assertEqual(group["write_completed_sec"], list(starts))
+                self.assertEqual(group["count_per_namespace"], 16)
+                self.assertEqual([row["namespace_hex"] for row in group["first_reuse"]],
+                                 [namespace.hex() for namespace in driver.NAMESPACES])
+                pending = [event for event in events if event[2] == list(range(first, first + 16))
+                           and event[1] < origin + 199]
+                self.assertEqual(len(pending), 2)
+                self.assertTrue(all(event[1] == origin + delay and event[3] for event in pending))
+                for index, row in enumerate(group["first_reuse"]):
+                    self.assertEqual(row["probe_started_sec"], origin + delay)
+                    self.assertEqual(row["write_to_probe_sec"], origin + delay - starts[index])
+                    self.assertEqual((row["hits"], row["misses"]), (15, 1))
+            for namespace in driver.NAMESPACES:
+                indices = [index for ns, batch in writes if ns == namespace for index in batch]
+                self.assertEqual(indices, list(range(args.count)))
+            self.assertEqual([json.loads(line) for line in (args.output / "steps.jsonl").read_text().splitlines()],
+                             result["steps"])
+            config = json.loads((args.output / "trace.json").read_text())["config"]
+            self.assertEqual(config["filler_start"], 80)
+            self.assertEqual(config["reuse_cohorts"], [
+                {"delay_sec": delay, "start_index": start, "count_per_namespace": 16}
+                for delay, start in zip((45, 90, 185), (32, 48, 64))])
+            self.assertTrue(config["reuse_once"])
+            self.assertFalse(config["refill_on_miss"])
+            self.assertEqual([row["name"] for row in result["phases"]],
+                             ["prefill", "warm", "before-pressure", "step-040", "step-080",
+                              "step-120", "step-160", "step-180", "step-200",
+                              "after-pressure", "after-scan"])
+            self.assertEqual((result["phases"][1]["hot_hits"],
+                              result["phases"][1]["filler_warmup_reads"]), (128, 64))
+
+    def test_mixed_first_reuse_uses_actual_time_after_stall_without_catchup(self):
+        now = [0.0]
+        def sleep(seconds):
+            now[0] += seconds
+
+        class StallingClient(MemoryClient):
+            def put(self, keys, values):
+                super().put(keys, values)
+                if now[0] == 44:
+                    now[0] += 3
+
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(driver, "QUICK_PREFILL", 96), \
+                mock.patch.object(driver.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(driver.time, "sleep", side_effect=sleep):
+            args = self.args(Path(temp) / "mixed-stall", "mixed-pressure")
+            result = driver.run(args, library_loader=lambda _: {}, client_factory=StallingClient)
+            first = result["steps"][44]
+            self.assertEqual(first["start_sec"], 44)
+            self.assertEqual(first["reuse_probes"], [
+                {"delay_sec": 45, "probe_started_sec": 47, "hits": 32, "misses": 0}])
+            self.assertEqual([row["probe_started_sec"] for row in result["reuse_cohorts"][0]["first_reuse"]],
+                             [47, 47])
+            self.assertEqual([row["start_sec"] for row in result["steps"][45:47]], [47, 48])
+            self.assertEqual(sum(len(row["reuse_probes"]) for row in result["steps"]), 3)
+            self.assertEqual(result["reuse_reads"], 96)
+
+    def test_mixed_failures_preserve_partial_cohorts_and_failed_status(self):
+        for failure in ("warm-hot-missing", "filler-missing", "hot-corrupt", "pending-corrupt", "pending-io"):
+            now = [0.0]
+            def sleep(seconds):
+                now[0] += seconds
+
+            class FailingClient(MemoryClient):
+                def __init__(self, storage, members, namespace):
+                    super().__init__(storage, members, namespace)
+                    self.namespace = namespace
+
+                def read(self, keys, values, *, allow_miss=False):
+                    first = int.from_bytes(keys[0][-8:], "big")
+                    if not allow_miss and ((failure == "warm-hot-missing" and first == 0) or
+                                           (failure == "filler-missing" and first == 80)):
+                        self.storage.pop(keys[0], None)
+                    if allow_miss and ((failure == "hot-corrupt" and first == 0) or
+                                       (failure == "pending-corrupt" and first == 32)):
+                        self.storage[keys[0]] = b"x" * len(values[0])
+                    if (allow_miss and first == 32 and failure == "pending-io" and
+                            self.namespace == driver.NAMESPACES[1]):
+                        raise RuntimeError("GET failed")
+                    return super().read(keys, values, allow_miss=allow_miss)
+
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.object(driver, "QUICK_PREFILL", 96), \
+                    mock.patch.object(driver.time, "monotonic", side_effect=lambda: now[0]), \
+                    mock.patch.object(driver.time, "sleep", side_effect=sleep):
+                args = self.args(Path(temp) / failure, "mixed-pressure")
+                message = ("below-capacity miss" if failure.endswith("missing") else
+                           "GET failed" if failure == "pending-io" else "wrong bytes/length")
+                with self.assertRaisesRegex(RuntimeError, message):
+                    driver.run(args, library_loader=lambda _: {}, client_factory=FailingClient)
+                result = json.loads((args.output / "result.json").read_text())
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["wrong_bytes"], int(failure.endswith("corrupt")))
+                self.assertEqual(len(result["reuse_cohorts"][0]["first_reuse"]),
+                                 1 if failure == "pending-io" else 0)
+                if failure.startswith("pending"):
+                    self.assertEqual(len(result["steps"]), 45)
+                    self.assertTrue(all(not row["reuse_probes"] for row in result["steps"]))
+
+    def test_mixed_incomplete_schedule_is_not_success(self):
+        now = [0.0]
+        def sleep(seconds):
+            now[0] += seconds
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(driver, "QUICK_PREFILL", 96), \
+                mock.patch.object(driver, "SUSTAIN_STEPS", 3), \
+                mock.patch.object(driver.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(driver.time, "sleep", side_effect=sleep):
+            args = self.args(Path(temp) / "incomplete", "mixed-pressure")
+            with self.assertRaisesRegex(RuntimeError, "did not reach every first reuse cohort"):
+                driver.run(args, library_loader=lambda _: {}, client_factory=MemoryClient)
+            result = json.loads((args.output / "result.json").read_text())
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(len(result["steps"]), 3)
+            self.assertTrue(all(not cohort["first_reuse"] for cohort in result["reuse_cohorts"]))
+
+    def test_mixed_arguments_fix_layout_and_disallow_single_delay_options(self):
+        args = self.args(Path("unused"), "mixed-pressure",
+                         ("--metrics-url", "http://127.0.0.1:12010/metrics"))
+        self.assertEqual((args.count, args.first_reuse_sec, args.pressure_delay_sec, args.readers),
+                         (7808, 0, 0, 0))
+        for extra in (("--count", "6452"), ("--pressure-delay-sec", "1"),
+                       ("--first-reuse-sec", "45"), ("--readers", "8")):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                self.args(Path("unused"), "mixed-pressure", extra)
+
     def test_missing_key_oracle_rejects_all_false_hits_including_empty(self):
         class FakeLib:
             status = 0

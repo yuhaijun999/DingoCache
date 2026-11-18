@@ -11,6 +11,8 @@
   Allow explicit lifetime-only P presets for isolated window screening; keep
   production defaults and scoring unchanged. Add delayed first-reuse cohorts
   with filler-only warmup, actual write-to-probe ages and complete read denominators.
+  Add a mixed retention scenario separating repeated hot reads from three once-only
+  delayed first-reuse cohorts under paced cold writes.
 
 - Enforce RDMA connection idle deadlines while pending receives or reply SENDs
   require short CQ waits. Preserve disabled idle reclamation and disk-read drain

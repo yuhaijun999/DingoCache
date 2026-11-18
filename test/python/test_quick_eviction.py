@@ -80,7 +80,104 @@ def delayed_metrics(client):
     return good_metrics().replace('12128', str(hits)).replace('20456', str(hits + misses)).replace('8328', str(misses))
 
 
+def mixed_client(reuse_miss=False, hot_miss=False):
+    client = sustained_client()
+    client.update(filler_warmup_reads=18112, reuse_hits=0 if reuse_miss else 96,
+                  reuse_misses=96 if reuse_miss else 0, reuse_reads=96, reuse_cohorts=[])
+    if hot_miss:
+        client.update(hot_hits=128, hot_misses=12800)
+    for row in client['steps']:
+        row.update(reuse_probes=[], hot_hits=0 if hot_miss else 64,
+                   hot_misses=64 if hot_miss else 0)
+    for index, delay in enumerate((45, 90, 185)):
+        client['steps'][delay]['reuse_probes'] = [
+            {'delay_sec': delay, 'probe_started_sec': delay + .003,
+             'hits': 0 if reuse_miss else 32, 'misses': 32 if reuse_miss else 0}]
+        client['reuse_cohorts'].append({
+            'delay_sec': delay, 'start_index': 32 + index * 16, 'count_per_namespace': 16,
+            'write_completed_sec': [1.0, 2.0], 'first_reuse': [
+                {'namespace_hex': ns.hex(), 'probe_started_sec': 3 + delay + .004 + i * .001,
+                 'write_to_probe_sec': 3 + delay + .004 + i * .001 - written,
+                 'hits': 0 if reuse_miss else 16, 'misses': 16 if reuse_miss else 0}
+                for i, (ns, written) in enumerate(zip(
+                    (b'disk-validation\x00A\xff', b'disk-validation\x00B\xfe'), (1, 2)))]})
+    return client
+
+
+def mixed_metrics(client):
+    hits = client['hits'] + client['hot_hits'] + 18112 + client['reuse_hits']
+    misses = client['misses'] + client['hot_misses'] + client['reuse_misses']
+    return good_metrics().replace('12128', str(hits)).replace('20456', str(hits + misses)).replace('8328', str(misses))
+
+
 class QuickEvictionTest(unittest.TestCase):
+    def test_mixed_cohorts_and_all_misses_are_distinct_valid_observations(self):
+        for pending_miss in (False, True):
+            for hot_miss in (False, True):
+                client = mixed_client(pending_miss, hot_miss)
+                checked = runner.check_result(mixed_metrics(client), client, scenario='mixed-pressure')
+                self.assertEqual(checked['reuse_reads'], 96)
+                self.assertEqual(checked['reuse_misses'], 96 if pending_miss else 0)
+                self.assertEqual(client['hot_reads'], 12928)
+
+    def test_mixed_checker_rejects_early_duplicate_missing_or_forged_cohorts(self):
+        for mutation in ('early', 'duplicate', 'missing', 'late', 'age', 'namespace',
+                         'overlap', 'outcome', 'reuse_denominator', 'filler', 'unknown', 'event_count'):
+            client = mixed_client()
+            if mutation == 'early':
+                client['steps'][45]['reuse_probes'][0]['probe_started_sec'] = 44.9
+            elif mutation == 'duplicate':
+                client['steps'][46]['reuse_probes'] = client['steps'][45]['reuse_probes']
+            elif mutation in ('missing', 'late'):
+                event = client['steps'][45]['reuse_probes'].pop()
+                if mutation == 'late':
+                    client['steps'][46]['reuse_probes'] = [{**event, 'probe_started_sec': 46.003}]
+            elif mutation == 'age':
+                client['reuse_cohorts'][0]['first_reuse'][0]['write_to_probe_sec'] += 1
+            elif mutation == 'namespace':
+                client['reuse_cohorts'][0]['first_reuse'][0]['namespace_hex'] = 'wrong'
+            elif mutation == 'overlap':
+                client['reuse_cohorts'][1]['start_index'] = 32
+            elif mutation == 'outcome':
+                client['reuse_cohorts'][0]['first_reuse'][0].update(hits=15, misses=1)
+            elif mutation == 'reuse_denominator':
+                client['reuse_reads'] = 95
+            elif mutation == 'filler':
+                client['filler_warmup_reads'] = 18111
+            elif mutation == 'unknown':
+                client['steps'][45]['reuse_probes'][0]['delay_sec'] = 46
+            else:
+                client['steps'][45]['reuse_probes'][0]['hits'] = 31
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                runner.check_mixed(client)
+
+    def test_mixed_terminals_and_heat_include_first_reuse_outcomes(self):
+        for misses in (False, True):
+            client = mixed_client(misses)
+            text = mixed_metrics(client)
+            total_success = client['hits'] + client['hot_hits'] + 18112 + client['reuse_hits']
+            total_missing = client['misses'] + client['hot_misses'] + client['reuse_misses']
+            changes = [
+                ('dispatched_total 46752', 'dispatched_total 46656'),
+                (f'result="success_nonempty"}} {total_success}',
+                 f'result="success_nonempty"}} {total_success - 1}'),
+                (f'result="not_found"}} {total_missing}', f'result="not_found"}} {total_missing - 1}'),
+                (f'dfkv_slab_lifetime_read_success_total {total_success}',
+                 f'dfkv_slab_lifetime_read_success_total {total_success - 1}'),
+            ]
+            for before, after in changes:
+                self.assertIn(before, text)
+                with self.subTest(misses=misses, changed=before), self.assertRaises(RuntimeError):
+                    runner.check_result(text.replace(before, after), client, scenario='mixed-pressure')
+
+    def test_mixed_options_reject_external_delay_overrides(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp)) + ['--scenario', 'mixed-pressure']
+            self.assertEqual(runner.parse_args(argv).scenario, 'mixed-pressure')
+            for extra in (['--first-reuse-sec', '45'], ['--pressure-delay-sec', '1']):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    runner.parse_args(argv + extra)
+
     def test_delayed_first_reuse_counts_and_all_miss_are_valid_observations(self):
         for delay in (45, 90, 185):
             for all_miss in (False, True):
@@ -324,7 +421,8 @@ class QuickEvictionTest(unittest.TestCase):
         for scenario, delay, reuse, count, timeout, client, metrics in (
                 ('quick-pressure', 185, 0, 6452, 305, good_client(), good_metrics()),
                 ('sustained-pressure', 0, 0, 7808, 320, sustained_client(), sustained_metrics()),
-                ('sustained-pressure', 0, 90, 7808, 320, delayed_client(), delayed_metrics(delayed_client()))):
+                ('sustained-pressure', 0, 90, 7808, 320, delayed_client(), delayed_metrics(delayed_client())),
+                ('mixed-pressure', 0, 0, 7808, 320, mixed_client(), mixed_metrics(mixed_client()))):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
                 args = runner.parse_args(self.arguments(Path(temp)) +
                                          ['--data-name', 'fixed', '--scenario', scenario,
