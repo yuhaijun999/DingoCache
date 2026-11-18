@@ -182,3 +182,19 @@ monitor和同样的精确归属检查，不能依赖“上轮曾有监控”。
 composite温度40–41°C/告警0，最大间隔10.192968秒，覆盖前置测试及四组负载。确认应用和端口清空后
 已正常停止新monitor（专用stop marker保留），VM空闲保留，旧私有daemon仍不可用。
 后续复跑必须重新验证实例和启动监控；不要把历史“保留运行中”的描述当作当前存活证据。
+
+
+## 9. 双尺寸首轮的冷盘复用（2026-11-18）
+
+沿用第8节精确QEMU PID/starttime/root/backing/data inode与netns核验，通过既有隔离
+网络SSH复用，没有回退默认daemon、新开VM或格式化。新monitor日志/证据归档在：
+`/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/multisize-20261118t084806z-4c8645a/`。
+监控代码SHA与回填轮相同；本轮封存88份SMART，composite40–41°C/warn0，最长间隔
+10.190078秒，覆盖前置测试与legacy/lifetime两组。负载后端口/应用清空，monitor正常
+停止，VM空闲保留，daemon仍不可用。下轮重新核验并启动新monitor，不能据旧日志假定存活。
+
+虚拟盘/物理盘映射仍为disk2承载root/backing/data1/results、disk3承载data2/3，
+仍只有两个物理盘。无宿主disk1测试压力，也未复制/清理它的旧大样本。
+结果见快速验证第15节：双档实际参与且账目通过，但默认lifetime大档热点丢失明显，
+水位计数0，不能冒充水位覆盖、性能收益或正式A/B通过。实际数据子目录按tag+policy
+唯一归档并保留owned marker，清理仍只针对核验后的本轮准确路径，不执行全局prune。

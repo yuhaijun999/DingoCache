@@ -18,7 +18,9 @@
   diagnostics separating first outcomes, attempted/acknowledged payload writes
   and verification reads. Validate per-object refill chronology and reconcile
   verification GETs and acknowledged logical PUT/payload denominators in the
-  opt-in eviction supervisor.
+  opt-in eviction supervisor. Add a compact two-class pressure diagnostic with
+  separate per-size admission, calibration, recurring-probe and scan accounting;
+  retain legitimate early donor losses rather than assuming strict hot residency.
 
 - Enforce RDMA connection idle deadlines while pending receives or reply SENDs
   require short CQ waits. Preserve disabled idle reclamation and disk-read drain

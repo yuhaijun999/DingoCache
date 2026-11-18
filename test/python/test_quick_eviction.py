@@ -143,6 +143,33 @@ def arrivals_metrics(client):
     return good_metrics().replace('12128', str(hits)).replace('20456', str(hits + misses)).replace('8328', str(misses))
 
 
+def multisize_client(warm_miss=False, hot_miss=False):
+    rows = [{'payload_bytes': length, 'slot_size': slot, 'put_attempts': 6400, 'put_acks': 6400,
+             'admission_hits': 32, 'admission_misses': 0,
+             'warmup_hits': 0 if warm_miss else 64, 'warmup_misses': 64 if warm_miss else 0,
+             'hot_hits': 0 if hot_miss else 11776, 'hot_misses': 11776 if hot_miss else 0,
+             'scan_hits': 5000, 'scan_misses': 1400}
+            for length, slot in ((4096, 1048576), (1048577, 2097152))]
+    return {**good_client(), 'hits': 10000, 'misses': 2800,
+            'admission_hits': 64, 'admission_misses': 0,
+            'warmup_hits': sum(row['warmup_hits'] for row in rows),
+            'warmup_misses': sum(row['warmup_misses'] for row in rows),
+            'hot_hits': sum(row['hot_hits'] for row in rows),
+            'hot_misses': sum(row['hot_misses'] for row in rows), 'hot_reads': 23552,
+            'multisize': rows}
+
+
+def multisize_metrics(client):
+    hits = client['hits'] + client['hot_hits'] + client['warmup_hits'] + client['admission_hits']
+    misses = client['misses'] + client['hot_misses'] + client['warmup_misses'] + client['admission_misses']
+    text = good_metrics().replace('12128', str(hits)).replace('20456', '36544').replace('8328', str(misses))
+    return text + '\n'.join(('dfkv_cache_put_total 12800', 'dfkv_bytes_written_total 6737107200',
+        'dfkv_slab_classes 6',
+        'dfkv_slab_class_put_total{slot_size="1048576"} 6400',
+        'dfkv_slab_class_put_total{slot_size="2097152"} 6400',
+        'dfkv_slab_class_put_total{slot_size="4194304"} 0')) + '\n'
+
+
 def refill_client(mode='partial', verify_miss=False):
     client = arrivals_client()
     stats = {'first_hits': 0, 'first_misses': 0, 'put_attempts': 0, 'put_acks': 0,
@@ -192,6 +219,87 @@ def refill_metrics(client):
 
 
 class QuickEvictionTest(unittest.TestCase):
+    def test_multisize_warm_and_hot_losses_remain_separate_valid_observations(self):
+        for warm_miss, hot_miss in ((False, False), (True, False), (True, True)):
+            with self.subTest(warm_miss=warm_miss, hot_miss=hot_miss):
+                client = multisize_client(warm_miss, hot_miss)
+                text = multisize_metrics(client).replace('dfkv_slab_watermark_evictions_total 900',
+                                                         'dfkv_slab_watermark_evictions_total 0')
+                text = text.replace('dfkv_slab_extent_steals_total 0', 'dfkv_slab_extent_steals_total 3')
+                result = runner.check_result(text, client, scenario='multisize-pressure')
+                self.assertEqual(result['multisize_gets'], 36544)
+                self.assertEqual(result['multisize_puts'], 12800)
+                self.assertEqual(result['watermark_evictions'], 0)
+                self.assertEqual(result['extent_steals'], 3)
+
+    def test_multisize_rejects_forged_layout_counts_and_aggregate_types(self):
+        mutations = [('payload_bytes', 4097), ('slot_size', 2097152), ('put_attempts', 6399),
+                     ('put_acks', 6399), ('put_acks', True), ('admission_hits', 31), ('admission_misses', True), ('warmup_hits', 63),
+                     ('warmup_misses', -1), ('hot_hits', 11775), ('hot_misses', 1),
+                     ('scan_hits', 4999), ('scan_misses', 1401), ('scan_hits', 5000.0)]
+        for field, value in mutations:
+            with self.subTest(field=field, value=value), self.assertRaises(RuntimeError):
+                client = multisize_client()
+                client['multisize'][0][field] = value
+                runner.check_result(multisize_metrics(client), client, scenario='multisize-pressure')
+        for field, value in (('admission_hits', 63), ('admission_misses', True), ('warmup_hits', 127), ('warmup_misses', True),
+                             ('hot_reads', 23551), ('hits', 9999)):
+            with self.subTest(field=field, value=value), self.assertRaises(RuntimeError):
+                client = multisize_client()
+                client[field] = value
+                runner.check_result(multisize_metrics(client), client, scenario='multisize-pressure')
+        for rows in (None, [], multisize_client()['multisize'][:1],
+                     multisize_client()['multisize'][::-1]):
+            with self.subTest(rows=rows), self.assertRaises(RuntimeError):
+                client = multisize_client()
+                client['multisize'] = rows
+                runner.check_result(multisize_metrics(client), client, scenario='multisize-pressure')
+        client = multisize_client(True, True)
+        client['multisize'][0].update(admission_hits=0, admission_misses=32, scan_hits=0, scan_misses=6400)
+        client.update(admission_hits=32, admission_misses=32)
+        client.update(hits=5000, misses=7800)
+        with self.assertRaisesRegex(RuntimeError, 'successful read'):
+            runner.check_result(multisize_metrics(client), client, scenario='multisize-pressure')
+
+    def test_multisize_requires_actual_class_and_full_get_put_payload_metrics(self):
+        client = multisize_client(True, True)
+        changes = [('dfkv_cache_put_total 12800', 'dfkv_cache_put_total 12799'),
+                   ('dfkv_bytes_written_total 6737107200', 'dfkv_bytes_written_total 6737107199'),
+                   ('dfkv_slab_classes 6', 'dfkv_slab_classes 1'),
+                   ('dfkv_slab_class_put_total{slot_size="1048576"} 6400', ''),
+                   ('dfkv_slab_class_put_total{slot_size="2097152"} 6400',
+                    'dfkv_slab_class_put_total{slot_size="2097152"} 6399'),
+                   ('dfkv_slab_class_put_total{slot_size="4194304"} 0',
+                    'dfkv_slab_class_put_total{slot_size="4194304"} 1'),
+                   ('dfkv_slab_class_put_total{slot_size="4194304"} 0',
+                    'dfkv_slab_class_put_total{slot_size="1048576"} 0'),
+                   ('dfkv_slab_class_put_total{slot_size="4194304"} 0',
+                    'dfkv_slab_class_put_total{other="4194304"} 0'),
+                   ('dfkv_rdma_pull_requests_dispatched_total 36544',
+                    'dfkv_rdma_pull_requests_dispatched_total 36352'),
+                   ('result="not_found"} 26480', 'result="not_found"} 26352'),
+                   ('dfkv_slab_lifetime_read_success_total 10064',
+                    'dfkv_slab_lifetime_read_success_total 10000'),
+                   ('dfkv_errors_total 0', 'dfkv_errors_total 1')]
+        for before, after in changes:
+            with self.subTest(before=before), self.assertRaises(RuntimeError):
+                text = multisize_metrics(client)
+                self.assertIn(before, text)
+                runner.check_result(text.replace(before, after), client, scenario='multisize-pressure')
+        for scenario, client in (('quick-pressure', multisize_client()),
+                                 ('multisize-pressure', good_client())):
+            with self.subTest(scenario=scenario), self.assertRaises(RuntimeError):
+                runner.check_result(good_metrics(), client, scenario=scenario)
+
+    def test_multisize_options_reject_reuse_refill_and_quiet_delay(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp)) + ['--scenario', 'multisize-pressure']
+            self.assertEqual(runner.parse_args(argv).scenario, 'multisize-pressure')
+            for extra in (['--first-reuse-sec', '45'], ['--refill-on-miss'],
+                          ['--pressure-delay-sec', '1']):
+                with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    runner.parse_args(argv + extra)
+
     def test_refill_counts_and_verification_misses_are_separate_valid_observations(self):
         for mode in ('hit', 'partial', 'miss'):
             for verify_miss in (False, True):
@@ -801,7 +909,8 @@ class QuickEvictionTest(unittest.TestCase):
                 ('sustained-pressure', 0, 90, 7808, 320, delayed_client(), delayed_metrics(delayed_client()), False),
                 ('mixed-pressure', 0, 0, 7808, 320, mixed_client(), mixed_metrics(mixed_client()), False),
                 ('arrivals-pressure', 0, 0, 7808, 320, arrivals_client(), arrivals_metrics(arrivals_client()), False),
-                ('arrivals-pressure', 0, 0, 7808, 320, refill_client(), refill_metrics(refill_client()), True)):
+                ('arrivals-pressure', 0, 0, 7808, 320, refill_client(), refill_metrics(refill_client()), True),
+                ('multisize-pressure', 0, 0, 6400, 320, multisize_client(), multisize_metrics(multisize_client()), False)):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
                 args = runner.parse_args(self.arguments(Path(temp)) +
                                          ['--data-name', 'fixed', '--scenario', scenario,

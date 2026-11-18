@@ -1152,3 +1152,135 @@ N=1/2/3分别映射宿主disk2/disk3/disk3，具体host路径见冷盘说明。
 当前完成 **O5 回填自动验收＋四配置首轮实测**，只是单顺序各一次、早段12批抽样，
 不等于稳态全业务、最佳P、正式A/B通过或默认切换放行。业务权重未填写，生产默认不变。
 后续按用户约定补多尺寸、独立高并发、正式A/B；需要业务输入的权重另列，不擅自假设。
+
+
+## 15. 双尺寸紧凑几何诊断（2026-11-18）
+
+新增独立 `multisize-pressure`，与原单尺寸/回填场景分开。只做legacy与默认P180的
+lifetime两组首轮；不引入回填、业务权重、首次复用年龄或独立高并发，不改产品C++、
+生产默认、公式/参数校验和格式。不是正式性能A/B，也不宣称覆盖所有尺寸边界。
+
+### 15.1 为什么允许低占用缺失
+
+仍使用12GiB总容量、每盘4个1GiB extent、1MiB slot quantum。两个真实档位分别是
+payload4096→slot1048576、payload1048577→slot2097152；每档期望8个非满extent轮转，
+紧凑布局不能同时提供完整余量，跨档donor重绑可能在低payload占用时合法淘汰。
+因此不复用旧quick的“严格预热全命中”前提，不强制两个策略初态住户/热度一致；
+预填充与后续缺失均保留。`dfkv_slab_classes`是canonical class结构数量，不凭该值
+证明两个档都活跃；用实际class PUT计数及各档成功字节读取证明参与。
+历史48GiB无淘汰混合边界基线见Docker验证第5节，本轮没有重跑或冒充新增该覆盖。
+
+### 15.2 冻结样本与独立分母
+
+两个既有binary namespace，每个6400对象；index按连续16 key批次交替两种长度，
+不是key奇偶交替。每namespace预填充512；周期热点集合仍[0,32)，每档16。
+- admission：每namespace最初两个16-key PUT批次各立即读取同批一次，才进入后续
+  不同档写入。共64 GET（每档32），用于证明字节路径；这些读取会加热初始key，
+  不假装它们完全无干预或保证后续常驻。
+- warmup：预填充后两轮校准探测，共128 GET（每档64），允许miss；单独计数，
+  不纳入压力期热点命中率，也不声称这些key已全部成为住户热点。
+- pressure：剩余368轮，每轮写入每namespace16个新key，随后各读32个周期探针，
+  共23552 GET（每档11776）。不暂停/不设年龄窗口，不补读重试或回填缺失。
+- scan：最终12800 GET（每档6400），只观察最终状态，不回填。
+
+每组12800 PUT（每档6400）、36544 GET（每档18272），逻辑payload写入
+6737107200字节，申请slot体积18.75GiB大于12GiB容量。这是操作量，不是物理/NAND
+写入字节或业务权重；不同档payload大小本身使请求/内存/IO成本不同。
+
+结果`multisize`两行依次记录payload_bytes/slot_size、put_attempts/put_acks、
+admission、warmup、hot、scan各自hits/misses。顶层admission/warmup也单列；
+`hot_hits/hot_misses/hot_reads`在该新场景**只含压力期23552次**；顶层hits/misses
+只含末扫12800次，不能套用原quick把预热也计入hot的口径。
+PUT发起前计attempt、成功返回后计ACK；异常可能已经提交，部分账不能当完整分母。
+错bytes/长度/IO或PUT错误仍失败，不把故障当合法miss；所有早段/热点miss均保留。
+
+### 15.3 自动验收与验证边界
+
+- 严格核对两行尺寸身份、整数计数、每阶段分母和顶层汇总；每档至少一项成功读取
+  才证明其字节路径，但不要求预热、压力或末扫每阶段均有命中，不掩盖单档后续饥饿。
+- 服务端已接受PUT12800、payload6737107200字节；实际class_put_total在1MiB/2MiB
+  档各6400，其他canonical零值序列合法，其他非零档、缺失/重复标签拒绝。
+- success/notfound终局及lifetime成功计热分母包含admission+warmup+压力探针+末扫，
+  不遗漏64次admission或128次warmup；applied可因原住户竞态小于success。
+- 健康、错误、真实RDMA/uring、fallback/inflight及正常退出门禁沿用；必须观察实际
+  淘汰和真实ring读取，但不强制水位/后台class/donor三条路径同时为正，也不相加重叠计数。
+- 五份phase快照：prefill、warm、before-pressure、after-pressure、after-scan。
+  逐phase保存class住户/extent/allocated/useful/fragmentation、PUT和读/淘汰计数。
+  不将不同锁/时刻采样的aggregate瞬态差额直接指认为损坏。
+
+完整6400轨迹单测用保留真实长度与key身份的virtual payload，避免内存oracle驻留近7GB；
+这些测试核操作/分母，不冒充真实大字节IO。另有真实SHAKE生成和错字节/IO/失败ACK
+回归，真实后端运行则使用完整payload oracle，没有缩短值或伪造长度。
+### 15.4 两组真实结果：保留不利观测
+
+|策略/尺寸|admission h/m|warmup h/m|压力探针 h/m|末扫 h/m|
+|---|---:|---:|---:|---:|
+|legacy，4096字节|32/0|60/4|11040/736|6398/2|
+|legacy，1048577字节|32/0|64/0|11776/0|1344/5056|
+|lifetime，4096字节|32/0|60/4|11040/736|6398/2|
+|lifetime，1048577字节|32/0|64/0|1696/10080|1344/5056|
+
+两档实际PUT均6400/组，class_put指标吻合；全长度byte oracle、终局/计热/PUT/payload/
+五phase健康及class各自resident/allocated/useful/fragmentation算术通过。实际接受的
+warmup miss和热点损失没有隐藏或当成传输错误。miss为请求数，不是不同key数；
+本轮没有逐探针时间或victim-key追踪，不能从整除关系推出何时/哪一个key丢失或唯一原因。
+
+两组总victim均5058，后台预回收slot5056、跨档extent steal3、水位淘汰0；
+lifetime前台class_victims0、background_victims5056。这些计数有不同单位/重叠边界，
+不能把5056+3当总victim，也不能称本轮已验证多尺寸水位路径。
+紧凑geometry下早段校准已有缺失；不宣称初始热度完全相同或全部探针已驻留。
+
+**默认lifetime在大档周期探针上明显更差**：1696/10080对legacy11776/0。保留该风险，
+不改评分/Keep/P180或生产默认，不拿终局对账通过包装为策略收益或线上验收通过。
+既有新写保护/后台选择可能影响结果，但没有因果隔离实验，不能据此断言唯一victim机制。
+
+两组服务均正常exit0，合计73088 GET、25600 PUT、13474214400逻辑payload字节，
+10份phase快照。legacy268.665614秒、lifetime211.312370秒，累计479.977984秒。
+轨迹不paced且耗时跨P180，命中与实际传输字节也不同；**不能把较短耗时当作提速**，
+不满足固定年龄或正式A/B的可比性门禁。这里只核实际命中字节、真实路径及分母并报告风险。
+byte oracle只校验命中返回；GET_AUTO的容量不足也可报告miss，本轮没有对每个miss做
+metadata EXIST或victim日志关联，所以健康/错误门禁通过也不证明每次miss的唯一原因。
+
+### 15.5 本轮验证、复跑与未覆盖项
+
+工具80项=39driver+41supervisor，全过0失败/0skip；host OFF/OFF build-test和guest
+ON/ON /opt/dfkv-build构建均Ninja no-op，双方各两个Python CTest入口通过。
+真实RXE1+kernel ring5+PULL Serve9均通过无skip（Serve故障CQE受控，不冒充真实ring）；
+本轮服务真实RDMA/uring读取及completion为正，无fallback/错误/inflight残留。
+125生产源码+4工具/测试SHA一致，server/client二进制前后不变。
+无C++改动，未重跑全量CTest、sanitizer、C++静态检查、物理HCA/GPU或正式性能A/B。
+
+全固定6400输入的driver→supervisor内存契约覆盖全hit、压力热点全miss、单档在admission
+后完全饥饿三类情况；这些长度token测试不当作完整大payload证据。真实后端则按冻结
+SHAKE生成器逐字节校验。独立verifier不导入driver/supervisor重算两组原始结果PASS，
+32项合成+10项真实拷贝审计负控拒绝（不是额外产品场景）；第一版真实fixture的metric
+selector未区分path，匹配两条series而断言失败，原日志保留，修复fixture定位后10项重跑
+通过，产品门禁未放宽。代码与文档独立审查未发现阻塞问题。
+
+封存88份本轮SMART，允许盘nvme2/nvme0的composite温度40–41°C、warning0，最大采样
+间隔10.190078秒，覆盖前置检查及两组负载，不证明采样间无瞬变。监控代码与上轮相同，
+沿用已测的精确QEMU身份/温度控制边界，不冒充本轮真实热故障关停测试。
+应用和测试均已退出、端口空闲后正常停止monitor；VM空闲保留，私有daemon仍不可用。
+宿主disk1继续禁压，root/backing/data/log/results只落disk2/disk3，复用步骤见冷盘说明§8。
+
+仓库单测/host构建命令仍为第13.3节的四条简短命令。真实单组仅在核验后的guest执行：
+```bash
+ulimit -l unlimited
+python3 /opt/dfkv/deploy/validation/quick_eviction.py \
+  --build /opt/dfkv-build --scenario multisize-pressure --policy lifetime \
+  --data-root /data/disk1/cases --data-root /data/disk2/cases \
+  --data-root /data/disk3/cases --output /data/disk1/results/NEW_UNIQUE_OUTPUT
+```
+不要在宿主直接执行；guestdisk1实际在宿主disk2。每次output/data子目录必须全新；
+此示例省略data-name会生成UUID，不能冒充本轮固定路由复现。每组client320秒、外层380秒
+只是有界诊断超时，不是业务性能阈值；超时失败也要保留，不能直接宣称通过。
+
+本轮证据：`.omx/evidence/multisize-validation/20261118t084806z-4c8645a/`。
+guest结果：`/data/disk1/results/multisize-retention-20261118t084806z-4c8645a/`。
+保留数据：`/data/diskN/cases/multi-20261118t084806z-4c8645a-active--20261118t084806z-4c8645a--{legacy,lifetime}`，
+N=1/2/3映射宿主disk2/disk3/disk3。宿主证据归档在
+`/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/multisize-20261118t084806z-4c8645a/`。
+详细命令/env、阶段class分布与归档目录见case.json/summary.json，不含私钥或raw/qcow镜像。
+
+当前仅完成 **O5双尺寸紧凑几何首轮诊断**，不是所有尺寸边界/水位路径或O5整体放行。
+多尺寸水位分支仍未覆盖；独立高并发、业务权重和正式A/B仍待后续，小迭代分开推进。

@@ -998,6 +998,182 @@ class DiskValidationTest(unittest.TestCase):
                 self.assertEqual(result["wrong_bytes"], int(failure == "verify-corrupt"))
                 self.assertEqual(len(result["steps"]), 45)
 
+    def test_multisize_arguments_and_real_payload_boundaries(self):
+        args = self.args(Path("unused"), "multisize-pressure")
+        self.assertEqual(args.count, 6400)
+        self.assertFalse(args.refill_on_miss)
+        for extra in (("--count", "6399"), ("--pressure-delay-sec", "1"),
+                      ("--first-reuse-sec", "45"), ("--refill-on-miss",), ("--readers", "8")):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                self.args(Path("unused"), "multisize-pressure", extra)
+        args = self.args(Path("unused"), "multisize-pressure",
+                         ("--metrics-url", "http://127.0.0.1:12010/metrics"))
+        self.assertEqual(args.metrics_url, "http://127.0.0.1:12010/metrics")
+        for length in (4096, 1048577):
+            value = driver.payload(1, b"ns", b"key", 0, length)
+            self.assertEqual(len(value), length)
+            self.assertTrue(driver.check_read(value, 1, value, length))
+            with self.assertRaisesRegex(RuntimeError, "wrong bytes/length"):
+                driver.check_read(value, 1, value[:-1] + bytes([value[-1] ^ 1]), length)
+
+    def test_multisize_fixed_schedule_separates_admission_warmup_hot_and_scan(self):
+        # Full 6400-key layout without allocating 6.7GB: tokens retain requested
+        # payload length and every generator identity. Actual bytes are tested
+        # separately above and in the corruption/failure cases below.
+        class PayloadToken:
+            def __init__(self, fields):
+                self.fields = fields
+
+            def __len__(self):
+                return self.fields[-1]
+
+            def __eq__(self, other):
+                return isinstance(other, PayloadToken) and self.fields == other.fields
+
+        for mode in ("hit", "warm-partial", "warm-all", "hot-loss", "large-starved"):
+            phase, operations = ["admission"], []
+            original_phase = driver.record_phase
+            def record_phase(args, result, name, started):
+                original_phase(args, result, name, started)
+                phase[0] = name
+
+            class TrackingClient(MemoryClient):
+                def __init__(self, storage, members, namespace):
+                    super().__init__(storage, members, namespace)
+                    self.namespace = namespace
+
+                def put(self, keys, values):
+                    indices = [int.from_bytes(key[-8:], "big") for key in keys]
+                    self_lengths = [len(value) for value in values]
+                    expected = (4096, 1048577)[(indices[0] // 16) % 2]
+                    if self_lengths != [expected] * 16:
+                        raise AssertionError("batch is not the frozen homogeneous size")
+                    operations.append(("put", self.namespace, indices))
+                    super().put(keys, values)
+                    if mode == "large-starved" and indices[0] >= 512 and expected == 1048577:
+                        for key in keys:
+                            self.storage.pop(key)
+
+                def read(self, keys, values, *, allow_miss=False):
+                    if not allow_miss:
+                        raise AssertionError("compact diagnostic reads must allow eviction misses")
+                    indices = [int.from_bytes(key[-8:], "big") for key in keys]
+                    operations.append(("read-" + phase[0], self.namespace, indices))
+                    if phase[0] == "prefill" and mode in ("warm-partial", "warm-all"):
+                        for key in keys[:8 if mode == "warm-partial" else 16]:
+                            self.storage.pop(key, None)
+                    if phase[0] == "before-pressure" and mode == "hot-loss":
+                        for key in keys:
+                            self.storage.pop(key, None)
+                    if phase[0] == "prefill" and mode == "large-starved":
+                        for key in list(self.storage):
+                            if (int.from_bytes(key[-8:], "big") // 16) % 2:
+                                self.storage.pop(key)
+                    return super().read(keys, values, allow_miss=allow_miss)
+
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.object(driver, "payload", side_effect=lambda *fields: PayloadToken(fields)), \
+                    mock.patch.object(driver, "record_phase", side_effect=record_phase):
+                args = self.args(Path(temp) / mode, "multisize-pressure")
+                result = driver.run(args, library_loader=lambda _: {}, client_factory=TrackingClient)
+                self.assertEqual(result["status"], "passed")
+                self.assertEqual((result["admission_hits"], result["admission_misses"]), (64, 0))
+                self.assertEqual(result["warmup_hits"] + result["warmup_misses"], 128)
+                self.assertEqual(result["hot_reads"], 23552)
+                self.assertEqual(result["hits"] + result["misses"], 12800)
+                self.assertEqual(sum(len(indices) for kind, _, indices in operations if kind.startswith("read")),
+                                 36544)
+                self.assertEqual(result["warmup_misses"],
+                                 64 if mode in ("warm-partial", "large-starved") else
+                                 128 if mode == "warm-all" else 0)
+                self.assertEqual(result["hot_misses"],
+                                 11776 if mode in ("warm-partial", "large-starved") else
+                                 23552 if mode in ("warm-all", "hot-loss") else 0)
+                for index, row in enumerate(result["multisize"]):
+                    self.assertEqual(row["payload_bytes"], (4096, 1048577)[index])
+                    self.assertEqual(row["slot_size"], (index + 1) * 1048576)
+                    self.assertEqual((row["put_attempts"], row["put_acks"]), (6400, 6400))
+                    for part, count in (("admission", 32), ("warmup", 64), ("hot", 11776), ("scan", 6400)):
+                        self.assertEqual(row[part + "_hits"] + row[part + "_misses"], count)
+                if mode == "large-starved":
+                    self.assertEqual(result["multisize"][1]["scan_hits"], 0)
+                    self.assertEqual(result["multisize"][0]["scan_hits"], 6400)
+                for namespace in driver.NAMESPACES:
+                    writes = [i for kind, ns, indices in operations if kind == "put" and ns == namespace
+                              for i in indices]
+                    self.assertEqual(writes, list(range(6400)))
+                    own = [(kind, indices) for kind, ns, indices in operations if ns == namespace]
+                    self.assertEqual(own[:4], [("put", list(range(16))), ("read-admission", list(range(16))),
+                                               ("put", list(range(16, 32))), ("read-admission", list(range(16, 32)))])
+                self.assertEqual([row["name"] for row in result["phases"]],
+                                 ["prefill", "warm", "before-pressure", "after-pressure", "after-scan"])
+                trace = json.loads((args.output / "trace.json").read_text())
+                config = trace["config"]
+                self.assertEqual(config["lengths"], [4096, 1048577])
+                self.assertEqual(config["length_layout"], "alternating-homogeneous-16-key-batches")
+                self.assertEqual((config["prefill"], config["hot"], config["warmup_rounds"],
+                                  config["admission_read_batches_per_namespace"]), (512, 32, 2, 2))
+                self.assertTrue(config["warmup_allow_miss"])
+                self.assertFalse(config["refill_on_miss"])
+                self.assertFalse(config["independent_read_threads"])
+
+    def test_multisize_real_byte_failures_and_partial_acks_remain_failed(self):
+        # Small injected layout, real payload generation and byte oracle. The
+        # full production-sized count/order is exercised by the token test.
+        for failure in ("put-ns2", "admission-io", "admission-corrupt", "warm-io",
+                        "hot-io", "scan-io", "scan-corrupt"):
+            phase = ["admission"]
+            original_phase = driver.record_phase
+            def record_phase(args, result, name, started):
+                original_phase(args, result, name, started)
+                phase[0] = name
+
+            class FailingClient(MemoryClient):
+                def __init__(self, storage, members, namespace):
+                    super().__init__(storage, members, namespace)
+                    self.namespace = namespace
+
+                def put(self, keys, values):
+                    if failure == "put-ns2" and self.namespace == driver.NAMESPACES[1]:
+                        super().put(keys, values)  # Completion is uncertain on error.
+                        raise RuntimeError("PUT failed")
+                    super().put(keys, values)
+
+                def read(self, keys, values, *, allow_miss=False):
+                    first = int.from_bytes(keys[0][-8:], "big")
+                    active = ((failure.startswith("admission") and phase[0] == "admission") or
+                              (failure == "warm-io" and phase[0] == "prefill") or
+                              (failure == "hot-io" and phase[0] == "before-pressure") or
+                              (failure.startswith("scan") and phase[0] == "after-pressure" and first == 32))
+                    if active:
+                        if failure.endswith("corrupt"):
+                            self.storage[keys[0]] = b"x" * len(values[0])
+                        else:
+                            raise RuntimeError("GET failed")
+                    return super().read(keys, values, allow_miss=allow_miss)
+
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.object(driver, "MULTISIZE_COUNT", 64), \
+                    mock.patch.object(driver, "MULTISIZE_PREFILL", 32), \
+                    mock.patch.object(driver, "record_phase", side_effect=record_phase):
+                args = self.args(Path(temp) / failure, "multisize-pressure")
+                with self.assertRaisesRegex(RuntimeError, "wrong bytes/length|PUT failed|GET failed"):
+                    driver.run(args, library_loader=lambda _: {}, client_factory=FailingClient)
+                result = json.loads((args.output / "result.json").read_text())
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["wrong_bytes"], int(failure.endswith("corrupt")))
+                rows = result["multisize"]
+                if failure == "put-ns2":
+                    self.assertEqual((rows[0]["put_attempts"], rows[0]["put_acks"]), (32, 16))
+                    self.assertEqual((rows[1]["put_attempts"], rows[1]["put_acks"]), (16, 16))
+                    self.assertEqual(result["admission_hits"], 32)
+                if failure.startswith("admission"):
+                    self.assertEqual((rows[0]["put_attempts"], rows[0]["put_acks"]), (16, 16))
+                    self.assertEqual(result["admission_hits"], 0)
+                if failure.startswith("scan"):
+                    self.assertEqual(sum(row["scan_hits"] for row in rows), 32)
+                    self.assertEqual(sum(row["put_acks"] for row in rows), 128)
+
     def test_missing_key_oracle_rejects_all_false_hits_including_empty(self):
         class FakeLib:
             status = 0

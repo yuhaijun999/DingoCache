@@ -24,6 +24,8 @@ HOT_READS = 7552
 SUSTAINED_COUNT = 7808
 SUSTAINED_HOT_READS = 12928
 SUSTAINED_STEPS = 200
+MULTISIZE_COUNT = 6400
+MULTISIZE_HOT_READS = 23552
 # Frozen diagnostic continuity eligibility, not a release performance threshold.
 MAX_STEP_GAP_SEC = 5
 PORTS = (12000, 12001, 12010)
@@ -351,16 +353,68 @@ def check_refill(client):
             'logical_payload_write_amplification': ratio}
 
 
+def check_multisize(text, client):
+    """Validate compact two-class pressure without requiring hot residence.
+
+    Four extents per disk cannot provide eight stripes for both size classes.
+    Donor eviction can therefore precede high-watermark pressure. Admission,
+    warmup, recurring hot and final scan reads retain separate denominators.
+    Class PUT counters prove both actual classes were used; the global classes
+    gauge describes canonical geometry, not simultaneous resident classes.
+    """
+    rows = client.get('multisize')
+    if not isinstance(rows, list) or len(rows) != 2:
+        raise RuntimeError('multisize class count mismatch')
+    totals = {name: 0 for name in ('admission_hits', 'admission_misses',
+                                  'warmup_hits', 'warmup_misses',
+                                  'hot_hits', 'hot_misses', 'scan_hits', 'scan_misses')}
+    for row, length, slot in zip(rows, (4096, 1048577), (1048576, 2097152)):
+        if (not isinstance(row, dict) or
+                any(type(row.get(name)) is not int or row[name] != expected for name, expected in
+                    (('payload_bytes', length), ('slot_size', slot), ('put_attempts', 6400), ('put_acks', 6400))) or
+                any(type(row.get(name)) is not int or row[name] < 0 for name in totals)):
+            raise RuntimeError('multisize class identity/count mismatch')
+        if any(row[stage + '_hits'] + row[stage + '_misses'] != count for stage, count in
+               (('admission', 32), ('warmup', 64), ('hot', 11776), ('scan', 6400))):
+            raise RuntimeError('multisize per-class read denominator mismatch')
+        if sum(row[stage + '_hits'] for stage in ('admission', 'warmup', 'hot', 'scan')) == 0:
+            raise RuntimeError('multisize class has no successful read')
+        for name in totals:
+            totals[name] += row[name]
+    for name, count in totals.items():
+        field = {'scan_hits': 'hits', 'scan_misses': 'misses'}.get(name, name)
+        if type(client.get(field)) is not int or client[field] != count:
+            raise RuntimeError('multisize aggregate mismatch')
+    if total(text, 'dfkv_cache_put_total') != 12800 or total(text, 'dfkv_bytes_written_total') != 6737107200:
+        raise RuntimeError('multisize accepted PUT/payload mismatch')
+    class_puts = {}
+    for labels, value in samples(text, 'dfkv_slab_class_put_total'):
+        match = re.fullmatch(r'\{slot_size="([0-9]+)"\}', labels)
+        if match is None or match[1] in class_puts:
+            raise RuntimeError('multisize class metric labels mismatch')
+        class_puts[match[1]] = value
+    if (class_puts.get('1048576') != 6400 or class_puts.get('2097152') != 6400 or
+            any(value != 0 for slot, value in class_puts.items() if slot not in ('1048576', '2097152')) or
+            total(text, 'dfkv_slab_classes') < 2):
+        raise RuntimeError('multisize actual class PUT mismatch')
+    return {'multisize_gets': 36544, 'multisize_puts': 12800,
+            'multisize_payload_bytes': 6737107200}
+
+
 def check_result(text, client, policy='lifetime', scenario='quick-pressure', first_reuse_sec=0, refill_on_miss=False):
     if (type(refill_on_miss) is not bool or ('refill' in client) != refill_on_miss or
             (refill_on_miss and scenario != 'arrivals-pressure')):
         raise RuntimeError('refill mode/result mismatch')
-    if scenario not in ('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure'):
+    if ('multisize' in client) != (scenario == 'multisize-pressure'):
+        raise RuntimeError('multisize mode/result mismatch')
+    if scenario not in ('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure'):
         raise RuntimeError('unknown scenario')
     if first_reuse_sec not in (0, 45, 90, 185) or (first_reuse_sec and scenario != 'sustained-pressure'):
         raise RuntimeError('invalid first reuse scenario')
     expected_count = SUSTAINED_COUNT if scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure') else COUNT
     expected_hot_reads = SUSTAINED_HOT_READS if scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure') else HOT_READS
+    if scenario == 'multisize-pressure':
+        expected_count, expected_hot_reads = MULTISIZE_COUNT, MULTISIZE_HOT_READS
     if client.get('status') != 'passed' or client.get('wrong_bytes') != 0:
         raise RuntimeError('client correctness failure')
     if client.get('transport_mode') != ['rdma', 'rdma']:
@@ -371,9 +425,11 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
     hits, misses, hot_hits, hot_misses, hot_reads = counts
     if (hits + misses != expected_count * 2 or
             (not first_reuse_sec and hot_reads != expected_hot_reads) or
-            hot_reads != hot_hits + hot_misses or (not first_reuse_sec and not hot_hits)):
+            hot_reads != hot_hits + hot_misses or
+            (scenario != 'multisize-pressure' and not first_reuse_sec and not hot_hits)):
         raise RuntimeError('client read denominator mismatch')
-    schedule = (check_arrivals(client) if scenario == 'arrivals-pressure' else
+    schedule = (check_multisize(text, client) if scenario == 'multisize-pressure' else
+                check_arrivals(client) if scenario == 'arrivals-pressure' else
                 check_mixed(client) if scenario == 'mixed-pressure' else
                 check_steps(client, first_reuse_sec) if scenario == 'sustained-pressure' else {})
     refill = check_refill(client) if refill_on_miss else {}
@@ -400,6 +456,8 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
         raise RuntimeError('all three disks must contain objects')
     filler_reads = (18112 if scenario == 'mixed-pressure' else
                     18304 if first_reuse_sec or scenario == 'arrivals-pressure' else 0)
+    early_hits = client['admission_hits'] + client['warmup_hits'] if scenario == 'multisize-pressure' else 0
+    early_misses = client['admission_misses'] + client['warmup_misses'] if scenario == 'multisize-pressure' else 0
     terminal = {}
     for labels, value in samples(text, 'dfkv_rdma_pull_requests_terminal_total'):
         match = re.search(r'(?:\{|,)result="([^"]+)"(?:,|\})', labels)
@@ -409,18 +467,18 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
         terminal[key] = terminal.get(key, 0) + value
         if key not in ('success_nonempty', 'not_found') and value:
             raise RuntimeError('unexpected PULL terminal: ' + key)
-    if terminal.get('success_nonempty', 0) != hits + hot_hits + filler_reads + reuse_hits + verify_hits:
+    if terminal.get('success_nonempty', 0) != hits + hot_hits + filler_reads + reuse_hits + verify_hits + early_hits:
         raise RuntimeError('success denominator mismatch')
-    if terminal.get('not_found', 0) != misses + hot_misses + reuse_misses + verify_misses:
+    if terminal.get('not_found', 0) != misses + hot_misses + reuse_misses + verify_misses + early_misses:
         raise RuntimeError('missing denominator mismatch')
     dispatched = total(text, 'dfkv_rdma_pull_requests_dispatched_total')
-    if dispatched != total(text, 'dfkv_rdma_pull_requests_terminal_total') or dispatched != sum(counts[:4]) + filler_reads + reuse_hits + reuse_misses + verify_hits + verify_misses:
+    if dispatched != total(text, 'dfkv_rdma_pull_requests_terminal_total') or dispatched != sum(counts[:4]) + filler_reads + reuse_hits + reuse_misses + verify_hits + verify_misses + early_hits + early_misses:
         raise RuntimeError('PULL requests not settled')
     heat = {}
     if policy == 'lifetime':
         success = total(text, 'dfkv_slab_lifetime_read_success_total')
         applied = total(text, 'dfkv_slab_lifetime_read_applied_total')
-        if success != hits + hot_hits + filler_reads + reuse_hits + verify_hits or applied > success:
+        if success != hits + hot_hits + filler_reads + reuse_hits + verify_hits + early_hits or applied > success:
             raise RuntimeError('lifetime heat denominator mismatch')
         # Pressure can reclaim the original resident before its heat notification.
         heat = {'read_success': success, 'read_applied': applied}
@@ -464,7 +522,7 @@ def parse_args(argv=None):
     parser.add_argument('--data-root', type=Path, action='append', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--policy', choices=('legacy', 'lifetime'), default='lifetime')
-    parser.add_argument('--scenario', choices=('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure'),
+    parser.add_argument('--scenario', choices=('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure'),
                         default='quick-pressure')
     parser.add_argument('--pressure-delay-sec', type=int, default=0,
                         help='wait after hot warmup before cold writes (0..300)')
@@ -484,7 +542,7 @@ def parse_args(argv=None):
         parser.error('protect-sec requires lifetime policy')
     if not 0 <= args.pressure_delay_sec <= 300:
         parser.error('pressure delay must be in 0..300 seconds')
-    if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure') and args.pressure_delay_sec:
+    if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure') and args.pressure_delay_sec:
         parser.error('paced pressure scenarios do not accept a pre-pressure delay')
     if args.data_name is not None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', args.data_name):
         parser.error('data name must be a safe ASCII component of 1..80 characters')
@@ -527,6 +585,8 @@ def run(args):
                    '--rdma-dev', 'rxe0', '--max-msg', '2097152', '--metrics-port', '12010',
                    '--metrics-bind', '127.0.0.1']
         count = SUSTAINED_COUNT if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure') else COUNT
+        if args.scenario == 'multisize-pressure':
+            count = MULTISIZE_COUNT
         client_command = [sys.executable, str(source / 'deploy/validation/disk_scenarios.py'),
                           '--lib', str(args.build / 'libdfkv.so'), '--members', 'n=127.0.0.1:12001',
                           '--scenario', args.scenario, '--count', str(count),
@@ -535,7 +595,7 @@ def run(args):
                           '--metrics-url', METRICS_URL, '--output', str(args.output / 'trace')]
         if args.refill_on_miss:
             client_command.append('--refill-on-miss')
-        client_timeout_sec = (320 if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure') else
+        client_timeout_sec = (320 if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure') else
                               120 + args.pressure_delay_sec)
         (args.output / 'case.json').write_text(json.dumps({'command': command, 'data_dirs': list(map(str, dirs)),
             'client_command': client_command, 'client_timeout_sec': client_timeout_sec,

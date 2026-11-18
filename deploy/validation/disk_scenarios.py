@@ -9,7 +9,8 @@ miss refill; delayed first reuse warms only the non-cohort filler. mixed-pressur
 combines existing hot reads with three once-only delayed cohorts. arrivals-pressure
 samples the first twelve newly arriving batches, delaying reuse from their PUT
 ACKs while writes continue. Its optional sampled-miss refill mode records
-first outcomes, one refill attempt and one verification GET separately. These are not
+first outcomes, one refill attempt and one verification GET separately. multisize-pressure
+uses two real slot classes, allowing compact-geometry donor losses during warmup. These are not
 persistence, performance, or transport-backend proof.
 Requires the repository's dfkv_common on PYTHONPATH (no third-party dependencies).
 """
@@ -39,6 +40,9 @@ SUSTAIN_INTERVAL_SEC = 1
 MIXED_REUSE_DELAYS = (45, 90, 185)
 MIXED_COHORT_SIZE = 16
 ARRIVAL_SAMPLE_STEPS = 12
+MULTISIZE_COUNT = 6400
+MULTISIZE_PREFILL = 512
+MULTISIZE_LENGTHS = (4096, 1048577)
 
 
 def key_for(seed, index):
@@ -175,7 +179,7 @@ def parse_args(argv=None):
     parser.add_argument("--members", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scenario", required=True,
-                        choices=("roundtrip", "write", "verify", "pressure", "quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure"))
+                        choices=("roundtrip", "write", "verify", "pressure", "quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure"))
     parser.add_argument("--seed", type=lambda s: int(s, 0), default=0xD1A60001)
     parser.add_argument("--count", type=int, help="objects PER namespace")
     parser.add_argument("--readers", type=int, choices=(0, 8), default=0,
@@ -193,6 +197,7 @@ def parse_args(argv=None):
     if args.count is None:
         args.count = (QUICK_PREFILL + SUSTAIN_STEPS * BATCH_SIZE
                       if args.scenario in ("sustained-pressure", "mixed-pressure", "arrivals-pressure") else
+                      MULTISIZE_COUNT if args.scenario == "multisize-pressure" else
                       6452 if args.scenario == "quick-pressure" else
                       26000 if args.scenario == "pressure" else len(LENGTHS))
     if args.count < (1 if args.scenario == "pressure" else len(LENGTHS)):
@@ -204,7 +209,10 @@ def parse_args(argv=None):
     if args.scenario in ("sustained-pressure", "mixed-pressure", "arrivals-pressure") and (
             args.pressure_delay_sec or args.count != QUICK_PREFILL + SUSTAIN_STEPS * BATCH_SIZE):
         parser.error(args.scenario + " requires fixed count and zero pressure delay")
-    if (args.pressure_delay_sec or args.metrics_url) and args.scenario not in ("quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure"):
+    if args.scenario == "multisize-pressure" and (
+            args.count != MULTISIZE_COUNT or args.pressure_delay_sec):
+        parser.error("multisize-pressure requires fixed count and zero pressure delay")
+    if (args.pressure_delay_sec or args.metrics_url) and args.scenario not in ("quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure"):
         parser.error("delay and phase metrics require quick-pressure")
     if args.first_reuse_sec and args.scenario != "sustained-pressure":
         parser.error("first-reuse-sec requires sustained-pressure")
@@ -319,6 +327,64 @@ def quick_pressure(args, clients, dataset, result, started):
             for client, namespace in zip(clients, NAMESPACES):
                 client.put(*dataset(namespace, start, min(start + BATCH_SIZE, args.count)))
             hot_reads(True)
+    result["hot_reads"] = result["hot_hits"] + result["hot_misses"]
+    record_phase(args, result, "after-pressure", started)
+
+
+def multisize_pressure(args, clients, dataset, result, started):
+    """Interleave homogeneous batches from two classes in a compact arena.
+
+    Two active classes can steal extents even at low payload occupancy. Warmup
+    therefore permits misses and stays separate from pressure hot reads; neither
+    misses nor a successful PUT imply the object's later residence. No refill or
+    independently concurrent reads are introduced by this diagnostic.
+    """
+    result.update(hot_hits=0, hot_misses=0, hot_reads=0, admission_hits=0,
+                  admission_misses=0, warmup_hits=0,
+                  warmup_misses=0, filler_warmup_reads=0,
+                  multisize=[{"payload_bytes": length, "slot_size": (index + 1) * 1048576,
+                              "put_attempts": 0, "put_acks": 0, "admission_hits": 0,
+                              "admission_misses": 0, "warmup_hits": 0,
+                              "warmup_misses": 0, "hot_hits": 0, "hot_misses": 0,
+                              "scan_hits": 0, "scan_misses": 0}
+                             for index, length in enumerate(MULTISIZE_LENGTHS)])
+
+    def write_batch(client, namespace, start):
+        row = result["multisize"][(start // BATCH_SIZE) % 2]
+        keys, values = dataset(namespace, start, start + BATCH_SIZE)
+        row["put_attempts"] += len(keys)
+        client.put(keys, values)
+        row["put_acks"] += len(keys)
+        # Prove both byte paths before the next different-class PUT can steal
+        # the newly bound extent. These probes intentionally heat initial keys.
+        if start < 2 * BATCH_SIZE:
+            read_batch(client, namespace, start, "admission")
+
+    def read_batch(client, namespace, start, phase):
+        row = result["multisize"][(start // BATCH_SIZE) % 2]
+        hits = client.read(*dataset(namespace, start, start + BATCH_SIZE), allow_miss=True)
+        row[phase + "_hits"] += hits
+        row[phase + "_misses"] += BATCH_SIZE - hits
+        result[phase + "_hits"] += hits
+        result[phase + "_misses"] += BATCH_SIZE - hits
+
+    def hot_reads(phase):
+        for client, namespace in zip(clients, NAMESPACES):
+            for start in range(0, QUICK_HOT, BATCH_SIZE):
+                read_batch(client, namespace, start, phase)
+
+    for client, namespace in zip(clients, NAMESPACES):
+        for start in range(0, MULTISIZE_PREFILL, BATCH_SIZE):
+            write_batch(client, namespace, start)
+    record_phase(args, result, "prefill", started)
+    for _ in range(2):
+        hot_reads("warmup")
+    record_phase(args, result, "warm", started)
+    record_phase(args, result, "before-pressure", started)
+    for start in range(MULTISIZE_PREFILL, args.count, BATCH_SIZE):
+        for client, namespace in zip(clients, NAMESPACES):
+            write_batch(client, namespace, start)
+        hot_reads("hot")
     result["hot_reads"] = result["hot_hits"] + result["hot_misses"]
     record_phase(args, result, "after-pressure", started)
 
@@ -498,7 +564,7 @@ def mixed_pressure(args, clients, dataset, result, started):
 def run(args, *, library_loader=load_library, client_factory=Client):
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    pressure = args.scenario in ("pressure", "quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure")
+    pressure = args.scenario in ("pressure", "quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure")
     config = {"schema": 1, "lib": args.lib, "members": args.members,
               "scenario": args.scenario, "seed": args.seed, "count": args.count,
               "readers": args.readers, "namespaces_hex": [n.hex() for n in NAMESPACES],
@@ -529,6 +595,13 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                       reuse_delays_sec=list(MIXED_REUSE_DELAYS),
                       reuse_delay_origin="later-namespace-put-ack",
                       reuse_once=True, pressure_delay_sec=0, first_reuse_sec=0)
+    if args.scenario == "multisize-pressure":
+        config.update(lengths=list(MULTISIZE_LENGTHS),
+                      length_layout="alternating-homogeneous-16-key-batches",
+                      prefill=MULTISIZE_PREFILL, hot=QUICK_HOT, warmup_rounds=2,
+                      warmup_allow_miss=True, admission_read_batches_per_namespace=2,
+                      refill_on_miss=False,
+                      independent_read_threads=False, metrics_url=args.metrics_url)
     if args.refill_on_miss:
         config.update(refill_on_miss=True, refill_scope="sampled-first-reuse-only",
                       refill_attempts_per_miss=1, refill_verification_reads=1,
@@ -554,6 +627,12 @@ def run(args, *, library_loader=load_library, client_factory=Client):
             "arrivals-pressure: sample only the first 12 arriving batches; rotate 45/90/185 "
             "seconds from the later namespace PUT ACK; once-only GET, no refill; "
             "later arrivals remain unsampled, incomplete cohorts fail")
+    if args.scenario == "multisize-pressure":
+        trace["operations"].append(
+            "multisize-pressure: alternate 16-key homogeneous 4096/1048577-byte batches; "
+            "probe each namespace first two admitted batches before the next PUT; "
+            "warmup permits donor losses and is separate from pressure hot reads; "
+            "per-size PUT/warmup/hot/scan counts, no refill")
     if args.refill_on_miss:
         # Replace the no-refill arrival description only for this opt-in trace.
         trace["operations"][-1] = (
@@ -567,6 +646,8 @@ def run(args, *, library_loader=load_library, client_factory=Client):
     def dataset(namespace, start, stop, changed=False):
         keys = [key_for(args.seed, i) for i in range(start, stop)]
         values = [payload(args.seed, namespace, key, int(changed and i == 0),
+                          MULTISIZE_LENGTHS[(i // BATCH_SIZE) % 2]
+                          if args.scenario == "multisize-pressure" else
                           4096 if pressure else LENGTHS[i % len(LENGTHS)])
                   for i, key in zip(range(start, stop), keys)]
         return keys, values
@@ -575,7 +656,12 @@ def run(args, *, library_loader=load_library, client_factory=Client):
         hits = 0
         for start in range(0, args.count, BATCH_SIZE):
             keys, values = dataset(namespace, start, min(start + BATCH_SIZE, args.count), changed)
-            hits += client.read(keys, values, allow_miss=pressure)
+            found = client.read(keys, values, allow_miss=pressure)
+            hits += found
+            if args.scenario == "multisize-pressure":
+                row = result["multisize"][(start // BATCH_SIZE) % 2]
+                row["scan_hits"] += found
+                row["scan_misses"] += len(keys) - found
         return hits
 
     try:
@@ -590,7 +676,9 @@ def run(args, *, library_loader=load_library, client_factory=Client):
             if args.scenario == "roundtrip":
                 for client in clients:
                     client.expect_missing(b"never-written\x00" + key_for(args.seed, 0))
-            if args.scenario in ("mixed-pressure", "arrivals-pressure"):
+            if args.scenario == "multisize-pressure":
+                multisize_pressure(args, clients, dataset, result, started)
+            elif args.scenario in ("mixed-pressure", "arrivals-pressure"):
                 mixed_pressure(args, clients, dataset, result, started)
             elif args.scenario in ("quick-pressure", "sustained-pressure"):
                 quick_pressure(args, clients, dataset, result, started)
@@ -622,7 +710,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                         futures = [pool.submit(read_all, clients[i % 2], NAMESPACES[i % 2], True)
                                    for i in range(args.readers)]
                         result["concurrent_reader_hits"] = sum(f.result() for f in futures)
-            if args.scenario in ("quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure"):
+            if args.scenario in ("quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure"):
                 record_phase(args, result, "after-scan", started)
             result["status"] = "passed"
     except Exception as error:
