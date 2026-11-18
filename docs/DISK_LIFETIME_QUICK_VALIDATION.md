@@ -728,12 +728,12 @@ guest结果：`/data/disk1/results/mixed-retention-20261118t024812z-6b0cc86/`。
 该混合场景的正反序确认已完成；持续新到达对象、业务权重/回填、多尺寸、
 独立高并发、正式A/B及整体O5验收仍未关闭。
 
-## 11. 持续新到达对象：驱动准备（尚未执行真实后端对照）
+## 11. 持续新到达对象：早段抽样与真实后端首筛
 
 第10节待复用对象都在施压前预填充，不能代表施压期间新到达的对象。本小步新增
-外部客户端场景 `arrivals-pressure`，只准备驱动与无硬件回归，不修改生产代码、
-评分、参数校验或默认配置。自动supervisor尚未接入该场景，不能直接给
-`quick_eviction.py --scenario` 传入此值，也不将内存客户端测试当作磁盘验证。
+外部客户端场景 `arrivals-pressure`。驱动准备步骤（`f6cbdb7`）仅有无硬件回归，
+当时尚未接入supervisor；本轮已接入自动校验并运行真实四配置对照，详见11.3。
+两个步骤均未修改生产代码、评分、参数校验或默认配置，不将内存测试当作磁盘验证。
 
 ### 11.1 冻结的早段抽样口径
 
@@ -754,12 +754,10 @@ guest结果：`/data/disk1/results/mixed-retention-20261118t024812z-6b0cc86/`。
   首次复用按每档128个不同对象统计，热点按重复请求统计，不能混用分母。
   首次全缺失是有效观测；字节错误、I/O失败和严格预热缺失不是有效淘汰结果。
 
-本次只锁定以上工具行为。下一小步再接入supervisor的逐组身份、实际年龄、完整读
-分母和失败门禁，然后在隔离RXE＋io_uring环境执行四配置对照。持续到达负载的
-真实存活结果尚未知，不能套用第10节命中表；业务权重、重算/回填、多尺寸、
-独立高并发和正式A/B仍分别后续处理。
+驱动准备步骤只锁定以上工具行为；后续supervisor接入及真实结果见11.3。不能套用
+第10节命中表；业务权重、重算/回填、多尺寸、独立高并发和正式A/B仍分别后续处理。
 
-### 11.2 本步验证记录（2026-11-18）
+### 11.2 驱动准备验证记录（f6cbdb7，2026-11-18）
 
 新增5个测试方法，驱动33项及既有supervisor 26项单测全部通过，无失败/跳过。
 新增场景在实现前的红测因CLI尚不识别该值而失败；实现后使用MemoryClient与
@@ -778,3 +776,93 @@ io_uring负载，也没有新增真实后端放行结论。Python编译及diff�
 单元测试及构建命令沿用10.4；本轮驱动单测33项，不再是此前28项。
 证据：`.omx/evidence/arrivals-driver/20261118t031026z-ef61e35/`，
 包括红/绿测试日志、完整规模回归、旧场景等价性、主机/guest CTest XML及审查报告。
+
+### 11.3 自动校验接入与四配置实测（2026-11-18）
+
+基线 `f6cbdb7`，本轮只修改supervisor及对应测试，未改驱动/生产代码或默认配置。
+独立 `check_arrivals` 校验12组身份/固定索引、ACK位于对应admission step且两
+namespace有序、较晚ACK起算due、实际逐namespace年龄、事件/namespace先后关系、
+每组恰好一次及384个对象分母。两个组拥有相同delay不代表同一身份。
+跳过到期组按row开始时间判断，避免将决策后跨deadline的行尾错误判为提前遗漏。
+
+CLI现在支持 `--scenario arrivals-pressure`，固定7808对象/namespace和320秒客户端
+超时，拒绝非零单次延迟/预压等待；完整PULL终局、计热账按47232次GET核对。
+全首次缺失或施压阶段热点缺失可以是有效保留性结果；严格预热缺失、字节/I/O、
+缺组/假年龄/分母错误、健康、ring fallback及非正常退出仍然失败。
+
+在原隔离guest中，单组复跑：
+```bash
+ulimit -l unlimited
+python3 /opt/dfkv/deploy/validation/quick_eviction.py \
+  --build /opt/dfkv-build --policy lifetime --scenario arrivals-pressure --protect-sec 180 \
+  --data-root /data/disk1/cases --data-root /data/disk2/cases \
+  --data-root /data/disk3/cases \
+  --output /data/disk1/results/arrivals-$(date -u +%Y%m%dT%H%M%S)-$$
+```
+
+legacy去掉P覆盖；完整四组须沿用6.2的固定新空 `--data-name`、唯一输出/归档、
+正常退出、端口与空间检查。默认UUID示例不保证跨组路由一致，不能直接当纯参数对照。
+
+实际顺序 **P180 → legacy → P60 → P30**，各一组，无反序/随机化重复。
+热点列为12928次重复GET（含128预热）；每档首次复用是4组共**128个不同对象**，
+不同于第10节每档32个对象，分母不能混用。
+
+| 配置 | 已有热点命中/缺失 | ACK后45秒首次命中/缺失 | ACK后90秒首次命中/缺失 | ACK后185秒首次命中/缺失 |
+|---|---:|---:|---:|---:|
+| lifetime P180 | 12928 / 0 | 128 / 0 | 128 / 0 | 0 / 128 |
+| legacy | 12928 / 0 | 128 / 0 | 128 / 0 | 128 / 0 |
+| lifetime P60 | 12928 / 0 | 128 / 0 | 0 / 128 | 0 / 128 |
+| lifetime P30 | 12928 / 0 | 115 / 13 | 0 / 128 | 0 / 128 |
+
+实际逐namespace ACK到首GET年龄范围：
+45秒组45.040714–45.057602秒，90秒组90.045760–90.064328秒，
+185秒组185.067123–185.078544秒。这次是真实写入ACK相对延迟，不是之前的
+压力原点相对延迟。P30的13个45秒缺失集中在最后一个45秒组（admission step 9），
+该组19命中/13缺失；前三个45秒组均32命中。保留全部12组明细，不用合并率隐藏差异。
+
+四组初态逐盘3181/3122/2913对象、slot字节相同、淘汰0；严格预热18432次GET。
+每组末扫10812命中/4804缺失、水位淘汰4804，后台class回收/extent steal均0。
+P覆盖及八项评分/桶默认字段核对通过。四组共188928次业务GET、800步、44份阶段
+快照，最大步间隔1.000260秒，总耗时910.645秒。字节、终局/计热分母、对象守恒、
+健康、真实RXE/kernel io_uring、正常退出均通过。没有删除全缺失样本或将其算作skip。
+
+**本冻结轨迹中，P180的185秒首次复用保留性低于legacy；缩短P又损失90秒组，
+P30还损失部分45秒对象，但没有观察到已有热点收益。** 这是需要保留和复测的
+负载相关风险，不证明唯一victim原因或全业务策略优劣。相比第10节，本轮不仅改变
+对象到达时机，还改变filler预热集合、抽样数量/索引及延迟原点，不能伪装单变量
+跨场景比较。没有逐victim原因追踪，不将差异直接命名为代码错误或已证实的根因。
+
+新增6个supervisor测试方法，驱动33＋supervisor32＝65项本轮重跑通过，无失败/
+跳过；包含34类身份/ACK/年龄/事件/计数篡改、同row多组到期的身份/namespace顺序、
+跨deadline有效边界、全缺失及完整supervisor模拟路径。红测留档。独立代码审查
+无遗留，并把真实默认规模MemoryClient驱动输出直接接入新校验器联核通过。
+
+主机OFF `build-test`、guest ON `/opt/dfkv-build` 均构建成功（Ninja无待编译工作），
+各两个Python CTest入口通过。125生产源码及4个工具/测试文件SHA与guest一致，
+服务器/客户端二进制SHA前后未变。九项独立审计负控全部拒绝：缺配置、重复身份、
+假ACK、假年龄、提前探测、索引重叠、错误复用分母、错误PULL分母和遗漏事件。
+负控脚本初版因假设指标不带label而在fixture断言停止，修正为实际uring label后
+九项重跑通过；保留初次日志，未改产品门禁或实测结果。负控不是额外产品场景。
+未重跑全量CTest、sanitizer、C++静态检查、物理HCA/GPU或正式性能A/B。
+
+实际单测/构建命令：
+```bash
+python3 -m unittest discover -s test/python -p test_disk_validation.py -v
+python3 -m unittest discover -s test/python -p test_quick_eviction.py -v
+cmake --build build-test -j2
+ctest --test-dir build-test --no-tests=error \
+  -R '^python_(disk_validation|quick_eviction)$' --output-on-failure
+```
+
+guest构建/CTest使用 `/opt/dfkv-build`；四组实际命令/环境逐组保存在
+`results/<配置>/case.json`。证据：
+`.omx/evidence/arrival-validation/20261118t032854z-f6cbdb7/`，
+含冻结清单、源码SHA、supervisor、原始指标/逐步轨迹、XML、负控与独立终审。
+guest结果：`/data/disk1/results/arrival-retention-20261118t032854z-f6cbdb7/`。
+数据目录：
+`/data/diskN/cases/sustain-20261117t090611z-80793be-active--20261118t032854z-f6cbdb7--{p180,legacy,p60,p30}`。
+应用及测试均退出，VM与样本保留，三盘各约15GiB可用，旧数据未覆盖。
+
+仅完成前12批早段新到达抽样的单轮四配置首筛；还需反序/重复确认及更晚到达、
+业务权重/回填、多尺寸、独立高并发和正式A/B。生产P180、策略默认、公式/校验及
+磁盘格式均未改变，O5未整体验收完成。

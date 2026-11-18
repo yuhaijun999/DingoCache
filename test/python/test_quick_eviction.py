@@ -110,7 +110,206 @@ def mixed_metrics(client):
     return good_metrics().replace('12128', str(hits)).replace('20456', str(hits + misses)).replace('8328', str(misses))
 
 
+def arrivals_client(reuse_miss=False, hot_miss=False):
+    client = sustained_client()
+    client.update(filler_warmup_reads=18304, reuse_hits=0 if reuse_miss else 384,
+                  reuse_misses=384 if reuse_miss else 0, reuse_reads=384, reuse_cohorts=[])
+    if hot_miss:
+        client.update(hot_hits=128, hot_misses=12800)
+    for row in client['steps']:
+        row.update(reuse_probes=[], hot_hits=0 if hot_miss else 64,
+                   hot_misses=64 if hot_miss else 0)
+    for index in range(12):
+        delay = (45, 90, 185)[index % 3]
+        first = index + delay
+        writes = [3 + index + .002, 3 + index + .003]
+        client['steps'][first]['reuse_probes'] = [
+            {'admission_step': index, 'delay_sec': delay, 'probe_started_sec': first + .004,
+             'hits': 0 if reuse_miss else 32, 'misses': 32 if reuse_miss else 0}]
+        client['reuse_cohorts'].append({
+            'admission_step': index, 'delay_sec': delay, 'start_index': 4608 + index * 16,
+            'count_per_namespace': 16, 'write_completed_sec': writes,
+            'due_sec': index + .003 + delay, 'first_reuse': [
+                {'namespace_hex': ns.hex(), 'probe_started_sec': 3 + first + .005 + i * .001,
+                 'write_to_probe_sec': 3 + first + .005 + i * .001 - writes[i],
+                 'hits': 0 if reuse_miss else 16, 'misses': 16 if reuse_miss else 0}
+                for i, ns in enumerate((b'disk-validation\x00A\xff', b'disk-validation\x00B\xfe'))]})
+    return client
+
+
+def arrivals_metrics(client):
+    hits = client['hits'] + client['hot_hits'] + 18304 + client['reuse_hits']
+    misses = client['misses'] + client['hot_misses'] + client['reuse_misses']
+    return good_metrics().replace('12128', str(hits)).replace('20456', str(hits + misses)).replace('8328', str(misses))
+
+
 class QuickEvictionTest(unittest.TestCase):
+    def test_arrivals_cohort_counts_and_all_misses_remain_valid_observations(self):
+        for reuse_miss in (False, True):
+            for hot_miss in (False, True):
+                client = arrivals_client(reuse_miss, hot_miss)
+                checked = runner.check_result(arrivals_metrics(client), client, scenario='arrivals-pressure')
+                self.assertEqual(checked['reuse_reads'], 384)
+                self.assertEqual(checked['reuse_hits'], 0 if reuse_miss else 384)
+                self.assertEqual(checked['reuse_misses'], 384 if reuse_miss else 0)
+                self.assertEqual(checked['sustained_steps'], 200)
+
+    def test_arrivals_checker_rejects_identity_ack_age_and_event_forgery(self):
+        for mutation in ('cohort_missing', 'cohort_order', 'identity', 'identity_bool', 'overlap',
+                         'size', 'delay', 'ack_prefill', 'ack_future', 'ack_order', 'due',
+                         'due_nan', 'ack_bool', 'early', 'duplicate', 'missing', 'late',
+                         'event_identity', 'event_delay', 'event_count', 'age', 'namespace',
+                         'outcome', 'reads', 'hits', 'filler', 'partial', 'outcome_time',
+                         'outcome_early', 'cohort_id_float', 'start_bool', 'missing_probes',
+                         'ack_deadline_early', 'filler_float'):
+            client = arrivals_client()
+            cohort = client['reuse_cohorts'][0]
+            event = client['steps'][45]['reuse_probes'][0]
+            if mutation == 'cohort_missing':
+                client['reuse_cohorts'].pop()
+            elif mutation == 'cohort_order':
+                client['reuse_cohorts'].reverse()
+            elif mutation == 'identity':
+                cohort['admission_step'] = 1
+            elif mutation == 'identity_bool':
+                cohort['admission_step'] = False
+            elif mutation == 'cohort_id_float':
+                cohort['admission_step'] = 0.0
+            elif mutation == 'start_bool':
+                cohort['start_index'] = True
+            elif mutation == 'overlap':
+                client['reuse_cohorts'][1]['start_index'] = 4608
+            elif mutation == 'size':
+                cohort['count_per_namespace'] = 32
+            elif mutation == 'delay':
+                cohort['delay_sec'] = 90
+            elif mutation == 'ack_prefill':
+                cohort['write_completed_sec'] = [1., 2.]
+            elif mutation == 'ack_future':
+                cohort['write_completed_sec'][1] = 4.003
+            elif mutation == 'ack_order':
+                cohort['write_completed_sec'].reverse()
+            elif mutation == 'due':
+                cohort['due_sec'] -= .001
+            elif mutation == 'due_nan':
+                cohort['due_sec'] = float('nan')
+            elif mutation == 'ack_bool':
+                cohort['write_completed_sec'][0] = True
+            elif mutation == 'early':
+                event['probe_started_sec'] = 44.9
+            elif mutation == 'ack_deadline_early':
+                event['probe_started_sec'] = 45.002
+            elif mutation == 'filler_float':
+                client['filler_warmup_reads'] = 18304.0
+            elif mutation == 'duplicate':
+                client['steps'][46]['reuse_probes'] = [event.copy()]
+            elif mutation == 'missing':
+                client['steps'][45]['reuse_probes'] = []
+            elif mutation == 'late':
+                client['steps'][45]['reuse_probes'] = []
+                client['steps'][47]['reuse_probes'] = [{**event, 'probe_started_sec': 47.004}]
+            elif mutation == 'event_identity':
+                event['admission_step'] = 3
+            elif mutation == 'event_delay':
+                event['delay_sec'] = 90
+            elif mutation == 'event_count':
+                event['hits'] = 31
+            elif mutation == 'age':
+                cohort['first_reuse'][0]['write_to_probe_sec'] += 1
+            elif mutation == 'namespace':
+                cohort['first_reuse'][0]['namespace_hex'] = 'wrong'
+            elif mutation == 'outcome':
+                cohort['first_reuse'][0].update(hits=15, misses=1)
+            elif mutation == 'reads':
+                client['reuse_reads'] = 383
+            elif mutation == 'hits':
+                client['reuse_hits'] = 383
+            elif mutation == 'filler':
+                client['filler_warmup_reads'] = 18303
+            elif mutation == 'partial':
+                cohort['first_reuse'].pop()
+            elif mutation == 'outcome_time':
+                cohort['first_reuse'][1]['probe_started_sec'] = 50
+            elif mutation == 'outcome_early':
+                cohort['first_reuse'][0]['probe_started_sec'] = 48.001
+                cohort['first_reuse'][0]['write_to_probe_sec'] = 44.999
+            else:
+                client['steps'][0].pop('reuse_probes')
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                runner.check_arrivals(client)
+
+    def test_arrivals_skipped_decision_can_precede_a_row_end_crossing_the_ack_deadline(self):
+        client = arrivals_client()
+        event = client['steps'][45]['reuse_probes'].pop()
+        # The decision can occur before 45.003 even though row assembly ends at
+        # 45.01. The next step is valid; a full extra skipped step is not.
+        client['steps'][46]['reuse_probes'] = [{**event, 'probe_started_sec': 46.004}]
+        for outcome in client['reuse_cohorts'][0]['first_reuse']:
+            outcome['probe_started_sec'] += 1
+            outcome['write_to_probe_sec'] += 1
+        self.assertEqual(runner.check_arrivals(client)['reuse_reads'], 384)
+
+    def test_arrivals_due_groups_keep_admission_and_namespace_chronology(self):
+        client = arrivals_client()
+        client['steps'][45]['end_sec'] = 49
+        for row in client['steps']:
+            row['reuse_probes'] = []
+            if row['step'] >= 46:
+                row['start_sec'] += 4
+                row['end_sec'] += 4
+        client['pressure_schedule_elapsed_sec'] += 4
+        # A long GET makes groups 0 and 3 due in one row. The driver scans
+        # cohorts in admission order, with both namespace GETs before the next.
+        for cohort in client['reuse_cohorts']:
+            due = cohort['due_sec']
+            row = next(row for row in client['steps'] if row['end_sec'] >= due)
+            at = max(row['start_sec'] + .003, due + .001)
+            row['reuse_probes'].append({'admission_step': cohort['admission_step'],
+                'delay_sec': cohort['delay_sec'], 'probe_started_sec': at, 'hits': 32, 'misses': 0})
+            for index, outcome in enumerate(cohort['first_reuse']):
+                outcome['probe_started_sec'] = 3 + at + .001 * (index + 1)
+                outcome['write_to_probe_sec'] = (outcome['probe_started_sec'] -
+                                                cohort['write_completed_sec'][index])
+        self.assertEqual([p['admission_step'] for p in client['steps'][45]['reuse_probes']], [0, 3])
+        self.assertEqual(runner.check_arrivals(client)['reuse_reads'], 384)
+        for mutation in ('event_order', 'namespace_order', 'next_group_before_prior_namespace'):
+            forged = json.loads(json.dumps(client))
+            if mutation == 'event_order':
+                forged['steps'][45]['reuse_probes'].reverse()
+            elif mutation == 'namespace_order':
+                forged['reuse_cohorts'][0]['first_reuse'].reverse()
+            else:
+                cohort = forged['reuse_cohorts'][0]
+                outcome = cohort['first_reuse'][1]
+                outcome['probe_started_sec'] = 3 + 48.006
+                outcome['write_to_probe_sec'] = outcome['probe_started_sec'] - cohort['write_completed_sec'][1]
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                runner.check_arrivals(forged)
+
+    def test_arrivals_terminals_and_heat_use_the_full_47232_get_denominator(self):
+        for all_miss in (False, True):
+            client = arrivals_client(all_miss)
+            text = arrivals_metrics(client)
+            hits = client['hits'] + client['hot_hits'] + 18304 + client['reuse_hits']
+            misses = client['misses'] + client['reuse_misses']
+            for before, after in (
+                    ('dispatched_total 47232', 'dispatched_total 46752'),
+                    (f'result="success_nonempty"}} {hits}', f'result="success_nonempty"}} {hits - 1}'),
+                    (f'result="not_found"}} {misses}', f'result="not_found"}} {misses - 1}'),
+                    (f'dfkv_slab_lifetime_read_success_total {hits}',
+                     f'dfkv_slab_lifetime_read_success_total {hits - 1}')):
+                self.assertIn(before, text)
+                with self.subTest(all_miss=all_miss, changed=before), self.assertRaises(RuntimeError):
+                    runner.check_result(text.replace(before, after), client, scenario='arrivals-pressure')
+
+    def test_arrivals_options_reject_other_delay_modes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp)) + ['--scenario', 'arrivals-pressure']
+            self.assertEqual(runner.parse_args(argv).scenario, 'arrivals-pressure')
+            for extra in (['--first-reuse-sec', '45'], ['--pressure-delay-sec', '1']):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    runner.parse_args(argv + extra)
+
     def test_mixed_cohorts_and_all_misses_are_distinct_valid_observations(self):
         for pending_miss in (False, True):
             for hot_miss in (False, True):
@@ -422,7 +621,8 @@ class QuickEvictionTest(unittest.TestCase):
                 ('quick-pressure', 185, 0, 6452, 305, good_client(), good_metrics()),
                 ('sustained-pressure', 0, 0, 7808, 320, sustained_client(), sustained_metrics()),
                 ('sustained-pressure', 0, 90, 7808, 320, delayed_client(), delayed_metrics(delayed_client())),
-                ('mixed-pressure', 0, 0, 7808, 320, mixed_client(), mixed_metrics(mixed_client()))):
+                ('mixed-pressure', 0, 0, 7808, 320, mixed_client(), mixed_metrics(mixed_client())),
+                ('arrivals-pressure', 0, 0, 7808, 320, arrivals_client(), arrivals_metrics(arrivals_client()))):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
                 args = runner.parse_args(self.arguments(Path(temp)) +
                                          ['--data-name', 'fixed', '--scenario', scenario,
