@@ -12,7 +12,9 @@
   production defaults and scoring unchanged. Add delayed first-reuse cohorts
   with filler-only warmup, actual write-to-probe ages and complete read denominators.
   Add a mixed retention scenario separating repeated hot reads from three once-only
-  delayed first-reuse cohorts under paced cold writes.
+  delayed first-reuse cohorts under paced cold writes. Prepare a standalone
+  sustained-arrival driver with ACK-relative first-reuse sampling; automated
+  backend comparisons remain a separate validation step.
 
 - Enforce RDMA connection idle deadlines while pending receives or reply SENDs
   require short CQ waits. Preserve disabled idle reclamation and disk-read drain

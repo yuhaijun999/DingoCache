@@ -6,7 +6,9 @@ initial dataset for clean-restart checks. pressure permits eviction misses only
 AFTER all writes; quick-pressure also probes hot keys during cold writes, after
 a strict warmup. sustained-pressure adds paced interleaving without catch-up or
 miss refill; delayed first reuse warms only the non-cohort filler. mixed-pressure
-combines existing hot reads with three once-only delayed cohorts. These are not
+combines existing hot reads with three once-only delayed cohorts. arrivals-pressure
+samples the first twelve newly arriving batches, delaying reuse from their PUT
+ACKs while writes continue. These are not
 persistence, performance, or transport-backend proof.
 Requires the repository's dfkv_common on PYTHONPATH (no third-party dependencies).
 """
@@ -35,6 +37,7 @@ SUSTAIN_STEPS = 200
 SUSTAIN_INTERVAL_SEC = 1
 MIXED_REUSE_DELAYS = (45, 90, 185)
 MIXED_COHORT_SIZE = 16
+ARRIVAL_SAMPLE_STEPS = 12
 
 
 def key_for(seed, index):
@@ -171,7 +174,7 @@ def parse_args(argv=None):
     parser.add_argument("--members", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scenario", required=True,
-                        choices=("roundtrip", "write", "verify", "pressure", "quick-pressure", "sustained-pressure", "mixed-pressure"))
+                        choices=("roundtrip", "write", "verify", "pressure", "quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure"))
     parser.add_argument("--seed", type=lambda s: int(s, 0), default=0xD1A60001)
     parser.add_argument("--count", type=int, help="objects PER namespace")
     parser.add_argument("--readers", type=int, choices=(0, 8), default=0,
@@ -186,7 +189,7 @@ def parse_args(argv=None):
         parser.error("seed must fit uint64")
     if args.count is None:
         args.count = (QUICK_PREFILL + SUSTAIN_STEPS * BATCH_SIZE
-                      if args.scenario in ("sustained-pressure", "mixed-pressure") else
+                      if args.scenario in ("sustained-pressure", "mixed-pressure", "arrivals-pressure") else
                       6452 if args.scenario == "quick-pressure" else
                       26000 if args.scenario == "pressure" else len(LENGTHS))
     if args.count < (1 if args.scenario == "pressure" else len(LENGTHS)):
@@ -195,10 +198,10 @@ def parse_args(argv=None):
         parser.error("quick-pressure count must exceed prefill (4608 per namespace)")
     if not 0 <= args.pressure_delay_sec <= 300:
         parser.error("pressure-delay-sec must be in 0..300")
-    if args.scenario in ("sustained-pressure", "mixed-pressure") and (
+    if args.scenario in ("sustained-pressure", "mixed-pressure", "arrivals-pressure") and (
             args.pressure_delay_sec or args.count != QUICK_PREFILL + SUSTAIN_STEPS * BATCH_SIZE):
         parser.error(args.scenario + " requires fixed count and zero pressure delay")
-    if (args.pressure_delay_sec or args.metrics_url) and args.scenario not in ("quick-pressure", "sustained-pressure", "mixed-pressure"):
+    if (args.pressure_delay_sec or args.metrics_url) and args.scenario not in ("quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure"):
         parser.error("delay and phase metrics require quick-pressure")
     if args.first_reuse_sec and args.scenario != "sustained-pressure":
         parser.error("first-reuse-sec requires sustained-pressure")
@@ -319,9 +322,12 @@ def mixed_pressure(args, clients, dataset, result, started):
     """Probe existing hot objects and once-only delayed cohorts under cold writes.
 
     Delayed objects are never warmed or refilled. Their first-read outcomes stay
-    separate from repeated hot reads and the final full scan.
+    separate from repeated hot reads and the final full scan. The arrivals mode
+    samples only the first twelve arriving batches, not the full arrival stream;
+    their deadlines use the later namespace PUT ACK instead of pressure origin.
     """
-    cohorts = [{"delay_sec": delay,
+    arrivals = args.scenario == "arrivals-pressure"
+    cohorts = [] if arrivals else [{"delay_sec": delay,
                 "start_index": QUICK_HOT + index * MIXED_COHORT_SIZE,
                 "count_per_namespace": MIXED_COHORT_SIZE,
                 "write_completed_sec": [], "first_reuse": []}
@@ -367,13 +373,29 @@ def mixed_pressure(args, clients, dataset, result, started):
             next_at = step_start + SUSTAIN_INTERVAL_SEC
             before_hits, before_misses = result["hot_hits"], result["hot_misses"]
             start = QUICK_PREFILL + step * BATCH_SIZE
+            arrival = None
+            if arrivals and step < ARRIVAL_SAMPLE_STEPS:
+                delay = MIXED_REUSE_DELAYS[step % len(MIXED_REUSE_DELAYS)]
+                arrival = {"admission_step": step, "delay_sec": delay,
+                           "start_index": start, "count_per_namespace": BATCH_SIZE,
+                           "write_completed_sec": [], "first_reuse": []}
+                # Append before PUT so failed admission retains partial ACKs.
+                cohorts.append(arrival)
             for client, namespace in zip(clients, NAMESPACES):
                 client.put(*dataset(namespace, start, start + BATCH_SIZE))
+                if arrival is not None:
+                    arrival["write_completed_sec"].append(time.monotonic() - started)
+            if arrival is not None:
+                # Both namespaces must reach the requested ACK-to-first-GET age.
+                arrival["due_sec"] = (max(arrival["write_completed_sec"]) -
+                                      result["pressure_schedule_origin_sec"] +
+                                      arrival["delay_sec"])
             hot_reads(True)
             probes = []
             for cohort in cohorts:
                 probe_at = time.monotonic() - origin
-                if cohort["first_reuse"] or probe_at < cohort["delay_sec"]:
+                due = cohort["due_sec"] if arrivals else cohort["delay_sec"]
+                if cohort["first_reuse"] or probe_at < due:
                     continue
                 hits = 0
                 for index, (client, namespace) in enumerate(zip(clients, NAMESPACES)):
@@ -390,9 +412,11 @@ def mixed_pressure(args, clients, dataset, result, started):
                 result["reuse_hits"] += hits
                 result["reuse_misses"] += reads - hits
                 result["reuse_reads"] += reads
-                probes.append({"delay_sec": cohort["delay_sec"],
-                               "probe_started_sec": probe_at,
-                               "hits": hits, "misses": reads - hits})
+                event = {"delay_sec": cohort["delay_sec"], "probe_started_sec": probe_at,
+                         "hits": hits, "misses": reads - hits}
+                if arrivals:
+                    event["admission_step"] = cohort["admission_step"]
+                probes.append(event)
             row = {"step": step, "start_sec": step_start - origin,
                    "end_sec": time.monotonic() - origin,
                    "cold_written": len(NAMESPACES) * BATCH_SIZE,
@@ -405,8 +429,10 @@ def mixed_pressure(args, clients, dataset, result, started):
             if (step + 1) % 40 == 0 or step + 1 == 180:
                 record_phase(args, result, "step-" + str(step + 1).zfill(3), started)
     result["pressure_schedule_elapsed_sec"] = time.monotonic() - origin
-    if any(len(cohort["first_reuse"]) != len(NAMESPACES) for cohort in cohorts):
-        raise RuntimeError("mixed schedule did not reach every first reuse cohort")
+    if ((arrivals and len(cohorts) != ARRIVAL_SAMPLE_STEPS) or
+            any(len(cohort["first_reuse"]) != len(NAMESPACES) for cohort in cohorts)):
+        mode = "arrivals" if arrivals else "mixed"
+        raise RuntimeError(mode + " schedule did not reach every first reuse cohort")
     result["hot_reads"] = result["hot_hits"] + result["hot_misses"]
     record_phase(args, result, "after-pressure", started)
 
@@ -414,7 +440,7 @@ def mixed_pressure(args, clients, dataset, result, started):
 def run(args, *, library_loader=load_library, client_factory=Client):
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    pressure = args.scenario in ("pressure", "quick-pressure", "sustained-pressure", "mixed-pressure")
+    pressure = args.scenario in ("pressure", "quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure")
     config = {"schema": 1, "lib": args.lib, "members": args.members,
               "scenario": args.scenario, "seed": args.seed, "count": args.count,
               "readers": args.readers, "namespaces_hex": [n.hex() for n in NAMESPACES],
@@ -426,7 +452,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                       filler_warmup_rounds=2 if args.first_reuse_sec else 0,
                       first_reuse_sec=args.first_reuse_sec,
                       pressure_delay_sec=args.pressure_delay_sec, metrics_url=args.metrics_url)
-    if args.scenario in ("sustained-pressure", "mixed-pressure"):
+    if args.scenario in ("sustained-pressure", "mixed-pressure", "arrivals-pressure"):
         config.update(steps=SUSTAIN_STEPS, step_interval_sec=SUSTAIN_INTERVAL_SEC,
                       refill_on_miss=False, independent_read_threads=False)
     if args.scenario == "mixed-pressure":
@@ -437,6 +463,13 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                                       "start_index": QUICK_HOT + index * MIXED_COHORT_SIZE,
                                       "count_per_namespace": MIXED_COHORT_SIZE}
                                      for index, delay in enumerate(MIXED_REUSE_DELAYS)],
+                      reuse_once=True, pressure_delay_sec=0, first_reuse_sec=0)
+    if args.scenario == "arrivals-pressure":
+        config.update(prefill=QUICK_PREFILL, hot=QUICK_HOT, warmup_rounds=2,
+                      filler_start=QUICK_HOT, filler_warmup_rounds=2,
+                      metrics_url=args.metrics_url, sampled_arrival_steps=ARRIVAL_SAMPLE_STEPS,
+                      reuse_delays_sec=list(MIXED_REUSE_DELAYS),
+                      reuse_delay_origin="later-namespace-put-ack",
                       reuse_once=True, pressure_delay_sec=0, first_reuse_sec=0)
     encoded = json.dumps(config, sort_keys=True).encode()
     config_hash = hashlib.sha256(encoded).hexdigest()
@@ -454,6 +487,11 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                             "cohort [0,hot) gets no GET before the requested pressure-origin delay",
                             "mixed-pressure: warm hot/filler only; each delayed cohort gets one "
                             "first GET when actual pressure time is due; no refill"]}
+    if args.scenario == "arrivals-pressure":
+        trace["operations"].append(
+            "arrivals-pressure: sample only the first 12 arriving batches; rotate 45/90/185 "
+            "seconds from the later namespace PUT ACK; once-only GET, no refill; "
+            "later arrivals remain unsampled, incomplete cohorts fail")
     (args.output / "trace.json").write_text(json.dumps(trace, indent=2) + "\n")
     result = {"config_sha256": config_hash, "status": "failed", "hits": 0,
               "misses": 0, "wrong_bytes": 0, "transport_mode": []}
@@ -484,7 +522,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
             if args.scenario == "roundtrip":
                 for client in clients:
                     client.expect_missing(b"never-written\x00" + key_for(args.seed, 0))
-            if args.scenario == "mixed-pressure":
+            if args.scenario in ("mixed-pressure", "arrivals-pressure"):
                 mixed_pressure(args, clients, dataset, result, started)
             elif args.scenario in ("quick-pressure", "sustained-pressure"):
                 quick_pressure(args, clients, dataset, result, started)
@@ -516,7 +554,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                         futures = [pool.submit(read_all, clients[i % 2], NAMESPACES[i % 2], True)
                                    for i in range(args.readers)]
                         result["concurrent_reader_hits"] = sum(f.result() for f in futures)
-            if args.scenario in ("quick-pressure", "sustained-pressure", "mixed-pressure"):
+            if args.scenario in ("quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure"):
                 record_phase(args, result, "after-scan", started)
             result["status"] = "passed"
     except Exception as error:
