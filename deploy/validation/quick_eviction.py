@@ -401,6 +401,137 @@ def check_multisize(text, client):
             'multisize_payload_bytes': 6737107200}
 
 
+def check_concurrent(client):
+    """Reconcile independent callers; C ABI overlap is not kernel pin overlap."""
+    data = client.get('concurrency')
+    if not isinstance(data, dict) or type(data.get('warmup_reads')) is not int or data['warmup_reads'] != 512:
+        raise RuntimeError('concurrent warmup metadata mismatch')
+    origin, end, middle = (data.get(key) for key in
+                           ('pressure_started_sec', 'pressure_finished_sec', 'midpoint_sec'))
+    if (any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in (origin, end, middle)) or
+            not origin < middle < end or end - origin > 90):
+        raise RuntimeError('concurrent pressure timing mismatch')
+    steps = data.get('writer_steps')
+    if not isinstance(steps, list) or len(steps) != 200:
+        raise RuntimeError('concurrent writer step count mismatch')
+    previous_end, previous_start = origin, None
+    for index, row in enumerate(steps):
+        if (not isinstance(row, dict) or any(type(row.get(k)) is not int for k in ('step', 'put_attempts', 'put_acks')) or
+                row['step'] != index or row['put_attempts'] != 32 or row['put_acks'] != 32):
+            raise RuntimeError('concurrent writer ACK mismatch')
+        start, finish = row.get('start_sec'), row.get('end_sec')
+        if (any(type(v) not in (int, float) or not math.isfinite(v) for v in (start, finish)) or
+                not previous_end <= start <= finish <= end or
+                (previous_start is not None and start - previous_start < .1 - 1e-6)):
+            raise RuntimeError('concurrent writer chronology mismatch')
+        previous_start, previous_end = start, finish
+    if not steps[99]['end_sec'] <= middle <= steps[100]['start_sec']:
+        raise RuntimeError('concurrent midpoint chronology mismatch')
+    rows = data.get('readers')
+    if not isinstance(rows, list) or len(rows) != 8:
+        raise RuntimeError('concurrent reader count mismatch')
+    hits = misses = batches = 0
+    events = []
+    last_read = end
+    for index, row in enumerate(rows):
+        namespace = (b'disk-validation\x00A\xff', b'disk-validation\x00B\xfe')[index % 2].hex()
+        start_index = index // 2 * 32
+        if (not isinstance(row, dict) or any(type(row.get(k)) is not int for k in ('reader_id', 'start_index', 'count', 'hits', 'misses')) or
+                row['reader_id'] != index or row.get('namespace_hex') != namespace or
+                row['start_index'] != start_index or row['count'] != 32 or
+                row.get('transport_mode') != 'rdma' or row.get('status') != 'passed' or row.get('error')):
+            raise RuntimeError('concurrent independent reader identity/status mismatch')
+        calls = row.get('batches')
+        if not isinstance(calls, list) or not 1 <= len(calls) <= 32768:
+            raise RuntimeError('concurrent reader batch count mismatch')
+        reader_hits = reader_misses = 0
+        previous = origin
+        before_midpoint = False
+        for number, call in enumerate(calls):
+            if (not isinstance(call, dict) or
+                    any(type(call.get(k)) is not int or call[k] < 0 for k in ('batch', 'start_index', 'hits', 'misses')) or
+                    call['batch'] != number or call['start_index'] != start_index + number % 2 * 16 or
+                    call['hits'] + call['misses'] != 16 or call.get('error')):
+                raise RuntimeError('concurrent read batch identity/count mismatch')
+            start, finish = call.get('call_started_sec'), call.get('call_finished_sec')
+            if (any(type(v) not in (int, float) or not math.isfinite(v) for v in (start, finish)) or
+                    not previous <= start < finish):
+                raise RuntimeError('concurrent C ABI chronology mismatch')
+            previous = finish
+            before_midpoint |= finish <= middle
+            reader_hits += call['hits']
+            reader_misses += call['misses']
+            # An already prepared call may start/end just after writer stop.
+            # Clip to its actual writer overlap, and sort ends before starts.
+            clipped_start, clipped_end = max(start, origin), min(finish, end)
+            if clipped_start < clipped_end:
+                events.extend(((clipped_start, 1), (clipped_end, -1)))
+            last_read = max(last_read, finish)
+        if (not before_midpoint or row['hits'] != reader_hits or row['misses'] != reader_misses):
+            raise RuntimeError('concurrent reader progress/aggregate mismatch')
+        hits += reader_hits
+        misses += reader_misses
+        batches += len(calls)
+    active = peak = 0
+    for _, delta in sorted(events):
+        active += delta
+        peak = max(peak, active)
+    if peak < 2:
+        raise RuntimeError('concurrent C ABI overlap coverage not observed')
+    if (client.get('filler_warmup_reads') != 0 or type(client.get('filler_warmup_reads')) is not int or
+            client.get('hot_hits') != 512 + hits or client.get('hot_misses') != misses or
+            client.get('hot_reads') != 512 + batches * 16):
+        raise RuntimeError('concurrent hot read denominator mismatch')
+    phases = client.get('phases')
+    names = ('prefill', 'warm', 'before-pressure', 'step-100', 'after-pressure', 'after-scan')
+    if not isinstance(phases, list) or len(phases) != len(names):
+        raise RuntimeError('concurrent phase count mismatch')
+    previous = 0
+    for index, (row, name) in enumerate(zip(phases, names)):
+        if not isinstance(row, dict) or row.get('name') != name:
+            raise RuntimeError('concurrent phase identity mismatch')
+        at = row.get('elapsed_sec')
+        if (type(at) not in (int, float) or not math.isfinite(at) or at < previous or
+                any(type(row.get(k)) is not int for k in ('hot_hits', 'hot_misses', 'filler_warmup_reads')) or
+                row.get('hot_hits') != (0 if index == 0 else 512 if index < 4 else 512 + hits) or
+                row.get('hot_misses') != (0 if index < 4 else misses) or row.get('filler_warmup_reads') != 0):
+            raise RuntimeError('concurrent phase timing/count mismatch')
+        previous = at
+    if (phases[2]['elapsed_sec'] > origin or
+            not steps[99]['end_sec'] <= phases[3]['elapsed_sec'] <= middle or
+            phases[4]['elapsed_sec'] < last_read):
+        raise RuntimeError('concurrent phase chronology mismatch')
+    return {'concurrent_readers': 8, 'concurrent_reader_batches': batches,
+            'concurrent_reader_gets': batches * 16, 'concurrent_gets': 15616 + 512 + batches * 16,
+            'concurrent_peak_calls': peak, 'concurrent_pressure_elapsed_sec': end - origin}
+
+
+def check_concurrent_watermarks(before, middle, after):
+    """Prove eviction in the active read/write stage, not a victim-instant race."""
+    counts, routes = [], []
+    for text in (before, middle, after):
+        rows = samples(text, 'dfkv_slab_watermark_evictions_total')
+        if len(rows) != 1 or rows[0][0] or not rows[0][1].is_integer():
+            raise RuntimeError('concurrent watermark counter mismatch')
+        counts.append(rows[0][1])
+        disks = samples(text, 'dfkv_disk_objects')
+        labels = {label for label, _ in disks}
+        if len(disks) != 3 or len(labels) != 3:
+            raise RuntimeError('concurrent watermark disk count mismatch')
+        routes.append(labels)
+        for name in ('dfkv_storage_healthy', 'dfkv_slab_healthy'):
+            if total(text, name) != 1:
+                raise RuntimeError('concurrent phase unhealthy')
+        for name in ('dfkv_errors_total', 'dfkv_uring_init_fallbacks_total'):
+            if total(text, name) != 0:
+                raise RuntimeError('concurrent phase error/fallback')
+    if not counts[0] < counts[1] <= counts[2] or routes[0] != routes[1] or routes[1] != routes[2]:
+        raise RuntimeError('concurrent midpoint watermark progress/route mismatch')
+    # Midpoint inflight and terminal counters are deliberately not required to
+    # be settled: readers still run, and metrics are not a transactional snapshot.
+    return {'concurrent_watermark_delta': int(counts[1] - counts[0])}
+
+
 def check_multisize_watermarks(text):
     """Check resolved per-store thresholds before writes and at completion."""
     expected = {'capacity_bytes': 4294967296, 'watermark_high_bytes': 2147483600,
@@ -439,13 +570,15 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
     if (type(refill_on_miss) is not bool or ('refill' in client) != refill_on_miss or
             (refill_on_miss and scenario != 'arrivals-pressure')):
         raise RuntimeError('refill mode/result mismatch')
+    if ('concurrency' in client) != (scenario == 'concurrent-pressure'):
+        raise RuntimeError('concurrent mode/result mismatch')
     if ('multisize' in client) != (scenario == 'multisize-pressure'):
         raise RuntimeError('multisize mode/result mismatch')
-    if scenario not in ('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure'):
+    if scenario not in ('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure', 'concurrent-pressure'):
         raise RuntimeError('unknown scenario')
     if first_reuse_sec not in (0, 45, 90, 185) or (first_reuse_sec and scenario != 'sustained-pressure'):
         raise RuntimeError('invalid first reuse scenario')
-    expected_count = SUSTAINED_COUNT if scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure') else COUNT
+    expected_count = SUSTAINED_COUNT if scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'concurrent-pressure') else COUNT
     expected_hot_reads = SUSTAINED_HOT_READS if scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure') else HOT_READS
     if scenario == 'multisize-pressure':
         expected_count, expected_hot_reads = MULTISIZE_COUNT, MULTISIZE_HOT_READS
@@ -458,14 +591,20 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
         raise RuntimeError('invalid client read counts')
     hits, misses, hot_hits, hot_misses, hot_reads = counts
     if (hits + misses != expected_count * 2 or
-            (not first_reuse_sec and hot_reads != expected_hot_reads) or
+            (not first_reuse_sec and scenario != 'concurrent-pressure' and hot_reads != expected_hot_reads) or
             hot_reads != hot_hits + hot_misses or
             (scenario != 'multisize-pressure' and not first_reuse_sec and not hot_hits)):
         raise RuntimeError('client read denominator mismatch')
-    schedule = (check_multisize(text, client) if scenario == 'multisize-pressure' else
+    schedule = (check_concurrent(client) if scenario == 'concurrent-pressure' else
+                check_multisize(text, client) if scenario == 'multisize-pressure' else
                 check_arrivals(client) if scenario == 'arrivals-pressure' else
                 check_mixed(client) if scenario == 'mixed-pressure' else
                 check_steps(client, first_reuse_sec) if scenario == 'sustained-pressure' else {})
+    if scenario == 'concurrent-pressure':
+        if (total(text, 'dfkv_cache_put_total') != 15616 or
+                total(text, 'dfkv_bytes_written_total') != 63963136 or
+                total(text, 'dfkv_slab_watermark_evictions_total') <= 0):
+            raise RuntimeError('concurrent PUT/payload/watermark denominator mismatch')
     refill = check_refill(client) if refill_on_miss else {}
     verify_hits = refill.get('refill_verify_hits', 0)
     verify_misses = refill.get('refill_verify_misses', 0)
@@ -556,7 +695,7 @@ def parse_args(argv=None):
     parser.add_argument('--data-root', type=Path, action='append', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--policy', choices=('legacy', 'lifetime'), default='lifetime')
-    parser.add_argument('--scenario', choices=('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure'),
+    parser.add_argument('--scenario', choices=('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure', 'concurrent-pressure'),
                         default='quick-pressure')
     parser.add_argument('--pressure-delay-sec', type=int, default=0,
                         help='wait after hot warmup before cold writes (0..300)')
@@ -576,11 +715,13 @@ def parse_args(argv=None):
         parser.error('refill-on-miss requires arrivals-pressure')
     if args.first_reuse_sec and args.scenario != 'sustained-pressure':
         parser.error('first-reuse-sec requires sustained-pressure')
+    if args.scenario == 'concurrent-pressure' and (args.pressure_delay_sec or args.protect_sec is not None):
+        parser.error('concurrent-pressure requires default timing and watermarks')
     if args.protect_sec is not None and args.policy != 'lifetime':
         parser.error('protect-sec requires lifetime policy')
     if not 0 <= args.pressure_delay_sec <= 300:
         parser.error('pressure delay must be in 0..300 seconds')
-    if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure') and args.pressure_delay_sec:
+    if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure', 'concurrent-pressure') and args.pressure_delay_sec:
         parser.error('paced pressure scenarios do not accept a pre-pressure delay')
     if args.data_name is not None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', args.data_name):
         parser.error('data name must be a safe ASCII component of 1..80 characters')
@@ -629,7 +770,7 @@ def run(args):
                    '--slab-eviction-policy', args.policy, '--port', '12000', '--rdma-port', '12001',
                    '--rdma-dev', 'rxe0', '--max-msg', '2097152', '--metrics-port', '12010',
                    '--metrics-bind', '127.0.0.1']
-        count = SUSTAINED_COUNT if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure') else COUNT
+        count = SUSTAINED_COUNT if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'concurrent-pressure') else COUNT
         if args.scenario == 'multisize-pressure':
             count = MULTISIZE_COUNT
         client_command = [sys.executable, str(source / 'deploy/validation/disk_scenarios.py'),
@@ -640,7 +781,7 @@ def run(args):
                           '--metrics-url', METRICS_URL, '--output', str(args.output / 'trace')]
         if args.refill_on_miss:
             client_command.append('--refill-on-miss')
-        client_timeout_sec = (320 if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure') else
+        client_timeout_sec = (320 if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure', 'multisize-pressure', 'concurrent-pressure') else
                               120 + args.pressure_delay_sec)
         (args.output / 'case.json').write_text(json.dumps({'command': command, 'data_dirs': list(map(str, dirs)),
             'client_command': client_command, 'client_timeout_sec': client_timeout_sec,
@@ -683,8 +824,13 @@ def run(args):
             client = json.loads((args.output / 'trace/result.json').read_text())
             after = scrape()
             (args.output / 'after.prom').write_text(after)
-            result.update(check_result(after, client, args.policy, args.scenario, args.first_reuse_sec,
-                                       args.refill_on_miss, args.multisize_watermark), client=client, status='passed')
+            checked = check_result(after, client, args.policy, args.scenario, args.first_reuse_sec,
+                                   args.refill_on_miss, args.multisize_watermark)
+            if args.scenario == 'concurrent-pressure':
+                checked.update(check_concurrent_watermarks(
+                    (args.output / 'trace/phase-before-pressure.prom').read_text(),
+                    (args.output / 'trace/phase-step-100.prom').read_text(), after))
+            result.update(checked, client=client, status='passed')
     except Exception as error:
         result.update(status='failed', error=str(error))
     finally:

@@ -9,6 +9,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -1282,6 +1284,201 @@ class DiskValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "PUT failed"):
             client.put([b"key"], [b"data"])
         client.close()
+
+
+class ConcurrentDriverTest(unittest.TestCase):
+    def arguments(self, output, extra=()):
+        return driver.parse_args(["--lib", "/fake/libdfkv.so", "--members", "n=localhost:1",
+                                  "--output", str(output), "--scenario", "concurrent-pressure", *extra])
+
+    def test_concurrent_arguments_are_fixed_and_do_not_reuse_roundtrip_readers(self):
+        args = self.arguments(Path("unused"))
+        self.assertEqual(args.count, 7808)
+        self.assertEqual(args.readers, 0)
+        for extra in (("--count", "7807"), ("--pressure-delay-sec", "1"),
+                      ("--readers", "8"), ("--first-reuse-sec", "45"), ("--refill-on-miss",)):
+            with self.subTest(extra=extra), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                self.arguments(Path("unused"), extra)
+
+    def test_cabi_timing_brackets_only_the_native_get_even_on_failure(self):
+        class Lib:
+            def dfkv_batch_get_auto(self, handle, keys, lengths, data, caps, count, hits, sizes):
+                self.called_at = time.monotonic()
+                time.sleep(.001)
+                hits[0], sizes[0] = 1, 3
+                ct.memmove(data[0], b"abc", 3)
+                return self.rc
+        lib = Lib()
+        client = driver.Client.__new__(driver.Client)
+        client.handle, client.lib = 1, lib
+        for rc in (0, -1):
+            lib.rc = rc
+            timing = {}
+            if rc:
+                with self.assertRaisesRegex(RuntimeError, "GET failed"):
+                    client.read([b"key"], [b"abc"], call_timing=timing)
+            else:
+                self.assertEqual(client.read([b"key"], [b"abc"], call_timing=timing), 1)
+            self.assertLessEqual(timing["call_started_sec"], lib.called_at)
+            self.assertLess(lib.called_at, timing["call_finished_sec"])
+        lib.rc = 0
+        with self.assertRaisesRegex(RuntimeError, "wrong bytes/length"):
+            client.read([b"key"], [b"xyz"], call_timing=timing)
+        self.assertLessEqual(timing["call_started_sec"], lib.called_at)
+        self.assertLess(lib.called_at, timing["call_finished_sec"])
+
+    def run_memory(self, output, failure=None):
+        storage, handles = {}, []
+        first_reads = threading.Barrier(8, timeout=3)
+        reader_failed = threading.Event()
+        class IndependentClient(MemoryClient):
+            def __init__(self, storage, members, namespace):
+                if failure == "open" and len(handles) == 5:
+                    raise RuntimeError("reader open failed")
+                super().__init__(storage, members, namespace)
+                self.number = len(handles)
+                self.active, self.closed, self.calls = False, False, 0
+                handles.append(self)
+            def close(self):
+                if self.active:
+                    raise AssertionError("close while native call active")
+                self.closed = True
+            def put(self, keys, values):
+                if failure == "writer-and-corrupt" and int.from_bytes(keys[0][-8:], "big") >= 4608:
+                    if not reader_failed.wait(3):
+                        raise RuntimeError("fixture reader never reached corruption")
+                    super().put(keys, values)
+                    raise RuntimeError("writer PUT failed concurrently")
+                super().put(keys, values)
+                if failure == "writer" and self.number == 1 and int.from_bytes(keys[0][-8:], "big") >= 4608:
+                    raise RuntimeError("writer PUT failed after uncertain completion")
+            def read(self, keys, values, *, allow_miss=False, call_timing=None):
+                if call_timing is None:
+                    return super().read(keys, values, allow_miss=allow_miss)
+                if self.closed or self.active or self.number < 2:
+                    raise AssertionError("reader did not own an independent idle handle")
+                self.active = True
+                call_timing["call_started_sec"] = time.monotonic()
+                try:
+                    if self.number == 9 and failure == "corrupt-last-start":
+                        driver.check_read(values[0], 1, b"x" * len(values[0]), len(values[0]))
+                    if self.calls == 0 and failure not in ("deadline", "submit"):
+                        first_reads.wait()
+                    self.calls += 1
+                    time.sleep(.002)
+                    if (self.number == 2 and failure == "io") or (self.number == 9 and failure == "io-last"):
+                        raise RuntimeError("reader GET failed")
+                    if (self.number == 2 and failure == "corrupt") or (self.number == 9 and failure in ("corrupt-last", "writer-and-corrupt")):
+                        reader_failed.set()
+                        driver.check_read(values[0], 1, b"x" * len(values[0]), len(values[0]))
+                    if failure == "miss":
+                        return 0
+                    return super().read(keys, values, allow_miss=allow_miss)
+                finally:
+                    call_timing["call_finished_sec"] = time.monotonic()
+                    self.active = False
+        args = self.arguments(output)
+        original_pool = driver.ThreadPoolExecutor
+        class FailingPool(original_pool):
+            def submit(self, *args, **kwargs):
+                self.submits = getattr(self, "submits", 0) + 1
+                if self.submits == 4:
+                    raise RuntimeError("reader submit failed")
+                return super().submit(*args, **kwargs)
+        with mock.patch.object(driver, "CONCURRENT_INTERVAL_SEC", .001), \
+                mock.patch.object(driver, "CONCURRENT_MAX_BATCHES", 1 if failure == "limit" else 8192), \
+                mock.patch.object(driver, "CONCURRENT_SOFT_DEADLINE_SEC", 0 if failure == "deadline" else 90), \
+                mock.patch.object(driver, "ThreadPoolExecutor", FailingPool if failure == "submit" else original_pool):
+            try:
+                outcome = driver.run(args, library_loader=lambda _: storage, client_factory=IndependentClient)
+                error = None
+            except Exception as caught:
+                outcome = json.loads((output / "result.json").read_text())
+                error = caught
+        self.assertTrue(all(handle.closed and not handle.active for handle in handles))
+        return outcome, handles, error
+
+    def test_full_fixed_schedule_uses_ten_handles_and_real_thread_overlap(self):
+        for mode in (None, "miss"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "case"
+                result, handles, error = self.run_memory(output, mode)
+                self.assertIsNone(error)
+                self.assertEqual(result["status"], "passed")
+                self.assertEqual(len(handles), 10)
+                stats = result["concurrency"]
+                self.assertEqual(stats["warmup_reads"], 512)
+                self.assertEqual(len(stats["writer_steps"]), 200)
+                self.assertEqual(sum(r["put_acks"] for r in stats["writer_steps"]), 6400)
+                self.assertEqual(result["hits"] + result["misses"], 15616)
+                self.assertEqual([r["name"] for r in result["phases"]],
+                                 ["prefill", "warm", "before-pressure", "step-100", "after-pressure", "after-scan"])
+                events = []
+                for index, row in enumerate(stats["readers"]):
+                    self.assertEqual((row["reader_id"], row["namespace_hex"], row["start_index"], row["count"]),
+                                     (index, driver.NAMESPACES[index % 2].hex(), index // 2 * 32, 32))
+                    self.assertEqual(row["status"], "passed")
+                    self.assertGreater(len(row["batches"]), 0)
+                    saved = [json.loads(line) for line in (output / f"concurrent-reader-{index:02d}.jsonl").read_text().splitlines()]
+                    self.assertEqual(saved, row["batches"])
+                    for batch, call in enumerate(row["batches"]):
+                        self.assertEqual((call["batch"], call["start_index"], call["hits"] + call["misses"]),
+                                         (batch, index // 2 * 32 + batch % 2 * 16, 16))
+                        events += [(call["call_started_sec"], 1), (call["call_finished_sec"], -1)]
+                active = peak = 0
+                for _, change in sorted(events):
+                    active += change
+                    peak = max(peak, active)
+                self.assertGreaterEqual(peak, 2)
+                hits = sum(r["hits"] for r in stats["readers"])
+                misses = sum(r["misses"] for r in stats["readers"])
+                self.assertEqual((result["hot_hits"], result["hot_misses"], result["hot_reads"]),
+                                 (512 + hits, misses, 512 + hits + misses))
+                self.assertEqual(misses > 0, mode == "miss")
+                trace = json.loads((output / "trace.json").read_text())
+                self.assertEqual((trace["config"]["independent_readers"], trace["config"]["hot"],
+                                  trace["config"]["reader_window"], trace["config"]["timing_origin"]),
+                                 (8, 128, 32, "driver-start"))
+
+    def test_originating_last_reader_corruption_survives_barrier_and_writer_failures(self):
+        for failure in ("corrupt-last-start", "writer-and-corrupt"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                result, handles, error = self.run_memory(Path(temp) / "case", failure)
+                self.assertIsNotNone(error)
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["wrong_bytes"], 1)
+                self.assertIn("wrong bytes/length", result["concurrency"]["readers"][7]["error"])
+                if failure == "corrupt-last-start":
+                    self.assertIn("wrong bytes/length", str(error))
+                else:
+                    self.assertIn("writer PUT failed concurrently", str(error))
+
+    def test_reader_and_writer_failures_preserve_partial_evidence_and_join_before_close(self):
+        for failure in ("io", "corrupt", "io-last", "corrupt-last", "writer", "open", "submit", "limit", "deadline"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "case"
+                result, handles, error = self.run_memory(output, failure)
+                self.assertIsNotNone(error)
+                expected = {"io": "reader GET failed", "io-last": "reader GET failed",
+                            "corrupt": "wrong bytes/length", "corrupt-last": "wrong bytes/length",
+                            "writer": "writer PUT failed", "open": "reader open failed",
+                            "submit": "reader submit failed", "limit": "batch limit exhausted",
+                            "deadline": "soft deadline exceeded"}
+                self.assertIn(expected[failure], str(error))
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["wrong_bytes"], int(failure.startswith("corrupt")))
+                if failure not in ("open", "submit"):
+                    self.assertIn("concurrency", result)
+                if failure in ("io", "corrupt", "io-last", "corrupt-last"):
+                    bad_index = 7 if failure.endswith("-last") else 0
+                    bad = result["concurrency"]["readers"][bad_index]
+                    self.assertEqual(bad["status"], "failed")
+                    self.assertEqual(bad["batches"], [])
+                    log = (output / f"concurrent-reader-{bad_index:02d}.jsonl").read_text()
+                    self.assertIn("error", log)
+                if failure == "writer":
+                    row = result["concurrency"]["writer_steps"][0]
+                    self.assertEqual((row["put_attempts"], row["put_acks"]), (32, 16))
 
 
 if __name__ == "__main__":

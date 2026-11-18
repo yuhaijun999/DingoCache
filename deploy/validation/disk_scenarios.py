@@ -10,7 +10,8 @@ combines existing hot reads with three once-only delayed cohorts. arrivals-press
 samples the first twelve newly arriving batches, delaying reuse from their PUT
 ACKs while writes continue. Its optional sampled-miss refill mode records
 first outcomes, one refill attempt and one verification GET separately. multisize-pressure
-uses two real slot classes, allowing compact-geometry donor losses during warmup. These are not
+uses two real slot classes, allowing compact-geometry donor losses during warmup.
+concurrent-pressure uses eight private reader handles alongside paced writes. These are not
 persistence, performance, or transport-backend proof.
 Requires the repository's dfkv_common on PYTHONPATH (no third-party dependencies).
 """
@@ -22,6 +23,7 @@ import ctypes as ct
 import hashlib
 import json
 from pathlib import Path
+import threading
 import time
 import urllib.request
 
@@ -43,6 +45,12 @@ ARRIVAL_SAMPLE_STEPS = 12
 MULTISIZE_COUNT = 6400
 MULTISIZE_PREFILL = 512
 MULTISIZE_LENGTHS = (4096, 1048577)
+CONCURRENT_READERS = 8
+CONCURRENT_HOT = 128
+CONCURRENT_WINDOW = 32
+CONCURRENT_INTERVAL_SEC = .1
+CONCURRENT_MAX_BATCHES = 32768
+CONCURRENT_SOFT_DEADLINE_SEC = 90
 
 
 def key_for(seed, index):
@@ -104,7 +112,7 @@ class Client:
         if rc != 0 or any(value != 1 for value in ok):
             raise RuntimeError(f"batch PUT failed: rc={rc}, slots={list(ok)}")
 
-    def read(self, keys, expected, *, allow_miss=False):
+    def read(self, keys, expected, *, allow_miss=False, call_timing=None):
         pointers, lengths, owners = make_key_array(keys)
         # Extra capacity detects incorrect returned lengths without truncating them.
         buffers = [ct.create_string_buffer(len(value) + 1) for value in expected]
@@ -112,8 +120,16 @@ class Client:
         caps = (ct.c_uint64 * len(keys))(*[ct.sizeof(b) for b in buffers])
         hits = (ct.c_int * len(keys))()
         sizes = (ct.c_uint64 * len(keys))()
-        rc = self.lib.dfkv_batch_get_auto(self.handle, pointers, lengths, data,
-                                          caps, len(keys), hits, sizes)
+        # Optional evidence brackets the native call, not Python buffer setup
+        # or byte validation. ctypes releases the GIL during this CDLL call.
+        if call_timing is not None:
+            call_timing["call_started_sec"] = time.monotonic()
+        try:
+            rc = self.lib.dfkv_batch_get_auto(self.handle, pointers, lengths, data,
+                                              caps, len(keys), hits, sizes)
+        finally:
+            if call_timing is not None:
+                call_timing["call_finished_sec"] = time.monotonic()
         if rc != 0:
             raise RuntimeError(f"batch GET failed: rc={rc}")
         checked_hits = 0
@@ -179,7 +195,7 @@ def parse_args(argv=None):
     parser.add_argument("--members", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scenario", required=True,
-                        choices=("roundtrip", "write", "verify", "pressure", "quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure"))
+                        choices=("roundtrip", "write", "verify", "pressure", "quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure", "concurrent-pressure"))
     parser.add_argument("--seed", type=lambda s: int(s, 0), default=0xD1A60001)
     parser.add_argument("--count", type=int, help="objects PER namespace")
     parser.add_argument("--readers", type=int, choices=(0, 8), default=0,
@@ -196,7 +212,7 @@ def parse_args(argv=None):
         parser.error("seed must fit uint64")
     if args.count is None:
         args.count = (QUICK_PREFILL + SUSTAIN_STEPS * BATCH_SIZE
-                      if args.scenario in ("sustained-pressure", "mixed-pressure", "arrivals-pressure") else
+                      if args.scenario in ("sustained-pressure", "mixed-pressure", "arrivals-pressure", "concurrent-pressure") else
                       MULTISIZE_COUNT if args.scenario == "multisize-pressure" else
                       6452 if args.scenario == "quick-pressure" else
                       26000 if args.scenario == "pressure" else len(LENGTHS))
@@ -206,13 +222,13 @@ def parse_args(argv=None):
         parser.error("quick-pressure count must exceed prefill (4608 per namespace)")
     if not 0 <= args.pressure_delay_sec <= 300:
         parser.error("pressure-delay-sec must be in 0..300")
-    if args.scenario in ("sustained-pressure", "mixed-pressure", "arrivals-pressure") and (
+    if args.scenario in ("sustained-pressure", "mixed-pressure", "arrivals-pressure", "concurrent-pressure") and (
             args.pressure_delay_sec or args.count != QUICK_PREFILL + SUSTAIN_STEPS * BATCH_SIZE):
         parser.error(args.scenario + " requires fixed count and zero pressure delay")
     if args.scenario == "multisize-pressure" and (
             args.count != MULTISIZE_COUNT or args.pressure_delay_sec):
         parser.error("multisize-pressure requires fixed count and zero pressure delay")
-    if (args.pressure_delay_sec or args.metrics_url) and args.scenario not in ("quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure"):
+    if (args.pressure_delay_sec or args.metrics_url) and args.scenario not in ("quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure", "concurrent-pressure"):
         parser.error("delay and phase metrics require quick-pressure")
     if args.first_reuse_sec and args.scenario != "sustained-pressure":
         parser.error("first-reuse-sec requires sustained-pressure")
@@ -561,10 +577,153 @@ def mixed_pressure(args, clients, dataset, result, started):
     record_phase(args, result, "after-pressure", started)
 
 
+def concurrent_pressure(args, clients, dataset, result, started, lib, client_factory):
+    """Eight private reader handles overlap paced writes, without miss refill.
+
+    Logs and counters belong to individual workers. Join every worker before
+    its handle can close; Python cancellation cannot interrupt a blocked C ABI
+    call, so the outer supervisor retains its process-level timeout.
+    """
+    result.update(hot_hits=0, hot_misses=0, hot_reads=0, filler_warmup_reads=0)
+    stats = {"warmup_reads": 0, "readers": [], "writer_steps": []}
+    result["concurrency"] = stats
+    for client, namespace in zip(clients, NAMESPACES):
+        for first in range(0, QUICK_PREFILL, BATCH_SIZE):
+            client.put(*dataset(namespace, first, first + BATCH_SIZE))
+    record_phase(args, result, "prefill", started)
+    for _ in range(2):
+        for client, namespace in zip(clients, NAMESPACES):
+            for first in range(0, CONCURRENT_HOT, BATCH_SIZE):
+                stats["warmup_reads"] += client.read(
+                    *dataset(namespace, first, first + BATCH_SIZE))
+    result["hot_hits"] = stats["warmup_reads"]
+    result["hot_reads"] = stats["warmup_reads"]
+    record_phase(args, result, "warm", started)
+    stop = threading.Event()
+    barrier = threading.Barrier(CONCURRENT_READERS + 1, timeout=10)
+    deadline = None
+
+    def reader(client, namespace, row):
+        try:
+            with (args.output / f'concurrent-reader-{row["reader_id"]:02d}.jsonl').open("x") as log:
+                barrier.wait()
+                for batch in range(CONCURRENT_MAX_BATCHES):
+                    if stop.is_set():
+                        break
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("concurrent reader soft deadline exceeded")
+                    first = row["start_index"] + batch % 2 * BATCH_SIZE
+                    keys, values = dataset(namespace, first, first + BATCH_SIZE)
+                    timing = {}
+                    call = {"batch": batch, "start_index": first}
+                    try:
+                        hits = client.read(keys, values, allow_miss=True, call_timing=timing)
+                        call.update({key: value - started for key, value in timing.items()})
+                        call.update(hits=hits, misses=BATCH_SIZE - hits)
+                    except Exception as error:
+                        call.update({key: value - started for key, value in timing.items()})
+                        call["error"] = str(error)
+                        log.write(json.dumps(call) + "\n")
+                        log.flush()
+                        raise
+                    row["batches"].append(call)
+                    row["hits"] += hits
+                    row["misses"] += BATCH_SIZE - hits
+                    log.write(json.dumps(call) + "\n")
+                    log.flush()
+                else:
+                    if not stop.is_set():
+                        raise RuntimeError("concurrent reader batch limit exhausted")
+                row["status"] = "passed"
+        except Exception as error:
+            row["error"] = str(error)
+            stop.set()
+            barrier.abort()
+            raise
+
+    # Open all handles before launching threads. The pool exits (and joins)
+    # before this nested ExitStack releases any independently owned handle.
+    with ExitStack() as reader_stack:
+        readers = []
+        for index in range(CONCURRENT_READERS):
+            namespace = NAMESPACES[index % len(NAMESPACES)]
+            client = client_factory(lib, args.members, namespace)
+            reader_stack.callback(client.close)
+            readers.append((client, namespace))
+            stats["readers"].append({"reader_id": index, "namespace_hex": namespace.hex(),
+                                     "start_index": index // 2 * CONCURRENT_WINDOW,
+                                     "count": CONCURRENT_WINDOW, "transport_mode": client.transport,
+                                     "status": "failed", "hits": 0, "misses": 0, "batches": []})
+        record_phase(args, result, "before-pressure", started)
+        writer_error, reader_errors = None, []
+        with ThreadPoolExecutor(max_workers=CONCURRENT_READERS) as pool:
+            futures = []
+            try:
+                for (client, namespace), row in zip(readers, stats["readers"]):
+                    futures.append(pool.submit(reader, client, namespace, row))
+                origin = time.monotonic()
+                stats["pressure_started_sec"] = origin - started
+                deadline = origin + CONCURRENT_SOFT_DEADLINE_SEC
+                barrier.wait()
+                next_at = origin
+                with (args.output / "concurrent-writer.jsonl").open("x") as log:
+                    for step in range(SUSTAIN_STEPS):
+                        if stop.wait(max(0, next_at - time.monotonic())):
+                            raise RuntimeError("concurrent reader aborted writer")
+                        if time.monotonic() > deadline:
+                            raise RuntimeError("concurrent writer soft deadline exceeded")
+                        at = time.monotonic()
+                        next_at = at + CONCURRENT_INTERVAL_SEC
+                        row = {"step": step, "start_sec": at - started,
+                               "put_attempts": 0, "put_acks": 0}
+                        stats["writer_steps"].append(row)
+                        first = QUICK_PREFILL + step * BATCH_SIZE
+                        try:
+                            for client, namespace in zip(clients, NAMESPACES):
+                                row["put_attempts"] += BATCH_SIZE
+                                client.put(*dataset(namespace, first, first + BATCH_SIZE))
+                                row["put_acks"] += BATCH_SIZE
+                        finally:
+                            row["end_sec"] = time.monotonic() - started
+                            log.write(json.dumps(row) + "\n")
+                            log.flush()
+                        if step == 99:
+                            record_phase(args, result, "step-100", started)
+                            stats["midpoint_sec"] = time.monotonic() - started
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("concurrent writer soft deadline exceeded")
+            except Exception as error:
+                writer_error = error
+            finally:
+                stats["pressure_finished_sec"] = time.monotonic() - started
+                stop.set()
+                barrier.abort()
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as error:
+                        reader_errors.append(error)
+                result["hot_hits"] += sum(row["hits"] for row in stats["readers"])
+                result["hot_misses"] = sum(row["misses"] for row in stats["readers"])
+                result["hot_reads"] = result["hot_hits"] + result["hot_misses"]
+                if any("wrong bytes/length" in row.get("error", "") for row in stats["readers"]):
+                    result["wrong_bytes"] = 1
+            if reader_errors and (writer_error is None or
+                                  isinstance(writer_error, threading.BrokenBarrierError) or
+                                  "reader aborted" in str(writer_error)):
+                # Abort can wake peers with BrokenBarrierError; retain the
+                # originating IO/oracle error rather than its empty wakeup.
+                raise next((error for error in reader_errors
+                            if not isinstance(error, threading.BrokenBarrierError)), reader_errors[0])
+            if writer_error is not None:
+                raise writer_error
+    record_phase(args, result, "after-pressure", started)
+
+
 def run(args, *, library_loader=load_library, client_factory=Client):
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    pressure = args.scenario in ("pressure", "quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure")
+    pressure = args.scenario in ("pressure", "quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure", "concurrent-pressure")
     config = {"schema": 1, "lib": args.lib, "members": args.members,
               "scenario": args.scenario, "seed": args.seed, "count": args.count,
               "readers": args.readers, "namespaces_hex": [n.hex() for n in NAMESPACES],
@@ -602,6 +761,14 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                       warmup_allow_miss=True, admission_read_batches_per_namespace=2,
                       refill_on_miss=False,
                       independent_read_threads=False, metrics_url=args.metrics_url)
+    if args.scenario == "concurrent-pressure":
+        config.update(prefill=QUICK_PREFILL, hot=CONCURRENT_HOT, warmup_rounds=2,
+                      independent_readers=CONCURRENT_READERS, reader_window=CONCURRENT_WINDOW,
+                      steps=SUSTAIN_STEPS, step_interval_sec=CONCURRENT_INTERVAL_SEC,
+                      max_reader_batches=CONCURRENT_MAX_BATCHES,
+                      soft_deadline_sec=CONCURRENT_SOFT_DEADLINE_SEC,
+                      independent_read_threads=True, refill_on_miss=False,
+                      timing_origin="driver-start", metrics_url=args.metrics_url)
     if args.refill_on_miss:
         config.update(refill_on_miss=True, refill_scope="sampled-first-reuse-only",
                       refill_attempts_per_miss=1, refill_verification_reads=1,
@@ -633,6 +800,12 @@ def run(args, *, library_loader=load_library, client_factory=Client):
             "probe each namespace first two admitted batches before the next PUT; "
             "warmup permits donor losses and is separate from pressure hot reads; "
             "per-size PUT/warmup/hot/scan counts, no refill")
+    if args.scenario == "concurrent-pressure":
+        trace["operations"].append(
+            "concurrent-pressure: strict warmup of 128 keys per namespace; eight new "
+            "independent reader handles rotate private 32-key windows while two writers "
+            "ACK 200 paced cold batches; native GET timing and private per-worker journals; "
+            "join readers before closing handles, no refill")
     if args.refill_on_miss:
         # Replace the no-refill arrival description only for this opt-in trace.
         trace["operations"][-1] = (
@@ -676,7 +849,9 @@ def run(args, *, library_loader=load_library, client_factory=Client):
             if args.scenario == "roundtrip":
                 for client in clients:
                     client.expect_missing(b"never-written\x00" + key_for(args.seed, 0))
-            if args.scenario == "multisize-pressure":
+            if args.scenario == "concurrent-pressure":
+                concurrent_pressure(args, clients, dataset, result, started, lib, client_factory)
+            elif args.scenario == "multisize-pressure":
                 multisize_pressure(args, clients, dataset, result, started)
             elif args.scenario in ("mixed-pressure", "arrivals-pressure"):
                 mixed_pressure(args, clients, dataset, result, started)
@@ -710,7 +885,7 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                         futures = [pool.submit(read_all, clients[i % 2], NAMESPACES[i % 2], True)
                                    for i in range(args.readers)]
                         result["concurrent_reader_hits"] = sum(f.result() for f in futures)
-            if args.scenario in ("quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure"):
+            if args.scenario in ("quick-pressure", "sustained-pressure", "mixed-pressure", "arrivals-pressure", "multisize-pressure", "concurrent-pressure"):
                 record_phase(args, result, "after-scan", started)
             result["status"] = "passed"
     except Exception as error:

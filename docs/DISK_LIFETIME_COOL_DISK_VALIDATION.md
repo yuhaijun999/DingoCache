@@ -219,3 +219,23 @@ VM空闲保留，下轮必须重新核验/启新监控。首次未设SO_REUSEADD
 实际数据与结果的准确路径见快速验证第16节及summary.json的archived_data_dirs。
 仅同轮固定路由legacy→lifetime首轮诊断；40/50水位覆盖不等于默认92/88表现，
 本轮lifetime两尺寸热点均更差。无独立高并发/正式A/B或生产默认变更，O5未整体放行。
+
+
+## 11. 独立并发首轮的冷盘复用（2026-11-18）
+
+仍按第8节重验唯一原QEMU的PID/starttime/cmdline、六个实际FD/root/backing/seed/data
+同inode与独立netns后才复用；无新VM/格式化或默认Docker回退。private socket本轮
+实查ConnectionRefused。8个reader独立handle＋2writer handle都在原guest内运行，
+不改宿主模块/sysctl/网络、容器硬资源预算或生产配置。三guest盘仍只有两块物理盘。
+
+新monitor日志/证据归档目录：
+`/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/concurrent-pressure-20261118t094212z-6ad2cbb/`。
+7项纯mock停止控制分支重跑通过；57份SMART覆盖前置检查及两组负载，nvme2的
+composite40–42°C、nvme0为40–41°C，warning均0、最长间隔10.399660秒。
+65°C仍仅诊断停止线，不证明采样间无瞬变或真实过热关停耗时。应用正常退出、
+listener/server清空并SO_REUSEADDR端口bind通过后，monitor正常停止，原VM空闲保留。
+下轮必须重新核验/启新monitor，不能凭历史PID、pointer或旧日志假定环境/监控存活。
+
+**继续禁止宿主/mnt/disk1测试压力**，不动旧热盘大文件。结果与保留data准确路径见
+快速验证第17节和summary.json。真实并发分母/字节/淘汰核验通过，不包装成默认lifetime
+保留收益（本轮仍大量热点miss）、性能扩展性、长期稳定性或正式A/B/O5整体验收。

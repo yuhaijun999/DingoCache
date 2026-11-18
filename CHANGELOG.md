@@ -24,6 +24,9 @@
   Add an explicit multi-size 40/50-percent watermark diagnostic preset with
   pre-write effective-threshold checks and a required real watermark victim count;
   keep the original compact profile and production defaults unchanged.
+  Add a bounded independent-reader pressure diagnostic with eight private reader
+  handles, C ABI call intervals, variable complete-read accounting and verified
+  watermark activity during the read/write stage; retain normal miss outcomes.
 
 - Enforce RDMA connection idle deadlines while pending receives or reply SENDs
   require short CQ waits. Preserve disabled idle reclamation and disk-read drain

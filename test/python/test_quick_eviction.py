@@ -227,7 +227,181 @@ def refill_metrics(client):
                    'dfkv_bytes_written_total ' + str(63963136 + client['refill']['acked_payload_bytes']) + '\n')
 
 
+def concurrent_client(all_miss=False):
+    readers = []
+    for index in range(8):
+        start = index // 2 * 32
+        batches = [{'batch': batch, 'start_index': start + batch * 16,
+                    'call_started_sec': at + index * .001,
+                    'call_finished_sec': at + index * .001 + .02,
+                    'hits': 0 if all_miss else 16, 'misses': 16 if all_miss else 0}
+                   for batch, at in enumerate((4.0, 22.9))]
+        readers.append({'reader_id': index, 'namespace_hex':
+                        (b'disk-validation\x00A\xff', b'disk-validation\x00B\xfe')[index % 2].hex(),
+                        'start_index': start, 'count': 32, 'transport_mode': 'rdma',
+                        'status': 'passed', 'hits': 0 if all_miss else 32,
+                        'misses': 32 if all_miss else 0, 'batches': batches})
+    hits, misses = (512, 256) if all_miss else (768, 0)
+    phases = [{'name': name, 'elapsed_sec': at, 'hot_hits': 0 if i == 0 else 512 if i < 4 else hits,
+               'hot_misses': 0 if i < 4 else misses, 'filler_warmup_reads': 0}
+              for i, (name, at) in enumerate((('prefill', 1), ('warm', 2), ('before-pressure', 2.5),
+                                               ('step-100', 12.92), ('after-pressure', 23), ('after-scan', 24)))]
+    return {**good_client(), 'hits': 14712, 'misses': 904,
+            'hot_hits': hits, 'hot_misses': misses, 'hot_reads': hits + misses,
+            'filler_warmup_reads': 0, 'phases': phases,
+            'concurrency': {'warmup_reads': 512, 'pressure_started_sec': 3,
+                            'pressure_finished_sec': 22.92, 'midpoint_sec': 12.93,
+                            'readers': readers,
+                            'writer_steps': [{'step': i, 'start_sec': 3 + i * .1,
+                                              'end_sec': 3.01 + i * .1,
+                                              'put_attempts': 32, 'put_acks': 32}
+                                             for i in range(200)]}}
+
+
+def concurrent_metrics(client):
+    hits = client['hits'] + client['hot_hits']
+    misses = client['misses'] + client['hot_misses']
+    return (good_metrics().replace('12128', str(hits)).replace('20456', str(hits + misses))
+            .replace('8328', str(misses)) +
+            'dfkv_cache_put_total 15616\ndfkv_bytes_written_total 63963136\n')
+
+
 class QuickEvictionTest(unittest.TestCase):
+    def test_concurrent_pressure_options_are_isolated(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp)) + ['--scenario', 'concurrent-pressure']
+            for policy in ('legacy', 'lifetime'):
+                self.assertEqual(runner.parse_args(argv + ['--policy', policy]).scenario, 'concurrent-pressure')
+            for extra in (['--pressure-delay-sec', '1'], ['--first-reuse-sec', '45'],
+                          ['--refill-on-miss'], ['--protect-sec', '30'], ['--multisize-watermark']):
+                with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    runner.parse_args(argv + extra)
+
+    def test_concurrent_pressure_counts_actual_batches_and_allows_pressure_losses(self):
+        for all_miss, extra_batch, expected_gets in ((False, False, 256), (True, True, 272)):
+            client = concurrent_client(all_miss)
+            if extra_batch:
+                reader = client['concurrency']['readers'][0]
+                reader['batches'].append({'batch': 2, 'start_index': 0, 'call_started_sec': 22.94,
+                                          'call_finished_sec': 22.96, 'hits': 0, 'misses': 16})
+                reader['misses'] += 16
+                client['hot_misses'] += 16
+                client['hot_reads'] += 16
+                for phase in client['phases'][4:]:
+                    phase['hot_misses'] += 16
+            for policy in ('legacy', 'lifetime'):
+                checked = runner.check_result(concurrent_metrics(client), client, policy, 'concurrent-pressure')
+                self.assertEqual(checked['concurrent_reader_gets'], expected_gets)
+                self.assertEqual(checked['concurrent_gets'], 16128 + expected_gets)
+                self.assertEqual(checked['concurrent_peak_calls'], 8)
+            for before, after in (('dfkv_cache_put_total 15616', 'dfkv_cache_put_total 15615'),
+                                  ('dfkv_bytes_written_total 63963136', 'dfkv_bytes_written_total 1'),
+                                  ('dfkv_slab_watermark_evictions_total 900', 'dfkv_slab_watermark_evictions_total 0')):
+                with self.subTest(before=before), self.assertRaises(RuntimeError):
+                    runner.check_result(concurrent_metrics(client).replace(before, after), client,
+                                        scenario='concurrent-pressure')
+
+    def test_concurrent_pressure_rejects_forged_reader_writer_and_timing_evidence(self):
+        mutations = [lambda c: c['readers'].pop(),
+                     lambda c: c['readers'][0].update(reader_id=True),
+                     lambda c: c['readers'][0].update(namespace_hex='00'),
+                     lambda c: c['readers'][0].update(start_index=32),
+                     lambda c: c['readers'][0].update(status='failed'),
+                     lambda c: c['readers'][0].update(transport_mode='tcp'),
+                     lambda c: c['readers'][0].update(hits=31),
+                     lambda c: c['readers'][0]['batches'][0].update(hits=True),
+                     lambda c: c['readers'][0]['batches'][0].update(start_index=16),
+                     lambda c: c['readers'][0]['batches'][1].update(batch=0),
+                     lambda c: c['readers'][0]['batches'][0].update(call_finished_sec=float('nan')),
+                     lambda c: c['readers'][0]['batches'][0].update(call_started_sec=0),
+                     lambda c: c['readers'][0]['batches'][0].update(call_started_sec=14, call_finished_sec=14.02),
+                     lambda c: c['writer_steps'].pop(),
+                     lambda c: c['writer_steps'][0].update(put_acks=16),
+                     lambda c: c['writer_steps'][1].update(start_sec=3.001),
+                     lambda c: c.update(midpoint_sec=12), lambda c: c.update(warmup_reads=511),
+                     lambda c: c.update(pressure_finished_sec=100),
+                     lambda c: c['readers'][0].update(batches=[]),
+                     lambda c: c['readers'][0].update(batches=[{}] * 32769)]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(RuntimeError):
+                client = concurrent_client()
+                mutate(client['concurrency'])
+                runner.check_concurrent(client)
+        client = concurrent_client()
+        for index, row in enumerate(client['concurrency']['readers']):
+            row['batches'][0].update(call_started_sec=4 + index * .1, call_finished_sec=4.02 + index * .1)
+            row['batches'][1].update(call_started_sec=20 + index * .1, call_finished_sec=20.02 + index * .1)
+        with self.assertRaisesRegex(RuntimeError, 'overlap'):
+            runner.check_concurrent(client)
+        for mutate in (lambda c: c.update(hot_reads=767),
+                       lambda c: c['phases'][3].update(elapsed_sec=0),
+                       lambda c: c['concurrency'].update(readers=[])):
+            client = concurrent_client()
+            mutate(client)
+            with self.assertRaises(RuntimeError):
+                runner.check_result(concurrent_metrics(client), client, scenario='concurrent-pressure')
+        with self.assertRaises(RuntimeError):
+            runner.check_result(concurrent_metrics(concurrent_client()), concurrent_client())
+
+    def test_concurrent_midpoint_requires_eviction_progress_but_not_settled_active_reads(self):
+        final = concurrent_metrics(concurrent_client())
+        before = final.replace('dfkv_slab_watermark_evictions_total 900', 'dfkv_slab_watermark_evictions_total 0')
+        middle = final.replace('dfkv_slab_watermark_evictions_total 900', 'dfkv_slab_watermark_evictions_total 200')
+        middle = middle.replace('dfkv_uring_inflight 0', 'dfkv_uring_inflight 4')
+        middle = middle.replace('dfkv_rdma_pull_requests_dispatched_total 16384',
+                                'dfkv_rdma_pull_requests_dispatched_total 99999')
+        self.assertEqual(runner.check_concurrent_watermarks(before, middle, final)['concurrent_watermark_delta'], 200)
+        for invalid in (before, middle.replace('watermark_evictions_total 200', 'watermark_evictions_total 901'),
+                        middle.replace('disk="a"', 'disk="other"'),
+                        middle.replace('dfkv_errors_total 0', 'dfkv_errors_total 1')):
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+                runner.check_concurrent_watermarks(before, invalid, final)
+
+    def test_concurrent_run_uses_fixed_count_and_requires_actual_midpoint_metrics(self):
+        for midpoint in (None, 0, 200):
+            with self.subTest(midpoint=midpoint), tempfile.TemporaryDirectory() as temp:
+                args = runner.parse_args(self.arguments(Path(temp)) + ['--data-name', 'fixed',
+                                                                       '--scenario', 'concurrent-pressure'])
+                client = concurrent_client(True)
+                text = concurrent_metrics(client)
+                for label, root in zip(('a', 'b', 'c'), args.data_root):
+                    text = text.replace('disk="' + label + '"', 'disk=' + json.dumps(str(root / 'fixed')))
+                server = mock.Mock()
+                server.poll.return_value = None
+                server.wait.return_value = 0
+                server.returncode = 0
+                response = mock.MagicMock()
+                response.__enter__.return_value.status = 200
+                response.__enter__.return_value.read.return_value = text.encode()
+
+                def complete(command, **kwargs):
+                    trace = args.output / 'trace'
+                    trace.mkdir()
+                    (trace / 'result.json').write_text(json.dumps(client))
+                    (trace / 'phase-before-pressure.prom').write_text(text.replace('watermark_evictions_total 900',
+                                                                                  'watermark_evictions_total 0'))
+                    if midpoint is not None:
+                        (trace / 'phase-step-100.prom').write_text(text.replace('watermark_evictions_total 900',
+                                                                              'watermark_evictions_total ' + str(midpoint)))
+                    return subprocess.CompletedProcess(command, 0)
+
+                with mock.patch.object(runner, 'check_ports'), \
+                        mock.patch.object(runner.subprocess, 'Popen', return_value=server), \
+                        mock.patch.object(runner.subprocess, 'run', side_effect=complete) as client_run, \
+                        mock.patch.object(runner.urllib.request, 'urlopen', return_value=response):
+                    result = runner.run(args)
+                self.assertEqual(result['status'], 'passed' if midpoint else 'failed')
+                command = client_run.call_args.args[0]
+                self.assertEqual(command[command.index('--count') + 1], '7808')
+                self.assertEqual(client_run.call_args.kwargs['timeout'], 320)
+                case = json.loads((args.output / 'case.json').read_text())
+                self.assertEqual(case['protect_sec_override'], None)
+                self.assertEqual(case['watermark_pct_override'], None)
+                if midpoint:
+                    self.assertEqual(result['concurrent_watermark_delta'], 200)
+                server.terminate.assert_called_once()
+
+
     def test_multisize_watermark_is_explicit_and_multisize_only(self):
         with tempfile.TemporaryDirectory() as temp:
             argv = self.arguments(Path(temp))

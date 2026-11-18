@@ -1402,5 +1402,128 @@ N=1/2/3映射宿主disk2/disk3/disk3。宿主日志/归档专用目录：
 不包含私钥或raw/qcow镜像，保留样本未删除，清理按冷盘说明准确路径执行。
 
 当前完成 **O5双尺寸40/50诊断档水位分支首轮验证**，不代表默认92/88多尺寸水位、
-所有尺寸/负载或O5整体放行。下一步单独补独立高并发，再正式A/B；业务权重仍单列，
+所有尺寸/负载或O5整体放行。本节之后的独立并发首轮见第17节；正式A/B、业务权重仍单列，
 不擅自假设，不自动修改策略优先级、公式或生产默认。
+
+
+## 17. 独立并发读＋冷写淘汰诊断（2026-11-18）
+
+### 17.1 冻结负载与独立性
+
+新增独立 `concurrent-pressure`，不复用旧roundtrip的 `--readers 8`：旧模式共享两个
+handle、没有并行writer，不能冒充本轮。新档创建 **8个独立读handle＋2个写handle**；
+实际为8个读线程、1个主写线程（后者管理两个namespace），不是两个写线程。
+仅单4096字节payload/1MiB slot、容量12GiB、三guest盘；生产默认88/92水位、P180、
+评分、KEEP与默认策略不改，不混多尺寸/回填/业务权重/延迟首次复用。
+
+- 每namespace预填4608、最终7808。预填后严格预热每namespace128个hot两轮，512GET。
+- 8读者按id%2分namespace，各自32key且同namespace不重叠；每次读取连续16key，
+  在自己的32key窗口轮换。8个handle都保留独立传输模式与逐批日志，不共用writer handle。
+- 主写线程200步，每步两个namespace各PUT16，步起点至少间隔100ms、不追赶突发；
+  每组15616逻辑PUT、63963136字节payload，失败尝试与成功ACK分别记录。
+- barrier共同起跑；各reader持续读取到writer结束。每reader最多32768批，90秒合作
+  软界，supervisor320秒进程级界。预算在真实运行前冻结，由初始8192提高至32768，
+  避免20秒正常miss快路径先撞请求预算；未根据真实结果事后调整门禁。
+- Reader错误立即停止其他读者/写者、解除barrier；writer的finally也停止读者。
+  所有线程join后才关闭其handle。Python无法中断卡死native调用，不能声称cancel就
+  已释放在用对象；这类卡死由外层终止整个driver并记失败，不能包装为通过。
+
+每组GET分母不是固定7552/12928：**512预热＋16×所有reader实际完成批数＋15616末扫**。
+预热后压力miss合法，不强制热点存活、不回填；错字节、长度、传输/IO错误不能降为miss。
+失败保留各reader/writer日志和已完成计数，不把不完整请求算成成功完整轨迹。
+
+### 17.2 并发与中途/终局门禁
+
+- `Client.read(call_timing=...)` 可选记录紧贴实际 `dfkv_batch_get_auto` 前后monotonic
+  时间，旧调用不改变结果。每reader私有 `concurrent-reader-XX.jsonl`、writer私有
+  `concurrent-writer.jsonl`，与result.concurrency逐行对账。
+- 核8个读者的身份、namespace/窗口、RDMA模式、顺序批号、16次结果、调用区间及
+  汇总；200步真实attempt/ACK、100ms非追赶起点和90秒软界均核验。
+- 每个reader在前半写入窗口有完成GET；对writer窗口内C ABI区间扫描，重叠peak至少2
+  才取得并发覆盖资格，报告实测peak。8条独立流不自动证明8个IO同时在飞；包络仍含
+  调度/GIL恢复等待，不等于精确native执行、kernel pin或网卡同时在途，也不是吞吐扩展性。
+- step100记录中途metrics，要求相对before-pressure实际WM增长。结合8reader逐批进展
+  证明同一读写阶段发生淘汰，不证明某个victim瞬间与指定GET重叠。
+- 中途reader仍活跃，inflight可正、dispatched/terminal可能暂不一致；counter不是事务
+  快照，不能要求此时全结算。所有线程join并关闭、末扫结束后，才要求完整success/
+  notfound终局、lifetime成功计热、实际PUT/payload及inflight0；applied允许原住户竞态差额。
+- 六phase：prefill/warm/before-pressure/step-100/after-pressure/after-scan。中途result
+  hot计数尚是预热缓存，实际读流计数在线程结束后汇总；不将其误作中途服务端请求分母。
+- 多余P/delay/reuse/refill/multisize-watermark组合拒绝；旧场景门禁保留。
+
+只有在核验后的冷盘guest执行，先按冷盘说明第8节重验原VM、启新monitor及前置检查：
+```bash
+ulimit -l unlimited
+python3 /opt/dfkv/deploy/validation/quick_eviction.py \
+  --build /opt/dfkv-build --scenario concurrent-pressure --policy lifetime \
+  --data-name NEW_UNIQUE_DATA_NAME \
+  --data-root /data/disk1/cases --data-root /data/disk2/cases \
+  --data-root /data/disk3/cases --output /data/disk1/results/NEW_UNIQUE_OUTPUT
+```
+宿主disk1继续禁压，guestdisk1实际上是宿主disk2；不得在宿主直接运行这些guest路径。
+legacy另用全新结果/data目录；要固定路由按第16.2节安全归档后复用同data-name，不能删除旧目录。
+
+
+### 17.3 两组真实结果：完整对账，不包装策略收益
+
+|策略|reader批数|reader GET|reader hit/miss（不含预热）|C ABI包络peak|中点WM增量/最终WM|写入阶段秒|
+|---|---:|---:|---:|---:|---:|---:|
+|legacy|9203|147248|147248/0|8|1596/4804|20.129290|
+|lifetime|14413|230608|53627/176981|8|1575/4804|20.285601|
+
+8读者各有完整时序及前半段进展；step100原始metrics两组均显示pull_connections=10，
+支持8reader＋2writer的独立连接观测。该快照的ring inflight_max分别3/2，是全运行累计
+（预热也贡献），不是8reader阶段精确native/kernel并行的独立证明。实测C ABI包络peak8
+不去掉前述调度/GIL边界，也不等于性能可线性扩展到8路。
+
+每组严格预热512GET均命中、末扫10812hit/4804miss。完整GET：legacy163376，
+lifetime246736；合计410112。两组31232PUT、127926272逻辑payload字节，12份phase。
+两组正常exit0、健康、无fallback/错误、最终inflight0；完整success/notfound、计热、
+PUT/payload与日志重算通过。lifetime成功及应用计热均64951，后台class/extent steal均0。
+legacy成功158572、notfound4804；lifetime成功64951、notfound181785。
+
+**保留lifetime热点缺失风险**：本轮各reader均观察到miss，合计176981次压力miss，
+不是176981个不同key，也未逐miss关联EXIST/victim，GET_AUTO容量歧义仍保留。
+这类soft-eviction miss没有伪装成错误，也不把字节/终局账目通过当成热点保留收益。
+闭环reader每批返回后继续下一批，miss更快等反馈会改变请求数，故两组并非固定
+相同offered-rate/同一GET序列；不能将不同请求总量或hit比例当作正式因果A/B。
+无固定年龄/真实业务回源权重。两组elapsed34.230004/36.597024秒、累计70.827029秒，
+不据此宣称延迟、吞吐、生产容量或TryNow等热路径已无瓶颈；本轮不做性能验收。
+
+### 17.4 单测、冷盘收尾与复跑证据
+
+新增driver5项、supervisor5项测试方法，现 **96=44driver＋52supervisor**，0失败/0skip。
+Driver先RED43方法11errors；后补的回归实测复现“writer同时失败掩盖reader错字节”，
+修复后任一reader错字节保留wrong_bytes=1，BrokenBarrier不掩盖原始错误。
+覆盖完整7808/200步（单测缩短间隔不冒充真实20秒）、10独立handle、受控阻塞线程
+重叠、错误/启动/预算/软界清理、非首reader启动即失败及join后close，不是手工伪造计数。
+Supervisor先RED52方法25errors；初版GREEN fixture的22.91小于浮点step199末尾，
+原失败日志保留，修正测试fixture为22.92后通过，未放宽实际时序门禁。
+单测还核可变GET分母、串行/漏reader/错窗口/ACK/计数、无WM增长、活跃mid允许inflight。
+
+host OFF/OFF `build-test` 与guest ON/ON `/opt/dfkv-build` 构建均Ninja no-op，各2个Python
+CTest入口通过。真实RXE1/kernel ring5/PULL Serve9均通过0skip；Serve故障CQE受控，
+不代替kernel ring证据。125生产源码＋4工具/测试SHA前后匹配、server/client二进制不变。
+独立审计不导入driver/supervisor，两组原始账目PASS；25项真实拷贝负控首次执行全部
+拒绝（串行区间、遗漏reader、窗口/计数、WM无增长、终局、计热等），不是25个产品负载。
+无C++/生产默认/评分/格式修改，无全量CTest、sanitizer、C++静态、物理HCA/GPU或正式A/B新执行。
+96项单测和这组并发运行不证明所有线程调度、故障分支或长期竞态都已覆盖。
+
+57份SMART覆盖前置检查和两组负载，允许盘nvme2温度40–42°C、nvme0为40–41°C，
+warning均0，最大间隔10.399660秒；不证明采样间无瞬变。7项monitor纯mock控制分支
+通过，不冒充真实过热关停。应用/测试退出、无listener/server且SO_REUSEADDR端口bind
+通过后，monitor正常停止；VM空闲保留，private socket本轮仍ConnectionRefused。
+宿主disk1继续禁压，不复制/清理旧大样本，下次重验原VM并启动新monitor，见冷盘说明§11。
+
+单测与host构建使用第16.4节四条命令；本轮具体日志及复跑冻结配置在：
+`.omx/evidence/concurrent-pressure/20261118t094212z-6ad2cbb/`。
+guest结果：`/data/disk1/results/concurrent-pressure-20261118t094212z-6ad2cbb/`。
+保留data：`/data/diskN/cases/concur-20261118t094212z-6ad2cbb-active--20261118t094212z-6ad2cbb--{legacy,lifetime}`，
+N=1/2/3映射宿主disk2/disk3/disk3。宿主日志/证据归档目录：
+`/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/concurrent-pressure-20261118t094212z-6ad2cbb/`。
+精确命令/env、线程日志、XML、原始metrics、source/binary指纹与独立审计均单列；
+归档不含私钥或raw/qcow镜像，样本保留未清理。
+
+当前完成 **O5独立8读流＋主写流淘汰诊断首轮**。不是极限压测、长期稳定性、所有
+同key并发/故障注入或O5整体放行；正式A/B尚未启动，须先按验收文档冻结负载、基线、
+资源、指标和门槛。业务权重仍单列，不擅自假设，不自动调评分/优先级/生产默认。
