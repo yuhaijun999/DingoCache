@@ -170,6 +170,15 @@ def multisize_metrics(client):
         'dfkv_slab_class_put_total{slot_size="4194304"} 0')) + '\n'
 
 
+def multisize_watermark_metrics(client):
+    text = multisize_metrics(client)
+    for metric, value in (('capacity_bytes', 4294967296), ('watermark_high_bytes', 2147483600),
+                          ('watermark_low_bytes', 1717986880)):
+        for index, disk in enumerate(('a', 'b', 'c')):
+            text += 'dfkv_slab_disk_' + metric + '{disk="' + disk + '",disk_index="' + str(index) + '"} ' + str(value) + '\n'
+    return text
+
+
 def refill_client(mode='partial', verify_miss=False):
     client = arrivals_client()
     stats = {'first_hits': 0, 'first_misses': 0, 'put_attempts': 0, 'put_acks': 0,
@@ -219,6 +228,155 @@ def refill_metrics(client):
 
 
 class QuickEvictionTest(unittest.TestCase):
+    def test_multisize_watermark_is_explicit_and_multisize_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp))
+            self.assertFalse(runner.parse_args(argv).multisize_watermark)
+            for policy in ('legacy', 'lifetime'):
+                args = runner.parse_args(argv + ['--scenario', 'multisize-pressure',
+                                                 '--policy', policy, '--multisize-watermark'])
+                self.assertTrue(args.multisize_watermark)
+            for scenario in ('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure'):
+                with self.subTest(scenario=scenario), contextlib.redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit):
+                    runner.parse_args(argv + ['--scenario', scenario, '--multisize-watermark'])
+
+    def test_multisize_watermark_requires_actual_activity_without_weakening_old_mode(self):
+        client = multisize_client(True, True)
+        text = multisize_watermark_metrics(client)
+        for policy in ('legacy', 'lifetime'):
+            result = runner.check_result(text, client, policy, 'multisize-pressure',
+                                         multisize_watermark=True)
+            self.assertEqual(result['watermark_evictions'], 900)
+            zero = text.replace('dfkv_slab_watermark_evictions_total 900',
+                                'dfkv_slab_watermark_evictions_total 0')
+            self.assertEqual(runner.check_result(zero, client, policy, 'multisize-pressure')
+                             ['watermark_evictions'], 0)
+            for invalid in (zero, text.replace('dfkv_slab_watermark_evictions_total 900', ''),
+                            text.replace('dfkv_slab_watermark_evictions_total 900',
+                                         'dfkv_slab_watermark_evictions_total nan')):
+                with self.subTest(policy=policy, invalid=invalid), self.assertRaises(RuntimeError):
+                    runner.check_result(invalid, client, policy, 'multisize-pressure',
+                                        multisize_watermark=True)
+        for invalid in (None, 0, 1, 'true'):
+            with self.subTest(value=invalid), self.assertRaises(RuntimeError):
+                runner.check_result(text, client, scenario='multisize-pressure',
+                                    multisize_watermark=invalid)
+        with self.assertRaises(RuntimeError):
+            runner.check_result(good_metrics(), good_client(), multisize_watermark=True)
+
+    def test_multisize_watermark_rejects_missing_duplicate_or_wrong_effective_thresholds(self):
+        client = multisize_client()
+        text = multisize_watermark_metrics(client)
+        runner.check_multisize_watermarks(text)
+        mutations = [
+            ('dfkv_slab_disk_capacity_bytes{disk="a",disk_index="0"} 4294967296', ''),
+            ('dfkv_slab_disk_watermark_high_bytes{disk="b",disk_index="1"} 2147483600', ''),
+            ('dfkv_slab_disk_watermark_low_bytes{disk="c",disk_index="2"} 1717986880', ''),
+            ('disk="a",disk_index="0"', 'disk="other",disk_index="0"'),
+            ('disk="c",disk_index="2"', 'disk="c",disk_index="1"'),
+            ('dfkv_slab_disk_watermark_high_bytes{disk="a",disk_index="0"}',
+             'dfkv_slab_disk_watermark_high_bytes{disk="other",disk_index="0"}'),
+            ('4294967296', '8589934592'), ('2147483600', '2147483648'),
+            ('1717986880', '1717986918'), ('1717986880', 'nan')]
+        for before, after in mutations:
+            with self.subTest(before=before, after=after), self.assertRaises(RuntimeError):
+                runner.check_result(text.replace(before, after), client, scenario='multisize-pressure',
+                                    multisize_watermark=True)
+        duplicate = text + 'dfkv_slab_disk_watermark_low_bytes{disk="a",disk_index="0"} 1717986880\n'
+        with self.assertRaises(RuntimeError):
+            runner.check_multisize_watermarks(duplicate)
+
+    def test_multisize_watermark_rejects_wrong_effective_threshold_before_any_client_writes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = runner.parse_args(self.arguments(Path(temp)) +
+                                     ['--data-name', 'fixed', '--scenario', 'multisize-pressure',
+                                      '--multisize-watermark'])
+            text = multisize_watermark_metrics(multisize_client()).replace('2147483600', '3951369824')
+            for label, root in zip(('a', 'b', 'c'), args.data_root):
+                text = text.replace('disk="' + label + '"', 'disk=' + json.dumps(str(root / 'fixed')))
+            server = mock.Mock()
+            server.poll.return_value = None
+            server.wait.return_value = 0
+            server.returncode = 0
+            response = mock.MagicMock()
+            response.__enter__.return_value.status = 200
+            response.__enter__.return_value.read.return_value = text.encode()
+            with mock.patch.object(runner, 'check_ports'), \
+                    mock.patch.object(runner.subprocess, 'Popen', return_value=server), \
+                    mock.patch.object(runner.subprocess, 'run') as client_run, \
+                    mock.patch.object(runner.urllib.request, 'urlopen', return_value=response):
+                result = runner.run(args)
+            self.assertEqual(result['status'], 'failed')
+            self.assertIn('watermark', result['error'])
+            client_run.assert_not_called()
+            server.terminate.assert_called_once()
+
+    def test_multisize_watermark_override_and_environment_are_frozen_even_on_start_failure(self):
+        for enabled in (False, True):
+            for policy in ('legacy', 'lifetime'):
+                with self.subTest(enabled=enabled, policy=policy), tempfile.TemporaryDirectory() as temp:
+                    argv = self.arguments(Path(temp)) + ['--scenario', 'multisize-pressure', '--policy', policy]
+                    args = runner.parse_args(argv + (['--multisize-watermark'] if enabled else []))
+                    with mock.patch.object(runner, 'check_ports'), \
+                            mock.patch.dict(runner.os.environ, {'DFKV_SLAB_EVICT_LOW_PCT': '98',
+                                                               'DFKV_SLAB_EVICT_HIGH_PCT': '99'}), \
+                            mock.patch.object(runner.subprocess, 'Popen', side_effect=OSError('spawn failed')) as popen:
+                        result = runner.run(args)
+                    override = {'low': 40, 'high': 50} if enabled else None
+                    env = popen.call_args.kwargs['env']
+                    self.assertEqual(env.get('DFKV_SLAB_EVICT_LOW_PCT'), '40' if enabled else None)
+                    self.assertEqual(env.get('DFKV_SLAB_EVICT_HIGH_PCT'), '50' if enabled else None)
+                    self.assertEqual(result['status'], 'failed')
+                    self.assertEqual(result['multisize_watermark'], enabled)
+                    self.assertEqual(result['watermark_pct_override'], override)
+                    case = json.loads((args.output / 'case.json').read_text())
+                    self.assertEqual(case['multisize_watermark'], enabled)
+                    self.assertEqual(case['watermark_pct_override'], override)
+                    saved = json.loads((args.output / 'result.json').read_text())
+                    self.assertEqual(saved['watermark_pct_override'], override)
+
+    def test_multisize_watermark_run_passes_only_with_real_counter_and_stops_server(self):
+        for policy in ('legacy', 'lifetime'):
+            for victims in (0, 900):
+                with self.subTest(policy=policy, victims=victims), tempfile.TemporaryDirectory() as temp:
+                    args = runner.parse_args(self.arguments(Path(temp)) +
+                                             ['--data-name', 'fixed', '--scenario', 'multisize-pressure',
+                                              '--policy', policy, '--multisize-watermark'])
+                    client = multisize_client(True, True)
+                    text = multisize_watermark_metrics(client).replace('dfkv_slab_watermark_evictions_total 900',
+                                                             'dfkv_slab_watermark_evictions_total ' + str(victims))
+                    for label, root in zip(('a', 'b', 'c'), args.data_root):
+                        text = text.replace('disk="' + label + '"', 'disk=' + json.dumps(str(root / 'fixed')))
+                    server = mock.Mock()
+                    server.poll.return_value = None
+                    server.wait.return_value = 0
+                    server.returncode = 0
+                    response = mock.MagicMock()
+                    response.__enter__.return_value.status = 200
+                    response.__enter__.return_value.read.return_value = text.encode()
+
+                    def complete_client(command, **kwargs):
+                        trace = args.output / 'trace'
+                        trace.mkdir()
+                        (trace / 'result.json').write_text(json.dumps(client))
+                        return subprocess.CompletedProcess(command, 0)
+
+                    with mock.patch.object(runner, 'check_ports'), \
+                            mock.patch.object(runner.subprocess, 'Popen', return_value=server), \
+                            mock.patch.object(runner.subprocess, 'run', side_effect=complete_client), \
+                            mock.patch.object(runner.urllib.request, 'urlopen', return_value=response):
+                        result = runner.run(args)
+                    self.assertEqual(result['status'], 'passed' if victims else 'failed')
+                    self.assertEqual(result['server_exit'], 0)
+                    self.assertTrue(result['multisize_watermark'])
+                    self.assertEqual(result['watermark_pct_override'], {'low': 40, 'high': 50})
+                    if victims:
+                        self.assertEqual(result['watermark_evictions'], victims)
+                    else:
+                        self.assertIn('watermark', result['error'])
+                    server.terminate.assert_called_once()
+
     def test_multisize_warm_and_hot_losses_remain_separate_valid_observations(self):
         for warm_miss, hot_miss in ((False, False), (True, False), (True, True)):
             with self.subTest(warm_miss=warm_miss, hot_miss=hot_miss):

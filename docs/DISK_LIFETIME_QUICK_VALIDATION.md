@@ -1283,4 +1283,124 @@ N=1/2/3映射宿主disk2/disk3/disk3。宿主证据归档在
 详细命令/env、阶段class分布与归档目录见case.json/summary.json，不含私钥或raw/qcow镜像。
 
 当前仅完成 **O5双尺寸紧凑几何首轮诊断**，不是所有尺寸边界/水位路径或O5整体放行。
-多尺寸水位分支仍未覆盖；独立高并发、业务权重和正式A/B仍待后续，小迭代分开推进。
+本节轮次未覆盖多尺寸水位；后续独立诊断档见第16节。独立高并发、业务权重和正式A/B
+仍待后续，小迭代分开推进。
+
+
+## 16. 多尺寸水位淘汰诊断档（2026-11-18）
+
+### 16.1 目的与固定配置
+
+第15节默认水位双尺寸轮次的watermark=0；该历史结果不改写。本轮复用其完整驱动，
+只增加supervisor显式 `--multisize-watermark`：仅 `multisize-pressure` 可用，默认关闭，
+legacy/lifetime都设置 `DFKV_SLAB_EVICT_LOW_PCT=40`、`DFKV_SLAB_EVICT_HIGH_PCT=50`。
+这是独立测试档，不改变生产88/92水位、评分、P180、KEEP或默认策略。
+
+上一轮初态各盘slot占用约12%，末态约73–75%；40/50档用于提前触发全局水位分支，
+不是推荐生产水位。容量仍12GiB、三guest盘各4GiB；两档payload4096/1048577字节、
+slot1MiB/2MiB、每namespace6400对象/预填512、连续16key同尺寸批交替，均不改变。
+每组12800PUT/6737107200逻辑payload字节，64admission+128warmup+23552压力探针+
+12800末扫=36544GET；两个尺寸的各阶段分母及实际class PUT门禁沿用第15节。
+无回填、独立读线程、业务权重或固定年龄控制；正常请求与后台回收仍有并发。
+
+### 16.2 新档门禁与复跑
+
+- case.json/result.json均冻结 `multisize_watermark` 和 `watermark_pct_override`；
+  继承DFKV环境仍清空，只有显式开关注入40/50。关闭时override=null，不偷用外部水位。
+- 写客户端启动前、最终对账时，都检查三个store的capacity/high/low指标及路径/index
+  集合与disk_objects一致，拒绝缺失、重复、错盘和错误阈值。C++先整数除100再乘百分比：
+  每盘capacity4294967296，high2147483600、low1717986880字节，不使用浮点四舍五入值。
+- 新档实际 `dfkv_slab_watermark_evictions_total > 0` 才通过；普通multisize模式仍允许
+  watermark=0。健康、完整读/计热/PUT分母、实际两个class、RDMA/ring及正常退出门禁不放宽。
+- 仍可能同时有后台class回收/donor，不能从水位总计数断言两尺寸分别被水位淘汰；
+  计数单位和重叠边界不同，不将水位、后台slot和extent事件直接相加。
+
+仅在按[冷盘说明](DISK_LIFETIME_COOL_DISK_VALIDATION.md)第8节核验的guest中执行，
+先启动新温度monitor、跑真实RXE/ring前置检查，不能在宿主直接使用guest路径：
+```bash
+ulimit -l unlimited
+python3 /opt/dfkv/deploy/validation/quick_eviction.py \
+  --build /opt/dfkv-build --scenario multisize-pressure --multisize-watermark \
+  --policy lifetime --data-name NEW_UNIQUE_DATA_NAME \
+  --data-root /data/disk1/cases --data-root /data/disk2/cases \
+  --data-root /data/disk3/cases --output /data/disk1/results/NEW_UNIQUE_OUTPUT
+```
+对照另用policy legacy和全新结果目录；要固定路由，需在服务正常退出、端口空闲后，
+仅将本轮准确data子目录安全归档再复用同data-name，不删除已有目录。client320秒、
+外层380秒仍仅有界诊断超时。禁止默认Docker daemon回退；宿主disk1继续禁压。
+
+
+### 16.3 两组真实结果及保留风险
+
+|策略/尺寸|admission h/m|warmup h/m|压力探针 h/m|末扫 h/m|
+|---|---:|---:|---:|---:|
+|legacy，4096字节|32/0|58/6|10672/1104|2200/4200|
+|legacy，1048577字节|32/0|64/0|11776/0|1344/5056|
+|lifetime，4096字节|32/0|58/6|5287/6489|2192/4208|
+|lifetime，1048577字节|32/0|64/0|1684/10092|1344/5056|
+
+|策略|watermark victim|后台class reclaimed slot|extent steal事件|总eviction|
+|---|---:|---:|---:|---:|
+|legacy|4197|5056|3|9256|
+|lifetime|4237|5024|3|9264|
+
+两组实际三盘解析阈值与40/50档一致，正常exit0；五phase及before/after原始指标、
+实际两个class PUT、完整GET/PUT/计热/payload对账通过。lifetime成功读及计热应用均10693，
+水位年龄/score victim histogram各4237。上述计数不跨路径相加，也不代表pin/故障分支实测。
+
+附加条件性证据：封闭负载只有两尺寸、每key写一次，稳定尾部三份快照的WM计数/
+释放slot字节/payload字节相同。令小/大档victim为S/L，核对count=S+L、slotMiB=S+2L、
+payload=4096S+1048577L，独立字节账目推算legacy4197/0、lifetime4205/32。
+这不是仅凭aggregate计数断言两档，也不是逐key追踪、热点或每次miss归因；不能推广到
+任意覆盖写/并发快照/其他尺寸。原始三项与依据单列verify-watermark-size-inference.json。
+
+**本轮lifetime两档周期热点均比legacy差**，不隐藏小档6489、大档10092次miss，
+不把“水位分支覆盖＋账目通过”包装成默认策略收益、最佳配置或上线验收。
+miss为请求数而非唯一key数；无逐miss EXIST/victim关联，仍保留GET_AUTO容量歧义。
+两个策略使用同一新鲜data-name/seed；初态允许合法donor损失，没有强制全热驻留。
+与第15节是不同轮次的新路径/后台时序，不把跨轮差异归因于水位这一唯一变量。
+本轮内部也只有legacy→lifetime各一次，未做反序、业务权重或时间控制。
+
+合计73088GET/25600PUT/13474214400逻辑payload字节、10份phase。
+legacy283.163973秒、lifetime210.745849秒，累计493.909822秒；轨迹非paced且跨P180，
+命中/实际传输字节不同，不能将较短耗时当作性能收益或正式A/B结果。
+历史默认水位轮次和生产配置均保持不变，本档不关闭既有大档保留性风险。
+
+### 16.4 验证证据与保留位置
+
+新增6项监督脚本单测，覆盖CLI适用性、继承环境隔离、配置留证、有效阈值、WM0拒绝、
+启动前拒绝及退出清理。先RED（47方法12个subtest errors）后GREEN；本轮工具单测
+86项=39driver+47supervisor，全过0失败/0skip。host OFF/OFF `build-test` 与guest ON/ON
+`/opt/dfkv-build` 构建均Ninja no-op，双方各两个Python CTest入口通过。
+真实RXE1、kernel ring5、PULL Serve9通过无skip；故障Serve的CQE受控，不冒充实际ring。
+125生产源码与4工具/测试SHA前后核验一致，server/client二进制不变。
+独立原始审计不导入driver/supervisor，两组通过，25项真实拷贝负控全部拒绝；
+初版负控fixture错误假设dispatch单series、后误用async selector的日志保留，改为实际
+uring selector后重跑，未修改产品或放宽门禁。这25项不是额外产品负载。
+
+封存75份SMART，两允许盘composite40–41°C/warning0，最大间隔10.291038秒；
+覆盖前置检查及两组负载，不证明采样间无瞬变。monitor的7项纯mock控制分支通过，
+不声称实测热故障关停耗时。应用/测试结束，ss无应用listener、无server进程且按应用
+SO_REUSEADDR端口bind通过后，monitor正常停止。首次未设SO_REUSEADDR的收尾bind
+报EADDRINUSE，原记录保留；核查listener/进程后重验，未误杀或当作产品故障。
+VM空闲保留，私有daemon本轮socket仍拒绝连接；下次必须重验实例、开启新monitor。
+无C++改动；未重跑全量CTest、sanitizer、C++静态、物理HCA/GPU、独立高并发或正式A/B。
+
+仓库根目录可用以下简短命令（build-test为已有OFF/OFF构建）：
+```bash
+cmake --build build-test -j2
+python3 -m unittest discover -s test/python -p test_disk_validation.py
+python3 -m unittest discover -s test/python -p test_quick_eviction.py
+ctest --test-dir build-test -R '^python_(disk_validation|quick_eviction)$' --output-on-failure
+```
+本轮证据：`.omx/evidence/multisize-watermark/20261118t091551z-9d83242/`，包括case/env、
+原始快照、完整命令、测试XML、独立审计和失败fixture。guest结果：
+`/data/disk1/results/multisize-watermark-20261118t091551z-9d83242/`。
+保留data：`/data/diskN/cases/wmulti-20261118t091551z-9d83242-active--20261118t091551z-9d83242--{legacy,lifetime}`，
+N=1/2/3映射宿主disk2/disk3/disk3。宿主日志/归档专用目录：
+`/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/multisize-watermark-20261118t091551z-9d83242/`。
+不包含私钥或raw/qcow镜像，保留样本未删除，清理按冷盘说明准确路径执行。
+
+当前完成 **O5双尺寸40/50诊断档水位分支首轮验证**，不代表默认92/88多尺寸水位、
+所有尺寸/负载或O5整体放行。下一步单独补独立高并发，再正式A/B；业务权重仍单列，
+不擅自假设，不自动修改策略优先级、公式或生产默认。

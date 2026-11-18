@@ -21,6 +21,9 @@
   opt-in eviction supervisor. Add a compact two-class pressure diagnostic with
   separate per-size admission, calibration, recurring-probe and scan accounting;
   retain legitimate early donor losses rather than assuming strict hot residency.
+  Add an explicit multi-size 40/50-percent watermark diagnostic preset with
+  pre-write effective-threshold checks and a required real watermark victim count;
+  keep the original compact profile and production defaults unchanged.
 
 - Enforce RDMA connection idle deadlines while pending receives or reply SENDs
   require short CQ waits. Preserve disabled idle reclamation and disk-read drain

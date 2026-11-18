@@ -198,3 +198,24 @@ composite温度40–41°C/告警0，最大间隔10.192968秒，覆盖前置测�
 结果见快速验证第15节：双档实际参与且账目通过，但默认lifetime大档热点丢失明显，
 水位计数0，不能冒充水位覆盖、性能收益或正式A/B通过。实际数据子目录按tag+policy
 唯一归档并保留owned marker，清理仍只针对核验后的本轮准确路径，不执行全局prune。
+
+
+## 10. 双尺寸水位诊断档的冷盘复用（2026-11-18）
+
+仍按第8节对原QEMU的PID/starttime/cmdline、六个root/backing/seed/data打开FD的
+同inode及独立netns逐项重验，才经netns SSH复用。未新开VM、格式化或fallback默认
+Docker daemon；本轮private socket实查ConnectionRefused，不能假设daemon存活。
+
+新monitor日志/证据归档专用目录：
+`/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/multisize-watermark-20261118t091551z-9d83242/`。
+同一monitor代码，7项纯mock控制分支重跑过；封存75份SMART，允许盘composite40–41°C、
+warning0、最长间隔10.291038秒，覆盖前置检查及两组实际负载。65°C仍仅诊断停止线，
+非厂家限值；不声称实测热故障关停耗时或采样间无瞬变。
+应用结束、listener/进程清空并按应用SO_REUSEADDR端口bind过后正常停止monitor，
+VM空闲保留，下轮必须重新核验/启新监控。首次未设SO_REUSEADDR的收尾bind失败保留，
+复核无listener后修正检查方法，不杀其他进程、不放宽产品门禁。
+
+虚拟盘仍只在宿主disk2/disk3，**继续禁止宿主/mnt/disk1测试压力**，不动旧大文件。
+实际数据与结果的准确路径见快速验证第16节及summary.json的archived_data_dirs。
+仅同轮固定路由legacy→lifetime首轮诊断；40/50水位覆盖不等于默认92/88表现，
+本轮lifetime两尺寸热点均更差。无独立高并发/正式A/B或生产默认变更，O5未整体放行。

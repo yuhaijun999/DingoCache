@@ -401,7 +401,41 @@ def check_multisize(text, client):
             'multisize_payload_bytes': 6737107200}
 
 
-def check_result(text, client, policy='lifetime', scenario='quick-pressure', first_reuse_sec=0, refill_on_miss=False):
+def check_multisize_watermarks(text):
+    """Check resolved per-store thresholds before writes and at completion."""
+    expected = {'capacity_bytes': 4294967296, 'watermark_high_bytes': 2147483600,
+                'watermark_low_bytes': 1717986880}
+    labels = None
+    for suffix, value in expected.items():
+        rows = samples(text, 'dfkv_slab_disk_' + suffix)
+        current = {label for label, _ in rows}
+        if len(rows) != 3 or len(current) != 3 or any(actual != value for _, actual in rows):
+            raise RuntimeError('multisize watermark effective threshold mismatch: ' + suffix)
+        if labels is not None and current != labels:
+            raise RuntimeError('multisize watermark disk labels mismatch')
+        labels = current
+    disks, indices = set(), set()
+    for label in labels:
+        match = re.fullmatch(r'\{disk=("(?:[^"\\]|\\.)*"),disk_index="([012])"\}', label)
+        if not match:
+            raise RuntimeError('multisize watermark disk identity mismatch')
+        disks.add(json.loads(match[1]))
+        indices.add(match[2])
+    objects = samples(text, 'dfkv_disk_objects')
+    if (len(disks) != 3 or indices != {'0', '1', '2'} or len(objects) != 3 or
+            {label for label, _ in objects} != {'{disk=' + json.dumps(disk, ensure_ascii=False) + '}' for disk in disks}):
+        raise RuntimeError('multisize watermark disk ownership mismatch')
+
+
+def check_result(text, client, policy='lifetime', scenario='quick-pressure', first_reuse_sec=0,
+                 refill_on_miss=False, multisize_watermark=False):
+    if (type(multisize_watermark) is not bool or
+            (multisize_watermark and scenario != 'multisize-pressure')):
+        raise RuntimeError('multisize watermark mode mismatch')
+    if multisize_watermark:
+        check_multisize_watermarks(text)
+        if total(text, 'dfkv_slab_watermark_evictions_total') <= 0:
+            raise RuntimeError('multisize watermark activity not observed')
     if (type(refill_on_miss) is not bool or ('refill' in client) != refill_on_miss or
             (refill_on_miss and scenario != 'arrivals-pressure')):
         raise RuntimeError('refill mode/result mismatch')
@@ -533,7 +567,11 @@ def parse_args(argv=None):
                         help='explicit lifetime P preset for isolated diagnostics only')
     parser.add_argument('--refill-on-miss', action='store_true',
                         help='arrivals-pressure: refill sampled first misses once and verify once')
+    parser.add_argument('--multisize-watermark', action='store_true',
+                        help='multisize-pressure: isolated low/high watermarks of 40/50 percent')
     args = parser.parse_args(argv)
+    if args.multisize_watermark and args.scenario != 'multisize-pressure':
+        parser.error('multisize-watermark requires multisize-pressure')
     if args.refill_on_miss and args.scenario != 'arrivals-pressure':
         parser.error('refill-on-miss requires arrivals-pressure')
     if args.first_reuse_sec and args.scenario != 'sustained-pressure':
@@ -562,7 +600,10 @@ def parse_args(argv=None):
 def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    result = {'status': 'failed', 'policy': args.policy, 'scenario': args.scenario, 'first_reuse_sec': args.first_reuse_sec}
+    watermark_override = {'low': 40, 'high': 50} if args.multisize_watermark else None
+    result = {'status': 'failed', 'policy': args.policy, 'scenario': args.scenario,
+              'first_reuse_sec': args.first_reuse_sec, 'multisize_watermark': args.multisize_watermark,
+              'watermark_pct_override': watermark_override}
     server = None
     try:
         check_ports()
@@ -579,6 +620,10 @@ def run(args):
                    PYTHONPATH=str(source / 'integration/common/src'))
         if args.protect_sec is not None:
             env['DFKV_SLAB_PROTECT_SEC'] = str(args.protect_sec)
+        if watermark_override is not None:
+            # Diagnostic only: C++ resolves capacity / 100 * percentage.
+            env['DFKV_SLAB_EVICT_LOW_PCT'] = str(watermark_override['low'])
+            env['DFKV_SLAB_EVICT_HIGH_PCT'] = str(watermark_override['high'])
         command = [str(args.build / 'dfkv_server'), '--dir', ','.join(map(str, dirs)),
                    '--cap', '12884901888', '--store-engine', 'slab', '--slab-write', 'buffered',
                    '--slab-eviction-policy', args.policy, '--port', '12000', '--rdma-port', '12001',
@@ -601,7 +646,8 @@ def run(args):
             'client_command': client_command, 'client_timeout_sec': client_timeout_sec,
             'pressure_delay_sec': args.pressure_delay_sec, 'scenario': args.scenario,
             'protect_sec_override': args.protect_sec, 'first_reuse_sec': args.first_reuse_sec,
-            'refill_on_miss': args.refill_on_miss,
+            'refill_on_miss': args.refill_on_miss, 'multisize_watermark': args.multisize_watermark,
+            'watermark_pct_override': watermark_override,
             'environment': {k: v for k, v in env.items() if k.startswith('DFKV_') or k == 'PYTHONPATH'}}, indent=2) + '\n')
         with (args.output / 'server.log').open('w') as server_log:
             server = subprocess.Popen(command, env=env, stdout=server_log, stderr=subprocess.STDOUT)
@@ -629,13 +675,16 @@ def run(args):
                                        for expected in expected_labels):
                 raise RuntimeError('metrics do not belong to this fresh server')
             (args.output / 'before.prom').write_text(before)
+            if args.multisize_watermark:
+                check_multisize_watermarks(before)
             with (args.output / 'client.log').open('w') as log:
                 subprocess.run(client_command, env={**env, 'DFKV_RDMA': '1'}, stdout=log,
                                stderr=subprocess.STDOUT, timeout=client_timeout_sec, check=True)
             client = json.loads((args.output / 'trace/result.json').read_text())
             after = scrape()
             (args.output / 'after.prom').write_text(after)
-            result.update(check_result(after, client, args.policy, args.scenario, args.first_reuse_sec, args.refill_on_miss), client=client, status='passed')
+            result.update(check_result(after, client, args.policy, args.scenario, args.first_reuse_sec,
+                                       args.refill_on_miss, args.multisize_watermark), client=client, status='passed')
     except Exception as error:
         result.update(status='failed', error=str(error))
     finally:
