@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Document the formal eviction A/B protocol and explicit freeze prerequisites;
+  keep numeric thresholds, independent approval and formal sampling pending.
+
 - Add a bounded quick-eviction smoke with prefill, interleaved hot/cold reads,
   byte-exact validation and actual eviction/terminal checks, without shortening
   lifetime timing defaults or treating synthetic results as performance A/B.
