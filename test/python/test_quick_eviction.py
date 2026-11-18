@@ -144,6 +144,13 @@ def arrivals_metrics(client):
 
 
 class QuickEvictionTest(unittest.TestCase):
+    def test_refill_trace_cannot_pass_the_no_refill_supervisor(self):
+        client = arrivals_client()
+        # Even an all-hit run has a different first-GET batching contract.
+        client['refill'] = {'put_attempts': 0, 'put_acks': 0}
+        with self.assertRaisesRegex(RuntimeError, 'refill supervisor validation'):
+            runner.check_result(arrivals_metrics(client), client, scenario='arrivals-pressure')
+
     def test_arrivals_cohort_counts_and_all_misses_remain_valid_observations(self):
         for reuse_miss in (False, True):
             for hot_miss in (False, True):

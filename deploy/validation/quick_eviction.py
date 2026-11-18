@@ -280,6 +280,8 @@ def check_arrivals(client):
 
 
 def check_result(text, client, policy='lifetime', scenario='quick-pressure', first_reuse_sec=0):
+    if 'refill' in client:
+        raise RuntimeError('refill supervisor validation is not implemented')
     if scenario not in ('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure'):
         raise RuntimeError('unknown scenario')
     if first_reuse_sec not in (0, 45, 90, 185) or (first_reuse_sec and scenario != 'sustained-pressure'):

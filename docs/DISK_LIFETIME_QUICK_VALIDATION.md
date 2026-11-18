@@ -959,3 +959,79 @@ guest结果：`/data/disk1/results/arrival-cool-retention-20261118t063414z-c9bbd
 本步只完成新到达早段抽样的冷盘正反序确认。持续更晚到达、业务权重/回填、
 多尺寸、独立高并发及正式A/B仍分步处理；生产P180、staged legacy默认、公式/校验、
 磁盘格式均未改变，O5尚未整体验收完成。
+
+
+## 13. 缺失后回填：驱动准备（尚未接入自动验收/真实盘对照）
+
+本轮只增加 `disk_scenarios.py --scenario arrivals-pressure --refill-on-miss`，
+默认关闭；其他场景拒绝该开关。不改变产品策略、P180、评分公式或磁盘格式。
+**不要直接把该开关传给 quick_eviction.py**：supervisor 尚未接入新分母，当前明确
+拒绝带 `refill` 的结果，避免全命中时误把不同批处理口径判为原 no-refill 场景通过。
+后续先接入自动验收，再在冷盘环境跑四配置真实对照；本节不是新的后端验证报告。
+
+### 13.1 固定操作与边界
+
+保留前12批新到达对象抽样、45/90/185秒 ACK 年龄、200个 paced 步骤和已有热点。
+每个抽样对象首次复用改为**单 key GET**，若 miss，则以原 key、原 payload **PUT一次**，
+收到成功返回后再 GET 一次校验。无重试；后续对象才继续首次读取。
+只回填这些抽样对象，不回填热点、filler、后续未抽样批次或末尾全扫的缺失。
+回填后的校验 miss 在淘汰压力下是有效观测，不承诺 ACK 后常驻；错字节或 I/O 错误仍失败。
+该校验 GET 本身也可能计热，回填 PUT 会改变住户年龄和后续淘汰状态。
+
+这不是之前每 namespace 一批16 key GET的纯单变量比较：请求批处理改变，且先发生的
+回填会影响后续首次读取。因此首次命中表示**有回填干预的顺序策略**，不是所有对象
+未受干预时的保留性；不得用其延迟或命中差异直接宣称性能收益。业务权重为 null，
+不自行给 miss/回填/热点附加经济权重，也不引入业务源端真实延迟或并发回源模型。
+
+### 13.2 分开记录的口径
+
+|口径|结果字段与含义|
+|---|---|
+|首次命中/缺失|`reuse_hits/reuse_misses`：正常完整运行共384次；`refill.first_hits/first_misses`逐 key 即时累计，异常也保留|
+|回填次数|`refill.put_attempts/put_acks`：发起前计 attempt、成功返回后计 ACK；异常返回的 PUT 可能已提交，不能当作无写入|
+|回填字节|`attempted_payload_bytes/acked_payload_bytes`：只计 payload，不含协议、key、元数据、刷盘或设备写入|
+|回填后校验|`verify_hits/verify_misses`：单列，不加到首次命中、热点或末扫计数；完整成功时之和等于 ACK 数|
+|热点损失|`hot_hits/hot_misses/hot_reads`保持独立；含128次严格预热，压力部分分母为12800，压力缺失率为 `hot_misses / 12800`|
+|末尾扫描|顶层 `hits/misses`：15616次读取，仅观察最终状态，不触发回填|
+
+每 key 明细在 `refill.objects`：namespace、index、首次 GET 开始时间（运行起点相对秒）、
+首次结果、PUT attempt/ACK、ACK 时间、校验开始时间和结果；未完成结果值为 null，
+尚未发生的时间字段省略，未发起标志为 false。
+原 cohort/step 保留完整成功的汇总；中途失败时这些汇总可能尚未合并，**应使用逐 key 明细，
+不能把部分结果当作完整分母**。`result.status=failed`仍必须保留；不因局部成功改判通过。
+
+完成全部 baseline 写入后才产生：
+- `baseline_payload_bytes = 15616 × 4096 = 63963136`；
+- `logical_payload_write_amplification = 1 + acked_payload_bytes / baseline_payload_bytes`。
+
+该值是**已确认逻辑 payload 写入放大**，不是物理盘/NAND写放大或服务端实际新增字节；
+keep-first/race 可能让成功PUT未增加住户。失败运行不用于收益比较，即使完整写入阶段
+已经产生上述值。完整运行 GET 总分母为 `47232 + verify_hits + verify_misses`，
+成功/缺失终局与计热需分别加校验 hits/misses，后续supervisor必须按此校验而非旧常量。
+全命中时放大为1、无回填写入/校验；384对象全缺失时最多384次回填，逻辑比为
+`1 + 384 / 15616`。这是早段抽样，不是全流量 miss 回填或业务写入放大上界。
+
+### 13.3 本轮验证与下一步
+
+新增单测覆盖全命中（真实4608预填充/7808总量）、部分/全缺失、ACK后再淘汰、
+热点损失不被回填掩盖、已提交但返回失败的PUT、首次/校验I/O异常、校验错字节、
+参数拒绝，以及supervisor防误放行。故障单测缩小预填充，但保留200步/12批/384次首次读取。
+这些是内存oracle和模拟时钟测试，不冒充真实RXE/io_uring或盘结果。
+
+仓库根目录执行（可在其他工作树同样使用）：
+```bash
+python3 -m unittest discover -s test/python -p test_disk_validation.py
+python3 -m unittest discover -s test/python -p test_quick_eviction.py
+cmake --build build-test -j2
+ctest --test-dir build-test --no-tests=error \
+  -R '^python_(disk_validation|quick_eviction)$' --output-on-failure
+```
+`build-test`需是该工作树已配置的构建目录；本轮使用host RDMA/OFF、io_uring/OFF，
+没有C++改动。本轮36项driver＋33项supervisor单测全过，0失败/0跳过，
+两个CTest入口全过；构建为Ninja no-op。四个既有no-refill场景相对ce10913的
+模拟运行trace/result逐字节一致，不能把模拟等价当作后端等价。证据：
+`.omx/evidence/refill-driver/`。真实回填四配置、额外GET终局/计热及回填写入的
+后端对账尚待下一轮。
+仍处于 **O5 缺失后回填场景的驱动准备**，后续多尺寸→独立高并发→正式A/B分步推进。
+测试环境继续排除宿主 `/mnt/disk1`，只用[冷盘说明](DISK_LIFETIME_COOL_DISK_VALIDATION.md)
+的disk2/disk3独立环境，不回退默认Docker daemon；本轮未向磁盘施加测试压力。

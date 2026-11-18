@@ -8,7 +8,8 @@ a strict warmup. sustained-pressure adds paced interleaving without catch-up or
 miss refill; delayed first reuse warms only the non-cohort filler. mixed-pressure
 combines existing hot reads with three once-only delayed cohorts. arrivals-pressure
 samples the first twelve newly arriving batches, delaying reuse from their PUT
-ACKs while writes continue. These are not
+ACKs while writes continue. Its optional sampled-miss refill mode records
+first outcomes, one refill attempt and one verification GET separately. These are not
 persistence, performance, or transport-backend proof.
 Requires the repository's dfkv_common on PYTHONPATH (no third-party dependencies).
 """
@@ -184,6 +185,8 @@ def parse_args(argv=None):
     parser.add_argument("--metrics-url", help="quick-pressure: optional phase metrics endpoint")
     parser.add_argument("--first-reuse-sec", type=int, choices=(0, 45, 90, 185), default=0,
                         help="sustained-pressure: defer the cohort first GET from pressure origin")
+    parser.add_argument("--refill-on-miss", action="store_true",
+                        help="arrivals-pressure: refill sampled first misses once, then verify once")
     args = parser.parse_args(argv)
     if not 0 <= args.seed < 2**64:
         parser.error("seed must fit uint64")
@@ -205,6 +208,8 @@ def parse_args(argv=None):
         parser.error("delay and phase metrics require quick-pressure")
     if args.first_reuse_sec and args.scenario != "sustained-pressure":
         parser.error("first-reuse-sec requires sustained-pressure")
+    if args.refill_on_miss and args.scenario != "arrivals-pressure":
+        parser.error("refill-on-miss requires arrivals-pressure")
     if args.readers and args.scenario != "roundtrip":
         parser.error("readers require roundtrip")
     return args
@@ -318,15 +323,59 @@ def quick_pressure(args, clients, dataset, result, started):
     record_phase(args, result, "after-pressure", started)
 
 
+def refill_first_reads(client, namespace, first, keys, values, result, started):
+    """Read each sampled key once; refill only a miss, without retrying errors.
+
+    Acknowledged PUT is not proof of continued residence: verification misses are
+    valid under pressure. A raised PUT may have committed, so its ACK stays false
+    (unknown completion), not a claim that no device write happened. Append before
+    GET and update immediately to preserve partial evidence on any exception.
+    """
+    stats = result["refill"]
+    hits = 0
+    for offset, (key, value) in enumerate(zip(keys, values)):
+        row = {"namespace_hex": namespace.hex(), "index": first + offset,
+               "first_get_started_sec": time.monotonic() - started,
+               "first_hit": None, "put_attempted": False, "put_acked": False,
+               "verify_hit": None}
+        stats["objects"].append(row)
+        found = client.read([key], [value], allow_miss=True)
+        row["first_hit"] = found
+        stats["first_hits"] += found
+        stats["first_misses"] += 1 - found
+        hits += found
+        if found:
+            continue
+        row["put_attempted"] = True
+        stats["put_attempts"] += 1
+        stats["attempted_payload_bytes"] += len(value)
+        client.put([key], [value])
+        row["put_acked"] = True
+        row["put_ack_sec"] = time.monotonic() - started
+        stats["put_acks"] += 1
+        stats["acked_payload_bytes"] += len(value)
+        row["verify_started_sec"] = time.monotonic() - started
+        verified = client.read([key], [value], allow_miss=True)
+        row["verify_hit"] = verified
+        stats["verify_hits"] += verified
+        stats["verify_misses"] += 1 - verified
+    return hits
+
+
 def mixed_pressure(args, clients, dataset, result, started):
     """Probe existing hot objects and once-only delayed cohorts under cold writes.
 
-    Delayed objects are never warmed or refilled. Their first-read outcomes stay
-    separate from repeated hot reads and the final full scan. The arrivals mode
+    Delayed objects are never warmed. Refill is opt-in for arrivals only. First
+    outcomes stay separate from repeated hot reads and the final full scan. The arrivals mode
     samples only the first twelve arriving batches, not the full arrival stream;
     their deadlines use the later namespace PUT ACK instead of pressure origin.
     """
     arrivals = args.scenario == "arrivals-pressure"
+    if args.refill_on_miss:
+        result["refill"] = {"first_hits": 0, "first_misses": 0,
+                            "put_attempts": 0, "put_acks": 0,
+                            "attempted_payload_bytes": 0, "acked_payload_bytes": 0,
+                            "verify_hits": 0, "verify_misses": 0, "objects": []}
     cohorts = [] if arrivals else [{"delay_sec": delay,
                 "start_index": QUICK_HOT + index * MIXED_COHORT_SIZE,
                 "count_per_namespace": MIXED_COHORT_SIZE,
@@ -402,7 +451,9 @@ def mixed_pressure(args, clients, dataset, result, started):
                     first = cohort["start_index"]
                     keys, values = dataset(namespace, first, first + MIXED_COHORT_SIZE)
                     probe_started = time.monotonic() - started
-                    found = client.read(keys, values, allow_miss=True)
+                    found = (refill_first_reads(client, namespace, first, keys, values,
+                                                result, started) if args.refill_on_miss else
+                             client.read(keys, values, allow_miss=True))
                     cohort["first_reuse"].append({
                         "namespace_hex": namespace.hex(), "probe_started_sec": probe_started,
                         "write_to_probe_sec": probe_started - cohort["write_completed_sec"][index],
@@ -434,6 +485,13 @@ def mixed_pressure(args, clients, dataset, result, started):
         mode = "arrivals" if arrivals else "mixed"
         raise RuntimeError(mode + " schedule did not reach every first reuse cohort")
     result["hot_reads"] = result["hot_hits"] + result["hot_misses"]
+    if args.refill_on_miss:
+        # Only a complete schedule proves all baseline PUTs were acknowledged.
+        stats = result["refill"]
+        baseline = args.count * len(NAMESPACES) * 4096
+        stats["baseline_payload_bytes"] = baseline
+        stats["logical_payload_write_amplification"] = (
+            1 + stats["acked_payload_bytes"] / baseline)
     record_phase(args, result, "after-pressure", started)
 
 
@@ -471,6 +529,10 @@ def run(args, *, library_loader=load_library, client_factory=Client):
                       reuse_delays_sec=list(MIXED_REUSE_DELAYS),
                       reuse_delay_origin="later-namespace-put-ack",
                       reuse_once=True, pressure_delay_sec=0, first_reuse_sec=0)
+    if args.refill_on_miss:
+        config.update(refill_on_miss=True, refill_scope="sampled-first-reuse-only",
+                      refill_attempts_per_miss=1, refill_verification_reads=1,
+                      first_reuse_get_batch_size=1, business_weights=None)
     encoded = json.dumps(config, sort_keys=True).encode()
     config_hash = hashlib.sha256(encoded).hexdigest()
     # A compact replay trace describes every index/generation before any C ABI call.
@@ -492,6 +554,12 @@ def run(args, *, library_loader=load_library, client_factory=Client):
             "arrivals-pressure: sample only the first 12 arriving batches; rotate 45/90/185 "
             "seconds from the later namespace PUT ACK; once-only GET, no refill; "
             "later arrivals remain unsampled, incomplete cohorts fail")
+    if args.refill_on_miss:
+        # Replace the no-refill arrival description only for this opt-in trace.
+        trace["operations"][-1] = (
+            "arrivals-pressure refill: ACK-aged cohorts, sequential single-key first GET; "
+            "each miss gets one same-byte PUT and one verification GET; no retries; "
+            "later first outcomes are conditional on earlier refills; hot/filler/scan never refill")
     (args.output / "trace.json").write_text(json.dumps(trace, indent=2) + "\n")
     result = {"config_sha256": config_hash, "status": "failed", "hits": 0,
               "misses": 0, "wrong_bytes": 0, "transport_mode": []}

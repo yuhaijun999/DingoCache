@@ -865,6 +865,139 @@ class DiskValidationTest(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(SystemExit):
                 self.args(Path("unused"), "arrivals-pressure", extra)
 
+    def test_refill_arguments_are_arrivals_only_and_opt_in(self):
+        self.assertFalse(self.args(Path("unused"), "arrivals-pressure").refill_on_miss)
+        self.assertTrue(self.args(Path("unused"), "arrivals-pressure",
+                                  ("--refill-on-miss",)).refill_on_miss)
+        for scenario in ("roundtrip", "write", "verify", "pressure", "quick-pressure",
+                         "sustained-pressure", "mixed-pressure"):
+            with self.subTest(scenario=scenario), self.assertRaises(SystemExit):
+                self.args(Path("unused"), scenario, ("--refill-on-miss",))
+
+    def test_refill_records_first_outcomes_and_separate_writes_and_verification(self):
+        # The all-hit run uses the actual 4608/7808 layout. Fault runs shrink only
+        # prefill, not the 200-step/12-cohort/384-first-read schedule.
+        for mode in ("hit", "partial", "miss", "evicted-again", "hot-loss"):
+            now, writes, reads = [0.0], [], []
+            def sleep(seconds):
+                now[0] += seconds
+
+            class RefillClient(MemoryClient):
+                def put(self, keys, values):
+                    first = int.from_bytes(keys[0][-8:], "big")
+                    writes.append((first, len(keys)))
+                    super().put(keys, values)
+                    if len(keys) == 16 and prefill <= first < prefill + 192:
+                        for index, key in enumerate(keys):
+                            if mode != "hit" and (mode != "partial" or index % 2 == 0):
+                                self.storage.pop(key)
+                    if len(keys) == 1 and mode == "evicted-again":
+                        self.storage.pop(keys[0])
+
+                def read(self, keys, values, *, allow_miss=False):
+                    reads.append(len(keys))
+                    if mode == "hot-loss" and allow_miss and int.from_bytes(keys[0][-8:], "big") == 0:
+                        for key in keys:
+                            self.storage.pop(key, None)
+                    return super().read(keys, values, allow_miss=allow_miss)
+
+            prefill = 4608 if mode == "hit" else 96
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.object(driver, "QUICK_PREFILL", prefill), \
+                    mock.patch.object(driver.time, "monotonic", side_effect=lambda: now[0]), \
+                    mock.patch.object(driver.time, "sleep", side_effect=sleep):
+                args = self.args(Path(temp) / mode, "arrivals-pressure", ("--refill-on-miss",))
+                result = driver.run(args, library_loader=lambda _: {}, client_factory=RefillClient)
+                refill = result["refill"]
+                misses = 0 if mode == "hit" else 192 if mode == "partial" else 384
+                self.assertEqual((result["reuse_hits"], result["reuse_misses"]), (384 - misses, misses))
+                self.assertEqual((refill["first_hits"], refill["first_misses"]), (384 - misses, misses))
+                self.assertEqual((refill["put_attempts"], refill["put_acks"]), (misses, misses))
+                self.assertEqual((refill["attempted_payload_bytes"], refill["acked_payload_bytes"]),
+                                 (misses * 4096, misses * 4096))
+                self.assertEqual((refill["verify_hits"], refill["verify_misses"]),
+                                 (0, misses) if mode == "evicted-again" else (misses, 0))
+                self.assertEqual(len(refill["objects"]), 384)
+                self.assertEqual(len({(row["namespace_hex"], row["index"])
+                                      for row in refill["objects"]}), 384)
+                self.assertEqual(sum(size == 1 for _, size in writes), misses)
+                self.assertEqual(sum(size for _, size in writes), args.count * 2 + misses)
+                self.assertEqual(sum(reads), 12928 + (prefill - 32) * 4 + 384 + misses + args.count * 2)
+                self.assertEqual(refill["baseline_payload_bytes"], args.count * 2 * 4096)
+                self.assertEqual(refill["logical_payload_write_amplification"],
+                                 1 + misses / (args.count * 2))
+                for row in refill["objects"]:
+                    self.assertIn(row["first_hit"], (0, 1))
+                    self.assertEqual(row["put_attempted"], not row["first_hit"])
+                    self.assertEqual(row["put_acked"], not row["first_hit"])
+                    self.assertGreaterEqual(row["first_get_started_sec"], 45)
+                    self.assertEqual(row["verify_hit"] is not None, not row["first_hit"])
+                self.assertEqual(result["hot_misses"], 12800 if mode == "hot-loss" else 0)
+                trace = json.loads((args.output / "trace.json").read_text())
+                self.assertTrue(trace["config"]["refill_on_miss"])
+                self.assertEqual(trace["config"]["refill_scope"], "sampled-first-reuse-only")
+
+    def test_refill_failures_preserve_partial_first_and_write_evidence(self):
+        for failure in ("first-io", "put-io", "verify-io", "verify-corrupt",
+                        "later-put-io", "second-ns-put-io"):
+            now = [0.0]
+            def sleep(seconds):
+                now[0] += seconds
+
+            class FailingRefillClient(MemoryClient):
+                def __init__(self, storage, members, namespace):
+                    super().__init__(storage, members, namespace)
+                    self.namespace = namespace
+
+                def put(self, keys, values):
+                    first = int.from_bytes(keys[0][-8:], "big")
+                    fail_put = (failure == "put-io" or
+                                (failure == "later-put-io" and first == 97) or
+                                (failure == "second-ns-put-io" and
+                                 self.namespace == driver.NAMESPACES[1]))
+                    if len(keys) == 1 and fail_put:
+                        # A transport failure can hide an already-committed PUT.
+                        super().put(keys, values)
+                        raise RuntimeError("refill PUT failed")
+                    super().put(keys, values)
+                    if len(keys) == 16 and 96 <= first < 288:
+                        for key in keys:
+                            self.storage.pop(key)
+                    if len(keys) == 1 and failure == "verify-corrupt":
+                        self.storage[keys[0]] = b"x" * len(values[0])
+
+                def read(self, keys, values, *, allow_miss=False):
+                    if len(keys) == 1:
+                        if failure == "first-io" or (failure == "verify-io" and keys[0] in self.storage):
+                            raise RuntimeError("refill GET failed")
+                    return super().read(keys, values, allow_miss=allow_miss)
+
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.object(driver, "QUICK_PREFILL", 96), \
+                    mock.patch.object(driver.time, "monotonic", side_effect=lambda: now[0]), \
+                    mock.patch.object(driver.time, "sleep", side_effect=sleep):
+                args = self.args(Path(temp) / failure, "arrivals-pressure", ("--refill-on-miss",))
+                with self.assertRaises(RuntimeError):
+                    driver.run(args, library_loader=lambda _: {}, client_factory=FailingRefillClient)
+                result = json.loads((args.output / "result.json").read_text())
+                self.assertEqual(result["status"], "failed")
+                refill = result["refill"]
+                self.assertNotIn("logical_payload_write_amplification", refill)
+                completed = 16 if failure == "second-ns-put-io" else 1 if failure == "later-put-io" else 0
+                self.assertEqual(len(refill["objects"]), completed + 1)
+                for previous in refill["objects"][:-1]:
+                    self.assertEqual((previous["first_hit"], previous["put_acked"],
+                                      previous["verify_hit"]), (0, True, 1))
+                row = refill["objects"][-1]
+                self.assertEqual(refill["first_misses"], completed + int(failure != "first-io"))
+                self.assertEqual(row["first_hit"], None if failure == "first-io" else 0)
+                self.assertEqual(refill["put_attempts"], completed + int(failure != "first-io"))
+                self.assertEqual(refill["put_acks"], completed + int(failure.startswith("verify")))
+                self.assertEqual(refill["verify_hits"], completed)
+                self.assertIsNone(row["verify_hit"])
+                self.assertEqual(result["wrong_bytes"], int(failure == "verify-corrupt"))
+                self.assertEqual(len(result["steps"]), 45)
+
     def test_missing_key_oracle_rejects_all_false_hits_including_empty(self):
         class FakeLib:
             status = 0

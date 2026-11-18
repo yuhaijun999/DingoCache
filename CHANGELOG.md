@@ -14,7 +14,10 @@
   Add a mixed retention scenario separating repeated hot reads from three once-only
   delayed first-reuse cohorts under paced cold writes. Add sustained-arrival
   first-reuse sampling with automated cohort identity, ACK-relative age and
-  complete read-denominator checks.
+  complete read-denominator checks. Add opt-in sampled-miss refill driver
+  diagnostics separating first outcomes, attempted/acknowledged payload writes
+  and verification reads; supervisor integration and real-backend refill
+  comparisons remain pending.
 
 - Enforce RDMA connection idle deadlines while pending receives or reply SENDs
   require short CQ waits. Preserve disabled idle reclamation and disk-read drain
