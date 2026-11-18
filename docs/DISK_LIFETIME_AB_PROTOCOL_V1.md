@@ -147,3 +147,45 @@ W06 必须覆盖重启后完整 0–900 秒；其他窗口由旧 baseline 决定
 需要用户/指定负责人提供或确认的是：业务 trace 或明确的合成范围、目标部署资源/
 现役 ACK 配置、合资格阈值制定者与独立验收者及权限安排。普通离线编码/构建/测试由
 代理完成；这些外部输入缺失不阻止离线工具开发，但阻止声称正式冻结完成和正式 A/B 启动。
+
+## 8. 已实现的离线合成 trace 小步（非正式负载）
+
+入口 `deploy/validation/eviction_trace.py`，仅 Python 标准库，不导入 C ABI、不加载
+libdfkv、不连接或启动服务。格式 `dfkv-offline-trace-v1` 是有界的单场景样本，
+**不是** W01–W09 的完整覆盖、真实业务 trace 导入器或冻结后的正式执行包。
+
+```bash
+# 在仓库根目录；选择自己的新文件，不覆盖已有文件。
+python3 deploy/validation/eviction_trace.py generate /tmp/dfkv-trace-new.json
+python3 deploy/validation/eviction_trace.py check /tmp/dfkv-trace-new.json
+python3 -m unittest discover -s test/python -p test_eviction_trace.py
+```
+
+默认 seed=1、objects=16、rounds=4、length=4096、interval-ns=1000000。
+`objects/rounds` 各 1–256、payload 1–65536 字节、间隔 1–1000000000 纳秒、seed
+为 uint64。上限仅限制本离线工具开销，不是服务端合法尺寸/几何的新限制。
+
+请求按顺序：objects 个 unique PUT 初始化、objects 个 GET 预热、rounds 轮
+“写入一个新对象＋读取一个原对象”。仅 generation=0，不支持重写/Remove/重启/
+回填/业务权重；这些应另一个明确版本实现，不能篡改本 schema 的含义。
+两个 namespace 包含 NUL；key 由 seed 和对象序号编码，payload 是按 namespace/key/
+generation/length 分隔的 SHAKE256 字节流。每条保留 payload SHA256，GET 摘要是
+“命中时必须匹配”的期望，不宣称缓存一定命中，也不把逻辑预热当实际预热已成功。
+
+所有请求含连续 request_id、phase、op、scheduled_ns、namespace/key 十六进制、
+generation、length、payload_sha256。scheduled_ns 是**计划 trace 起点**起算的整型
+纳秒，不是实际发送/完成或 ACK 时间；没有执行器，也没有实测计时。
+完整 PUT/GET 分母各 objects+rounds、总请求 2×(objects+rounds)，测量段 2×rounds；
+输出 JSON 汇总全阶段计数和逻辑请求字节，不冒充成功/ACK/实际传输字节。
+默认各20 PUT/GET、共40请求、测量段8请求。原始字节可用同模块 payload(row) 重建。
+
+文件采用 canonical JSON+末尾换行，sha256 是排除自身字段后的 canonical 内容摘要；
+它不是签名，也不是自己的完整文件 SHA，正式外部 manifest 仍需另算文件 SHA。
+校验时根据配置**重建整个既定计划**，因此修改请求并重算 sha256 也不能通过。
+拒绝重复 JSON 字段、非有限数字、非法类型/范围、未知字段、遗漏/重复/重排请求、
+计划时间/代际/摘要不一致及超过16 MiB文件。不同 seed/合法配置会生成另一个合法
+样本，因此正式采样仍必须比对**外部冻结的配置与文件哈希**，校验成功不等于已获注册。
+
+生成仅独占创建文件，不创建父目录，不覆盖文件/符号链接，不设只读权限或保证防篡改。
+写入中断可能留下部分文件；保留该文件和错误，check 应失败，不自动删除或覆盖重试。
+只有未来回放器才能实现队列/超时/实际计时规则，本轮不能用于取得 A/B 性能样本。

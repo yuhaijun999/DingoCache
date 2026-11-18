@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add a bounded offline synthetic eviction trace generator and strict plan/checksum
+  validation with hardware-free tests; do not connect to services or start formal A/B.
+
 - Document the formal eviction A/B protocol and explicit freeze prerequisites;
   keep numeric thresholds, independent approval and formal sampling pending.
 
