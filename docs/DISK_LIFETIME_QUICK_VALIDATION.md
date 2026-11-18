@@ -1,5 +1,10 @@
 # 快速触发磁盘淘汰：隔离环境冒烟验证
 
+> **本机测试限制（2026-11-18）：不再向 `/mnt/disk1` 施加负载。**
+> 先按[冷盘隔离说明](DISK_LIFETIME_COOL_DISK_VALIDATION.md)准备仅落disk2/disk3的
+> 系统盘/backing/数据/日志/结果环境，再使用下文负载命令。guest的 `/data/disk1`
+> 是逻辑路径，不代表继续使用宿主过温disk1；原三宿主盘结果均为历史记录。
+
 目标是在已有 Docker/VM 环境中，用小容量和预填充快速制造压力，不等待默认寿命
 参数自然老化。只验证有限合成场景的正确性与实际淘汰，不是性能 A/B、默认配置长期
 收益、物理 HCA/GPU 或线上放行证明。环境创建/连接见
@@ -866,3 +871,91 @@ guest结果：`/data/disk1/results/arrival-retention-20261118t032854z-f6cbdb7/`�
 仅完成前12批早段新到达抽样的单轮四配置首筛；还需反序/重复确认及更晚到达、
 业务权重/回填、多尺寸、独立高并发和正式A/B。生产P180、策略默认、公式/校验及
 磁盘格式均未改变，O5未整体验收完成。
+
+## 12. 仅两块冷盘的新到达正反序复测（2026-11-18）
+
+用户报告宿主disk1温度告警，明确要求不再施加测试负载，该限制持续有效，不能因
+温度下降自动恢复。原Docker数据根也在disk1，不能只改应用路径。原测试VM已正常
+关机、容器停止，样本保留；未大规模复制或清理disk1的旧镜像/样本，也未清理其他服务。
+
+新建独立rootless Docker/slirp/vfs环境，Docker数据、VM root/backing/seed、数据1、
+日志及实际结果落disk2，数据2/3落disk3；源码及小型证据副本在仓库所在的/home，
+不在过温盘。保留三个guest逻辑路径，但只有两个物理宿主盘，不声称三物理盘独立I/O。
+rootless Docker26的network host实际在独立RootlessKit netns中，已核对不同于物理
+宿主；不将该参数照搬到rootful Docker。完整映射与安全复跑入口见
+[冷盘隔离说明](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
+
+物理布局及容器资源边界已改变，**本轮重新跑正序＋反序**，不把旧三宿主盘正序
+拿来配对新反序。rootless/cgroup v1未提供可宣称的CPU/内存硬限额；guest仍6vCPU/
+8GiB。所有八组共用这一新环境，不能据此与旧布局作性能等价性判断。
+
+冻结顺序：正序P180→legacy→P60→P30，随后反序P30→P60→legacy→P180。
+基线c9bbdca，无产品/驱动/supervisor代码改动；相同固定路径/seed/尺寸/预填充/
+预热/200步节拍、不回填与ACK相对首次复用策略。每组空初始化，正常退出且端口释放
+后唯一归档。逐配置完整trace、服务端命令/环境相同，仅输出路径改变；逐盘对象
+3181/3122/2913及slot字节相同、初始淘汰0、严格预热18432次GET。
+
+下表每个数对为“命中/缺失”。**同配置的正反两组分别得到下表结果**，不是把两组
+分母相加。热点是12928次重复GET（含128预热），每档首次是128个不同对象。
+
+| 配置 | 已有热点 | ACK后45秒首次 | ACK后90秒首次 | ACK后185秒首次 |
+|---|---:|---:|---:|---:|
+| lifetime P180 | 12928 / 0 | 128 / 0 | 128 / 0 | 0 / 128 |
+| legacy | 12928 / 0 | 128 / 0 | 128 / 0 | 128 / 0 |
+| lifetime P60 | 12928 / 0 | 128 / 0 | 0 / 128 | 0 / 128 |
+| lifetime P30 | 12928 / 0 | 115 / 13 | 0 / 128 | 0 / 128 |
+
+12个cohort逐组汇总也一致，包括P30两次均在admission step9的45秒组得到19/13，
+其他45秒组各32/0。这里是批次汇总，不证明两次正好丢失同13个key，也没有逐victim
+原因追踪。**本次新布局正反各一次，未观察到这些命中计数随顺序变化**；不证明
+普遍顺序无关、性能等价、全业务最优P或唯一淘汰根因，不能据此翻默认。
+
+实际ACK到首GET年龄范围：45秒组45.039437–45.058241秒，
+90秒组90.047188–90.063536秒，185秒组185.065033–185.078011秒。
+每组末扫10812/4804、水位淘汰4804、后台class回收/extent steal均0。
+每组47232业务GET；八组共377856 GET、1600步、88份阶段快照，
+最大相邻步间隔1.001525秒，负载总耗时1808.204秒（约30分钟，另有环境建立/编译）。
+全部字节、IO/健康、身份/ACK/年龄、完整终局/计热分母、对象守恒、真实RXE/kernel
+io_uring与正常退出门禁通过；九类审计负控全部拒绝，不是额外产品场景。
+
+宿主每约10秒仅查询nvme2、nvme0的SMART。告警非零、显示温度达到65°C、
+采样失败/异常即记录告警并核验归属后停止精确私有RootlessKit进程树；归属不符
+不扩大停止范围。65°C是保守诊断停止线，不是厂商安全上限，未改硬件阈值。
+截至本轮结果采集的258份记录，两盘复合及最高传感器均40–41°C、告警0，
+最大采样间隔10.424秒，未触发停止；不声称采样间绝无瞬时变化或硬件绝对安全。
+正常/六类字段负例及六个全mock监控控制分支核验留档，无实环境告警注入；
+它们验证判定/发信号意图与归属边界，不证明实际热故障关停耗时。
+不承诺整个宿主disk1零I/O（其他既有服务不在本任务控制范围），只保证本轮测试
+环境无该盘挂载/backing/data-root引用，不再向它施加测试负载。
+
+新Ubuntu22 wrapper及noble镜像重新下载/核对SHA，未复制旧盘大文件；guest内核仍
+6.8.0-147。新guest ON从源码完成311步构建，真实RXE probe1、kernel ring5、
+PULL Serve9全部通过无skip（Serve异步故障CQE受控，不冒充真实ring证据）。
+65项既有工具单测本轮重跑全过无失败/跳过；host OFF build-test构建成功（Ninja
+no-op），host/guest各两个Python CTest入口通过。125生产源码＋4工具/测试SHA一致；
+服务器/客户端二进制SHA与历史指纹一致且本轮前后未变。未重跑全量CTest、
+sanitizer、C++静态检查、物理HCA/GPU或正式性能A/B。纯验证/文档迭代，不新增测试方法。
+
+实际工具单测与host构建命令沿用11.3；新guest构建先配置：
+```bash
+cmake -S /opt/dfkv -B /opt/dfkv-build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug -DDFKV_BUILD_TESTS=ON \
+  -DDFKV_WITH_RDMA=ON -DDFKV_WITH_URING=ON \
+  -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=/opt/googletest
+cmake --build /opt/dfkv-build -j2
+ctest --test-dir /opt/dfkv-build --no-tests=error \
+  -R '^python_(disk_validation|quick_eviction)$' --output-on-failure
+```
+
+源码快照、GoogleTest输入、依赖/镜像版本、完整bootstrap与八组命令见证据：
+`.omx/evidence/arrival-cool-repeat/20261118t063414z-c9bbdca/`。
+guest结果：`/data/disk1/results/arrival-cool-retention-20261118t063414z-c9bbdca/`。
+保留数据：
+`/data/diskN/cases/sustain-20261117t090611z-80793be-active--20261118t063414z-c9bbdca--{forward,reverse}-{p180,legacy,p60,p30}`，
+准确八组路径见summary.json；guestdisk1映射宿主disk2，guestdisk2/3映射宿主disk3。
+具体宿主RUN_ID目录及独立socket见冷盘说明；旧disk1样本未触碰，应用/测试均已退出，
+新VM/私有daemon/温度监控保留供复用，不回退到旧daemon。
+
+本步只完成新到达早段抽样的冷盘正反序确认。持续更晚到达、业务权重/回填、
+多尺寸、独立高并发及正式A/B仍分步处理；生产P180、staged legacy默认、公式/校验、
+磁盘格式均未改变，O5尚未整体验收完成。
