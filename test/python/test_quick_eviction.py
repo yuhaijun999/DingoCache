@@ -143,13 +143,184 @@ def arrivals_metrics(client):
     return good_metrics().replace('12128', str(hits)).replace('20456', str(hits + misses)).replace('8328', str(misses))
 
 
+def refill_client(mode='partial', verify_miss=False):
+    client = arrivals_client()
+    stats = {'first_hits': 0, 'first_misses': 0, 'put_attempts': 0, 'put_acks': 0,
+             'attempted_payload_bytes': 0, 'acked_payload_bytes': 0,
+             'verify_hits': 0, 'verify_misses': 0, 'objects': [],
+             'baseline_payload_bytes': 63963136}
+    client['refill'] = stats
+    for step in client['steps']:
+        for event in step['reuse_probes']:
+            cohort = client['reuse_cohorts'][event['admission_step']]
+            for ns_index, outcome in enumerate(cohort['first_reuse']):
+                hits = 0
+                for offset in range(16):
+                    hit = int(mode == 'hit' or (mode == 'partial' and offset % 2))
+                    at = outcome['probe_started_sec'] + offset * .00001
+                    row = {'namespace_hex': outcome['namespace_hex'],
+                           'index': cohort['start_index'] + offset,
+                           'first_get_started_sec': at, 'first_hit': hit,
+                           'put_attempted': not hit, 'put_acked': not hit,
+                           'verify_hit': None}
+                    if not hit:
+                        row.update(put_ack_sec=at + .000001,
+                                   verify_started_sec=at + .000002,
+                                   verify_hit=int(not verify_miss))
+                    stats['objects'].append(row)
+                    hits += hit
+                outcome.update(hits=hits, misses=16 - hits)
+            event.update(hits=sum(o['hits'] for o in cohort['first_reuse']),
+                         misses=sum(o['misses'] for o in cohort['first_reuse']))
+    client['reuse_hits'] = sum(row['first_hit'] for row in stats['objects'])
+    client['reuse_misses'] = 384 - client['reuse_hits']
+    misses = client['reuse_misses']
+    stats.update(first_hits=client['reuse_hits'], first_misses=misses,
+                 put_attempts=misses, put_acks=misses,
+                 attempted_payload_bytes=misses * 4096, acked_payload_bytes=misses * 4096,
+                 verify_hits=0 if verify_miss else misses, verify_misses=misses if verify_miss else 0,
+                 logical_payload_write_amplification=1 + misses / 15616)
+    return client
+
+
+def refill_metrics(client):
+    hits = client['hits'] + client['hot_hits'] + 18304 + client['reuse_hits'] + client['refill']['verify_hits']
+    misses = client['misses'] + client['hot_misses'] + client['reuse_misses'] + client['refill']['verify_misses']
+    text = good_metrics().replace('12128', str(hits)).replace('20456', str(hits + misses)).replace('8328', str(misses))
+    return text + ('dfkv_cache_put_total ' + str(15616 + client['refill']['put_acks']) + '\n' +
+                   'dfkv_bytes_written_total ' + str(63963136 + client['refill']['acked_payload_bytes']) + '\n')
+
+
 class QuickEvictionTest(unittest.TestCase):
-    def test_refill_trace_cannot_pass_the_no_refill_supervisor(self):
-        client = arrivals_client()
-        # Even an all-hit run has a different first-GET batching contract.
-        client['refill'] = {'put_attempts': 0, 'put_acks': 0}
-        with self.assertRaisesRegex(RuntimeError, 'refill supervisor validation'):
-            runner.check_result(arrivals_metrics(client), client, scenario='arrivals-pressure')
+    def test_refill_counts_and_verification_misses_are_separate_valid_observations(self):
+        for mode in ('hit', 'partial', 'miss'):
+            for verify_miss in (False, True):
+                client = refill_client(mode, verify_miss)
+                with self.subTest(mode=mode, verify_miss=verify_miss):
+                    checked = runner.check_result(refill_metrics(client), client,
+                                                  scenario='arrivals-pressure', refill_on_miss=True)
+                    self.assertEqual(checked['refill_put_acks'], client['reuse_misses'])
+                    self.assertEqual(checked['refill_verify_hits'], client['refill']['verify_hits'])
+                    self.assertEqual(checked['refill_verify_misses'], client['refill']['verify_misses'])
+                    self.assertEqual(checked['reuse_reads'], 384)
+                    self.assertEqual(sum(checked['terminal_results'].values()),
+                                     47232 + client['reuse_misses'])
+
+    def test_refill_requires_explicit_matching_flag_and_scenario(self):
+        for flag, client, scenario in ((False, refill_client(), 'arrivals-pressure'),
+                                       (True, arrivals_client(), 'arrivals-pressure'),
+                                       (True, good_client(), 'quick-pressure')):
+            with self.subTest(flag=flag, scenario=scenario), self.assertRaisesRegex(RuntimeError, 'refill'):
+                runner.check_result(good_metrics(), client, scenario=scenario, refill_on_miss=flag)
+
+    def test_refill_rejects_identity_timing_flags_outcomes_and_forged_aggregates(self):
+        changes = ('missing', 'duplicate', 'order', 'namespace', 'index_bool', 'first_bool',
+                   'pending', 'early', 'late', 'nan', 'timestamp_bool', 'backwards',
+                   'ack_early', 'verify_early', 'verify_late', 'flag_int', 'no_ack',
+                   'no_attempt', 'verify_bool', 'verify_pending', 'hit_refilled',
+                   'hit_timestamp', 'first_sum', 'attempts', 'acks', 'bytes', 'attempt_bytes',
+                   'verify_sum', 'baseline', 'ratio', 'ratio_nan', 'ratio_bool', 'count_bool')
+        for change in changes:
+            client = refill_client()
+            stats = client['refill']
+            row = stats['objects'][0]
+            if change == 'missing':
+                stats['objects'].pop()
+            elif change == 'duplicate':
+                stats['objects'][1] = dict(row)
+            elif change == 'order':
+                stats['objects'].reverse()
+            elif change == 'namespace':
+                row['namespace_hex'] = 'bad'
+            elif change == 'index_bool':
+                row['index'] = True
+            elif change == 'first_bool':
+                row['first_hit'] = False
+            elif change == 'pending':
+                row['first_hit'] = None
+            elif change == 'early':
+                row['first_get_started_sec'] -= .01
+            elif change == 'late':
+                row['first_get_started_sec'] += 1
+            elif change == 'nan':
+                row['first_get_started_sec'] = float('nan')
+            elif change == 'timestamp_bool':
+                row['put_ack_sec'] = True
+            elif change == 'backwards':
+                stats['objects'][2]['first_get_started_sec'] = row['first_get_started_sec']
+            elif change == 'ack_early':
+                row['put_ack_sec'] = row['first_get_started_sec'] - .001
+            elif change == 'verify_early':
+                row['verify_started_sec'] = row['first_get_started_sec']
+            elif change == 'verify_late':
+                row['verify_started_sec'] += 1
+            elif change == 'flag_int':
+                row['put_attempted'] = 1
+            elif change == 'no_ack':
+                row['put_acked'] = False
+            elif change == 'no_attempt':
+                row['put_attempted'] = False
+            elif change == 'verify_bool':
+                row['verify_hit'] = True
+            elif change == 'verify_pending':
+                row['verify_hit'] = None
+            elif change == 'hit_refilled':
+                stats['objects'][1]['put_attempted'] = True
+            elif change == 'hit_timestamp':
+                stats['objects'][1]['put_ack_sec'] = row['put_ack_sec']
+            elif change == 'first_sum':
+                stats['first_hits'] += 1
+            elif change == 'attempts':
+                stats['put_attempts'] += 1
+            elif change == 'acks':
+                stats['put_acks'] -= 1
+            elif change == 'bytes':
+                stats['acked_payload_bytes'] += 1
+            elif change == 'attempt_bytes':
+                stats['attempted_payload_bytes'] += 1
+            elif change == 'verify_sum':
+                stats['verify_hits'] -= 1
+            elif change == 'baseline':
+                stats['baseline_payload_bytes'] -= 4096
+            elif change == 'ratio':
+                stats['logical_payload_write_amplification'] += .01
+            elif change == 'ratio_nan':
+                stats['logical_payload_write_amplification'] = float('nan')
+            elif change == 'ratio_bool':
+                stats['logical_payload_write_amplification'] = True
+            elif change == 'count_bool':
+                stats['put_acks'] = True
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                runner.check_result(refill_metrics(client), client, scenario='arrivals-pressure', refill_on_miss=True)
+
+    def test_refill_terminal_and_heat_denominators_include_verification_gets(self):
+        for verify_miss in (False, True):
+            client = refill_client('miss', verify_miss)
+            text = refill_metrics(client)
+            good = runner.check_result(text, client, scenario='arrivals-pressure', refill_on_miss=True)
+            for metric in ('dfkv_rdma_pull_requests_dispatched_total',
+                           'dfkv_rdma_pull_requests_terminal_total', 'dfkv_slab_lifetime_read_success_total',
+                           'dfkv_cache_put_total', 'dfkv_bytes_written_total'):
+                lines = text.splitlines()
+                for index, line in enumerate(lines):
+                    if line.startswith(metric) and not line.endswith(' 0'):
+                        name, value = line.rsplit(' ', 1)
+                        lines[index] = name + ' ' + str(float(value) - 1)
+                        break
+                with self.subTest(verify_miss=verify_miss, metric=metric), self.assertRaises(RuntimeError):
+                    runner.check_result('\n'.join(lines), client, scenario='arrivals-pressure', refill_on_miss=True)
+            self.assertEqual(good['refill_put_acks'], 384)
+
+    def test_refill_cli_is_opt_in_and_arrivals_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp))
+            self.assertFalse(runner.parse_args(argv).refill_on_miss)
+            self.assertTrue(runner.parse_args(argv + ['--scenario', 'arrivals-pressure',
+                                                      '--refill-on-miss']).refill_on_miss)
+            for scenario in ('quick-pressure', 'sustained-pressure', 'mixed-pressure'):
+                with self.subTest(scenario=scenario), contextlib.redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit):
+                    runner.parse_args(argv + ['--scenario', scenario, '--refill-on-miss'])
 
     def test_arrivals_cohort_counts_and_all_misses_remain_valid_observations(self):
         for reuse_miss in (False, True):
@@ -624,16 +795,18 @@ class QuickEvictionTest(unittest.TestCase):
             self.assertEqual(list(args.data_root[2].iterdir()), [])
 
     def test_delay_and_metrics_are_passed_to_client_with_extended_timeout(self):
-        for scenario, delay, reuse, count, timeout, client, metrics in (
-                ('quick-pressure', 185, 0, 6452, 305, good_client(), good_metrics()),
-                ('sustained-pressure', 0, 0, 7808, 320, sustained_client(), sustained_metrics()),
-                ('sustained-pressure', 0, 90, 7808, 320, delayed_client(), delayed_metrics(delayed_client())),
-                ('mixed-pressure', 0, 0, 7808, 320, mixed_client(), mixed_metrics(mixed_client())),
-                ('arrivals-pressure', 0, 0, 7808, 320, arrivals_client(), arrivals_metrics(arrivals_client()))):
+        for scenario, delay, reuse, count, timeout, client, metrics, refill in (
+                ('quick-pressure', 185, 0, 6452, 305, good_client(), good_metrics(), False),
+                ('sustained-pressure', 0, 0, 7808, 320, sustained_client(), sustained_metrics(), False),
+                ('sustained-pressure', 0, 90, 7808, 320, delayed_client(), delayed_metrics(delayed_client()), False),
+                ('mixed-pressure', 0, 0, 7808, 320, mixed_client(), mixed_metrics(mixed_client()), False),
+                ('arrivals-pressure', 0, 0, 7808, 320, arrivals_client(), arrivals_metrics(arrivals_client()), False),
+                ('arrivals-pressure', 0, 0, 7808, 320, refill_client(), refill_metrics(refill_client()), True)):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
                 args = runner.parse_args(self.arguments(Path(temp)) +
                                          ['--data-name', 'fixed', '--scenario', scenario,
-                                          '--pressure-delay-sec', str(delay), '--first-reuse-sec', str(reuse)])
+                                          '--pressure-delay-sec', str(delay), '--first-reuse-sec', str(reuse)] +
+                                         (['--refill-on-miss'] if refill else []))
                 server = mock.Mock()
                 server.poll.return_value = None
                 server.wait.return_value = 0
@@ -668,6 +841,8 @@ class QuickEvictionTest(unittest.TestCase):
                 self.assertEqual(case['first_reuse_sec'], reuse)
                 self.assertEqual(command[command.index('--first-reuse-sec') + 1], str(reuse))
                 self.assertEqual(case['scenario'], scenario)
+                self.assertEqual(case['refill_on_miss'], refill)
+                self.assertEqual('--refill-on-miss' in command, refill)
                 self.assertEqual(case['client_command'], command)
                 self.assertEqual(case['client_timeout_sec'], timeout)
                 self.assertEqual(case['data_dirs'], [str(root / 'fixed') for root in args.data_root])

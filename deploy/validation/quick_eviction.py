@@ -279,9 +279,82 @@ def check_arrivals(client):
     return {**schedule, 'reuse_hits': hits, 'reuse_misses': misses, 'reuse_reads': 384}
 
 
-def check_result(text, client, policy='lifetime', scenario='quick-pressure', first_reuse_sec=0):
-    if 'refill' in client:
-        raise RuntimeError('refill supervisor validation is not implemented')
+def check_refill(client):
+    """Recompute sampled first outcomes, once-only refill and verification counts.
+
+    Called after check_arrivals validates the schedule/cohort metadata. Records
+    must follow actual event/namespace/key order, not admission order: delayed
+    cohorts can become due out of order. Only complete acknowledged runs pass;
+    a failed PUT has unknown completion and belongs in retained failure evidence.
+    """
+    stats = client.get('refill')
+    if not isinstance(stats, dict) or not isinstance(stats.get('objects'), list) or len(stats['objects']) != 384:
+        raise RuntimeError('refill object count mismatch')
+    objects = iter(stats['objects'])
+    first_hits, verify_hits, verify_misses = 0, 0, 0
+    previous = 0
+    origin = client['pressure_schedule_origin_sec']
+    for step in client['steps']:
+        for event in step['reuse_probes']:
+            cohort = client['reuse_cohorts'][event['admission_step']]
+            if origin + event['probe_started_sec'] + 1e-6 < previous:
+                raise RuntimeError('refill event chronology mismatch')
+            for ns_index, outcome in enumerate(cohort['first_reuse']):
+                upper = (cohort['first_reuse'][ns_index + 1]['probe_started_sec'] if ns_index == 0 else
+                         origin + step['end_sec'])
+                namespace_hits = 0
+                for offset in range(16):
+                    row = next(objects)
+                    if (not isinstance(row, dict) or row.get('namespace_hex') != outcome['namespace_hex'] or
+                            type(row.get('index')) is not int or row['index'] != cohort['start_index'] + offset or
+                            type(row.get('first_hit')) is not int or row['first_hit'] not in (0, 1)):
+                        raise RuntimeError('refill object identity/first outcome mismatch')
+                    at = row.get('first_get_started_sec')
+                    if (type(at) not in (int, float) or not math.isfinite(at) or
+                            not max(previous, outcome['probe_started_sec']) <= at <= upper or
+                            at - cohort['write_completed_sec'][ns_index] + 1e-6 < cohort['delay_sec']):
+                        raise RuntimeError('refill first GET timing/age mismatch')
+                    miss = not row['first_hit']
+                    if (type(row.get('put_attempted')) is not bool or row['put_attempted'] != miss or
+                            type(row.get('put_acked')) is not bool or row['put_acked'] != miss):
+                        raise RuntimeError('refill PUT attempt/ACK mismatch')
+                    previous = at
+                    if miss:
+                        ack, verify = row.get('put_ack_sec'), row.get('verify_started_sec')
+                        if (any(type(v) not in (int, float) or not math.isfinite(v) for v in (ack, verify)) or
+                                not at <= ack <= verify <= upper or
+                                type(row.get('verify_hit')) is not int or row['verify_hit'] not in (0, 1)):
+                            raise RuntimeError('refill verification timing/outcome mismatch')
+                        previous = verify
+                        verify_hits += row['verify_hit']
+                        verify_misses += 1 - row['verify_hit']
+                    elif row.get('verify_hit') is not None or 'put_ack_sec' in row or 'verify_started_sec' in row:
+                        raise RuntimeError('refill attempted for a first hit')
+                    namespace_hits += row['first_hit']
+                if namespace_hits != outcome['hits']:
+                    raise RuntimeError('refill first outcomes disagree with cohort')
+                first_hits += namespace_hits
+    misses = 384 - first_hits
+    expected = {'first_hits': first_hits, 'first_misses': misses,
+                'put_attempts': misses, 'put_acks': misses,
+                'attempted_payload_bytes': misses * 4096, 'acked_payload_bytes': misses * 4096,
+                'verify_hits': verify_hits, 'verify_misses': verify_misses,
+                'baseline_payload_bytes': 15616 * 4096}
+    if any(type(stats.get(name)) is not int or stats[name] != value for name, value in expected.items()):
+        raise RuntimeError('refill aggregate mismatch')
+    ratio = stats.get('logical_payload_write_amplification')
+    if (type(ratio) not in (int, float) or not math.isfinite(ratio) or
+            abs(ratio - (1 + misses / 15616)) > 1e-12):
+        raise RuntimeError('refill logical payload amplification mismatch')
+    return {'refill_put_acks': misses, 'refill_verify_hits': verify_hits,
+            'refill_verify_misses': verify_misses,
+            'logical_payload_write_amplification': ratio}
+
+
+def check_result(text, client, policy='lifetime', scenario='quick-pressure', first_reuse_sec=0, refill_on_miss=False):
+    if (type(refill_on_miss) is not bool or ('refill' in client) != refill_on_miss or
+            (refill_on_miss and scenario != 'arrivals-pressure')):
+        raise RuntimeError('refill mode/result mismatch')
     if scenario not in ('quick-pressure', 'sustained-pressure', 'mixed-pressure', 'arrivals-pressure'):
         raise RuntimeError('unknown scenario')
     if first_reuse_sec not in (0, 45, 90, 185) or (first_reuse_sec and scenario != 'sustained-pressure'):
@@ -303,6 +376,14 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
     schedule = (check_arrivals(client) if scenario == 'arrivals-pressure' else
                 check_mixed(client) if scenario == 'mixed-pressure' else
                 check_steps(client, first_reuse_sec) if scenario == 'sustained-pressure' else {})
+    refill = check_refill(client) if refill_on_miss else {}
+    verify_hits = refill.get('refill_verify_hits', 0)
+    verify_misses = refill.get('refill_verify_misses', 0)
+    if refill_on_miss:
+        # These server counters count accepted logical PUTs/payload, not device IO.
+        if (total(text, 'dfkv_cache_put_total') != 15616 + refill['refill_put_acks'] or
+                total(text, 'dfkv_bytes_written_total') != 63963136 + client['refill']['acked_payload_bytes']):
+            raise RuntimeError('refill accepted PUT/payload denominator mismatch')
     reuse_hits = client['reuse_hits'] if scenario in ('mixed-pressure', 'arrivals-pressure') else 0
     reuse_misses = client['reuse_misses'] if scenario in ('mixed-pressure', 'arrivals-pressure') else 0
     for name in ('dfkv_storage_healthy', 'dfkv_slab_healthy'):
@@ -328,22 +409,22 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
         terminal[key] = terminal.get(key, 0) + value
         if key not in ('success_nonempty', 'not_found') and value:
             raise RuntimeError('unexpected PULL terminal: ' + key)
-    if terminal.get('success_nonempty', 0) != hits + hot_hits + filler_reads + reuse_hits:
+    if terminal.get('success_nonempty', 0) != hits + hot_hits + filler_reads + reuse_hits + verify_hits:
         raise RuntimeError('success denominator mismatch')
-    if terminal.get('not_found', 0) != misses + hot_misses + reuse_misses:
+    if terminal.get('not_found', 0) != misses + hot_misses + reuse_misses + verify_misses:
         raise RuntimeError('missing denominator mismatch')
     dispatched = total(text, 'dfkv_rdma_pull_requests_dispatched_total')
-    if dispatched != total(text, 'dfkv_rdma_pull_requests_terminal_total') or dispatched != sum(counts[:4]) + filler_reads + reuse_hits + reuse_misses:
+    if dispatched != total(text, 'dfkv_rdma_pull_requests_terminal_total') or dispatched != sum(counts[:4]) + filler_reads + reuse_hits + reuse_misses + verify_hits + verify_misses:
         raise RuntimeError('PULL requests not settled')
     heat = {}
     if policy == 'lifetime':
         success = total(text, 'dfkv_slab_lifetime_read_success_total')
         applied = total(text, 'dfkv_slab_lifetime_read_applied_total')
-        if success != hits + hot_hits + filler_reads + reuse_hits or applied > success:
+        if success != hits + hot_hits + filler_reads + reuse_hits + verify_hits or applied > success:
             raise RuntimeError('lifetime heat denominator mismatch')
         # Pressure can reclaim the original resident before its heat notification.
         heat = {'read_success': success, 'read_applied': applied}
-    return {**schedule, **heat, 'watermark_evictions': total(text, 'dfkv_slab_watermark_evictions_total'),
+    return {**schedule, **refill, **heat, 'watermark_evictions': total(text, 'dfkv_slab_watermark_evictions_total'),
             'background_reclaimed': total(text, 'dfkv_slab_reclaimed_total'),
             'extent_steals': total(text, 'dfkv_slab_extent_steals_total'),
             'evictions': total(text, 'dfkv_evictions_total'), 'terminal_results': terminal,
@@ -392,7 +473,11 @@ def parse_args(argv=None):
     parser.add_argument('--data-name', help='new child name shared across all data roots')
     parser.add_argument('--protect-sec', type=int, choices=(30, 60, 180),
                         help='explicit lifetime P preset for isolated diagnostics only')
+    parser.add_argument('--refill-on-miss', action='store_true',
+                        help='arrivals-pressure: refill sampled first misses once and verify once')
     args = parser.parse_args(argv)
+    if args.refill_on_miss and args.scenario != 'arrivals-pressure':
+        parser.error('refill-on-miss requires arrivals-pressure')
     if args.first_reuse_sec and args.scenario != 'sustained-pressure':
         parser.error('first-reuse-sec requires sustained-pressure')
     if args.protect_sec is not None and args.policy != 'lifetime':
@@ -448,12 +533,15 @@ def run(args):
                           '--pressure-delay-sec', str(args.pressure_delay_sec),
                           '--first-reuse-sec', str(args.first_reuse_sec),
                           '--metrics-url', METRICS_URL, '--output', str(args.output / 'trace')]
+        if args.refill_on_miss:
+            client_command.append('--refill-on-miss')
         client_timeout_sec = (320 if args.scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure') else
                               120 + args.pressure_delay_sec)
         (args.output / 'case.json').write_text(json.dumps({'command': command, 'data_dirs': list(map(str, dirs)),
             'client_command': client_command, 'client_timeout_sec': client_timeout_sec,
             'pressure_delay_sec': args.pressure_delay_sec, 'scenario': args.scenario,
             'protect_sec_override': args.protect_sec, 'first_reuse_sec': args.first_reuse_sec,
+            'refill_on_miss': args.refill_on_miss,
             'environment': {k: v for k, v in env.items() if k.startswith('DFKV_') or k == 'PYTHONPATH'}}, indent=2) + '\n')
         with (args.output / 'server.log').open('w') as server_log:
             server = subprocess.Popen(command, env=env, stdout=server_log, stderr=subprocess.STDOUT)
@@ -487,7 +575,7 @@ def run(args):
             client = json.loads((args.output / 'trace/result.json').read_text())
             after = scrape()
             (args.output / 'after.prom').write_text(after)
-            result.update(check_result(after, client, args.policy, args.scenario, args.first_reuse_sec), client=client, status='passed')
+            result.update(check_result(after, client, args.policy, args.scenario, args.first_reuse_sec, args.refill_on_miss), client=client, status='passed')
     except Exception as error:
         result.update(status='failed', error=str(error))
     finally:

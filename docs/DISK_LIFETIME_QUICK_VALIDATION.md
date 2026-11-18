@@ -961,13 +961,14 @@ guest结果：`/data/disk1/results/arrival-cool-retention-20261118t063414z-c9bbd
 磁盘格式均未改变，O5尚未整体验收完成。
 
 
-## 13. 缺失后回填：驱动准备（尚未接入自动验收/真实盘对照）
+## 13. 缺失后回填：驱动准备（582ea1d，历史步骤）
 
 本轮只增加 `disk_scenarios.py --scenario arrivals-pressure --refill-on-miss`，
 默认关闭；其他场景拒绝该开关。不改变产品策略、P180、评分公式或磁盘格式。
-**不要直接把该开关传给 quick_eviction.py**：supervisor 尚未接入新分母，当前明确
+**不要直接把该开关传给 quick_eviction.py**：supervisor 尚未接入新分母，当时明确
 拒绝带 `refill` 的结果，避免全命中时误把不同批处理口径判为原 no-refill 场景通过。
-后续先接入自动验收，再在冷盘环境跑四配置真实对照；本节不是新的后端验证报告。
+以上为582ea1d提交时的边界；后续supervisor接入及四配置证据见第14节。
+本节记录驱动准备，不是新的后端验证报告。
 
 ### 13.1 固定操作与边界
 
@@ -1035,3 +1036,119 @@ ctest --test-dir build-test --no-tests=error \
 仍处于 **O5 缺失后回填场景的驱动准备**，后续多尺寸→独立高并发→正式A/B分步推进。
 测试环境继续排除宿主 `/mnt/disk1`，只用[冷盘说明](DISK_LIFETIME_COOL_DISK_VALIDATION.md)
 的disk2/disk3独立环境，不回退默认Docker daemon；本轮未向磁盘施加测试压力。
+
+
+## 14. 回填自动验收与四配置真实对照（2026-11-18）
+
+基线582ea1d，仅修改supervisor及对应测试，不修改已提交的驱动、产品C++、默认P180、
+评分/参数校验或磁盘格式。`quick_eviction.py --scenario arrivals-pressure --refill-on-miss`
+现在显式转发开关并验收；不带开关仍使用原no-refill路径，结果与开关不一致会拒绝。
+业务权重仍为null，没有真实回源服务/业务成本模型；这不是正式性能A/B或O5整体放行。
+
+### 14.1 新自动门禁
+
+- 先复用原arrival的200步、12批布局、45/90/185 ACK年龄、完整384首次读取校验。
+- 按实际event→namespace→key顺序重算384条明细，而不是错误地按admission排序。
+  严格校验namespace/index、唯一顺序、首次GET时间/年龄、PUT ACK与校验开始时间，
+  限制在对应namespace/step区间内，跨对象、namespace和event的时间不倒退。
+- 首次hit不允许PUT/校验；首次miss必须恰好一次attempt/ACK及一次校验结果，
+  未完成/null/伪造bool-as-int或重复/漏对象拒绝；校验miss仍是有效观测。
+- 逐key首次结果与namespace/cohort/event/top-level汇总一致；attempt/ACK/payload/
+  校验计数和逻辑放大逐项重算，拒绝伪造汇总或非有限值。
+- GET完整分母=`47232+verify_hits+verify_misses`；终局success/notfound及lifetime
+  成功计热分别计入校验hit/miss，不把回填后的命中算作首次命中。
+- 服务端已接受PUT计数=`15616+put_acks`、payload字节=`63963136+acked_payload_bytes`。
+  这只是逻辑操作/字节对账，不代表实际新增住户、设备字节或NAND写放大。
+
+新增单测覆盖全hit、部分/全miss、校验再miss，以及身份/顺序/年龄/类型/汇总伪造、
+完整GET/热度/PUT/payload分母、参数拒绝和真实client命令转发。驱动→checker的完整
+4608/7808内存轨迹验证覆盖全hit和192/192首次结果；仅是内存/模拟时钟契约，不冒充后端。
+
+### 14.2 隔离环境恢复与执行范围
+
+复用第12节的disk2/disk3冷盘VM；宿主disk1继续禁压。复用检查发现私有daemon和旧温度
+monitor已退出，但唯一原QEMU仍存活。未回退默认Docker、未新开daemon/VM或格式化盘，
+先对精确QEMU PID/starttime、mount-root文件inode、root/backing/data FD及独立netns重新
+核验，再用`nsenter`仅进入该VM进程的网络namespace进行SSH；不进入宿主物理网络。
+此为专门恢复步骤，不放宽冷盘说明第3节“socket缺失不得盲目复用”的原则；复跑时必须重新证明
+该实例归属，不照搬过期PID。具体恢复与新监控边界见冷盘说明第8节。
+
+新温度监控只查nvme2/nvme0，覆盖本轮前置检查与真实负载；异常/告警或>=65°C时，
+核对精确PID/starttime/root镜像归属后只SIGTERM该诊断QEMU，不再依赖已退出的RootlessKit。
+无归属证明不扩大杀进程范围；该关停为安全止损，不能当作正常退出/持久化验收。
+65°C仍是保守诊断停止线，不是厂商安全阈值。
+
+真实四配置顺序冻结为P180→legacy→P60→P30，全部显式启用回填。每组同seed、固定路径、
+空初始化、预热和200步，结束后正常停止服务并唯一归档；不预设hit/回填数来放宽/收紧门禁。
+单key及回填改变请求/住户状态，第13节的因果与性能比较限制继续有效。
+
+### 14.3 四组实测结果
+
+|配置|首次45秒 h/m|首次90秒 h/m|首次185秒 h/m|回填 attempt/ACK|校验 h/m|逻辑 payload 写入放大|
+|---|---:|---:|---:|---:|---:|---:|
+|P180|128/0|128/0|0/128|128/128|128/0|1.0081967213|
+|legacy|128/0|128/0|128/0|0/0|0/0|1.0000000000|
+|P60|128/0|0/128|0/128|256/256|256/0|1.0163934426|
+|P30|115/13|0/128|0/128|269/269|269/0|1.0172259221|
+
+每组首次分母384（各延迟128），热点均12928/0，其中严格预热128、压力读取12800。
+末扫均10812/4804。这里热点损失为0，不表示其他负载没有热点损失；回填校验全命中
+也不表示对象长期保留。P30额外13个45秒miss来自admission_step9（该批19/13），
+保留该观测，不推断唯一victim原因。
+
+四组最终水位淘汰依次4932/4804/5060/5073，后台class reclaim和extent steal均0。
+对本次序列，最终对象及每phase对象与已接受PUT/淘汰计数守恒；这不是keep-first并发
+插入的一般不变量。原始no-refill轨迹的末扫与首次汇总恰好相同，不能因此宣称普遍
+回填不影响首次结果、单变量比较成立或性能无损。
+
+合计653次回填、653次额外校验GET，189581次GET、63117次已接受PUT，800步、44份
+phase快照，四组服务退出码均0。实际累计907.186133秒，max步间隔1.000281秒。
+逐key ACK→首次GET实际年龄（不是namespace首个GET的时间）为：
+45秒档45.039886–45.104918、90秒档90.047700–90.149636、
+185秒档185.064002–185.173757秒。无提前读取、重复回填或遗漏分母；字节oracle、
+终局/计热、PUT/payload、phase健康和初态一致性检查均过。
+初态每盘3181/3122/2913对象，使用slot字节一致、预热18432次GET、淘汰0；
+三个guest路径对应两个宿主物理盘，不宣称三物理盘独立I/O。
+
+### 14.4 验证证据、复跑与后续
+
+本轮73项工具单测=36driver+37supervisor，全过0失败/0skip；新增身份/时间/计数等
+33条伪造mutation为单测子例，不重复计入73。host OFF/OFF build-test与guest ON/ON
+/opt/dfkv-build构建均Ninja no-op，双方各2个Python CTest入口通过；真实RXE1、kernel
+ring5、PULL Serve9全部通过无skip（Serve故障CQE受控，不冒充真实ring）。
+125份生产源码＋4工具/测试SHA核对一致；server/client二进制SHA前后不变。
+无产品C++变化，未重跑全量CTest、sanitizer、C++静态检查、物理HCA/GPU或正式A/B。
+
+独立verifier不导入driver/supervisor重算四组原始证据，PASS；18个合成与8个真实结果
+拷贝mutation均被拒绝，这26项是审计负控，不是产品场景。第一次负控fixture误以为
+一个dispatched metric无labels导致fixture断言失败，日志保留；修正fixture定位后8项
+重跑通过，产品结果与verifier门禁未改。安全监控另有7个纯mock控制分支验证，不冒充
+真实温度告警关停耗时。最终独立审查未发现阻塞问题。
+
+封存116份SMART覆盖本轮前置测试和全部四组负载，允许盘nvme2/nvme0的composite温度均40–41°C、
+critical warning0，最大采样间隔10.192968秒；不证明采样间绝无瞬变。
+全部应用/测试已退出、端口空闲，监控在确认无负载后正常停止；VM保留空闲，私有daemon
+仍不可用，下次必须重新核验实例并启动新鲜监控，不能沿用历史存活声明。
+
+复跑使用第13.3节简短单测/构建命令；真实受测guest内的单组入口是：
+```bash
+ulimit -l unlimited
+python3 /opt/dfkv/deploy/validation/quick_eviction.py \
+  --build /opt/dfkv-build --scenario arrivals-pressure --refill-on-miss \
+  --policy lifetime --protect-sec 180 \
+  --data-root /data/disk1/cases --data-root /data/disk2/cases \
+  --data-root /data/disk3/cases --output /data/disk1/results/NEW_UNIQUE_OUTPUT
+```
+仅限已按冷盘说明核验的guest（guestdisk1映射宿主disk2），**不要在宿主直接执行**。
+每次output和数据子目录必须全新；例子省略data-name会生成唯一UUID，不能用它假装复现
+本轮固定路由。精确四组固定路径/命令/env/归档与恢复记录见下面的证据。
+
+证据：`.omx/evidence/refill-validation/20261118t081007z-582ea1d/`。
+guest结果：`/data/disk1/results/refill-retention-20261118t081007z-582ea1d/`。
+保留数据：`/data/diskN/cases/sustain-20261117t090611z-80793be-active--20261118t081007z-582ea1d--{p180,legacy,p60,p30}`；
+N=1/2/3分别映射宿主disk2/disk3/disk3，具体host路径见冷盘说明。
+宿主证据归档位于该说明第8节的refill专用目录；不包含SSH私钥、raw/qcow镜像。
+
+当前完成 **O5 回填自动验收＋四配置首轮实测**，只是单顺序各一次、早段12批抽样，
+不等于稳态全业务、最佳P、正式A/B通过或默认切换放行。业务权重未填写，生产默认不变。
+后续按用户约定补多尺寸、独立高并发、正式A/B；需要业务输入的权重另列，不擅自假设。

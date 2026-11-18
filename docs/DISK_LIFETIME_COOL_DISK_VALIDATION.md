@@ -145,3 +145,40 @@ SSH私钥只保留在本轮 `seed/`，不提交或打包分发；不要输出私
 先正常关闭guest，再停止经名称/ID/标签/socket核验的本轮容器和私有daemon；
 确认没有QEMU引用backing后，才处理对应文件。不要删除共享父目录或执行全局prune。
 这不授权清理disk1旧数据，不修改其他服务；源代码、密钥和证据按各自边界保留。
+
+## 8. 回填轮次的存活VM恢复（2026-11-18）
+
+回填轮次开始前实查：原独立Docker socket已无daemon响应，旧温度monitor也不存在；
+但原唯一QEMU仍运行，应用进程不存在。不能继续声称daemon/monitor仍存活，也没有
+回退默认Docker（其root在disk1）、盲目重启旧容器、启动第二个QEMU或重新格式化。
+
+本轮采用有证据的维护恢复，不替代第3节正常复用门禁：
+1. 在任何负载前冻结现有QEMU的PID、`/proc/<pid>/stat` starttime和cmdline。
+2. 检查`/proc/<pid>/root/cool2/{guest.qcow2,noble-base.img,data1.raw}`与宿主disk2
+   文件是同inode，cool3的data2/3与宿主disk3同inode；核对实际打开FD和backing链。
+3. 比较该进程netns与物理宿主不同；通过`sudo nsenter -t <已核验PID> -n -- ssh ...`
+   仅进入既有隔离网络进行本地转发SSH。保留已有host-key校验，不输出或复制私钥。
+4. guest再次核对标记、内核、三盘mount、应用/端口空闲、RXE、真实ring前置检查，
+   新温度monitor采样持续更新且无告警后才开始负载。
+
+不把历史PID或文本标记当作新执行授权/实例归属；实例退出/PID复用/文件或namespace
+不一致就停止，不能绕过检查。这里没有新增特权容器、host模块/sysctl或物理网络变更。
+VM仍是原6vCPU/8GiB/两个物理盘的隔离诊断布局，不因此获得容器硬资源上限。
+
+新monitor每约10秒仅采nvme2/nvme0。warning非零、有效温度>=65°C或采样/字段异常，
+先写本轮专用告警，再核对PID/starttime/cmdline与root镜像同inode后SIGTERM唯一QEMU；
+不再尝试终止已不存在的旧RootlessKit。归属无法证明时保留失败，不杀其他实例。
+真实温度告警未人为注入，不宣称硬件热故障关停耗时已经验证。
+
+本轮恢复、命令、source/binary指纹及新monitor记录：
+`.omx/evidence/refill-validation/20261118t081007z-582ea1d/`。
+宿主新日志/归档专用目录：
+`/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/refill-20261118t081007z-582ea1d/`。
+新日志不覆盖旧258采样历史证据，旧disk1文件不复制/清理。后续每次复跑仍需新鲜
+monitor和同样的精确归属检查，不能依赖“上轮曾有监控”。
+
+
+本轮四配置回填实测均正常退出，结果见快速验证第14节；封存116份SMART，两块允许盘
+composite温度40–41°C/告警0，最大间隔10.192968秒，覆盖前置测试及四组负载。确认应用和端口清空后
+已正常停止新monitor（专用stop marker保留），VM空闲保留，旧私有daemon仍不可用。
+后续复跑必须重新验证实例和启动监控；不要把历史“保留运行中”的描述当作当前存活证据。
