@@ -116,6 +116,62 @@ class TraceClientTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.client.execute(2)
 
+    def install_status_get(self, status=0, value=None, length=None):
+        def get(handle, key, key_len, buffer, cap, out_len):
+            self.lib.calls.append("status_get")
+            self.assertEqual(ct.string_at(key, key_len), bytes.fromhex(
+                self.document["requests"][2]["key_hex"]))
+            data = trace.payload(self.document["requests"][2]) if value is None else value
+            if status == 0:
+                ct.memmove(buffer, data, min(len(data), cap))
+            ct.cast(out_len, ct.POINTER(ct.c_uint64))[0] = (
+                (len(data) if status == 0 else 0) if length is None else length)
+            return status
+        self.lib.dfkv_get_auto_status = get
+
+    def test_status_symbol_hit_and_only_explicit_absence_is_miss(self):
+        self.install_status_get()
+        self.assertEqual(self.client.execute(2), {"outcome": "get_hit"})
+        self.install_status_get(1)
+        self.assertEqual(self.client.execute(2), {"outcome": "get_miss"})
+        for status in (2, 3, 4, 5, 6, 7, 8, -1, 999):
+            with self.subTest(status=status):
+                self.install_status_get(status)
+                with self.assertRaisesRegex(RuntimeError, "scalar GET failed"):
+                    self.client.execute(2)
+        self.assertEqual(self.lib.calls, ["status_get"] * 11)
+
+    def test_status_hit_validates_bytes_and_full_length(self):
+        for value, length in ((b"bad", None), (b"x", None),
+                              (b"", None), (b"abcd", None), (b"abc", 999)):
+            with self.subTest(value=value, length=length):
+                self.install_status_get(value=value, length=length)
+                with self.assertRaises(RuntimeError):
+                    self.client.execute(2)
+        self.install_status_get(1, length=99)
+        with self.assertRaisesRegex(RuntimeError, "nonzero length"):
+            self.client.execute(2)
+
+    def test_status_exception_does_not_fall_back_to_legacy(self):
+        self.lib.dfkv_get_auto_status = mock.Mock(side_effect=RuntimeError("native error"))
+        with self.assertRaisesRegex(RuntimeError, "native error"):
+            self.client.execute(2)
+        self.assertEqual(self.lib.calls, [])
+
+    def test_loader_optionally_binds_status_symbol(self):
+        for available in (False, True):
+            lib = mock.Mock(spec=["dfkv_open_v2", "dfkv_close", "dfkv_transport_mode",
+                                  "dfkv_remove", "dfkv_exist", "dfkv_batch_put",
+                                  "dfkv_batch_get_auto"] +
+                                 (["dfkv_get_auto_status"] if available else []))
+            with mock.patch.object(driver.ct, "CDLL", return_value=lib):
+                self.assertIs(driver.load_library("unused-test-path"), lib)
+            if available:
+                function = lib.dfkv_get_auto_status
+                self.assertEqual(function.restype, ct.c_int)
+                self.assertEqual(function.argtypes, [ct.c_void_p, ct.c_void_p,
+                    ct.c_uint64, ct.c_void_p, ct.c_uint64, ct.POINTER(ct.c_uint64)])
+
     def test_bad_id_or_other_namespace_makes_no_call(self):
         for request_id in (-1, True, 1.0, 99, 1):
             with self.subTest(request_id=request_id):

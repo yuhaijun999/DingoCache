@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add an independent status-preserving scalar GET C API and optional Python
+  trace-client support; distinguish explicit absence from failures while keeping
+  legacy-library no-hit unresolved and strict smoke gates unchanged.
+
 - Add a status-preserving C++ scalar GET API with compatible bool wrappers,
   safe response validation and regression tests; leave C ABI/Python integration
   for separate steps.

@@ -1,5 +1,6 @@
 #include "client/dfkv_c_api.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -9,6 +10,7 @@
 
 #include "client/kv_client.h"
 #include "common/membership.h"
+#include "common/status.h"
 #include "common/version.h"
 #include "utils/log.h"
 
@@ -218,6 +220,40 @@ int dfkv_get_auto(dfkv_client_t c, const void* key, uint64_t key_len,
         CopyKey(key, key_len), ptr, static_cast<size_t>(cap), &got);
     if (hit && out_len) *out_len = static_cast<uint64_t>(got);
     return hit ? 1 : 0;
+  });
+}
+
+int dfkv_get_auto_status(dfkv_client_t c, const void* key, uint64_t key_len,
+                         void* ptr, uint64_t cap, uint64_t* out_len) {
+  if (out_len != nullptr) *out_len = 0;
+  return NoThrow(DFKV_GET_INTERNAL_ERROR, [&] {
+    if (c == nullptr || !ValidKey(key, key_len) || !ValidBuffer(ptr, cap)) {
+      return DFKV_GET_INVALID;
+    }
+    size_t got = 0;
+    const dfkv::Status status = static_cast<KVClient*>(c)->GetAutoWithStatus(
+        CopyKey(key, key_len), ptr, static_cast<size_t>(cap), &got);
+    // Map explicitly: the internal enum is not part of the new C contract.
+    switch (status) {
+      case dfkv::Status::kOk:
+        if (out_len != nullptr) *out_len = static_cast<uint64_t>(got);
+        return DFKV_GET_OK;
+      case dfkv::Status::kNotFound:
+        return DFKV_GET_NOT_FOUND;
+      case dfkv::Status::kCacheFull:
+        return DFKV_GET_CACHE_FULL;
+      case dfkv::Status::kQuotaExceeded:
+        return DFKV_GET_QUOTA_EXCEEDED;
+      case dfkv::Status::kIOError:
+        return DFKV_GET_IO_ERROR;
+      case dfkv::Status::kInvalid:
+        return DFKV_GET_INVALID;
+      case dfkv::Status::kResourceExhausted:
+        return DFKV_GET_RESOURCE_EXHAUSTED;
+      case dfkv::Status::kNoCompatibleRail:
+        return DFKV_GET_NO_COMPATIBLE_RAIL;
+    }
+    return DFKV_GET_INTERNAL_ERROR;
   });
 }
 

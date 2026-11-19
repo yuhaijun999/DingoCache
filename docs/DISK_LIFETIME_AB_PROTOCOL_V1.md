@@ -503,3 +503,13 @@ lifetime read_success=12。两例均正常退出0、端口释放。停服后额�
 本小步新增C++ `GetAutoWithStatus` 和共享buffer核心，保留旧bool外观及指标一次；
 修正坏结果形状的越界/假成功。**C ABI、Python和批量去重状态尚未接通**，
 当前Python仍保持 `get_unresolved` / 严格命中冒烟，不因此开始正式A/B或改变默认。
+
+## 16. C ABI与验证用Python单键状态贯通
+
+第15节记录首步；后续已新增独立 `dfkv_get_auto_status`，以稳定C常量显式映射结果。
+验证用TraceClient自动探测新符号，只有明确NOT_FOUND计get_miss；失败保留错误，
+旧库no-hit仍unresolved。生产连接器及并发batch/SG/dedup没有切换成串行状态读取。
+严格hit-only smoke认识get_miss完整失败记录，但不因此放宽门槛。
+接口/验证/后续边界详见[状态兼容方案第5节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
+仅在tiny file/TCP服务验证本轮新增接口；此前RXE/uring二进制未含该新接口，
+不能沿用旧guest结果声称新接口已过真实RDMA。正式A/B仍未开始、默认不变。

@@ -144,6 +144,31 @@ class Client:
                     f"expected_length={len(value)}: {error}") from error
         return checked_hits
 
+    def read_outcome(self, key, expected):
+        """One checked scalar GET; legacy no-hit remains unresolved.
+
+        This is deliberately separate from the concurrent batch diagnostic path.
+        Only the additive C status symbol can prove absence; errors never fall
+        back to the bool API or to EXIST probes.
+        """
+        function = getattr(self.lib, "dfkv_get_auto_status", None)
+        if function is None:
+            hits = self.read([key], [expected], allow_miss=True)
+            return "get_hit" if hits else "get_unresolved"
+        pointer, owner = make_key_buffer(key)
+        buffer = ct.create_string_buffer(len(expected) + 1)
+        size = ct.c_uint64(0)
+        status = function(self.handle, pointer, len(key), buffer,
+                          ct.sizeof(buffer), ct.byref(size))
+        if status != 0:  # DFKV_GET_OK
+            if size.value != 0:
+                raise RuntimeError("failed scalar GET returned a nonzero length")
+            if status == 1:  # DFKV_GET_NOT_FOUND is the only trusted miss.
+                return "get_miss"
+            raise RuntimeError(f"scalar GET failed: status={status}")
+        check_read(expected, 1, buffer.raw[:size.value], size.value)
+        return "get_hit"
+
     def expect_missing(self, key):
         pointers, lengths, owners = make_key_array([key])
         buffer = ct.create_string_buffer(1)
@@ -186,6 +211,11 @@ def load_library(path):
     for name, (args, result) in signatures.items():
         function = getattr(lib, name)
         function.argtypes, function.restype = args, result
+    status_get = getattr(lib, "dfkv_get_auto_status", None)
+    if status_get is not None:
+        status_get.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint64,
+                               ct.c_void_p, ct.c_uint64, size_array]
+        status_get.restype = ct.c_int
     return lib
 
 

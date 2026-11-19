@@ -101,6 +101,28 @@ sys.exit({rc!r} if {rc!r} is not None else (0 if r['passed'] else 1))
                          ["put_ack", "put_ack", "get_unresolved"] + ["not_attempted"] * 5)
         self.assertEqual(smoke._verify(self.document, result, self.config)["attempted"], 3)
 
+    def test_explicit_miss_is_complete_failure_not_invalid_or_success(self):
+        original = Adapter.execute
+        def execute(client, request_id):
+            return {"outcome": "get_miss"} if request_id == 2 else original(client, request_id)
+        with mock.patch.object(Adapter, "execute", execute):
+            result = self.run_client()
+        self.assertFalse(result["passed"])
+        self.assertEqual([r["terminal"] for r in result["requests"]],
+                         ["put_ack", "put_ack", "get_miss"] + ["not_attempted"] * 5)
+        summary = smoke._verify(self.document, result, self.config)
+        self.assertEqual((summary["attempted"], summary["completed"]), (3, 3))
+        self.assertEqual(summary["hit_get_bytes"], 0)
+        command = self.command()
+        command[-1] = command[-1].replace("r=s.run(",
+            "original=Adapter.execute\n"
+            "Adapter.execute=lambda client, index: ({'outcome':'get_miss'} "
+            "if index==2 else original(client,index))\nr=s.run(")
+        report = self.supervise(command)
+        self.assertEqual(report["status"], "workload_failed")
+        self.assertEqual(report["completed_requests"], 3)
+        self.assertFalse(report["passed"])
+
     def test_call_and_close_failures_remain_failures(self):
         Adapter.raise_id = 0
         result = self.run_client()

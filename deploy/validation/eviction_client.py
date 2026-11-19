@@ -35,9 +35,8 @@ class TraceClient:
 
         No scheduling/deadline/cancellation occurs here. A caller timing out cannot
         release this handle or assume an in-flight native PUT was cancelled.
-        The existing C ABI folds some network errors and capacity failures into
-        hit=0. Even EXIST returns false on some errors, so no-hit is unresolved,
-        never a proven cache miss or a successful measurement terminal.
+        The additive scalar C ABI distinguishes explicit absence from failures.
+        Older libraries still fold errors into hit=0: those remain unresolved.
         """
         if type(request_id) is not int or not 0 <= request_id < len(self._rows):
             raise ValueError("request_id not present in trace")
@@ -51,12 +50,7 @@ class TraceClient:
             if row["op"] == "put":
                 self._client.put([key], [value])
                 return {"outcome": "put_ack"}
-            hits = self._client.read([key], [value], allow_miss=True)
-            if hits == 1:
-                return {"outcome": "get_hit"}
-            if hits != 0:
-                raise RuntimeError("invalid single-key hit count")
-            return {"outcome": "get_unresolved"}
+            return {"outcome": self._client.read_outcome(key, value)}
 
     def close(self):
         # Never close a handle while a native call still owns its buffers.

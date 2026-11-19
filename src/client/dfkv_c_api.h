@@ -50,6 +50,29 @@ int dfkv_get(dfkv_client_t c, const void* key, uint64_t key_len,
 // size; a stored payload larger than cap is a miss. 1=hit, 0=miss/failure.
 int dfkv_get_auto(dfkv_client_t c, const void* key, uint64_t key_len,
                   void* ptr, uint64_t cap, uint64_t* out_len);
+// Stable scalar GET results, independent of the internal C++ Status layout.
+// Macros keep this header C-compatible without exposing an enum representation.
+#define DFKV_GET_OK 0
+#define DFKV_GET_NOT_FOUND 1
+#define DFKV_GET_CACHE_FULL 2
+#define DFKV_GET_QUOTA_EXCEEDED 3
+#define DFKV_GET_IO_ERROR 4
+#define DFKV_GET_INVALID 5
+#define DFKV_GET_RESOURCE_EXHAUSTED 6
+#define DFKV_GET_NO_COMPATIBLE_RAIL 7
+#define DFKV_GET_INTERNAL_ERROR 8
+
+// Additive status-preserving scalar GET. Only NOT_FOUND proves a cache miss.
+// Invalid arguments (including null client) return INVALID; caught exceptions
+// return INTERNAL_ERROR. IO_ERROR also includes local no-route/peer-cooldown
+// refusal, not necessarily a new failed network operation. Unknown future codes
+// must be treated as errors. No exception crosses this boundary.
+// out_len is optional; when supplied it is cleared on entry and set only on OK.
+// A zero-length OK is a hit. Discard the destination on any non-OK result: it
+// may already contain partial bytes. Nonzero cap requires a non-null ptr.
+// As with other C calls, pointers and non-null client handles must be live.
+int dfkv_get_auto_status(dfkv_client_t c, const void* key, uint64_t key_len,
+                         void* ptr, uint64_t cap, uint64_t* out_len);
 int dfkv_exist(dfkv_client_t c, const void* key, uint64_t key_len);  // 1/0
 // Drop a key from the cache (LMCache L2 eviction). Returns 1 if the owning node
 // confirmed the op (block removed OR already absent), 0 on route/health/IO error.

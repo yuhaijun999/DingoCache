@@ -1,7 +1,8 @@
 # 真实 GET 状态接口：兼容方案与第一小步
 
 基线 `752d1eb`，2026-11-19。属于 **O5 / AB7前置准备**，不是正式A/B放行。
-本轮只实现C++单键buffer接口；C ABI、Python和批量去重状态仍待后续小步接入。
+首步实现C++单键buffer接口；随后新增C ABI和验证用Python单键适配（见第5节）。
+下文第1–4节保留首步设计/验证记录，批量去重状态仍待后续小步接入。
 
 ## 1. 状态在哪里丢失
 
@@ -100,3 +101,64 @@ ctest --test-dir build-test \
 POSIX mkdtemp直接包含stdlib.h，针对无C++等价声明的deprecated-header检查给出局部技术理由。
 未做新ON构建/真实RDMA、全量CTest或sanitizer，未改变共享锁/状态布局；
 8线程用例不是TSan或高并发性能证明。
+
+## 5. 第二步：兼容C ABI＋验证用Python单键读取
+
+源码基线 `f5e0ded`。新增 `dfkv_get_auto_status`，参数与旧scalar auto相同，
+直接返回稳定的int常量 `DFKV_GET_*`，不新增结果struct/枚举，不依赖内部Status布局：
+
+| 常量后缀 | 固定值 | 含义 |
+|---|---:|---|
+| OK | 0 | 完整读取成功，长度0仍是命中 |
+| NOT_FOUND | 1 | 明确不存在，唯一可信miss |
+| CACHE_FULL / QUOTA_EXCEEDED | 2 / 3 | 相应失败，非miss |
+| IO_ERROR | 4 | I/O失败或本地无路由/冷却拒绝，非miss |
+| INVALID | 5 | 参数/容量等错误，包括null handle |
+| RESOURCE_EXHAUSTED / NO_COMPATIBLE_RAIL | 6 / 7 | 客户端资源/rail失败 |
+| INTERNAL_ERROR | 8 | C边界捕获异常或未识别内部状态 |
+
+C头使用宏常量保持C兼容，没有C++ enum ABI依赖；实现逐项switch显式映射。
+这是单键结果，不再叠加“调用rc＋out_status”双层结构。非法参数直接INVALID，
+既有NoThrow边界把异常变为INTERNAL_ERROR；不把异常当NOT_FOUND或抛出C边界。
+可选out_len入口清零、仅OK设置；失败buffer可能部分写入，调用方必须丢弃。
+有效指针/有效handle生命周期仍由调用方负责，不能检查伪造/悬空地址。
+旧函数/符号/返回值、wire、Status数值、批量/SG/dedup均不改。
+
+`deploy/validation/disk_scenarios.py` loader显式探测并配置可选ctypes符号。
+新增单独 `Client.read_outcome`，仅供trace单键适配：
+- 新库OK须通过原有完整字节及长度oracle，返回get_hit；
+- 仅NOT_FOUND且长度0返回get_miss；其余失败/未知码/矛盾长度抛错，不回退重读；
+- 旧库无符号时仍走原batch单项读取，no-hit是get_unresolved，绝不靠EXIST假推miss。
+
+原并发batch诊断及生产 `dfkv_common`/连接器没有改成逐项串行循环。
+这不是宣称全部Python或批量路径已状态保真。TraceClient保留原close互斥/缓冲区生命期。
+严格hit-only smoke收到get_miss仍失败、停止后续请求；父验收器现在认识该完整失败终局，
+保留已知尝试/完成计数，而非误判invalid_result或允许miss通过。
+
+新增6个C ABI用例（含真实tiny file/TCP服务），Python adapter14个、smoke17个方法。
+C ABI首次编译时实现已存在，不声称有API缺失RED；审阅发现smoke未识别get_miss，
+先补回归得到真实ValueError RED，再修复并通过。另用本轮libdfkv.so＋真实TCP服务运行
+Python ctypes全链路：显式不存在、PUT后完整命中、先Remove再写大对象→INVALID、停服→IO_ERROR。
+脚本初次把日志放在cache目录导致启动被正确拒绝；另一次对已有key重复PUT未改变旧值，
+改为先Remove再PUT后得到预期大对象错误。保留失败尝试，不计成功样本，不算生产缺陷。
+
+验证命令（仓库根目录）：
+
+```bash
+cmake --build build-test -j2
+ctest --test-dir build-test --output-on-failure \
+  -R '^(GetAuto|KvClientHealth|KVClientTest|Client|CApi|Batch|AutoBatchWorkers|python_eviction_|python_disk_validation|python_quick_eviction)'
+```
+
+本轮证据：`.omx/evidence/cabi-get-status/20261119T034633Z/`。
+未运行VM/RXE/io_uring、全量CTest、sanitizer或压力；继续禁止宿主/mnt/disk1压测。
+正式A/B与生产默认不变。下一步应先核验新状态接口在有界真实服务冒烟中的终局及报告，
+再单独设计批量/SG/dedup状态传播；不自动扩大本轮范围。
+
+本轮最终验证：build-test OFF/OFF完整构建成功；96项相关CTest全部通过、0失败/跳过，
+58.69秒。新C ABI6例、Python adapter14方法、smoke17方法均通过。
+独立审阅APPROVE；C11头/稳定常量/签名编译、Python编译、diff/本地链接检查通过。
+LLVM17.0.6新测试全配置clang-tidy与默认format通过；核心diff范围clang-tidy通过，
+范围外旧诊断未整改；旧include块保留，diff format关闭include重排。
+初轮缺少直接cstdint依赖已补齐。一次CTest与目标重链接竞争，6例permission denied未执行，
+保留该无效验证账；最终在完整构建结束后顺序重跑全部96项通过，不把未执行算通过。

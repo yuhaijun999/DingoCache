@@ -1,5 +1,9 @@
 # 磁盘寿命淘汰：验收收敛与剩余实施清单
 
+最新增量：O5/AB7前置已接通新增C ABI＋验证用Python单键GET状态，
+仅明确NOT_FOUND计miss；旧库保留unresolved。严格冒烟仍hit-only，
+批量/SG/dedup及正式A/B未放行，见[状态兼容方案第5节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
+
 核查版本：2026-11-17，源码基线 `0cde375`；阶段 **DOC6 操作说明收口**。
 O5bd 原清单由 O5be/O5bf/O5bg 增量更新；不将历史日志视为本轮重新执行。
 本轮用户已授权隔离 Docker/VM 内实际 RXE＋io_uring 诊断，解除此前该项后置安排；

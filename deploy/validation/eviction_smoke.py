@@ -52,8 +52,9 @@ def _summary(rows):
 def run(document, config, *, library_loader=None, client_factory=TraceClient):
     """Sequential strict ACK/hit gates. Open/call/close all remain in the child.
 
-    Source scheduled_ns is identity only: no pacing or fixed-arrival claims. A
-    no-hit is unresolved and fails the smoke. No resident/heat snapshot inferred.
+    Source scheduled_ns is identity only: no pacing or fixed-arrival claims. An
+    explicit miss or legacy unresolved no-hit fails the smoke. No resident/heat
+    snapshot is inferred.
     """
     _bounded(document)
     rows = [dict(row, terminal="not_attempted") for row in document["requests"]]
@@ -125,7 +126,7 @@ def _verify(document, result, config):
             raise ValueError("invalid sequential call timing")
         previous = end
         expected = "put_ack" if source["op"] == "put" else "get_hit"
-        if terminal not in ({expected, "client_error"} | ({"get_unresolved"} if source["op"] == "get" else set())):
+        if terminal not in ({expected, "client_error"} | ({"get_unresolved", "get_miss"} if source["op"] == "get" else set())):
             raise ValueError("invalid operation outcome")
         if terminal == "client_error" and (not isinstance(row.get("error"), str) or not row["error"]):
             raise ValueError("missing call error")
