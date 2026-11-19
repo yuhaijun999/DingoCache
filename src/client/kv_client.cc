@@ -8,6 +8,8 @@
 #include <cctype>
 #include <atomic>
 #include <climits>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <chrono>
@@ -22,18 +24,23 @@
 #include <mutex>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "client/group_shard.h"
 #include "client/key_map.h"
+#include "client/op_metrics.h"
 #include "client/read_scheduler.h"
 #include "utils/log.h"
 #include "utils/sha256.h"
 #include "utils/thread_name.h"
 #include "utils/parallel_for.h"
+#include "transport/transport.h"
 #include "transport/transport_factory.h"
 #include "common/config_dump.h"
+#include "common/kv_types.h"
+#include "common/status.h"
 
 namespace dfkv {
 
@@ -747,39 +754,59 @@ bool KVClient::GetAutoDirect(const std::string& key, std::string* out,
 
 bool KVClient::GetAuto(const std::string& key, void* out, size_t cap,
                        size_t* out_len) {
-  auto metric = op_stats_.Begin(OpMetrics::kGet);
-  size_t got = 0;
-  const bool hit = GetAutoDirect(key, out, cap, &got);
-  if (out_len) *out_len = hit ? got : 0;
-  metric.hits = hit ? 1 : 0;
-  metric.bytes = hit ? got : 0;
-  return hit;
+  return GetAutoWithStatus(key, out, cap, out_len) == Status::kOk;
+}
+
+Status KVClient::GetAutoWithStatus(const std::string& key, void* out,
+                                   size_t cap, size_t* out_len) {
+  if (out_len) *out_len = 0;
+  OpMetrics::Scope metric = op_stats_.Begin(OpMetrics::kGet);
+  size_t length = 0;
+  const Status status = GetAutoStatusDirect(key, out, cap, &length);
+  if (out_len) *out_len = length;
+  metric.hits = status == Status::kOk ? 1 : 0;
+  metric.bytes = length;
+  return status;
 }
 
 bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
                              size_t* out_len) {
+  return GetAutoStatusDirect(key, out, cap, out_len) == Status::kOk;
+}
+
+Status KVClient::GetAutoStatusDirect(const std::string& key, void* out,
+                                     size_t cap, size_t* out_len) {
   if (out_len) *out_len = 0;
-  std::string node = Route(key);
-  if (node.empty()) return false;
-  uint64_t now = NowMs();
-  if (!health_.Healthy(node, now)) return false;
-  const BlockKey bk = ToBlockKey(key_namespace_, key);
-  uint64_t value_len = 0;
-  std::vector<BlockKey> keys{bk};
-  std::vector<RangeDst> dsts{
+  if (key.empty() || !ValidBuffer(out, cap)) return Status::kInvalid;
+  const std::string node = Route(key);
+  // Neither local refusal is an authoritative absence or a fresh peer failure.
+  if (node.empty() || !health_.Healthy(node, NowMs())) return Status::kIOError;
+  const std::vector<BlockKey> keys{ToBlockKey(key_namespace_, key)};
+  const std::vector<RangeDst> destinations{
       RangeDst{cap ? out : nullptr, cap, ClassifyDestination(out, cap)}};
-  std::vector<uint64_t> value_lens;
-  const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
-  if (!value_lens.empty()) value_len = value_lens[0];
-  if (st == Status::kIOError) {
-    health_.MarkBad(node, NowMs());
-    return false;
+  std::vector<uint64_t> lengths;
+  const std::vector<Status> statuses =
+      t_->RangeInto(node, keys, destinations, &lengths);
+  // Do not index an incomplete response or turn missing size metadata into a
+  // zero-byte hit. This is a local contract failure, not a peer-health update.
+  if (statuses.size() != 1 ||
+      (statuses[0] == Status::kOk && lengths.size() != 1)) {
+    return Status::kIOError;
   }
-  if (st == Status::kOk || st == Status::kNotFound)
+  const Status status = statuses[0];
+  if (status == Status::kIOError) {
+    health_.MarkBad(node, NowMs());
+    return status;
+  }
+  if (status == Status::kOk || status == Status::kNotFound) {
     health_.MarkGood(node, NowMs());
-  if (st != Status::kOk || value_len > cap) return false;
-  if (out_len) *out_len = static_cast<size_t>(value_len);
-  return true;
+  }
+  if (status != Status::kOk) return status;
+  // TCP can return a valid prefix with a full size larger than the requested
+  // range; RDMA may already return kInvalid. Neither is a cache miss.
+  if (lengths[0] > cap) return Status::kInvalid;
+  if (out_len) *out_len = static_cast<size_t>(lengths[0]);
+  return Status::kOk;
 }
 
 bool KVClient::Exist(const std::string& key) {

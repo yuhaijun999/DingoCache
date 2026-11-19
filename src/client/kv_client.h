@@ -24,6 +24,7 @@
 #include "client/node_dedup.h"
 #include "client/node_dedup_gpu.h"
 #include "common/membership.h"
+#include "common/status.h"
 #include "mds/mds_member_poller.h"
 #include "mds/mds_registrar.h"
 #include "client/op_metrics.h"
@@ -89,6 +90,15 @@ class KVClient {
   // Variable-size get into a caller buffer. Returns false when the stored value
   // does not fit; on success *out_len is the full stored size.
   bool GetAuto(const std::string& key, void* out, size_t cap, size_t* out_len);
+  // Status-preserving single-key GET; only kNotFound is a cache miss.
+  // No route or peer cooldown returns kIOError without issuing new I/O.
+  // Invalid arguments or insufficient capacity return kInvalid; other transport
+  // failures retain their status. Optional out_len is zero unless kOk,
+  // including on early refusal. Failed reads may modify out; discard its
+  // contents. Like scalar GetAuto, this uses RangeInto directly, not batch
+  // rendezvous.
+  Status GetAutoWithStatus(const std::string& key, void* out, size_t cap,
+                           size_t* out_len);
   bool Exist(const std::string& key);
   // Drop a key from its owning node. true iff the node confirmed the op (the
   // block was removed OR was already absent); false on route/health/IO failure.
@@ -218,6 +228,8 @@ class KVClient {
                      size_t max_bytes);
   bool GetAutoDirect(const std::string& key, void* out, size_t cap,
                      size_t* out_len);
+  Status GetAutoStatusDirect(const std::string& key, void* out, size_t cap,
+                             size_t* out_len);
   bool ExistDirect(const std::string& key, Status* status);
   bool RemoveDirect(const std::string& key);
   void InvalidateRendezvous(const BlockKey& key);

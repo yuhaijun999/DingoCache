@@ -257,3 +257,7 @@ keep-first 与 Remove 后新值、全 pin 拒绝后释放一份 lease 再重试�
 新16单测/guest同16、9目标CTest通过；实际legacy/lifetime各12 PUT/12 GET正确、
 RXE＋io_uring指标闭合，停服负例失败。无淘汰压力，不当性能A/B或默认切换依据；
 真实GET no-hit仍不可判定，旧baseline/业务输入/独立职责/数值门槛及正式A/B门禁未解除。
+
+最新前置小步：[真实GET状态兼容方案](CLIENT_GET_STATUS_COMPATIBILITY.md)与C++单键
+状态入口已落地，明确区分权威NotFound和非miss错误，旧bool保留。
+C ABI/Python/批量去重仍待分步接入，不能宣称真实A/B miss计量全链路已修复。

@@ -495,3 +495,11 @@ lifetime read_success=12。两例均正常退出0、端口释放。停服后额�
 另保留一次SSH返回0但只给MOTD的无执行尝试：无guest结果目录，已判无效，不计成功样本；
 实际执行改为直接sudo python并要求唯一完成标记，再独立校验原始账/指标，不能只看SSH退出码。
 冷盘温控及保留文件位置见冷盘说明第12节。正式A/B仍未开始，生产默认/评分/保护参数不变。
+
+## 15. 真实GET状态兼容方案：先C++单键
+
+[状态接口方案与实施第一步](CLIENT_GET_STATUS_COMPATIBILITY.md)明确状态丢失层、
+仅权威NotFound才计miss、错误/本地拒绝/容量不足不能当miss，以及旧ABI/wire兼容路线。
+本小步新增C++ `GetAutoWithStatus` 和共享buffer核心，保留旧bool外观及指标一次；
+修正坏结果形状的越界/假成功。**C ABI、Python和批量去重状态尚未接通**，
+当前Python仍保持 `get_unresolved` / 严格命中冒烟，不因此开始正式A/B或改变默认。

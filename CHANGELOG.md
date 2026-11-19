@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a status-preserving C++ scalar GET API with compatible bool wrappers,
+  safe response validation and regression tests; leave C ABI/Python integration
+  for separate steps.
+
 - Add bounded loopback real-client smoke with exact-child timeout supervision,
   strict ACK/hit gates and failure ledgers; validate small RXE/io_uring cases
   without starting formal A/B or changing eviction defaults.
