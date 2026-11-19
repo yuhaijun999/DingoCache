@@ -50,8 +50,9 @@ int dfkv_get(dfkv_client_t c, const void* key, uint64_t key_len,
 // size; a stored payload larger than cap is a miss. 1=hit, 0=miss/failure.
 int dfkv_get_auto(dfkv_client_t c, const void* key, uint64_t key_len,
                   void* ptr, uint64_t cap, uint64_t* out_len);
-// Stable scalar GET results, independent of the internal C++ Status layout.
-// Macros keep this header C-compatible without exposing an enum representation.
+// Stable scalar/batch GET results, independent of the internal C++ Status
+// layout. Macros keep this header C-compatible without exposing an enum
+// representation.
 #define DFKV_GET_OK 0
 #define DFKV_GET_NOT_FOUND 1
 #define DFKV_GET_CACHE_FULL 2
@@ -110,6 +111,28 @@ int dfkv_batch_get_auto(dfkv_client_t c, const void* const* keys,
                         const uint64_t* key_lens, void** ptrs,
                         const uint64_t* caps, int n, int* out_hit,
                         uint64_t* out_len);
+// Additive direct-only status batch GET; uses the scalar DFKV_GET_* codes.
+// Return 0 means all n per-item results are available, NOT that all are OK.
+// Only NOT_FOUND proves absence. Return -1 rejects the entire call: discard all
+// results/buffers; reads may already have happened, with no rollback/cancel.
+// A live non-null client is required even for n=0. For n>0 all descriptor
+// arrays and out_status are required; out_len is optional. For n=0 arrays may
+// be null. n<0 touches no outputs. Otherwise supplied status/length arrays are
+// set to INVALID/0 before validation. Caught exceptions return -1 with all
+// statuses INTERNAL_ERROR and lengths 0. Executor-contained item exceptions may
+// instead produce return 0 with IO_ERROR slots. No exception crosses this
+// boundary. Invalid keys/buffers fail only their slot as INVALID; valid
+// siblings execute. Null destination with cap=0 is valid. Only OK sets length
+// (0 is still a hit). Discard failed buffers, which may contain partial bytes.
+// Always bypasses opt-in dedup, potentially adding I/O vs the old API; no SG
+// status propagation. All supplied arrays must have n live elements. Output
+// arrays must not overlap each other, input descriptors, keys, or destinations;
+// concurrent destination buffers must not overlap. Handles/storage stay valid
+// until this call returns.
+int dfkv_batch_get_auto_status(dfkv_client_t c, const void* const* keys,
+                               const uint64_t* key_lens, void** ptrs,
+                               const uint64_t* caps, int n, int* out_status,
+                               uint64_t* out_len);
 int dfkv_batch_exist(dfkv_client_t c, const void* const* keys,
                      const uint64_t* key_lens, int n, int* out_exist);
 int dfkv_batch_remove(dfkv_client_t c, const void* const* keys,

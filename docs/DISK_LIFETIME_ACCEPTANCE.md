@@ -1,5 +1,8 @@
 # 磁盘寿命淘汰：验收收敛与剩余实施清单
 
+最新增量：新增兼容的批量 GET C ABI 状态接口，调用级失败与逐项结果分离，旧接口保持不变。
+Python 本轮尚未接入，SG/dedup 与正式 A/B 仍后续处理，见[状态兼容方案第8节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
+
 最新增量：C++直接批量GET状态契约/共享核心已完成，132相关CTest与两策略真实RXE/uring混合批次通过。
 批量C ABI/Python及SG/dedup状态仍未接通；新接口明确绕过去重，不宣称旧dedup性能等价。
 见[状态兼容方案第7节](CLIENT_GET_STATUS_COMPATIBILITY.md)。

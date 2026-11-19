@@ -531,3 +531,12 @@ lifetime read_success=12。两例均正常退出0、端口释放。停服后额�
 真实RXE/uring两策略各一个64项新状态批次和一个64项旧bool投影批次通过。
 这不是新增批量C ABI/Python或SG/dedup状态传播，也不是整套ON/全量CTest、性能或正式A/B。
 详见[状态兼容方案第7节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
+
+
+## 19. 批量 GET C ABI：调用失败与逐项结果分离
+
+新增 dfkv_batch_get_auto_status，沿用固定 DFKV_GET_* 结果；返回0表示完整逐项结果，
+不表示全命中。-1整体失败不得当作miss，异常无回滚保证，输出长度仅OK有效。
+复用C++直接批量核心并绕过去重，旧C符号不变；Python/SG/dedup状态接入另行处理。
+完整契约及本轮验证见[状态兼容方案第8节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
+这不是正式A/B、性能、物理HCA或生产默认切换放行。

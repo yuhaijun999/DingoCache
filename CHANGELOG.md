@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a compatible direct-only batch GET C status API with stable per-item
+  results and fail-closed call-level errors; keep legacy symbols unchanged and
+  leave Python, SG and dedup status integration for separate steps.
+
 - Add a direct-only status-preserving C++ batch GET API with shared legacy bool
   projection, safe response-shape checks and retained parallel/sharded reads;
   leave batch C ABI/Python, SG and dedup status integration for separate steps.

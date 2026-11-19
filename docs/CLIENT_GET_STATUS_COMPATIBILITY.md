@@ -266,3 +266,60 @@ uring成功grant126＋not_found2，读/完成各126，无回退/在途/淘汰；
 尚未新增**批量C ABI/Python状态接口**，旧C batch hit0仍不能当可信miss；
 定长BatchGet、SG、dedup均未做新状态传播。下一小步再定义批量C ABI的调用级错误与逐项结果，
 不能把本轮C++直接批量完成说成整个客户端栈或正式A/B已完成。
+
+## 8. 第二小步：兼容的批量 C ABI 状态接口
+
+基线 `934d595`，新增符号，不改变旧 batch、scalar、SG、wire 或 ABI version：
+
+```c
+int dfkv_batch_get_auto_status(
+    dfkv_client_t c, const void* const* keys, const uint64_t* key_lens,
+    void** ptrs, const uint64_t* caps, int n, int* out_status,
+    uint64_t* out_len);
+```
+
+- 返回 **0** 表示已获得完整的 N 项结果，并非全命中。`out_status[i]` 使用现有
+  `DFKV_GET_*` 固定值，仅 `NOT_FOUND` 是可信 miss；`OK` 长度 0 仍是命中。
+  返回 **-1** 表示调用整体被拒绝或捕获到向外传播的异常，全部 buffer/result 应丢弃，
+  不能计作逐项 miss/hit。不是事务：此前 I/O 不会回滚，也不保证远端取消。
+- `n < 0` 不触碰任何输出。否则在参数校验前将提供的 N 项 status 置 `INVALID`、
+  长度置 0。client 必须有效且非 null；`n == 0` 时所有数组均可 null，合法 client
+  仍调用一次 C++ 空批次接口。`n > 0` 时 keys/key_lens/ptrs/caps/out_status 必填；
+  `out_len` 可选，不要求为了接收状态而额外分配长度数组。
+- 完成调用级参数校验后、任何分配或 I/O 前，将全部 status 置 `INTERNAL_ERROR`。
+  C++ 完整返回、确认两组结果均为 N 项后才发布 C 输出；因此捕获的异常返回 -1，
+  所有 status 保持 `INTERNAL_ERROR`、长度 0，即使部分 I/O 已完成。
+  C++ executor 内部吞掉的任务异常仍可能正常返回 0＋逐项 `IO_ERROR`；不能混淆两种边界。
+- 二进制 key/namespace 不变。空/null/长度溢出的 key、非零 cap 配 null 或容量溢出，
+  只让对应项 `INVALID`，合法 sibling 继续读取；cap 0 配 null 是合法输入。
+  无路由/peer 冷却为 `IO_ERROR`，未必有新网络 I/O；容量不足为 `INVALID`。
+  失败 buffer 可能部分写入，必须丢弃；仅 OK 输出完整长度。
+- 复用一个 `BatchGetAutoWithStatus` 调用，不循环调用公开 scalar，不把批量退化为串行。
+  非法项用空 key 占位，使 C++ 公开指标仍记 N 个提交项/一次请求；调用级拒绝未进入 C++，
+  不新增请求指标。稳定 C 状态转换与 scalar 共享显式 switch，不依赖内部 enum 布局。
+- **direct-only**：即使用户开启 opt-in dedup 也绕过 claim/publish/wait，可能比旧
+  dedup 接口产生额外 I/O，不承诺同等去重/性能。旧 `dfkv_batch_get_auto` bool 行为不变。
+  所有输入/输出指针和句柄须有效并存活到调用结束；输出数组、输入描述符和并发目标 buffer
+  不得重叠。C 无法校验指针实际可访问范围，非 null 不等于有效内存。
+
+Python 本轮不绑定新符号；旧 Python batch 的 hit0 仍是未命中或失败，不能据此可靠计 miss。
+SG/dedup 状态传播、真实服务新 C 符号的 RXE/io_uring 运行验证和正式 A/B 另行处理；
+不把上一轮 C++ 探针当作本轮 C 符号实测，不修改生产默认配置。
+
+### 本轮验证
+
+- 新 API 未声明时先取得目标编译 RED；实现后新增8例通过，最后完整构建后再次执行8例，
+  0失败/跳过。覆盖8种状态及旧bool投影、二进制key/零长度hit/optional长度、
+  无效sibling隔离/N项指标、全局参数/负数/空批次、传播异常/worker吞异常、
+  部分I/O完成后整体异常不发布部分成功、无路由/冷却，以及真实tiny file/TCP服务的
+  hit/NotFound/容量不足/停服。64位宿主未运行32位size_t溢出分支。
+- GCC13 RelWithDebInfo OFF/OFF完整构建成功；其后顺序执行140项相关CTest，
+  全部通过，0失败/跳过，62.97秒。不是全量CTest，也不是本轮真实RDMA新C符号验证。
+- LLVM17.0.6新测试全配置clang-tidy/默认format、生产diff范围tidy/format通过；
+  旧范围外20条诊断未改。初次test tidy的unused `<utility>` 已移除并重验，失败日志保留。
+  C11头文件/新旧函数签名/固定状态值编译通过；重建共享库的新旧符号存在，
+  独立C程序动态链接后验证整体拒绝/负数计数契约通过；这不是网络负载测试。
+- 独立审查未发现阻断问题。证据：
+  `.omx/evidence/batch-cabi-status/20261119T101203Z-934d595/`；
+  `commands.md`记录完整命令，`off-ctest.log/xml`、`final-direct.log/xml`为最终版本证据。
+  未运行sanitizer、压力或正式A/B，未连接VM或对宿主`/mnt/disk1`施压。
