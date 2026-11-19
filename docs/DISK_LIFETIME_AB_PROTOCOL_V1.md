@@ -397,3 +397,44 @@ root/phase的ACK和hit字节均是各自原始行汇总，测量分母不得包�
 
 本小步只改fake调度/父验证和单测，默认策略/评分/保护窗口、trace schema及生产C++不变。
 无服务连接/磁盘压力；正式trace/业务权重、旧baseline、人员隔离与数值门槛仍缺，正式A/B未开始。
+
+## 13. 真实客户端最小适配接口（单测完成，未接服务）
+
+`deploy/validation/eviction_client.py` 的 `TraceClient(document, lib, members,
+namespace)` 复用既有 `disk_scenarios.Client`。构造前严格校验整个trace和二进制namespace，
+然后打开一个该namespace专属句柄；`lib` 由调用者用既有 `load_library` 加载。
+导入模块不连接服务；构造会连接。调用时需将 `deploy/validation` 与
+`integration/common/src` 加入Python搜索路径，沿用现有诊断工具环境。
+
+- `execute(request_id)`：只执行trace中对应的一个请求，拒绝其他namespace和非法ID；
+  PUT必须返回成功才报 `put_ack`，GET复用现有完整长度/字节校验。
+  返回 `{outcome: put_ack|get_hit|get_unresolved}`；异常直接传播，
+  不把错误转成miss/ACK。trace源对象不会被修改。
+- **当前C ABI不能可靠区分缓存miss和服务/网络错误**：GET_AUTO的hit=0也可能来自
+  IO错误、无路由/冷却或容量不足；EXIST也将部分错误压成0，多探测不能修复信息丢失。
+  因此no-hit只返回 `get_unresolved`，绝不能计为正常缓存miss或成功测量终局。
+  不增加GET/EXIST探测，不用重复读伪造证据；未来需要携带明确错误状态的接口，
+  才能支持可信miss计量。本步不修改C ABI。根因位置见 `src/client/dfkv_c_api.cc`
+  的 `dfkv_batch_get_auto/dfkv_exist` 与 `src/client/kv_client.cc` 的GET/ExistDirect路径。
+- 一个句柄的execute/close由锁串行化；独立并发使用每worker/namespace独立句柄，
+  不将锁等待称为网络并发。`close`/上下文退出等待当前调用返回，幂等且禁止复用；
+  关闭异常仍传播并禁止复用，不声称资源已成功释放。
+- 无请求调度、阶段barrier、deadline、取消或自动重试；native调用挂住时close也可能等待。
+  `put_ack`仅表示现有API返回成功，不能独自证明磁盘ACK、RXE或io_uring路径。
+  外层进程监护和服务配置/指标证明仍必须另行接入，不能把fake guard直接当真实监护器。
+- 没有真实resident/热度/评分快照接口，不能套用fake payload快照为真实初态证明。
+
+硬件无关单测通过既有Client的ctypes缓冲区读写、假C ABI返回值检查二进制key/value、
+成功/错误、no-hit歧义/过大对象/错字节、关闭与在途调用、非法trace/ID/namespace和默认工厂复用。
+这里C ABI库是测试替身，**不是已连接真实lib/服务的冒烟**。
+
+```bash
+python3 -m unittest discover -s test/python -p test_eviction_client.py
+cmake --build build-test -j2
+ctest --test-dir build-test -R '^python_eviction_client$' --output-on-failure
+```
+
+下一小步安排：先补真实适配器专属的进程隔离/超时失败账与有界init→warm→measure冒烟入口，
+再在重新核验归属的隔离VM内跑少量对象的字节正确性冒烟；新建冷盘目录并先启温度监控。
+禁止宿主 `/mnt/disk1`，不重用默认Docker daemon，不自动开始压力或正式A/B。
+当前未启动任何真实服务/VM/测试盘负载；正式业务输入、旧baseline、独立职责和数值门槛仍未齐。

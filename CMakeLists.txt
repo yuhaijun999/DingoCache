@@ -265,6 +265,11 @@ if(DFKV_BUILD_TESTS)
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
               -p test_eviction_stages.py)
     set_tests_properties(python_eviction_stages PROPERTIES TIMEOUT 30)
+    add_test(NAME python_eviction_client
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
+              -p test_eviction_client.py)
+    set_tests_properties(python_eviction_client PROPERTIES TIMEOUT 30)
     add_test(NAME python_quick_eviction
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python

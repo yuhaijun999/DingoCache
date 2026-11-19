@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a minimal namespace-bound trace adapter over the existing C ABI client,
+  with byte validation, unresolved no-hit results and lifecycle tests; real-service smoke
+  and formal A/B remain pending.
+
 - Add opt-in staged fake replay with drained initialization/warmup/measurement
   gates, exact payload-state checks and separate planned/offered phase accounting.
 
