@@ -18,14 +18,17 @@ from eviction_replay import integer
 TERM_GRACE_SEC = 1
 KILL_GRACE_SEC = 1
 GOOD = {"put_ack", "get_hit", "get_miss"}
-TERMINALS = GOOD | {"queue_full", "timeout", "arrival_late", "backend_error", "wrong_bytes"}
+TERMINALS = GOOD | {"queue_full", "timeout", "arrival_late", "backend_error", "wrong_bytes", "phase_blocked"}
 
 
 def _command(source, result, config):
     script = Path(__file__).resolve().with_name("eviction_realtime.py")
-    return [sys.executable, "-I", str(script), str(source), str(result),
-            *[value for name, setting in config.items()
-              for value in ("--" + name.replace("_", "-"), str(setting))]]
+    command = [sys.executable, "-I", str(script), str(source), str(result)]
+    for name, setting in config.items():
+        command.append("--" + name.replace("_", "-"))
+        if setting is not True:
+            command.append(str(setting))
+    return command
 
 
 def _stop(child):
@@ -44,10 +47,82 @@ def _stop(child):
     return actions
 
 
+def _counts(rows, staged):
+    expected = {"offered": sum("arrival_observed_ns" in row for row in rows) if staged else len(rows), "terminal": dict(Counter(row["terminal"] for row in rows)),
+                "submitted": sum("submitted_ns" in row for row in rows),
+                "started": sum("started_ns" in row for row in rows),
+                "completed": sum("completed_ns" in row for row in rows),
+                "late_completions": sum(row.get("late_completion", False) for row in rows),
+                "wrong_bytes": sum(row.get("backend_outcome") == "wrong_bytes" for row in rows),
+                "acked_put_bytes": sum(row["length"] for row in rows if row["terminal"] == "put_ack"),
+                "hit_get_bytes": sum(row["length"] for row in rows if row["terminal"] == "get_hit")}
+    if staged:
+        expected["planned"] = len(rows)
+    return expected
+
+
+def _verify_phases(document, result):
+    phases, rows = result.get("phases"), result["requests"]
+    if result.get("schedule_mode") != "phase-relative-v1" or not isinstance(phases, list) or len(phases) != 3:
+        raise ValueError("invalid staged schedule/phase proof")
+    entries = sorted([r["namespace_hex"], r["key_hex"], r["length"], r["payload_sha256"]]
+                     for r in document["requests"] if r["phase"] == "init")
+    initial = {"residents": len(entries), "payload_bytes": sum(e[2] for e in entries),
+               "sha256": hashlib.sha256(trace.encode(entries)).hexdigest()}
+    empty = {"residents": 0, "payload_bytes": 0,
+             "sha256": hashlib.sha256(trace.encode([])).hexdigest()}
+    previous_finish, failed = 0, False
+    for index, name in enumerate(("init", "warmup", "measure")):
+        phase = phases[index]
+        if not isinstance(phase, dict) or phase.get("phase") != name:
+            raise ValueError("phase identity mismatch")
+        members = [row for row in rows if row["phase"] == name]
+        if failed:
+            integer("blocked_ns", phase.get("blocked_ns"), previous_finish, 10**18)
+            if phase.get("status") != "blocked" or any(k in phase for k in ("origin_ns", "finished_ns", "start_state", "end_state")):
+                raise ValueError("failed preparation did not block next phase")
+            if trace.encode(phase.get("summary")) != trace.encode(_counts(members, True)):
+                raise ValueError("blocked phase denominator mismatch")
+            for row in members:
+                if row["terminal"] != "phase_blocked" or row["settled_ns"] < phase["blocked_ns"]:
+                    raise ValueError("invalid blocked row")
+                if any(k in row for k in ("deadline_ns", "effective_scheduled_ns", "terminal_ns", "latency_ns",
+                                         "arrival_observed_ns", "admitted_ns", "submitted_ns", "started_ns", "completed_ns", "observed_latency_ns", "service_ns", "queue_wait_ns", "schedule_lag_ns",
+                                         "dispatch_lag_ns", "worker_expired_ns", "backend_outcome", "backend_error", "late_completion")):
+                    raise ValueError("blocked work falsely claimed activity")
+            continue
+        integer("origin_ns", phase.get("origin_ns"), previous_finish, 10**18)
+        integer("finished_ns", phase.get("finished_ns"), phase["origin_ns"], 10**18)
+        offset = members[0]["scheduled_ns"]
+        if phase.get("source_offset_ns") != offset:
+            raise ValueError("phase source offset mismatch")
+        for row in members:
+            if row.get("effective_scheduled_ns") != phase["origin_ns"] + row["scheduled_ns"] - offset:
+                raise ValueError("phase schedule retimed inconsistently")
+            if max(row["settled_ns"], row.get("completed_ns", 0)) > phase["finished_ns"]:
+                raise ValueError("phase barrier precedes physical drain")
+        expected_start = empty if index == 0 else initial
+        if trace.encode(phase.get("start_state")) != trace.encode(expected_start):
+            raise ValueError("invalid initial/pre-measure state")
+        counts = _counts(members, True)
+        if trace.encode(phase.get("summary")) != trace.encode(counts):
+            raise ValueError("phase denominator mismatch")
+        required = {"put_ack"} if index == 0 else {"get_hit"} if index == 1 else GOOD
+        valid = all(row["terminal"] in required for row in members)
+        if index < 2:
+            valid = valid and trace.encode(phase.get("end_state")) == trace.encode(initial)
+        if phase.get("status") != ("passed" if valid else "failed"):
+            raise ValueError("phase gate flag contradicts state/outcomes")
+        failed = not valid
+        previous_finish = phase["finished_ns"]
+    return not failed
+
+
 def _verify(document, result, config):
     """Minimum whole-ledger consistency, not independent performance acceptance."""
     if not isinstance(result, dict) or result.get("model") != "monotonic-threaded-fake-only":
         raise ValueError("wrong child result model")
+    staged = config.get("staged", False)
     expected_config = dict(config, durations={}, error_ids=[], miss_ids=[], corrupt_ids=[])
     if (result.get("trace_sha256") != document["sha256"]
             or trace.encode(result.get("config")) != trace.encode(expected_config)):
@@ -60,11 +135,22 @@ def _verify(document, result, config):
             raise ValueError("child request identity mismatch")
         if row.get("terminal") not in TERMINALS:
             raise ValueError("missing/invalid terminal")
+        if row["terminal"] == "phase_blocked":
+            if not staged:
+                raise ValueError("flat replay cannot block a phase")
+            integer("settled_ns", row.get("settled_ns"), 0, 10**18)
+            continue
+        planned = row.get("effective_scheduled_ns") if staged else row["scheduled_ns"]
+        integer("planned time", planned, 0, 10**18)
         for name in ("terminal_ns", "settled_ns", "deadline_ns"):
             integer(name, row.get(name), 0, 10**18)
-        if not row["scheduled_ns"] <= row["terminal_ns"] <= row["settled_ns"]:
+        if not planned <= row["terminal_ns"] <= row["settled_ns"]:
             raise ValueError("invalid child settlement times")
-        if row["deadline_ns"] != row["scheduled_ns"] + config["timeout_ns"]:
+        if staged:
+            integer("arrival_observed_ns", row.get("arrival_observed_ns"), planned, row["settled_ns"])
+            if "admitted_ns" in row and row["admitted_ns"] < row["arrival_observed_ns"]:
+                raise ValueError("admission predates actual arrival observation")
+        if row["deadline_ns"] != planned + config["timeout_ns"]:
             raise ValueError("child deadline mismatch")
         if ("started_ns" in row) != ("completed_ns" in row):
             raise ValueError("child calls not drained")
@@ -73,9 +159,9 @@ def _verify(document, result, config):
             integer("completed_ns", row["completed_ns"], 0, 10**18)
             for name in ("admitted_ns", "submitted_ns"):
                 integer(name, row.get(name), 0, 10**18)
-            if not row["scheduled_ns"] <= row["admitted_ns"] <= row["submitted_ns"] <= row["started_ns"]:
+            if not planned <= row["admitted_ns"] <= row["submitted_ns"] <= row["started_ns"]:
                 raise ValueError("child call missing admission/submission provenance")
-            if not row["scheduled_ns"] <= row["started_ns"] < row["deadline_ns"] or row["completed_ns"] < row["started_ns"]:
+            if not planned <= row["started_ns"] < row["deadline_ns"] or row["completed_ns"] < row["started_ns"]:
                 raise ValueError("invalid child call times")
         if row["terminal"] in GOOD:
             allowed = {"put_ack"} if row["op"] == "put" else {"get_hit", "get_miss"}
@@ -85,30 +171,28 @@ def _verify(document, result, config):
                 raise ValueError("unsubstantiated child success")
         if row["terminal"] == "timeout" and row["terminal_ns"] != row["deadline_ns"]:
             raise ValueError("child timeout mismatch")
-    expected = {"offered": len(rows), "terminal": dict(Counter(row["terminal"] for row in rows)),
-                "submitted": sum("submitted_ns" in row for row in rows),
-                "started": sum("started_ns" in row for row in rows),
-                "completed": sum("completed_ns" in row for row in rows),
-                "late_completions": sum(row.get("late_completion", False) for row in rows),
-                "wrong_bytes": sum(row.get("backend_outcome") == "wrong_bytes" for row in rows),
-                "acked_put_bytes": sum(row["length"] for row in rows if row["terminal"] == "put_ack"),
-                "hit_get_bytes": sum(row["length"] for row in rows if row["terminal"] == "get_hit")}
+    expected = _counts(rows, staged)
     summary = result.get("summary")
     if not isinstance(summary, dict) or trace.encode({k: summary.get(k) for k in expected}) != trace.encode(expected):
         raise ValueError("child summary does not reconcile")
-    passed = all(row["terminal"] in GOOD for row in rows) and expected["wrong_bytes"] == 0
+    phases_passed = _verify_phases(document, result) if staged else True
+    passed = phases_passed and all(row["terminal"] in GOOD for row in rows) and expected["wrong_bytes"] == 0
     if type(result.get("passed")) is not bool or result["passed"] != passed:
         raise ValueError("child passed flag contradicts ledger")
     return summary
 
 
 def supervise(source, output, *, process_timeout_sec=30, workers=1,
-              queue_capacity=16, timeout_ns=1000000000, service_ns=1):
+              queue_capacity=16, timeout_ns=1000000000, service_ns=1, staged=False):
     if (type(process_timeout_sec) not in (int, float) or not .05 <= process_timeout_sec <= 60
             or not math.isfinite(process_timeout_sec)):
         raise ValueError("process_timeout_sec must be finite in [0.05, 60]")
+    if type(staged) is not bool:
+        raise ValueError("staged must be boolean")
     config = dict(workers=workers, queue_capacity=queue_capacity,
                   timeout_ns=timeout_ns, service_ns=service_ns)
+    if staged:
+        config["staged"] = True
     for name, low, high in (("workers", 1, 16), ("queue_capacity", 0, 1024),
                             ("timeout_ns", 1, 5000000000), ("service_ns", 1, 1000000000)):
         integer(name, config[name], low, high)
@@ -122,7 +206,7 @@ def supervise(source, output, *, process_timeout_sec=30, workers=1,
     frozen.write_bytes(trace.encode(document))
     report = {"model": "process-guard-fake-only", "passed": False,
               "status": "pending", "planned_requests": planned["requests"],
-              "request_outcomes": "unknown", "completed_requests": None,
+              "request_outcomes": "unknown", "completed_requests": None, "offered_requests": None,
               "acked_put_bytes": None, "trace_sha256": document["sha256"],
               "trace_file_sha256": hashlib.sha256(frozen.read_bytes()).hexdigest(),
               "config": config, "process_timeout_sec": process_timeout_sec,
@@ -171,7 +255,7 @@ def supervise(source, output, *, process_timeout_sec=30, workers=1,
                     raise ValueError("child exit code contradicts passed flag")
                 report.update(status="passed" if result["passed"] else "workload_failed",
                               passed=result["passed"], request_outcomes="complete_child_ledger",
-                              completed_requests=summary["completed"],
+                              completed_requests=summary["completed"], offered_requests=summary["offered"],
                               acked_put_bytes=summary["acked_put_bytes"])
             except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError) as error:
                 report.update(status="invalid_result", error=f"{type(error).__name__}: {error}")
@@ -185,6 +269,7 @@ def supervise(source, output, *, process_timeout_sec=30, workers=1,
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace")
+    parser.add_argument("--staged", action="store_true")
     parser.add_argument("output", help="NEW owned directory")
     parser.add_argument("--process-timeout-sec", type=float, default=30)
     for name, default in (("workers", 1), ("queue_capacity", 16),
@@ -194,7 +279,7 @@ def main(argv=None):
     try:
         report = supervise(args.trace, args.output, process_timeout_sec=args.process_timeout_sec,
                            workers=args.workers, queue_capacity=args.queue_capacity,
-                           timeout_ns=args.timeout_ns, service_ns=args.service_ns)
+                           timeout_ns=args.timeout_ns, service_ns=args.service_ns, staged=args.staged)
         print(json.dumps(report, sort_keys=True))
         return 0 if report["passed"] else 1
     except (OSError, ValueError, TypeError, UnicodeError, RecursionError) as error:

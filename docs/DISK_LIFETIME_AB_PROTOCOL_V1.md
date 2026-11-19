@@ -344,4 +344,56 @@ reaped、结果状态。只有正常退出0+完整一致的passed结果才整体
 **边界：**只验证直接fake子进程，不清理未知孙进程、不修改宿主进程组/内核/daemon，
 也不证明真实native/磁盘I/O在KILL后安全取消或数据已持久化。父被SIGKILL/未处理的终止信号、磁盘满/权限
 故障等可能使报告不存在/不完整；报告写失败不得返回成功，保留已有文件并明确报错。
-output目录/log没有系统级硬配额。正式服务适配、阶段初态和A/B冻结门禁仍未完成。
+output目录/log没有系统级硬配额。fake阶段初态验证见第12节；真实服务适配、真实热度初态
+和A/B冻结门禁仍未完成。
+
+## 12. 显式三阶段与初态校验（fake-only，默认平铺模式不变）
+
+第10/11节新增 `--staged`，API对应 `staged=True`；默认不设置时仍是原来的平铺
+调度，不改变旧诊断的允许miss规则、时间轴和分母。第9节纯虚拟模型不变。
+
+```bash
+python3 deploy/validation/eviction_guard.py /tmp/dfkv-real-trace-new.json /tmp/dfkv-staged-new --staged --process-timeout-sec 5
+python3 -m unittest discover -s test/python -p test_eviction_stages.py
+```
+
+这个模式是**显式的新回放时间协议**，不是悄悄重定时原trace：源 `scheduled_ns`、
+request_id、phase、对象/字节和trace SHA保持不变；输出另记
+`schedule_mode=phase-relative-v1`、各阶段 `source_offset_ns`/实际 `origin_ns` 及逐请求
+`effective_scheduled_ns = origin_ns + scheduled_ns - source_offset_ns`。
+同一阶段内部间隔保持原计划；请求deadline/到达滞后/端到端延迟基于effective时间。
+初始化与预热耗时另报，不混进测量请求；不可拿这个模式与旧平铺结果当同负载A/B。
+未来正式注册还须冻结模式、phase计划与成本口径，当前不是正式冻结包。
+
+| 阶段 | 入场/关闭条件 | 失败处理 |
+|---|---|---|
+| init | fresh且空fake store；所有初始化PUT及时ACK，结束后key集合、长度和payload摘要严格等于计划 | 失败后不进入warmup/measure |
+| warmup | init物理调用全部排空；每条预热GET必须get_hit，结束时payload驻留快照仍完全一致 | miss即失败，不当成功预热；measure不发出 |
+| measure | warmup物理调用排空且校验通过后才定新origin；新PUT/原对象GET按阶段计划到达 | 测量miss仍可作为正常缓存结果；错bytes/超时等仍失败 |
+
+切换依据不只是逻辑请求终局：reserved/等待队列都清空，已启动假调用实际completed，
+才取结束快照和开启下一阶段。初始化超时即使随后迟到PUT提交成功，也必须排空后
+判失败，不允许把迟到提交当作预热资格。快照计算先于下阶段origin，计算成本仍体现在
+整个回放耗时/阶段转换间隔中，不让取快照自身提前耗尽下一阶段的到达槽。
+
+`start_state/end_state` 为实际fake store的resident数、payload字节及排序后
+`[namespace_hex,key_hex,length,payload_sha256]` 清单摘要。init前必须为空；init后、
+warmup前后及measure前必须是计划初始化集合。额外对象、缺对象、长度/字节不符均
+失败，不能只比较对象数量或只相信PUT返回ACK。父监护器按trace元数据独立核对摘要。
+**这不是实际磁盘/RAM的热度/评分初态**：fake没有真实读热度、pin、淘汰链和恢复状态，
+也不能证明真实cache在相同逻辑预热下有相同驻留/热度。当前只验证payload初态及阶段资格。
+
+每阶段保留status（passed/failed/blocked）、实际origin/finished或blocked时刻、
+原始请求账与独立summary。父进程核验阶段顺序/排空时序、effective时间映射、状态摘要、
+严格ACK/hit条件及计数，不能仅凭passed/preparation布尔值接纳子报告。
+
+前置失败的后续请求保留 `phase_blocked` 和实际阻止决策时间；没有实际到达、deadline、
+启动/完成或伪造latency，也不生成一个假的阶段origin。各阶段/root同时报告
+**planned（计划数）与offered（实际被调度观察到的到达数）**，blocked不进入offered。
+terminal计数包含全部计划行以便审计，因此可能大于offered；不能把terminal总数用作
+实际读分母。已开始阶段每行必须有真实arrival观察凭据；父进程拒绝删凭据后重算分母。
+root/phase的ACK和hit字节均是各自原始行汇总，测量分母不得包含初始化/预热请求。
+完整失败账允许明确报告“测量offered=0、blocked”，不是宣称测量成功率或业务收益为0。
+
+本小步只改fake调度/父验证和单测，默认策略/评分/保护窗口、trace schema及生产C++不变。
+无服务连接/磁盘压力；正式trace/业务权重、旧baseline、人员隔离与数值门槛仍缺，正式A/B未开始。

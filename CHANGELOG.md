@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add opt-in staged fake replay with drained initialization/warmup/measurement
+  gates, exact payload-state checks and separate planned/offered phase accounting.
+
 - Supervise threaded fake replay in an owned child process with bounded TERM/KILL
   escalation, exit/result consistency checks and persistent unknown-outcome failure reports.
 
