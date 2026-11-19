@@ -290,6 +290,58 @@ summary的offered/submitted/started/completed、终局计数、late/wrong_bytes�
 原始时间先后/计数，不要求真实调度达到精确纳秒或给出性能达标结论。
 
 **仍缺：**真实服务适配器、真实ACK/网络/磁盘淘汰、正式阶段barrier与热度初态、
-任意native调用不可取消时的进程级超时兜底。当前线程等待仅针对有界fake，不能推广为
-native卡死可安全join；测试CLI用外部subprocess timeout保护，生产级进程隔离尚未实现。
+实际native调用的取消/隔离契约。当前线程等待仅针对有界fake，不能推广为
+native卡死可安全join；第11节新增fake子进程监护，不替代生产服务的进程/资源隔离。
 正式业务trace、旧baseline、人员隔离及逐项数值门槛仍缺，正式A/B未启动，默认/评分不改。
+
+## 11. fake 回放的父进程监护与失败报告
+
+入口 `deploy/validation/eviction_guard.py`。父进程只启动固定的 `eviction_realtime.py`，
+不提供任意命令/真实服务参数；仍不连接服务、不压盘、不作正式A/B。
+
+```bash
+# 输入可用第10节生成的trace，输出必须是尚不存在的目录。
+python3 deploy/validation/eviction_guard.py /tmp/dfkv-real-trace-new.json /tmp/dfkv-guard-new --process-timeout-sec 5
+python3 -m unittest discover -s test/python -p test_eviction_guard.py
+```
+
+输出目录以独占mkdir取得，不建父目录、不复用文件/符号链接、不自动删除或重试。
+先校验trace，在新目录保存canonical `trace.json`，子进程只读此副本；report同时登记
+内容摘要和这份文件的SHA，防止把源文件后续修改当成同一输入。其余线程/队列/请求
+超时/服务假等待参数沿用第10节，进程时限额外传 `--process-timeout-sec`（有限数值
+0.05–60秒、默认30秒），从启动子进程前起算，包含解释器启动，不是仅请求执行时间。等待使用扣除启动耗时后的剩余预算；启动返回或观察到退出时已过
+预算，即使已有有效passed文件也失败。Popen本身在内核中阻塞时，当前父进程不能强行
+抢占它，只能返回后识别超时；因此不宣称整个函数是硬墙钟上限。终止宽限另计，
+报告elapsed包含清理，但不把这些时间当作成功执行预算。
+
+监护规则：
+
+- 使用参数列表、stdin=DEVNULL，无shell；stdout/stderr直接写各自日志文件，不用可能
+  填满的PIPE。固定fake输出有界，不因此承诺任意程序日志有配额/截断保护。
+- 到进程时限仍未退出，给**本次Popen对象代表的直接子进程**请求TERM，宽限1秒；
+  仍未结束则请求KILL，再有界等待1秒并核对回收。记录请求动作、错误和returncode/
+  reaped，不把“发了KILL”当作已经回收。只操作自有句柄，不按进程名、目录或PID扫描杀进程。
+- 若有界等待后仍不能确认回收，保存cleanup_failed、原失败原因及PID，保持失败，
+  不转为成功、不自动重跑。该极端分支用mock验证，不冒充真实D-state故障注入。
+- 正常退出0也必须核对child-result：固定model/trace/config、完整原请求身份与顺序、
+  唯一终局/启动完成、基本时间顺序、PUT/GET与成功类型对应、成功结算等于完成时刻、
+  admitted/submitted/started凭据、原始行与终局/字节汇总守恒，以及passed与退出码一致。
+  这里只是最小整体一致性核验，不是独立性能验收器，也不证明不可信程序不能伪造整份报告。
+- 超时优先于已有结果：即使子进程写了passed后卡住，也记process_timeout，不放行。
+  崩溃/信号/退出1无有效结果、缺失/截断/重复字段/矛盾结果分别保留原文件与日志。
+- 对完整且正常返回的成功/工作负载失败账，可以登记已知完成数和ACK字节；对超时、
+  异常、无效/不完整结果，一律 `request_outcomes=unknown`、完成数/ACK字节=null。
+  planned_requests是计划数，不冒充实际已发送数；不把未知调用补成逐请求timeout或0次ACK。
+- 启动失败也保存父报告。父进程可捕获的异常/KeyboardInterrupt会先有界清理自有子进程、
+  保存错误；KeyboardInterrupt再向上抛出，不吞掉停止请求。不会声称可拦截父进程SIGKILL。
+
+目录保留 `trace.json`、`stdout.log`、`stderr.log`、可能存在/不完整的`child-result.json`、
+父 `report.json`。父报告记child_pid、command、process时限、elapsed、动作、returncode、
+reaped、结果状态。只有正常退出0+完整一致的passed结果才整体passed，CLI返回0；
+其余返回1或继续传播父中断。失败不覆盖/删改子报告，不用stdout的“成功”字样代替结果。
+输入/参数非法或目录已存在在启动前拒绝，不创建新的输出目录。
+
+**边界：**只验证直接fake子进程，不清理未知孙进程、不修改宿主进程组/内核/daemon，
+也不证明真实native/磁盘I/O在KILL后安全取消或数据已持久化。父被SIGKILL/未处理的终止信号、磁盘满/权限
+故障等可能使报告不存在/不完整；报告写失败不得返回成功，保留已有文件并明确报错。
+output目录/log没有系统级硬配额。正式服务适配、阶段初态和A/B冻结门禁仍未完成。

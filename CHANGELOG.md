@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Supervise threaded fake replay in an owned child process with bounded TERM/KILL
+  escalation, exit/result consistency checks and persistent unknown-outcome failure reports.
+
 - Add monotonic-clock threaded fake replay with bounded admission, no catch-up
   bursts and separate timeout observation/late-completion accounting; no real services.
 
