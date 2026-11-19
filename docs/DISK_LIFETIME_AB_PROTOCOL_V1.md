@@ -438,3 +438,60 @@ ctest --test-dir build-test -R '^python_eviction_client$' --output-on-failure
 再在重新核验归属的隔离VM内跑少量对象的字节正确性冒烟；新建冷盘目录并先启温度监控。
 禁止宿主 `/mnt/disk1`，不重用默认Docker daemon，不自动开始压力或正式A/B。
 当前未启动任何真实服务/VM/测试盘负载；正式业务输入、旧baseline、独立职责和数值门槛仍未齐。
+
+## 14. 有界真实客户端正确性冒烟（已实测，非正式 A/B）
+
+入口 `deploy/validation/eviction_smoke.py`；工具**只连接已有的专用scratch服务**，
+不创建/重置/停止服务，不用于线上实例。参数限制单个 `name=127.0.0.1:port`，
+最多8个初始化对象、4个新增对象、每对象4096B，即最多24条计划请求/49152B PUT。
+复用§13适配器，先全部init PUT，再全部warm GET，最后measure交错PUT/GET；
+任一异常/no-hit立即失败，后续（包括当前阶段剩余）标为 `not_attempted`。
+这里no-hit只能为 `get_unresolved`，不能当普通miss通过。没有真正驻留/热度快照。
+
+这是**串行、无节奏的正确性检查**：源计划时间/ID/字节/SHA保留作身份，
+`schedule_mode=sequential-unpaced`，不按scheduled_ns调度、无追赶、不形成性能到达率对照。
+GET检查全部返回字节；当前trace的测量GET仍访问初始对象，新增测量PUT只检查ACK，
+不声称所有新写对象都做过回读。started/completed是整个适配器调用的墙钟边界，
+不是精确native/NIC区间；没有逐请求deadline或取消承诺。
+
+父进程独占新输出目录，冻结trace、库绝对路径/SHA、members及固定客户端环境。
+清除继承的 `DFKV_*`，显式使用RDMA=1/rxe0/depth4、8MiB recv、2MiB payload/block。
+加载库、打开句柄、执行及关闭全部放在自有直接child；默认总预算10秒，可设0.05–30秒。
+预算含启动成本，超时先TERM宽限1秒、再KILL宽限1秒；复用fake guard的exact-child
+停止函数，但不复用fake结果验证。无任意command CLI、无进程枚举/进程组批量信号。
+父核对完整trace/config/逐请求op与终局、顺序起止、首次失败后禁执行、句柄清单、
+汇总和退出码，而不只信passed。完整失败账可给已知计数；杀死/异常退出/坏账则完成数、
+ACK字节为null未知，不能填0。stdout/stderr及原始child账、父report均保留。
+
+边界：TERM/KILL及reaped只证明直接child处理，不代表远端PUT撤销或落盘回滚；
+未证明后代清理。Popen自身内核阻塞不可硬抢占，父SIGKILL/落盘失败可能缺报告，
+日志无系统硬配额。`--child`仅内部使用，不能当绕过监护的公开入口。
+服务健康/磁盘ACK/实际路径和空闲回收由外层独立核验，不能仅凭客户端transport字符串证明。
+
+专用隔离guest内，**先按冷盘说明核验归属、fresh目录/服务与温控**，再执行：
+
+```bash
+# 每轮换新seed/文件名/结果目录；只针对本轮专用scratch服务。
+python3 /opt/dfkv/deploy/validation/eviction_trace.py generate /tmp/smoke-trace-NEW.json \
+  --seed 2026111901 --objects 8 --rounds 4 --length 4096
+python3 /opt/dfkv/deploy/validation/eviction_smoke.py /tmp/smoke-trace-NEW.json \
+  /data/disk1/results/smoke-NEW --lib /opt/dfkv-build/libdfkv.so \
+  --members n=127.0.0.1:12001 --process-timeout-sec 10
+```
+
+上例guest `/data/disk1`必须已证明由宿主disk2承载，**不允许映射宿主 `/mnt/disk1`**。
+服务启动/停止与温控归属门禁见[冷盘说明](DISK_LIFETIME_COOL_DISK_VALIDATION.md)；
+不能对未核验的本地端口盲目重跑。失败后保留原目录/原账，不续跑、不自动重试/覆盖。
+
+2026-11-19实测：同一冻结trace、同一既有ON二进制，fresh slab/legacy与slab/lifetime
+各24计划/24尝试/24完成：12 PUT ACK、12 GET命中，各49152B写入及读取。
+RAM关闭、disk ACK、buffered；每例3个新guest盘目录，初始对象数为0且metrics归属匹配。
+两例均实际uring读取/完成12，PULL终局12 success_nonempty，错误/fallback/inflight/淘汰均0；
+lifetime read_success=12。两例均正常退出0、端口释放。停服后额外负例第一PUT失败，
+1尝试/1返回、ACK0，余23不执行；不是正常miss，也不是已撤销写入证明。
+两例不是正式A/B样本，不比较约0.9秒运行时间，不证明大容量/长时间淘汰效果。
+
+新16硬件无关单测、guest同16方法均0失败/跳过；本机OFF/OFF构建及9目标CTest通过。
+另保留一次SSH返回0但只给MOTD的无执行尝试：无guest结果目录，已判无效，不计成功样本；
+实际执行改为直接sudo python并要求唯一完成标记，再独立校验原始账/指标，不能只看SSH退出码。
+冷盘温控及保留文件位置见冷盘说明第12节。正式A/B仍未开始，生产默认/评分/保护参数不变。

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add bounded loopback real-client smoke with exact-child timeout supervision,
+  strict ACK/hit gates and failure ledgers; validate small RXE/io_uring cases
+  without starting formal A/B or changing eviction defaults.
+
 - Add a minimal namespace-bound trace adapter over the existing C ABI client,
   with byte validation, unresolved no-hit results and lifecycle tests; real-service smoke
   and formal A/B remain pending.

@@ -239,3 +239,31 @@ listener/server清空并SO_REUSEADDR端口bind通过后，monitor正常停止，
 **继续禁止宿主/mnt/disk1测试压力**，不动旧热盘大文件。结果与保留data准确路径见
 快速验证第17节和summary.json。真实并发分母/字节/淘汰核验通过，不包装成默认lifetime
 保留收益（本轮仍大量热点miss）、性能扩展性、长期稳定性或正式A/B/O5整体验收。
+
+## 12. 有界真实客户端首次小规模冒烟（2026-11-19）
+
+基线 `c7ef424`，O5/AB7前置小步；入口与复跑边界见
+[正式协议第14节](DISK_LIFETIME_AB_PROTOCOL_V1.md#14-有界真实客户端正确性冒烟已实测非正式-ab)。
+本轮复用原QEMU，重新校验PID/start/cmdline、6实际FD/root/宿主资产inode和独立netns，
+未使用已失效私有Docker socket，也未回退默认daemon/新建VM/格式化。
+仅显式同步5个eviction工具和新单测；既有driver/CABI源及server/lib SHA前后相同。
+
+两例fresh legacy/lifetime各12 PUT/12 GET，字节一致；确认RDMA＋实际io_uring，
+无错误/回退/在途/淘汰，server正常退出0。停服负例失败且阻止余请求。
+这不是水位压力、热度初态对等、性能对照或正式A/B；无可靠miss状态能力不因本轮通过而解除。
+
+保留文件（没有自动删除）：
+- 宿主新增目录及archive/monitor：
+  `/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/real-smoke-20261119T024347Z-c7ef424/`
+  ，其中 `real-smoke-results.tgz` 为仅结果包，不含虚拟盘/密钥。
+- guest结果：`/data/disk1/results/real-smoke-20261119T024347Z-c7ef424/`。
+- guest数据：`/data/disk{1,2,3}/cases/real-smoke-20261119T024347Z-c7ef424-{legacy,lifetime}`，
+  共6个本轮新目录。它们经既有虚拟盘映射到宿主disk2/3，guest disk1不是宿主disk1。
+- 仓库本地证据：`.omx/evidence/real-smoke/20261119T024347Z-c7ef424/`，
+  含原始账/指标、测试、hash/归属、审查、无效SSH尝试与完成标记证据。
+
+新monitor仅采nvme2/nvme0，35次SMART均warning0，所有有效传感器最高41°C，
+最大采样间隔10.180秒；覆盖同步/guest单测/实际执行与结束后，未触发>=65°C停止线。
+外层watchdog监视monitor归属/样本新鲜度，死亡/超25秒陈旧则重新证明并停止唯一ownedVM，
+不对其他进程发送信号。该兜底本轮未触发，不冒充实际热故障注入。
+所有服务/直接客户端和本轮monitor已结束；原VM留存空闲。继续禁止宿主 `/mnt/disk1` 压测。

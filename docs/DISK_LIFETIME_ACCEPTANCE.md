@@ -251,3 +251,9 @@ keep-first 与 Remove 后新值、全 pin 拒绝后释放一份 lease 再重试�
 最新前置小步：真实客户端最小适配接口及硬件无关单测完成，见
 [正式A/B协议第13节](DISK_LIFETIME_AB_PROTOCOL_V1.md#13-真实客户端最小适配接口单测完成未接服务)。
 仅复用既有Client，不连接服务；真实监护/阶段入口和小规模正确性冒烟仍待接入，正式A/B未开始。
+
+最新前置小步：真实客户端进程保护＋串行有界冒烟已完成，详见
+[协议第14节](DISK_LIFETIME_AB_PROTOCOL_V1.md#14-有界真实客户端正确性冒烟已实测非正式-ab)。
+新16单测/guest同16、9目标CTest通过；实际legacy/lifetime各12 PUT/12 GET正确、
+RXE＋io_uring指标闭合，停服负例失败。无淘汰压力，不当性能A/B或默认切换依据；
+真实GET no-hit仍不可判定，旧baseline/业务输入/独立职责/数值门槛及正式A/B门禁未解除。
