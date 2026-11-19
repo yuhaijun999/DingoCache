@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Document rebuilt RXE/io_uring scalar GET status validation, including explicit
+  misses, capacity errors and stopped-service failure reports for both policies;
+  keep client outcomes separate from server grants and formal A/B gates.
+
 - Add an independent status-preserving scalar GET C API and optional Python
   trace-client support; distinguish explicit absence from failures while keeping
   legacy-library no-hit unresolved and strict smoke gates unchanged.

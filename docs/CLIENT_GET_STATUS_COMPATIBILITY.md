@@ -162,3 +162,45 @@ LLVM17.0.6新测试全配置clang-tidy与默认format通过；核心diff范围cl
 范围外旧诊断未整改；旧include块保留，diff format关闭include重排。
 初轮缺少直接cstdint依赖已补齐。一次CTest与目标重链接竞争，6例permission denied未执行，
 保留该无效验证账；最终在完整构建结束后顺序重跑全部96项通过，不把未执行算通过。
+
+## 6. 第三步：隔离RXE＋io_uring状态与报告实测
+
+2026-11-19，基线 `5abc009`，仅验证已提交实现，没有新增生产代码。
+143个源码/构建/绑定/工具/测试文件与宿主冻结SHA逐项一致；guest GCC13.3、Debug、
+RDMA=ON/URING=ON完整重建成功，23项目标C++测试与Python14＋17方法全部通过，0跳过。
+包含实际RXE loopback1例、内核io_uring5例、新旧scalar状态17例。
+新库SHA256为 `402a5028e366747371245a145e41eec6ccafc5ac97fa15c356e9ca058666741d`，
+新C符号已导出；server重建后的SHA与上一轮相同，不能把它描述成服务端行为变更。
+
+legacy/lifetime各启动一个fresh slab服务（RAM关闭、disk ACK、buffered、uring开启）：
+
+| 场景（每种策略各一例） | 实际结果 | 父报告 |
+|---|---|---|
+| 正常trace：8对象/4轮/4096B | 24计划/24尝试/24完成，12 PUT ACK＋12完整GET命中，写读各49152B | passed、rc0、已回收 |
+| 首个预热GET前显式REMOVE | 实际C结果NOT_FOUND=1、长度0；get_miss | workload_failed、rc1、完整子账 |
+| REMOVE后额外PUT4098B，GET容量4097B | 实际C结果INVALID=5、长度0；client_error | workload_failed、rc1、完整子账 |
+| 首个预热GET前停止唯一owned服务 | 实际C结果IO_ERROR=4、长度0；client_error | workload_failed、rc1、完整子账 |
+
+每个负例6计划，仅前2 PUT ACK与1 GET被尝试/完成，余3不执行；父报告准确保留3/3、
+ACK8192B，不是invalid_result/未知，更不把miss或错误判成功。每次GET仅调用一次真实C符号。
+负例以**证据目录内的诊断child**做受控注入，复用提交的run/TraceClient/父验收器；
+不是修改公开smoke CLI或伪造后端结果。父报告记录实际child命令。
+每种策略内四场景使用不同seed，两种策略复用同组seed；两种策略累计84计划、
+66尝试/完成，trace PUT ACK36次/147456B。
+额外注入的2次PUT/8196B及4次REMOVE单列，不混入trace分母；两台服务累计PUT38次/155652B。
+
+每种策略PULL终局：正常uring/success_nonempty12、缺失uring/not_found1、
+容量不足uring/success_nonempty1；其他路径/结果增量0。uring读/完成各13，无回退/残留在途/淘汰。
+**容量不足的客户端失败不等于服务端授权失败**：按定稿spec第3节口径，MR/有效grant成立即可计热，
+客户端收到READY后才因完整长度不足拒绝。因此lifetime服务端热度成功/应用各13、客户端命中12，
+不是将失败客户端请求伪记为命中，也不改成仅凭RELEASE补热；legacy热度0。
+停服后的GET没有活服务端可抓取最终计数，保留停服前快照，不声称服务端io_error增量或远端取消。
+
+两台服务正常退出0、所有直接child回收、端口空闲；VM保留空闲，温控已正常结束。
+有效monitor期间60次SMART：nvme2最高41°C、nvme0最高40°C、warning均0，最大间隔10.208秒。
+全部VM资产与数据只由宿主disk2/3承载，继续禁止宿主/mnt/disk1压测。
+源码/二进制、原始账/指标、独立审计、重建/测试及保留位置见
+[冷盘说明第13节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
+
+本轮未做压力、真实物理HCA、全量CTest、sanitizer或正式A/B，不依据约1秒或停服耗时比较性能。
+下一小步应独立梳理批量GET状态传播契约，不能将当前单键证明扩大到SG/dedup/生产连接器。

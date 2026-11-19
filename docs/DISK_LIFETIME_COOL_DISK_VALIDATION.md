@@ -267,3 +267,71 @@ listener/server清空并SO_REUSEADDR端口bind通过后，monitor正常停止，
 外层watchdog监视monitor归属/样本新鲜度，死亡/超25秒陈旧则重新证明并停止唯一ownedVM，
 不对其他进程发送信号。该兜底本轮未触发，不冒充实际热故障注入。
 所有服务/直接客户端和本轮monitor已结束；原VM留存空闲。继续禁止宿主 `/mnt/disk1` 压测。
+
+## 13. 新C ABI＋Python单键状态：小规模RXE/io_uring复核
+
+2026-11-19，源码 `5abc009`。本轮不改生产代码或默认值，不运行水位/容量压力或正式A/B。
+继续使用第12节同一已重新核验的VM，未启动默认Docker daemon、未重建/格式化虚拟盘。
+六个QEMU实际FD、进程starttime/uid/netns、宿主文件dev/inode/size均重新核对，
+根盘/seed/data1由宿主disk2承载，data2/3由宿主disk3承载；guest `/data/disk1`不是宿主disk1。
+
+### 构建、用例及口径
+
+同步提交的源码与新增测试后，143文件SHA逐项核验；完整ON/ON Debug构建成功。
+新库包含 `dfkv_get_auto_status`；SHA为
+`402a5028e366747371245a145e41eec6ccafc5ac97fa15c356e9ca058666741d`。
+server重新链接后字节SHA仍为上一轮值，本轮没有服务端实现变更。
+实际guest命令包括：
+
+```bash
+cmake --build /opt/dfkv-build -j2
+# 17个scalar状态用例；另运行实际RXE1例、内核io_uring5例。
+ctest --test-dir /opt/dfkv-build --output-on-failure -R '^(CApiGetStatus|GetAutoStatus)'
+python3 -m unittest discover -s /opt/dfkv/test/python -p test_eviction_client.py
+python3 -m unittest discover -s /opt/dfkv/test/python -p test_eviction_smoke.py
+```
+
+实际使用有界root guest脚本设置本进程memlock上限，未改宿主限制。完整23项C++过滤器/命令/XML
+在证据 `guest-units.py` 及结果目录中；Python分别14/17方法，全部0失败/跳过。
+两种策略各正常24请求＋缺失/容量不足/停服3负例，合计8例均符合预设判定。
+负例各6计划、3尝试/完成、trace ACK8192B；实际C状态依次1/5/4且长度0，
+父报告均workload_failed、完整已知计数、rc1/已回收，余请求不执行。
+trace累计84计划、66尝试/完成、36 PUT ACK/147456B；另有受控注入2 PUT/8196B、4 REMOVE。
+注入脚本调用真实库/服务，单次GET无预探测，不是fake backend；它不是公开CLI新增模式。
+每种策略实际PULL终局14（成功grant13、明确not_found1），uring读/完成13，无同步回退/残留/淘汰。
+每种策略客户端正常命中12、服务端成功grant13；lifetime热度13、legacy热度0。
+该差异按spec已明确的服务端成功口径单列，
+不能将容量不足的成功grant算客户端hit。细表见[状态接口第6节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
+
+### 复跑顺序与保留位置
+
+1. 重新证明唯一owned VM与六个backing资产归属；不要只复用历史PID或目录标签。
+2. 用新TAG、新host结果目录启动**持续存活**monitor，只采nvme2/nvme0；
+   warning非0、任一有效温度>=65°C、样本不合法/陈旧或monitor死亡立即失败并按归属停止唯一VM。
+3. 同步冻结源码，比较SHA，顺序执行构建→目标单测→二进制SHA/符号检查。
+4. 每种策略仅一个fresh scratch服务，3个新guest数据目录，核验空初态/端口/metrics归属。
+   正常例使用公开smoke入口；负例使用本轮证据中的受控child，父账保存真实命令。
+   改新TAG/seed/目录后重新冻结脚本SHA，不对旧目录续跑或覆盖，也不盲目复制旧watch的PID。
+5. 独立审核原始状态/字节/分母/终局标签，正常退出并回收服务及child，验证端口空闲；
+   fresh结束后SMART样本出现后正常结束monitor，结果归档，不清理旧样本。
+
+本轮文件未自动删除：
+- 宿主新增结果包/monitor目录：
+  `/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/rxe-get-status-20261119T092144Z-5abc009/`，
+  `results.tgz`仅含本轮结果/日志/指标/测试，不含密钥或虚拟盘。
+- guest结果：`/data/disk1/results/rxe-status-20261119T092144Z-5abc009/`；
+  测试结果：`/data/disk1/results/rxe-status-tests-20261119T092144Z-5abc009/`。
+- guest数据：`/data/disk{1,2,3}/cases/rxe-status-20261119T092144Z-5abc009-{legacy,lifetime}`，共6新目录。
+- guest诊断脚本：`/tmp/dfkv-rxe-status-20261119T092144Z-5abc009.py`、
+  `/tmp/dfkv-rxe-status-fault-20261119T092144Z-5abc009.py`、
+  `/tmp/dfkv-rxe-status-units-20261119T092144Z-5abc009.py`。
+- 仓库证据：`.omx/evidence/rxe-get-status/20261119T092144Z-5abc009/`，含脚本/完整命令、
+  143文件SHA、二进制SHA、父子原账、故障注入操作账、指标与测试/独立审计。
+
+有效monitor期间60样本，nvme2最高41°C、nvme0最高40°C，warning均0，最大间隔10.208秒。
+最初两次普通shell后台monitor未跨工具调用存活，尚未运行guest工作；
+正式操作前改为持久前台执行会话并验证PID/starttime/新鲜样本，原2样本保留但不计连续有效监护。
+结束复核的首次复杂SSH命令又出现rc0仅MOTD，无完成标记，判无效、不计成功；
+改为简单python stdin后实际确认无server、端口空闲、二进制SHA未变。不得只看SSH退出码。
+两台服务正常退出0，所有直接child回收、monitor正常结束，VM留存空闲；未触发实际热故障，
+不把未触发的兜底说成热故障注入证明。无物理HCA/压力/全量测试/正式A/B或默认切换放行。

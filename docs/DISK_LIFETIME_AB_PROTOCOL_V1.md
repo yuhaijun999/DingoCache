@@ -513,3 +513,12 @@ lifetime read_success=12。两例均正常退出0、端口释放。停服后额�
 接口/验证/后续边界详见[状态兼容方案第5节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
 仅在tiny file/TCP服务验证本轮新增接口；此前RXE/uring二进制未含该新接口，
 不能沿用旧guest结果声称新接口已过真实RDMA。正式A/B仍未开始、默认不变。
+
+## 17. 新单键状态接口的隔离RXE/io_uring验证
+
+源码 `5abc009` 已在既有冷盘VM中完整ON重建，143文件SHA匹配、新库符号/哈希核验。
+23项C++及Python14＋17方法通过，legacy/lifetime各正常24请求和3类真实故障诊断符合预期。
+只计明确NOT_FOUND为miss；容量不足/停服均错误，父报告保留完整已知失败账、停止余请求。
+服务端grant成功与客户端最终hit分别核验，不混用两者分母；注入PUT/REMOVE单列。
+详见[状态接口第6节](CLIENT_GET_STATUS_COMPATIBILITY.md)及[冷盘说明第13节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
+这补齐单键接口的RXE/uring正确性证据，不是物理HCA/批量/SG/dedup或正式A/B放行。
