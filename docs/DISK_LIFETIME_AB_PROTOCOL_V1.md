@@ -188,4 +188,53 @@ generation、length、payload_sha256。scheduled_ns 是**计划 trace 起点**�
 
 生成仅独占创建文件，不创建父目录，不覆盖文件/符号链接，不设只读权限或保证防篡改。
 写入中断可能留下部分文件；保留该文件和错误，check 应失败，不自动删除或覆盖重试。
-只有未来回放器才能实现队列/超时/实际计时规则，本轮不能用于取得 A/B 性能样本。
+trace 工具本身不回放；第9节仅新增队列/超时的虚拟时间模型，实际计时仍未实现，
+不能用于取得 A/B 性能样本。
+
+## 9. fake backend 虚拟回放小步（不是实际执行器）
+
+入口 `deploy/validation/eviction_replay.py`，复用第8节 trace 校验与 payload 生成，
+纯标准库、内存数据、整数虚拟时钟。**不睡眠、不启动线程、不连接真实服务、不发服务 I/O
+请求**；输出 ns 全为模型时间，不是实测延迟、吞吐、锁时间或调度能力。这里只锁定
+排队/超时/终局计量语义，不宣称已有生产可用的异步回放器。
+
+```bash
+python3 deploy/validation/eviction_replay.py /tmp/dfkv-trace-new.json /tmp/dfkv-replay-new.json
+python3 -m unittest discover -s test/python -p test_eviction_replay.py
+```
+
+CLI 可指定 `--workers`（1–64，默认1）、`--queue-capacity`（等待队列0–1024，默认16）、
+`--timeout-ns`（1–10^12，默认10^9）、`--service-ns`（1–10^12，默认1）。
+workers 是模拟执行槽数，不是真实线程数；超时、队列和服务时长均为离线测试参数，
+不是正式性能阈值。每次 run 要求 fresh FakeBackend，不能沿用上一组缓存状态。
+
+- 所有计划请求仍按原 scheduled_ns 到达，FIFO 排队，不因慢请求而减少 offered 分母。
+  容量只限制等待队列，不包含执行槽；等待队满记 queue_full，保留请求 ID、不调用 backend。
+- deadline=scheduled_ns+timeout_ns，包括排队时间。执行中在截止时刻恰好完成则完成优先；
+  已排队请求在截止时刻不能再启动，即使该刻恰好有槽释放。完成同刻按 request_id 排序。
+- 执行中超时只结算一次逻辑 timeout，**不提前释放执行槽**。模型继续到所有已启动调用
+  完成；迟到 PUT 仍可能写入内存，记录 backend_outcome，但绝不追补逻辑 ACK/ACK 字节。
+  完整排空时刻 drained_ns 不改变原到达计划，也不当作性能测量窗口。
+- 内存 PUT/GET 在完成时写入/观察状态（非真实系统一致性模型）。GET 在其 PUT 完成前
+  可能 miss；这不是严格预热已成立。后续真实执行器仍需定义阶段 barrier、预热资格与
+  实际观测时间，不能直接用本模型当正式初态构造器。
+- 单测可按 request_id 注入有界服务时长、backend_error、GET miss 或错误 bytes。
+  错误 PUT 不提交；miss 合法、错误 bytes 否决。迟到错 bytes 同样计入独立安全计数，
+  不因请求早已 timeout 而被覆盖；继续模拟其余请求是为了保留完整分母，不表示安全放行。
+
+每请求保留 trace 身份、计划时间、deadline、唯一 terminal/terminal_ns/latency_ns。
+仅真正启动者有 started_ns/queue_wait_ns，仅完成者有 completed_ns/service_ns/
+backend_outcome/late_completion。未开始/未完成时间不填0，不伪造调用记录。
+latency_ns 是从计划到逻辑终局的时间；service_ns 是完整模拟调用时间，迟到时可超过
+逻辑 latency；不能把这两种延迟互相替代。summary 的 offered、terminal、started、
+completed、late_completions、wrong_bytes、acked_put_bytes、hit_get_bytes 均从原始行汇总。
+trace_sha256 是原 trace 的内容摘要；输出保存模型参数/注入配置，不是正式外部冻结 manifest。
+
+terminal 为 put_ack/get_hit/get_miss/queue_full/timeout/backend_error/wrong_bytes。
+只有前三者组成的完整模拟才 passed；这里的 passed 只表示本模型没有模拟失败，
+不是 A/B 通过。失败模型也落完整结果且 CLI 返回1；输入/配置非法返回1且不创建结果。
+输出独占创建，不覆盖文件/符号链接、不创建父目录；写入中断可能留下部分文件，保留错误。
+
+**剩余缺口：**真实单调时钟/固定到达调度、真实线程/并发、不可取消调用的进程级兜底、
+实际排队/网络/ACK/取消、容量淘汰与恢复均未实现/验证。模型所有服务时长有界，不能
+据此声称真实 native 卡死可排空。正式负载/旧基线/隔离/阈值门禁仍保持未完成。

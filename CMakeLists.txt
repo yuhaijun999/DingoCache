@@ -246,6 +246,10 @@ if(DFKV_BUILD_TESTS)
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
               -p test_eviction_trace.py)
+    add_test(NAME python_eviction_replay
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
+              -p test_eviction_replay.py)
     add_test(NAME python_quick_eviction
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add offline virtual-time fake replay with bounded queues, arrival-based deadlines
+  and late-completion accounting; keep real service execution and formal A/B pending.
+
 - Add a bounded offline synthetic eviction trace generator and strict plan/checksum
   validation with hardware-free tests; do not connect to services or start formal A/B.
 
