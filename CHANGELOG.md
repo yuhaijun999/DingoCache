@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add monotonic-clock threaded fake replay with bounded admission, no catch-up
+  bursts and separate timeout observation/late-completion accounting; no real services.
+
 - Add offline virtual-time fake replay with bounded queues, arrival-based deadlines
   and late-completion accounting; keep real service execution and formal A/B pending.
 

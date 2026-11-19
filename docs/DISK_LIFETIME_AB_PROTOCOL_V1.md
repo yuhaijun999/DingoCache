@@ -188,8 +188,8 @@ generation、length、payload_sha256。scheduled_ns 是**计划 trace 起点**�
 
 生成仅独占创建文件，不创建父目录，不覆盖文件/符号链接，不设只读权限或保证防篡改。
 写入中断可能留下部分文件；保留该文件和错误，check 应失败，不自动删除或覆盖重试。
-trace 工具本身不回放；第9节仅新增队列/超时的虚拟时间模型，实际计时仍未实现，
-不能用于取得 A/B 性能样本。
+trace 工具本身不回放；第9节为虚拟时间模型，第10节为实际时钟fake回放，
+两者均不能用于取得正式 A/B 性能样本。
 
 ## 9. fake backend 虚拟回放小步（不是实际执行器）
 
@@ -235,6 +235,61 @@ terminal 为 put_ack/get_hit/get_miss/queue_full/timeout/backend_error/wrong_byt
 不是 A/B 通过。失败模型也落完整结果且 CLI 返回1；输入/配置非法返回1且不创建结果。
 输出独占创建，不覆盖文件/符号链接、不创建父目录；写入中断可能留下部分文件，保留错误。
 
-**剩余缺口：**真实单调时钟/固定到达调度、真实线程/并发、不可取消调用的进程级兜底、
-实际排队/网络/ACK/取消、容量淘汰与恢复均未实现/验证。模型所有服务时长有界，不能
-据此声称真实 native 卡死可排空。正式负载/旧基线/隔离/阈值门禁仍保持未完成。
+**本虚拟模型的边界：**不验证实际时钟或线程调度；实际fake回放另见第10节。
+真实服务/不可取消调用的进程级兜底、网络/ACK/取消、容量淘汰与恢复仍未实现/验证。
+模型所有服务时长有界，不能据此声称真实 native 卡死可排空；正式门禁仍未完成。
+
+## 10. 实际单调时钟＋线程 fake 回放（仍不连接服务）
+
+入口 `deploy/validation/eviction_realtime.py`，复用既有 trace 和内存 FakeBackend，
+`time.monotonic_ns()` 记时、真实线程等待/并发。与第9节虚拟模型分别输出，不混称
+同一种实测。没有 C ABI、服务、网络、磁盘缓存读写或真实淘汰；仅读trace/写结果文件。
+
+```bash
+# 4个请求、80ms间隔；新文件名，不能覆盖原样本。
+python3 deploy/validation/eviction_trace.py generate /tmp/dfkv-real-trace-new.json --objects 1 --rounds 1 --interval-ns 80000000
+python3 deploy/validation/eviction_realtime.py /tmp/dfkv-real-trace-new.json /tmp/dfkv-real-result-new.json --workers 2 --service-ns 1000000
+python3 -m unittest discover -s test/python -p test_eviction_realtime.py
+```
+
+本小步限制 workers=1–16、等待队列0–1024、timeout=1–5×10^9 ns；默认分别为1/16/10^9。
+service默认1ns（只是假等待参数），单调用配置等待≤1秒、全部配置等待之和≤10秒、
+trace最后计划到达≤5秒。超出拒绝且不启动；这些是诊断开销上限，不是服务合法范围
+或正式放行阈值，也不是 OS 的硬实时/强制停止保证。
+
+调度规则：
+
+- 原 trace 的 scheduled_ns/请求 ID 不改，起点为本轮 monotonic origin。调度线程独立
+  于有界 worker；主线程只给已预留的执行槽提交任务，executor 不接管无界等待队列。
+- `arrival_observed_ns` 为调度器实际看到到达的时刻，`schedule_lag_ns` 单列。若已经
+  达到deadline记timeout；尚未超时但已错过下一到达槽（scheduled+interval）记
+  **arrival_late**，不集中补发。所有迟到/拒绝/超时仍保留原请求分母，并使本轮失败。
+- 接受后记录 admitted_ns；排队FIFO，过期等待不提交。submitted_ns 仅证明任务提交，
+  不等于已启动；worker拿锁后再次核验deadline，已过期不调用backend、不伪造started。
+- 真实 started_ns 后才调用假等待；内存访问、完成时间记录与结算在同一Condition下。
+  `peak_reserved` 包含已提交未启动及超时但未结束者，`peak_running` 才是同时在假调用
+  包络内的线程数；不等于物理I/O、NIC或native在飞数。store锁成本/调度/GIL可计入时间。
+- deadline始终从**计划到达**起算。active timeout不撤销线程/释放槽；迟到完成及PUT
+  可能已提交的结果保留，逻辑timeout不补ACK。调用恰好在deadline完成可成功；等待或
+  尚未启动的任务到deadline不再启动。真实时钟测试不伪造纳秒级精确相等，边界数学由虚拟模型另证。
+- `terminal_ns` 对timeout为有效deadline，`settled_ns` 是实际发现/结算时刻，必须分别
+  保存。`latency_ns` 是前者减scheduled；**实际观察延迟是 observed_latency_ns**，不能
+  把截止时间裁剪后的latency当p99。服务时间从started到completed，包含假等待及本地开销；
+  queue_wait从admitted到started，dispatch_lag从scheduled到started，不能丢掉schedule_lag。
+- 捕获假等待/完成异常为backend_error并保留异常类型/信息；迟到错bytes仍计安全失败。
+  所有提交的future均取结果，线程退出/join后才返回报告，不在后台继续改结果或访问状态。
+
+输出 `model=monotonic-threaded-fake-only`，保留配置/注入参数及逐请求原始账，新增
+arrival_late终局。仅put_ack/get_hit/get_miss且全量终结才passed；miss仍不证明严格预热。
+summary的offered/submitted/started/completed、终局计数、late/wrong_bytes及ACK/hit逻辑
+字节从原始行汇总。输入无效不创建输出；完整失败报告仍保存并返回1，成功返回0；
+输出独占创建、不覆盖原文件/符号链接，不自动删除partial或重试。
+
+验证用Event握手证明两个假调用确实重叠，延迟worker入口证明“submitted不等于started”；
+人工拖慢调度器检查不追赶，假调用跨过真实到达/截止窗口检查排队与超时。断言比较
+原始时间先后/计数，不要求真实调度达到精确纳秒或给出性能达标结论。
+
+**仍缺：**真实服务适配器、真实ACK/网络/磁盘淘汰、正式阶段barrier与热度初态、
+任意native调用不可取消时的进程级超时兜底。当前线程等待仅针对有界fake，不能推广为
+native卡死可安全join；测试CLI用外部subprocess timeout保护，生产级进程隔离尚未实现。
+正式业务trace、旧baseline、人员隔离及逐项数值门槛仍缺，正式A/B未启动，默认/评分不改。
