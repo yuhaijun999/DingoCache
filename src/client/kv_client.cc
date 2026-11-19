@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "client/group_shard.h"
@@ -1136,67 +1137,118 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
   return RecordBatch(OpMetrics::kGet, t0, std::move(res), bytes);
 }
 
-std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& items,
-                                         std::vector<size_t>* out_lens) {
-  const size_t N = items.size();
-  std::vector<char> hit(N, 0);
-  std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
-  if (!t_->pipelined()) {  // TCP: parallelize per item with our own threads.
-    RunParallel(N, BatchWorkers(N), [&](size_t i) {
-      size_t got = 0;
-      if (GetAutoDirect(items[i].key, items[i].out, items[i].n, &got)) {
-        hit[i] = 1;
-        lens[i] = got;
-      }
+std::vector<Status> KVClient::BatchGetAutoWithStatus(
+    const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens) {
+  OpMetrics::Scope metric = op_stats_.Begin(OpMetrics::kGet);
+  metric.keys = items.size();
+  if (out_lens != nullptr) out_lens->assign(items.size(), 0);
+  std::vector<size_t> lengths;
+  std::vector<Status> statuses = BatchGetAutoStatusDirect(items, &lengths);
+  for (size_t i = 0; i < statuses.size(); ++i) {
+    if (statuses[i] == Status::kOk) {
+      ++metric.hits;
+      metric.bytes += lengths[i];
+    }
+  }
+  if (out_lens != nullptr) *out_lens = std::move(lengths);
+  return statuses;
+}
+
+std::vector<bool> KVClient::BatchGetAutoDirect(
+    const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens) {
+  const std::vector<Status> statuses =
+      BatchGetAutoStatusDirect(items, out_lens);
+  std::vector<bool> hits;
+  hits.reserve(statuses.size());
+  for (const Status status : statuses) hits.push_back(status == Status::kOk);
+  return hits;
+}
+
+std::vector<Status> KVClient::BatchGetAutoStatusDirect(
+    const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens) {
+  const size_t count = items.size();
+  // Distinct non-bitpacked slots are safe for parallel writes. Executor-caught
+  // exceptions leave kIOError, never a fabricated cache miss or hit.
+  std::vector<Status> statuses(count, Status::kIOError);
+  std::vector<size_t> lengths(count, 0);
+  if (!t_->pipelined()) {
+    RunParallel(count, BatchWorkers(count), [&](size_t i) {
+      size_t length = 0;
+      statuses[i] =
+          GetAutoStatusDirect(items[i].key, items[i].out, items[i].n, &length);
+      lengths[i] = length;
     });
-    if (out_lens) *out_lens = std::move(lens);
-    return std::vector<bool>(hit.begin(), hit.end());
+    if (out_lens != nullptr) *out_lens = std::move(lengths);
+    return statuses;
   }
-  // RDMA: group by (node, cap) so each group shares the Range length, then
-  // pipeline. Same staged-publication datapath as BatchGet; the only
-  // difference is accepting payload_len <= cap and reporting the true length.
-  std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
-  for (size_t i = 0; i < N; ++i) {
-    std::string node = Route(items[i].key);
-    if (node.empty()) continue;
-    by[{node, items[i].n}].push_back(i);
+
+  // Keep the existing RDMA batching and bounded shard scheduler. Calling the
+  // public scalar API here would lose batching and double-count GET metrics.
+  using GroupKey = std::pair<std::string, size_t>;
+  using Group = std::pair<GroupKey, std::vector<size_t>>;
+  std::map<GroupKey, std::vector<size_t>> by;
+  for (size_t i = 0; i < count; ++i) {
+    if (items[i].key.empty() || !ValidBuffer(items[i].out, items[i].n)) {
+      statuses[i] = Status::kInvalid;
+      continue;
+    }
+    const std::string node = Route(items[i].key);
+    if (!node.empty()) by[{node, items[i].n}].push_back(i);
   }
-  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
+  const std::vector<Group> groups =
+      ShardReadGroups(std::vector<Group>(by.begin(), by.end()));
   RunReadScheduled(groups.size(), [&](size_t g) {
     const std::string& node = groups[g].first.first;
-    uint64_t now = NowMs();
-    if (!health_.Healthy(node, now)) return;
+    if (!health_.Healthy(node, NowMs())) return;
     const size_t cap = groups[g].first.second;
-    const std::vector<size_t>& idx = groups[g].second;
+    const std::vector<size_t>& indices = groups[g].second;
     std::vector<BlockKey> keys;
-    std::vector<RangeDst> dsts;
-    keys.reserve(idx.size());
-    dsts.reserve(idx.size());
-    for (size_t k : idx) {
-      keys.push_back(ToBlockKey(key_namespace_, items[k].key));
-      dsts.push_back(RangeDst{items[k].out, cap,
-                              ClassifyDestination(items[k].out, cap)});
+    std::vector<RangeDst> destinations;
+    keys.reserve(indices.size());
+    destinations.reserve(indices.size());
+    for (const size_t i : indices) {
+      keys.push_back(ToBlockKey(key_namespace_, items[i].key));
+      destinations.push_back(RangeDst{cap != 0 ? items[i].out : nullptr, cap,
+                                      ClassifyDestination(items[i].out, cap)});
     }
     std::vector<uint64_t> value_lens;
-    std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
-    bool resp = false, ioerr = false;
-    // kInvalid (oversize/per-item guard) is neither: it must not clear the
-    // peer cooldown (resp) nor trip MarkBad (ioerr).
-    for (Status s : sts) {
-      if (s == Status::kIOError) ioerr = true;
-      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+    const std::vector<Status> results =
+        t_->RangeInto(node, keys, destinations, &value_lens);
+    // Without one status per requested key, even an apparent NotFound cannot
+    // be assigned reliably. Reject the shard before indexing or marking health.
+    if (results.size() != indices.size()) return;
+    const bool valid_lengths = value_lens.size() == indices.size();
+    bool response = false;
+    bool io_error = false;
+    for (size_t m = 0; m < indices.size(); ++m) {
+      const Status status = results[m];
+      const size_t i = indices[m];
+      if (status == Status::kIOError) io_error = true;
+      if (status == Status::kNotFound) response = true;
+      if (status != Status::kOk) {
+        statuses[i] = status;
+      } else if (valid_lengths) {
+        // A valid raw success remains a served response even when the full
+        // object exceeds capacity, matching the scalar path's health policy.
+        response = true;
+        if (value_lens[m] > cap) {
+          statuses[i] = Status::kInvalid;
+        } else {
+          statuses[i] = Status::kOk;
+          lengths[i] = static_cast<size_t>(value_lens[m]);
+        }
+      }
     }
-    if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
-    for (size_t m = 0; m < idx.size(); ++m) {
-      if (sts[m] != Status::kOk || m >= value_lens.size() ||
-          value_lens[m] > cap)
-        continue;
-      lens[idx[m]] = static_cast<size_t>(value_lens[m]);
-      hit[idx[m]] = 1;
+    // Preserve the existing mixed-group rule: a valid served response wins
+    // over an I/O error. Malformed Ok metadata alone must not restore health.
+    if (response) {
+      health_.MarkGood(node, NowMs());
+    } else if (io_error) {
+      health_.MarkBad(node, NowMs());
     }
   });
-  if (out_lens) *out_lens = std::move(lens);
-  return std::vector<bool>(hit.begin(), hit.end());
+  if (out_lens != nullptr) *out_lens = std::move(lengths);
+  return statuses;
 }
 
 std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {

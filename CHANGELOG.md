@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a direct-only status-preserving C++ batch GET API with shared legacy bool
+  projection, safe response-shape checks and retained parallel/sharded reads;
+  leave batch C ABI/Python, SG and dedup status integration for separate steps.
+
 - Document rebuilt RXE/io_uring scalar GET status validation, including explicit
   misses, capacity errors and stopped-service failure reports for both policies;
   keep client outcomes separate from server grants and formal A/B gates.

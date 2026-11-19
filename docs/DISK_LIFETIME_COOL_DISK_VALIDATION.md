@@ -335,3 +335,45 @@ trace累计84计划、66尝试/完成、36 PUT ACK/147456B；另有受控注入2
 改为简单python stdin后实际确认无server、端口空闲、二进制SHA未变。不得只看SSH退出码。
 两台服务正常退出0，所有直接child回收、monitor正常结束，VM留存空闲；未触发实际热故障，
 不把未触发的兜底说成热故障注入证明。无物理HCA/压力/全量测试/正式A/B或默认切换放行。
+
+## 14. C++直接批量状态核心的小规模RXE/uring验证
+
+2026-11-19，`a05b9be`＋本轮未提交C++改动；详细契约见
+[状态兼容方案第7节](CLIENT_GET_STATUS_COMPATIBILITY.md)。重新证明第13节同一VM六个FD/backing、
+PID/starttime/uid/netns，仅宿主disk2/3；未使用默认Docker或宿主/mnt/disk1。
+fresh持久monitor覆盖源码同步/ON构建/测试/结束复核；37样本，两设备所有有效传感器最高41°C、
+warning均0，最大间隔10.210秒；fresh结束样本后正常停止，未触发热故障兜底。
+
+133个生产/绑定/构建/新增测试文件SHA核对一致。仅重建ON相关目标
+`cmake --build /opt/dfkv-build --target dfkv dfkv_server batch_get_auto_status_test -j2`，
+不是整套ON测试目标全部重编。新库SHA
+`53e92f50ad018e15034dda9020acf372729b6efb5a0c5f8da108f63b709f60da`，
+新C++ BatchGetAutoWithStatus符号已导出；server字节SHA仍未改变。
+ON新13测试通过；另编译显式链接本轮libdfkv.so的有界C++探针并执行，非mock/pipeline标志推测。
+
+legacy/lifetime各一个fresh slab服务，RAM关闭、disk ACK、buffered/uring开启，
+容量12GiB只用于稳定几何，**不是容量压力**：每例仅PUT63个16B对象（1008B）。
+新接口一个64项批次：62 Ok/1 NotFound/1 Invalid；旧bool接口再读相同64项，
+逐项长度和完整字节均验证，旧bool与状态投影相符。两例共126 PUT/2016B、256 GET，
+248命中/3968B、4明确miss、4容量错误；每例公开GET指标恰好2请求/128key/124hit/1984B。
+读分片配置显式16key/最多8连接，scheduler requeue累计8，结束pending/active0；
+不据此宣称8路真实并发或吞吐收益。dedup显式关闭，不冒充dedup状态验证。
+服务端每例128终局=uring有效grant126＋not_found2，uring读取/完成126，健康1、
+错误/回退/在途/淘汰0；lifetime热度126、legacy0。容量错误的有效grant仍按spec服务端口径计热，
+不能改计客户端命中。两台服务正常退出0、child回收、端口空闲；VM留空闲。
+
+本轮文件保留，无自动删除：
+- 宿主新目录：
+  `/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/batch-get-status-20261119T094456Z-a05b9be/`，
+  `results.tgz`仅结果，不含VM资产/密钥。
+- guest结果：`/data/disk1/results/batch-status-20261119T094456Z-a05b9be/`。
+- guest数据：`/data/disk{1,2,3}/cases/batch-status-20261119T094456Z-a05b9be-{legacy,lifetime}`，共6新目录。
+- guest探针源/程序：`/tmp/dfkv-batch-status-20261119T094456Z-a05b9be.cc`及去掉`.cc`后的同名程序；
+  编排脚本 `/tmp/dfkv-batch-status-on-20261119T094456Z-a05b9be.py`。
+- 本地证据：`.omx/evidence/batch-get-status/20261119T094456Z-a05b9be/`，
+  含源码与二进制SHA、完整命令、OFF132相关CTest、ON13测试及原始探针状态/字节oracle/指标/退出账。
+
+第一次结束复核脚本以guest普通用户向root结果目录写symbol文件，被PermissionError拒绝，
+该次无完成标记、判失败并保留；改为只读nm输出后重新确认无server、端口空闲、新库符号/哈希。
+不把该脚本权限错误算生产缺陷或已通过验证。复跑仍按第13节顺序先证明归属、换新TAG/目录，
+冻结source/probe并启动fresh温控，不续跑/覆盖旧数据。未做压力、物理HCA、全量CTest、sanitizer或正式A/B。

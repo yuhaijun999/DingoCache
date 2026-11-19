@@ -116,6 +116,18 @@ class KVClient {
   // full-size items (same RangeInto path as BatchGet).
   std::vector<bool> BatchGetAuto(const std::vector<KvGetItem>& items,
                                  std::vector<size_t>* out_lens);
+  // Direct-only status-preserving batch GET, in input order. Always bypasses
+  // opt-in dedup: no rendezvous claim, publish or wait, even when enabled. This
+  // may issue extra I/O compared with BatchGetAuto; it does not change that
+  // API. Retains TCP parallel fanout and RDMA grouping/sharding. Only kNotFound
+  // is a cache miss; invalid inputs/capacity return kInvalid, no route/cooldown
+  // return kIOError without new I/O. Optional out_lens receives exactly
+  // items.size() entries, zero unless kOk (including before a transport
+  // exception propagates). Discard failed buffers. Existing executors may
+  // swallow item/shard exceptions as kIOError; this method is not noexcept. No
+  // SG or dedup status propagation.
+  std::vector<Status> BatchGetAutoWithStatus(
+      const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens);
   std::vector<bool> BatchExist(const std::vector<std::string>& keys);
   // Batched remove, fanned out across owning nodes (grouped per node). Per-item
   // result like BatchExist: true iff the owning node confirmed the op.
@@ -241,6 +253,8 @@ class KVClient {
   std::vector<bool> BatchGetDirect(const std::vector<KvGetItem>& items);
   std::vector<bool> BatchGetAutoDirect(const std::vector<KvGetItem>& items,
                                        std::vector<size_t>* out_lens);
+  std::vector<Status> BatchGetAutoStatusDirect(
+      const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens);
   std::vector<bool> BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
                                          std::vector<size_t>* out_lens);
   std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys,

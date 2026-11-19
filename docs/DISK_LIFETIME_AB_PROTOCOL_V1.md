@@ -522,3 +522,12 @@ lifetime read_success=12。两例均正常退出0、端口释放。停服后额�
 服务端grant成功与客户端最终hit分别核验，不混用两者分母；注入PUT/REMOVE单列。
 详见[状态接口第6节](CLIENT_GET_STATUS_COMPATIBILITY.md)及[冷盘说明第13节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
 这补齐单键接口的RXE/uring正确性证据，不是物理HCA/批量/SG/dedup或正式A/B放行。
+
+## 18. C++直接批量GET状态核心：兼容契约已落地
+
+新增BatchGetAutoWithStatus，返回N项原序Status，保留TCP并行和RDMA分组/分片调度；
+明确direct-only绕过opt-in dedup，旧bool/dedup/SG契约不变，异常响应先校验再索引。
+本机完整OFF构建及132相关CTest通过，ON相关目标与新13用例通过；
+真实RXE/uring两策略各一个64项新状态批次和一个64项旧bool投影批次通过。
+这不是新增批量C ABI/Python或SG/dedup状态传播，也不是整套ON/全量CTest、性能或正式A/B。
+详见[状态兼容方案第7节](CLIENT_GET_STATUS_COMPATIBILITY.md)。

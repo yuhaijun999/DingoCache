@@ -204,3 +204,65 @@ ACK8192B，不是invalid_result/未知，更不把miss或错误判成功。每�
 
 本轮未做压力、真实物理HCA、全量CTest、sanitizer或正式A/B，不依据约1秒或停服耗时比较性能。
 下一小步应独立梳理批量GET状态传播契约，不能将当前单键证明扩大到SG/dedup/生产连接器。
+
+## 7. 批量GET契约与第一小步：C++直接批量核心
+
+基线 `a05b9be`。新增接口，无新结果struct/枚举：
+
+```cpp
+std::vector<Status> KVClient::BatchGetAutoWithStatus(
+    const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens);
+```
+
+### 兼容边界
+
+- 返回恰好N项，按原输入顺序；仅kNotFound可计miss。optional out_lens正常返回时为N项，
+  失败项长度0、仅Ok写完整长度；Ok＋长度0仍保留命中语义，不凭0推断miss。
+- 这是**稳定的direct-only接口**：即使启用了opt-in dedup也不claim/publish/wait，
+  与scalar状态接口一致；相比旧dedup接口可能产生额外真实I/O、观察到不同即时结果。
+  不能宣称同等去重或性能；后续dedup状态设计不能悄悄改掉这一明确契约。
+- 原公开BatchGetAuto保持bool结果及原Claim/Publish/Abort/Wait/回退流程；
+  只将私有Direct改为共享状态核心的 `status == kOk` 投影，避免维护两套批量传输逻辑。
+- TCP仍RunParallel逐项并行调用**私有**状态核心；RDMA仍按(node,cap)分组、
+  ShardReadGroups分片及RunReadScheduled调度，不是串行调用公开scalar接口。
+- 公开指标一次请求/N个提交key，命中数与字节仅来自最终Ok，不重复计逐项公开GET。
+  输出buffer由调用方保证有效且并发项之间不重叠；失败buffer可能部分写入，必须丢弃。
+- 空批次返回空status/长度；空key或非零容量配null为Invalid，合法sibling继续执行。
+  无路由/冷却为IOError且无新I/O，不为本地拒绝额外MarkBad；容量不足为Invalid。
+- status数量不等于整个shard请求数：整shard本地IOError，先拒绝再索引，不假推NotFound，
+  不改变peer健康。status数量正确而长度数量不正确：原Ok项改本地IOError，
+  明确NotFound/其他错误保留；坏Ok元数据本身不能MarkGood或MarkBad。
+- 合法原Ok（包括完整长度可信但容量不足）或明确NotFound是已服务响应；
+  同组有响应优先MarkGood，否则实际IOError才MarkBad，保留旧混合组规则。
+  Invalid/resource/rail保持中立。既有无效参数/异常transport的安全修复不承诺旧版UB兼容。
+- 输出status用非bitpacked vector，先设IOError；worker/scheduler吞掉的任务异常留下失败槽，
+  不变成miss。**不承诺noexcept或统一异常状态**：现有TCP单worker路径可传播异常；
+  公开入口先清外部长度，RAII仍记一次失败请求。异常向调用方传播时，整个调用无返回status，丢弃输出。
+
+### 本轮验证与范围
+
+13个新增用例覆盖8种混合状态/两类transport、参数/容量、status与长度缺项/多项、
+坏Ok健康中立、顺序及128项多节点/容量/分片、TCP实际并行重叠、空批次、两种异常边界、
+旧bool投影与指标，以及tiny真实TCP file服务。先取得新API缺失编译RED，再接入实现通过。
+启用dedup后的绕过契约本轮为源码核查，没有新增共享内存fixture；不冒充dedup状态已贯通。
+
+GCC13本机OFF/OFF完整构建成功；132项相关CTest全部通过，0失败/跳过，60.00秒。
+LLVM17新测试全配置clang-tidy/默认format、核心diff范围clang-tidy/format通过，
+范围外旧诊断未改；旧include顺序保留，diff format关闭include重排。独立代码审查APPROVE。
+
+另在重新证明归属并启动fresh温控的既有冷盘VM中，133个生产/绑定/构建/新增测试文件SHA匹配，
+完成ON相关目标（dfkv、server、新测试）重建，新13测试同样通过。
+**不是整套ON测试二进制全部重新构建或全量CTest。**
+真实RXE＋io_uring C++探针分别验证legacy/lifetime：每种策略先写63个16B对象，
+新API一个64项混合批次返回62 Ok、1 NotFound、1 Invalid，再以旧bool接口读同64项并核验投影/字节。
+共256逻辑GET、248命中/3968B读取、4明确miss、4容量错误；126 PUT/2016B。
+每种策略客户端GET公开请求恰好2、keys128、hits124、bytes1984；服务端PULL128终局闭合，
+uring成功grant126＋not_found2，读/完成各126，无回退/在途/淘汰；lifetime热度126，legacy0。
+容量不足的有效grant不等于客户端hit，继续遵守spec第3节服务端成功口径。
+探针不证明物理HCA、性能收益或高并发上限，启用dedup的探针路径明确关闭。
+
+本轮证据：`.omx/evidence/batch-get-status/20261119T094456Z-a05b9be/`。
+真实盘安全边界与保留路径见[冷盘说明第14节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
+尚未新增**批量C ABI/Python状态接口**，旧C batch hit0仍不能当可信miss；
+定长BatchGet、SG、dedup均未做新状态传播。下一小步再定义批量C ABI的调用级错误与逐项结果，
+不能把本轮C++直接批量完成说成整个客户端栈或正式A/B已完成。

@@ -1,5 +1,9 @@
 # 磁盘寿命淘汰：验收收敛与剩余实施清单
 
+最新增量：C++直接批量GET状态契约/共享核心已完成，132相关CTest与两策略真实RXE/uring混合批次通过。
+批量C ABI/Python及SG/dedup状态仍未接通；新接口明确绕过去重，不宣称旧dedup性能等价。
+见[状态兼容方案第7节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
+
 最新增量：已完成新C ABI＋验证用Python单键接口的隔离RXE/io_uring小规模复核，
 23项C++、31个Python方法及8个场景判定通过；批量/SG/dedup和正式A/B仍未放行。
 见[状态兼容方案第6节](CLIENT_GET_STATUS_COMPATIBILITY.md)及[冷盘说明第13节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
