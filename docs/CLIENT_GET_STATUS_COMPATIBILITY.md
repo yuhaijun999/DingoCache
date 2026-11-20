@@ -484,3 +484,81 @@ nvme0最高41℃、critical_warning全0、最大间隔10.221秒；fresh结束样
 包含完整命令、源码/二进制SHA、ON构建、44/56测试日志、八场景父子报告、负例逐项native-call、
 注入/指标/退出/温控及失败尝试账。保留路径和复跑约束见[冷盘说明第15节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
 下一步再单独梳理SG状态契约，dedup另行处理，不能把direct-only状态闭环说成两者已贯通。
+
+
+## 11. SG 批量 GET：C++ → C ABI 状态闭环
+
+本轮新增 `KVClient::BatchGetAutoSgWithStatus` 和
+`dfkv_batch_get_auto_sg_status`，不修改既有 SG bool 接口、wire、磁盘格式或生产默认值。
+状态继续使用现有 `Status` / `DFKV_GET_*`，不新增结果结构体或 ABI 枚举。
+
+### 调用与逐项契约
+
+- 输入顺序对应完整 N 项状态；只有明确 `NotFound` / `NOT_FOUND` 才证明未命中。
+  非 OK 的长度为 0；OK 的长度是完整对象长度，0 字节 OK 仍是命中。
+- 目的段按顺序拼接为容量，允许任意描述符数，不以单 WR 的 SGE 宽度限制逻辑请求。
+  空段列表、零容量及零容量空指针有效；非零容量空指针、空 key、段数/容量数组不匹配、
+  容量累加溢出为该项 Invalid，合法 sibling 继续执行。二进制 key 不按 C 字符串截断。
+- 按 node/总容量分组，经既有有界分片调度器调用 `RangeIntoMulti`；TCP 使用既有
+  operation-owned scratch/scatter fallback，RDMA 使用既有 SG transport。
+  无路由/冷却为 IO_ERROR，可能没有新网络 I/O，不能当成 miss。
+- 返回状态数不等于组大小时，整组本地 IO_ERROR；长度数组形状错误不伪造 OK，
+  但保留可定位的显式非 OK 状态。合法 OK 的完整长度超过容量为 Invalid。
+- 新接口 **direct-only、single-pass**：不 Claim/Publish/Wait CPU/GPU dedup，
+  不执行旧 SG 的少数失败项重试。相较旧接口，可能增加去重缺失导致的 I/O，
+  也可能减少重试 I/O、暴露首次失败；不是旧调用的性能/命中率等价替代。
+  旧 SG 的 dedup、重试和 per-node 诊断路径保持原样；新增状态入口不输出旧 SG
+  的 per-node 文件日志，仍提供下述公开 GET 指标。
+- 每次 C++ 公开调用只记一次 GET/N keys，hit/bytes 只计 OK；不把 transport
+  内部调用叠加为公开请求。失败目的缓冲区可能已有部分字节，应丢弃，不承诺回滚。
+  所有输入/段/目的内存和 client 必须活到返回，调度并行的目的区间不能重叠；
+  C++ out_lens 不得引用任何输入 item.caps（入场清零会修改它）。
+
+### C ABI 边界
+
+新符号形参与旧 `dfkv_batch_get_auto_sg` 对应，将 `out_hit` 替换为 `out_status`；
+`out_len` 可选。rc=0 仅表示 N 项结果可用，**不是全部成功**；rc=-1 表示整次调用失败，
+全部结果/缓冲区丢弃，已执行的 I/O 不取消或回滚。n<0 不触碰输出；n>=0 时提供的
+状态/长度数组先设 INVALID/0。活 client 即使 n=0 也必需，此时其他数组可空；
+n>0 顶层描述符和 out_status 必需。嵌套数组仅在该项段数>0时必需，负段数为该项 Invalid。
+全局参数通过后先将状态设 INTERNAL_ERROR，再分配/执行；边界捕获异常返回 -1，
+状态保持 INTERNAL_ERROR、长度0。既有执行器吞掉的 item/shard 异常则可成为 rc=0 的
+IO_ERROR 项。输出数组不得与输入描述符、key、目的内存或其他输出数组重叠。
+
+### 范围与后续
+
+本轮不接 Python SG、dedup 状态或正式 A/B；不证明真实 HCA/GPU/RXE/uring 路径。
+服务端评分和 valid-grant 计热规则不变；client 最终失败仍可能对应已成功授予的服务端读取。
+
+### 本轮验证（基线0ebf59c，2026-11-20）
+
+- GCC13 OFF/OFF完整构建通过；最终源顺序运行 **161项相关CTest，0失败/跳过，67.07秒**。
+  不是全量CTest。新 **C++13＋C ABI6＝19方法** 已进入CMake自动发现，包含两组实际
+  tiny file/TCP服务测试：二进制分段字节、命中、明确miss、容量不足、停服IO_ERROR。
+  fake transport另覆盖全部现有状态与未知状态映射、坏形状、溢出/空段、1024段、
+  节点/容量分组、并行重叠、健康、指标、吞异常和旧SG少数失败重试不变。
+- GCC13 RDMA/uring ON的两个新目标编译通过，19方法通过/0跳过；运行的是fake/TCP，
+  **不是实际RXE/uring/HCA/GPU路径证明**，也不是ON全目标构建。独立审查在最终构建
+  完成后另跑19方法通过，无代码问题。
+- C11头文件/新旧签名与稳定状态常量、重建共享库动态链接、新符号/null/负数边界通过；
+  新旧SG及contiguous批量符号均保留。LLVM17新测试全文件格式、完整tidy通过，
+  生产代码仅检查本次diff格式和修改行tidy，不将旧文件/系统头诊断计为全仓合规。
+- 代码不新增复杂结果结构体，不重写旧SG核心；四个生产文件均为增量接口，无旧代码删除。
+  whole-call分配异常未做确定性注入，32位容量转换未实机验证；执行器吞transport异常
+  已测为IO_ERROR，不冒充整批异常注入。sanitizer/全量CTest/设备压测本轮未执行。
+
+复跑（仓库根目录，已有构建）：
+
+```bash
+cmake --build build-test -j2
+DFKV_STORE_ENGINE=file DFKV_SLAB_WRITE=buffered build-test/batch_get_auto_sg_status_test
+DFKV_STORE_ENGINE=file DFKV_SLAB_WRITE=buffered build-test/c_api_batch_get_sg_status_test
+```
+
+证据 `.omx/evidence/sg-status/20261120T021850Z-0ebf59c/`：commands.md含相关回归、
+ON、C11和静态命令，原始日志/XML、独立审查与失败尝试分开保留。
+真实missing-API RED保留；初次CABI测试const指针容器不匹配已修复；初次C11链接时
+共享库尚未重链，重建后通过；一次审查在重链接期间遇rc126，构建结束后另名复测通过，
+这些均不算测试通过或生产故障。首次LLVM17生产tidy parser崩溃(-11)，原因未定，
+冻结源码后逐文件重跑tidy通过（359.38秒，修改行无诊断；旧/系统头诊断过滤保留），
+不掩盖首次失败。

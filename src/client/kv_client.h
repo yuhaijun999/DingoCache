@@ -146,6 +146,23 @@ class KVClient {
   std::vector<bool> BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                    std::vector<size_t>* out_lens);
 
+  // Direct-only, single-pass SG GET statuses in input order. Bypasses opt-in
+  // dedup and the legacy SG minority-miss retries; this may issue different I/O
+  // from BatchGetAutoSg without changing that API. Uses the existing grouped,
+  // sharded RangeIntoMulti path (including the TCP scatter fallback).
+  // Invalid keys, segment shape/pointers, capacity overflow or insufficient
+  // capacity return kInvalid. Zero segments/capacity are valid for an empty
+  // object. Descriptor count is not a transport-window limit. Only kNotFound
+  // proves absence; no route/cooldown returns kIOError without issuing I/O.
+  // Optional out_lens has exactly items.size() entries, zero unless kOk,
+  // including before a propagated exception. Executor-contained exceptions
+  // leave kIOError slots; this method is not noexcept. Failed destinations may
+  // contain partial bytes and must be discarded. All descriptors and distinct,
+  // non-overlapping destination storage must remain valid until return.
+  // out_lens must not alias item.caps or any input/destination storage.
+  std::vector<Status> BatchGetAutoSgWithStatus(
+      const std::vector<KvGetItemSg>& items, std::vector<size_t>* out_lens);
+
   // Batch fan-out worker count. 0 (the default) = auto: one worker per node
   // group, floored at kMinAutoBatchWorkers (8) so single-node rings get
   // 8-way parallelism, capped at kMaxAutoBatchWorkers (32). Explicit n

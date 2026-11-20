@@ -576,6 +576,68 @@ int dfkv_batch_get_auto_sg(dfkv_client_t c, const void* const* keys,
   });
 }
 
+int dfkv_batch_get_auto_sg_status(dfkv_client_t c, const void* const* keys,
+                                  const uint64_t* key_lens, void*** dsts,
+                                  const uint64_t** caps, const int* num_dsts,
+                                  int n, int* out_status, uint64_t* out_len) {
+  // A negative count must not access any supplied output storage.
+  for (int i = 0; i < n; ++i) {
+    if (out_status != nullptr) out_status[i] = DFKV_GET_INVALID;
+    if (out_len != nullptr) out_len[i] = 0;
+  }
+  return NoThrow(-1, [&] {
+    if (c == nullptr || n < 0) return -1;
+    if (n > 0 &&
+        (keys == nullptr || key_lens == nullptr || dsts == nullptr ||
+         caps == nullptr || num_dsts == nullptr || out_status == nullptr)) {
+      return -1;
+    }
+    // Do not publish a prefix if allocation or the C++ call throws. Completed
+    // reads and destination writes cannot be rolled back by this boundary.
+    for (int i = 0; i < n; ++i) out_status[i] = DFKV_GET_INTERNAL_ERROR;
+    const size_t count = static_cast<size_t>(n);
+    std::vector<dfkv::KvGetItemSg> items(count);
+    for (size_t i = 0; i < count; ++i) {
+      const int segments = num_dsts[i];
+      if (!ValidKey(keys[i], key_lens[i]) || segments < 0 ||
+          (segments > 0 && (dsts[i] == nullptr || caps[i] == nullptr))) {
+        continue;
+      }
+      bool valid = true;
+      size_t total = 0;
+      for (int j = 0; j < segments; ++j) {
+        if (!ValidBuffer(dsts[i][j], caps[i][j]) ||
+            !AddBufferSize(caps[i][j], &total)) {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid) continue;
+      dfkv::KvGetItemSg& item = items[i];
+      item.key = CopyKey(keys[i], key_lens[i]);
+      item.dsts.reserve(static_cast<size_t>(segments));
+      item.caps.reserve(static_cast<size_t>(segments));
+      for (int j = 0; j < segments; ++j) {
+        item.dsts.push_back(dsts[i][j]);
+        item.caps.push_back(static_cast<size_t>(caps[i][j]));
+      }
+      // Invalid slots retain an empty key, preserving order and the N-key
+      // metric while the core still executes valid siblings.
+    }
+    std::vector<size_t> lengths;
+    const std::vector<dfkv::Status> statuses =
+        static_cast<KVClient*>(c)->BatchGetAutoSgWithStatus(items, &lengths);
+    if (statuses.size() != count || lengths.size() != count) return -1;
+    for (size_t i = 0; i < count; ++i) {
+      out_status[i] = ToCGetStatus(statuses[i]);
+      if (statuses[i] == dfkv::Status::kOk && out_len != nullptr) {
+        out_len[i] = static_cast<uint64_t>(lengths[i]);
+      }
+    }
+    return 0;
+  });
+}
+
 const char* dfkv_transport_mode(dfkv_client_t c) {
   return NoThrow<const char*>("", [&] {
     if (!c) return "";

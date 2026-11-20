@@ -2369,6 +2369,104 @@ GpuNodeDedup* KVClient::GpuDedup(const void* device_dst_hint) {
   return gpu_dedup_.get();
 }
 
+std::vector<Status> KVClient::BatchGetAutoSgWithStatus(
+    const std::vector<KvGetItemSg>& items, std::vector<size_t>* out_lens) {
+  OpMetrics::Scope metric = op_stats_.Begin(OpMetrics::kGet);
+  const size_t count = items.size();
+  metric.keys = count;
+  if (out_lens != nullptr) out_lens->assign(count, 0);
+  // Parallel workers own distinct, non-bitpacked result slots. If the existing
+  // scheduler contains an exception, the untouched shard remains an I/O error.
+  std::vector<Status> statuses(count, Status::kIOError);
+  std::vector<size_t> lengths(count, 0);
+  using GroupKey = std::pair<std::string, size_t>;
+  using Group = std::pair<GroupKey, std::vector<size_t>>;
+  std::map<GroupKey, std::vector<size_t>> by;
+  for (size_t i = 0; i < count; ++i) {
+    size_t capacity = 0;
+    bool valid = !items[i].key.empty() &&
+                 items[i].dsts.size() == items[i].caps.size() &&
+                 CheckedSizeSum(items[i].caps, &capacity);
+    if (valid) {
+      for (size_t j = 0; j < items[i].dsts.size(); ++j) {
+        if (!ValidBuffer(items[i].dsts[j], items[i].caps[j])) {
+          valid = false;
+          break;
+        }
+      }
+    }
+    if (!valid) {
+      statuses[i] = Status::kInvalid;
+      continue;
+    }
+    const std::string node = Route(items[i].key);
+    if (!node.empty()) by[{node, capacity}].push_back(i);
+  }
+  const std::vector<Group> groups =
+      ShardReadGroups(std::vector<Group>(by.begin(), by.end()));
+  RunReadScheduled(groups.size(), [&](size_t g) {
+    const std::string& node = groups[g].first.first;
+    if (!health_.Healthy(node, NowMs())) return;
+    const size_t capacity = groups[g].first.second;
+    const std::vector<size_t>& indices = groups[g].second;
+    std::vector<BlockKey> keys;
+    std::vector<RangeDstMulti> destinations;
+    keys.reserve(indices.size());
+    destinations.reserve(indices.size());
+    for (const size_t i : indices) {
+      keys.push_back(ToBlockKey(key_namespace_, items[i].key));
+      RangeDstMulti destination;
+      destination.payloads.reserve(items[i].dsts.size());
+      for (size_t j = 0; j < items[i].dsts.size(); ++j) {
+        destination.payloads.emplace_back(
+            items[i].dsts[j], items[i].caps[j],
+            ClassifyDestination(items[i].dsts[j], items[i].caps[j]));
+      }
+      destinations.push_back(std::move(destination));
+    }
+    std::vector<size_t> value_lengths;
+    const std::vector<Status> results =
+        t_->RangeIntoMulti(node, keys, destinations, &value_lengths);
+    // Status cardinality is required before assigning even NotFound to a key.
+    if (results.size() != indices.size()) return;
+    const bool valid_lengths = value_lengths.size() == indices.size();
+    bool response = false;
+    bool io_error = false;
+    for (size_t m = 0; m < indices.size(); ++m) {
+      const Status status = results[m];
+      const size_t i = indices[m];
+      if (status == Status::kIOError) io_error = true;
+      if (status == Status::kNotFound) response = true;
+      if (status != Status::kOk) {
+        statuses[i] = status;
+      } else if (valid_lengths) {
+        response = true;
+        if (value_lengths[m] > capacity) {
+          statuses[i] = Status::kInvalid;
+        } else {
+          statuses[i] = Status::kOk;
+          lengths[i] = value_lengths[m];
+        }
+      }
+    }
+    // A served response wins mixed I/O failures, matching the direct scalar
+    // and contiguous batch status APIs. Malformed Ok lengths alone are neutral.
+    if (response) {
+      health_.MarkGood(node, NowMs());
+    } else if (io_error) {
+      health_.MarkBad(node, NowMs());
+    }
+  });
+  for (size_t i = 0; i < count; ++i) {
+    if (statuses[i] == Status::kOk) {
+      ++metric.hits;
+      metric.bytes += lengths[i];
+    }
+  }
+  if (out_lens != nullptr) *out_lens = std::move(lengths);
+  return statuses;
+}
+
 std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                            std::vector<size_t>* out_lens) {
   const auto t0 = std::chrono::steady_clock::now();

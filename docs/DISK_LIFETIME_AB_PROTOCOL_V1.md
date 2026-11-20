@@ -562,3 +562,12 @@ lifetime read_success=12。两例均正常退出0、端口释放。停服后额�
 本轮VM backing与guest诊断落盘仅宿主disk2/3，服务/子进程回收、端口空闲；未修改生产默认配置。
 详见[状态接口第10节](CLIENT_GET_STATUS_COMPATIBILITY.md)与[冷盘说明第15节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
 这是direct-only批量状态正确性证据；SG/dedup、物理HCA、性能和正式A/B仍未放行。
+
+
+## 22. SG C++ / C ABI 状态接口的前置边界
+
+本轮补 `BatchGetAutoSgWithStatus` / `dfkv_batch_get_auto_sg_status`：保持原序逐项状态、
+合法 sibling、完整长度和调用级失败区分。新接口 direct-only/single-pass，不参与 CPU/GPU
+rendezvous，不走旧 SG 少数失败重试；旧接口保留。不能将新旧 I/O、命中率、时延直接视为等价。
+见[状态兼容方案第11节](CLIENT_GET_STATUS_COMPATIBILITY.md)。Python SG、dedup、
+真实设备 SG 状态验证及正式 A/B 仍需单独安排；本轮不改变冻结负载、数值门槛和生产默认配置。

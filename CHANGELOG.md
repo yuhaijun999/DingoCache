@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add direct-only, single-pass SG batch GET status APIs in C++ and C, preserving
+  per-item failures and lengths without changing legacy SG retry/dedup behavior;
+  keep Python SG, dedup status propagation and formal A/B as separate work.
+
 - Document rebuilt RXE/io_uring batch GET C/Python/report validation, including
   mixed outcomes, legacy-symbol fallback and stopped-service failure ledgers;
   retain separate server-grant metrics and unchanged formal A/B/default gates.

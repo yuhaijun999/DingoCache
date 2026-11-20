@@ -1,5 +1,9 @@
 # 磁盘寿命淘汰：验收收敛与剩余实施清单
 
+最新增量：SG 批量 GET 新增 C++ → C ABI 的 direct-only、single-pass 状态链路；
+旧 SG bool/dedup/重试路径保留，Python SG 与真实设备验证未包含。
+契约与本轮验证见[状态接口第11节](CLIENT_GET_STATUS_COMPATIBILITY.md)，不构成正式 A/B 放行。
+
 最新增量：新批量C ABI/Python链路已完成隔离RXE/io_uring复核，完整ON构建、44目标C++、
 56个Python方法及两策略8组场景预期符合。direct-only链路证据已补齐，SG/dedup和正式A/B仍后续处理。
 见[状态接口第10节](CLIENT_GET_STATUS_COMPATIBILITY.md)及[冷盘说明第15节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。

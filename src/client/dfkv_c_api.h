@@ -160,6 +160,34 @@ int dfkv_batch_get_auto_sg(dfkv_client_t c, const void* const* keys,
                            const uint64_t** caps, const int* num_dsts, int n,
                            int* out_hit, uint64_t* out_len);
 
+// Additive direct-only SG status GET using the scalar DFKV_GET_* codes.
+// Return 0 means n per-item outcomes are available, not that every read hit;
+// only NOT_FOUND proves absence. Return -1 rejects the whole call: discard all
+// results and destinations, even if earlier reads modified some buffers.
+// A live client is required even for n=0, when all arrays may be null. For n>0,
+// all top-level descriptor arrays and out_status are required; out_len is
+// optional. Negative n touches no outputs; otherwise supplied status/length
+// arrays are initialized to INVALID/0. After whole-call validation, a caught
+// exception returns -1 with INTERNAL_ERROR/0 for every slot. Executor-contained
+// shard exceptions instead return 0 with IO_ERROR slots. No exception escapes.
+// Invalid keys, negative segment counts, missing nonempty nested arrays,
+// nonzero capacities with null destinations, and capacity-sum overflow fail
+// only their slot as INVALID. Zero segments (nested arrays may be null) and
+// null segments with zero capacity are valid. Descriptor count is not limited
+// to one transport WR's SGE width. Only OK sets length; zero-byte OK is a hit.
+// Failed buffers may contain partial bytes and must be discarded.
+// This API bypasses opt-in dedup and performs no transient miss retries, unlike
+// the old SG API; I/O counts and observations may therefore differ. Existing
+// interfaces, wire protocol and status values remain unchanged. Supplied
+// arrays need n live elements and nested arrays need num_dsts[i] live elements.
+// Output arrays must not overlap each other, keys, descriptors or destinations;
+// concurrently used destination regions must not overlap. Handles and all
+// descriptor/destination storage must remain valid until the call returns.
+int dfkv_batch_get_auto_sg_status(dfkv_client_t c, const void* const* keys,
+                                  const uint64_t* key_lens, void*** dsts,
+                                  const uint64_t** caps, const int* num_dsts,
+                                  int n, int* out_status, uint64_t* out_len);
+
 // Client-side Prometheus metrics snapshot. Every public scalar/batch call is
 // counted exactly once with its submitted key count, including early failures
 // and rendezvous-served hits. Writes up to `cap` bytes (NUL-terminated when it
