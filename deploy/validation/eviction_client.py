@@ -52,6 +52,40 @@ class TraceClient:
                 return {"outcome": "put_ack"}
             return {"outcome": self._client.read_outcome(key, value)}
 
+    def execute_batch(self, request_ids):
+        """Read one same-namespace GET group, without scalar retries or reordering.
+
+        Complete group results are returned together, even if one sibling fails.
+        A raised exception invalidates the whole group; already performed I/O is
+        not rolled back. The lock keeps all native backing storage alive through
+        close, just as for execute().
+        """
+        if not isinstance(request_ids, (list, tuple)):
+            raise ValueError("request_ids must be a list or tuple")
+        rows = []
+        for request_id in request_ids:
+            if type(request_id) is not int or not 0 <= request_id < len(self._rows):
+                raise ValueError("request_id not present in trace")
+            row = self._rows[request_id]
+            if row["op"] != "get" or row["namespace_hex"] != self._namespace:
+                raise ValueError("batch requires GETs from this namespace")
+            rows.append(row)
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("duplicate request_id in batch")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("trace client is closed")
+            results = self._client.read_outcomes(
+                [bytes.fromhex(row["key_hex"]) for row in rows],
+                [trace.payload(row) for row in rows])
+            # Check the complete shape before exposing even the first sibling.
+            if not isinstance(results, list) or len(results) != len(rows):
+                raise RuntimeError("incomplete batch GET results")
+            from eviction_batch import check_outcome
+            for result in results:
+                check_outcome(result)
+            return [dict(result) for result in results]
+
     def close(self):
         # Never close a handle while a native call still owns its buffers.
         with self._lock:

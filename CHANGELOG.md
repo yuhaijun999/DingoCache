@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Connect optional batch GET C status results through the validation Python
+  client to opt-in namespace-batched smoke reports; retain legacy no-hit as
+  unresolved, preserve strict gates and add explicit TCP correctness mode.
+
 - Add a compatible direct-only batch GET C status API with stable per-item
   results and fail-closed call-level errors; keep legacy symbols unchanged and
   leave Python, SG and dedup status integration for separate steps.

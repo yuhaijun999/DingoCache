@@ -14,6 +14,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eviction_trace as trace
+import eviction_batch as batch
 from eviction_client import TraceClient
 from eviction_guard import _stop
 
@@ -31,15 +32,20 @@ def _bounded(document):
     return counts
 
 
-def _config(lib, members):
+def _config(lib, members, *, batch_gets=False, tcp=False):
+    if type(batch_gets) is not bool or type(tcp) is not bool:
+        raise ValueError("batch_gets and tcp must be bool")
     match = re.fullmatch(r"[A-Za-z0-9_-]+=127\.0\.0\.1:([0-9]{1,5})", members)
     if match is None or not 1 <= int(match[1]) <= 65535:
         raise ValueError("smoke requires one explicit loopback member: name=127.0.0.1:port")
     library = Path(lib).resolve(strict=True)
     if not library.is_file():
         raise ValueError("library must be a regular file")
-    return {"lib": str(library), "lib_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
-            "members": members, "client_environment": CLIENT_ENV}
+    config = {"lib": str(library), "lib_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
+              "members": members, "client_environment": dict(CLIENT_ENV, DFKV_RDMA="0") if tcp else CLIENT_ENV}
+    if batch_gets:
+        config["batch_gets"] = True
+    return config
 
 
 def _summary(rows):
@@ -50,7 +56,7 @@ def _summary(rows):
 
 
 def run(document, config, *, library_loader=None, client_factory=TraceClient):
-    """Sequential strict ACK/hit gates. Open/call/close all remain in the child.
+    """Strict ACK/hit gates with optional namespace-batched GET windows.
 
     Source scheduled_ns is identity only: no pacing or fixed-arrival claims. An
     explicit miss or legacy unresolved no-hit fails the smoke. No resident/heat
@@ -61,13 +67,19 @@ def run(document, config, *, library_loader=None, client_factory=TraceClient):
     result = {"model": MODEL, "schedule_mode": "sequential-unpaced", "config": config,
               "trace_sha256": document["sha256"], "requests": rows, "errors": [],
               "transports": [], "passed": False}
+    batch_gets = config.get("batch_gets", False)
+    if batch_gets:
+        result.update(model=batch.MODEL, schedule_mode=batch.SCHEDULE,
+                      groups=[{"group_id": index, "request_ids": ids, "state": "not_attempted"}
+                              for index, ids in enumerate(batch.plan(document))])
     origin = time.monotonic_ns()
     try:
         if library_loader is None:
             sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "integration/common/src"))
             from disk_scenarios import load_library
             library_loader = load_library
-        if _config(config["lib"], config["members"]) != config:
+        if _config(config["lib"], config["members"], batch_gets=batch_gets,
+                   tcp=config["client_environment"].get("DFKV_RDMA") == "0") != config:
             raise ValueError("library/config changed before loading")
         with ExitStack() as stack:
             clients = {}
@@ -78,18 +90,21 @@ def run(document, config, *, library_loader=None, client_factory=TraceClient):
                 client = stack.enter_context(client_factory(document, library, config["members"], bytes.fromhex(namespace)))
                 clients[namespace] = client
                 result["transports"].append({"namespace_hex": namespace, "mode": client.transport})
-            for row in rows:
-                row["started_ns"] = time.monotonic_ns() - origin
-                try:
-                    row["terminal"] = clients[row["namespace_hex"]].execute(row["request_id"])["outcome"]
-                except Exception as error:
-                    row.update(terminal="client_error", error=f"{type(error).__name__}: {error}")
-                row["completed_ns"] = time.monotonic_ns() - origin
-                if row["terminal"] != ("put_ack" if row["op"] == "put" else "get_hit"):
-                    break  # Failure also blocks the rest of the current phase.
+            if batch_gets:
+                batch.execute(rows, clients, result["groups"], origin)
+            else:
+                for row in rows:
+                    row["started_ns"] = time.monotonic_ns() - origin
+                    try:
+                        row["terminal"] = clients[row["namespace_hex"]].execute(row["request_id"])["outcome"]
+                    except Exception as error:
+                        row.update(terminal="client_error", error=f"{type(error).__name__}: {error}")
+                    row["completed_ns"] = time.monotonic_ns() - origin
+                    if row["terminal"] != ("put_ack" if row["op"] == "put" else "get_hit"):
+                        break  # Failure also blocks the rest of the current phase.
     except Exception as error:
         result["errors"].append(f"{type(error).__name__}: {error}")
-    result["summary"] = _summary(rows)
+    result["summary"] = batch.summary(rows, result["groups"]) if batch_gets else _summary(rows)
     result["passed"] = not result["errors"] and all(
         row["terminal"] == ("put_ack" if row["op"] == "put" else "get_hit") for row in rows)
     result["elapsed_ns"] = time.monotonic_ns() - origin
@@ -97,6 +112,9 @@ def run(document, config, *, library_loader=None, client_factory=TraceClient):
 
 
 def _verify(document, result, config):
+    # The frozen parent configuration, never the child's model, picks the rules.
+    if config.get("batch_gets") is True:
+        return batch.verify(document, result, config)
     if (not isinstance(result, dict) or result.get("model") != MODEL
             or result.get("schedule_mode") != "sequential-unpaced"
             or result.get("trace_sha256") != document["sha256"]
@@ -152,16 +170,21 @@ def _verify(document, result, config):
 
 
 def _command(source, result, config):
-    return [sys.executable, "-I", str(Path(__file__).resolve()), str(source), str(result),
-            "--lib", config["lib"], "--members", config["members"], "--child"]
+    command = [sys.executable, "-I", str(Path(__file__).resolve()), str(source), str(result),
+               "--lib", config["lib"], "--members", config["members"], "--child"]
+    if config.get("batch_gets") is True:
+        command.append("--batch-gets")
+    if config["client_environment"]["DFKV_RDMA"] == "0":
+        command.append("--tcp")
+    return command
 
 
-def supervise(source, output, *, lib, members, process_timeout_sec=10):
+def supervise(source, output, *, lib, members, process_timeout_sec=10, batch_gets=False, tcp=False):
     if (type(process_timeout_sec) not in (int, float) or not math.isfinite(process_timeout_sec)
             or not .05 <= process_timeout_sec <= 30):
         raise ValueError("process timeout must be finite in [0.05, 30] seconds")
     document = trace.load(source)
-    counts, config = _bounded(document), _config(lib, members)
+    counts, config = _bounded(document), _config(lib, members, batch_gets=batch_gets, tcp=tcp)
     output = Path(output).absolute()
     output.mkdir()  # New owned directory only, no overwrite/retry or server reset.
     frozen, raw = output / "trace.json", output / "child-result.json"
@@ -172,10 +195,12 @@ def supervise(source, output, *, lib, members, process_timeout_sec=10):
               "config": config, "trace_sha256": document["sha256"],
               "process_timeout_sec": process_timeout_sec, "actions": [], "child_pid": None,
               "returncode": None, "reaped": False, "command": _command(frozen, raw, config)}
+    if batch_gets:
+        report.update(get_outcomes=None, get_adapter_calls=None, get_failed_adapter_calls=None)
     child, interruption = None, None
     started = time.monotonic_ns()
     env = {key: value for key, value in os.environ.items() if not key.startswith("DFKV_")}
-    env.update(CLIENT_ENV)
+    env.update(config["client_environment"])
     try:
         with (output / "stdout.log").open("xb") as stdout, (output / "stderr.log").open("xb") as stderr:
             child = subprocess.Popen(report["command"], stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, env=env)
@@ -214,6 +239,9 @@ def supervise(source, output, *, lib, members, process_timeout_sec=10):
                 report.update(status="passed" if result["passed"] else "workload_failed", passed=result["passed"],
                               request_outcomes="complete_child_ledger", attempted_requests=summary["attempted"],
                               completed_requests=summary["completed"], acked_put_bytes=summary["acked_put_bytes"])
+                if batch_gets:
+                    report.update({key: summary[key] for key in
+                                   ("get_outcomes", "get_adapter_calls", "get_failed_adapter_calls")})
             except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError) as error:
                 report.update(status="invalid_result", error=f"{type(error).__name__}: {error}")
     (output / "report.json").write_bytes(trace.encode(report))
@@ -229,17 +257,19 @@ def main(argv=None):
     parser.add_argument("--lib", required=True)
     parser.add_argument("--members", required=True)
     parser.add_argument("--process-timeout-sec", type=float, default=10)
+    parser.add_argument("--tcp", action="store_true", help="explicit TCP correctness smoke; default still requests RDMA/rxe0")
+    parser.add_argument("--batch-gets", action="store_true", help="opt-in namespace-batched correctness mode; not arrival/performance replay")
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         if args.child:
             document = trace.load(args.trace)
-            result = run(document, _config(args.lib, args.members))
+            result = run(document, _config(args.lib, args.members, batch_gets=args.batch_gets, tcp=args.tcp))
             with Path(args.output).open("xb") as output:
                 output.write(trace.encode(result))
         else:
             result = supervise(args.trace, args.output, lib=args.lib, members=args.members,
-                               process_timeout_sec=args.process_timeout_sec)
+                               process_timeout_sec=args.process_timeout_sec, batch_gets=args.batch_gets, tcp=args.tcp)
         print(trace.encode(result).decode("ascii"), end="")
         return 0 if result["passed"] else 1
     except (OSError, ValueError, TypeError, UnicodeError, RecursionError) as error:

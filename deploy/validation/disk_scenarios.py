@@ -169,6 +169,66 @@ class Client:
         check_read(expected, 1, buffer.raw[:size.value], size.value)
         return "get_hit"
 
+    def read_outcomes(self, keys, expected):
+        """One checked batch, preserving slots and explicit absence when available.
+
+        A failed native call raises for the whole batch: partial outputs must not
+        become hits or misses. Per-item errors stay in the returned ledger so a
+        valid sibling is not lost. Only a missing symbol selects the old bool
+        API; its no-hit result remains unresolved, without retry/EXIST probes.
+        The new symbol is direct-only: it bypasses opt-in dedup and may issue
+        more I/O than the legacy batch API. No dedup/performance equivalence.
+        """
+        if not self.handle:
+            raise RuntimeError("client is closed")
+        keys, expected = list(keys), list(expected)
+        if len(keys) != len(expected):
+            raise ValueError("keys and expected payloads must have equal length")
+        if len(keys) > (1 << 31) - 1:
+            raise ValueError("batch count exceeds the C ABI int limit")
+        for key, value in zip(keys, expected):
+            if not isinstance(key, bytes) or not key:
+                raise ValueError("batch keys must be non-empty bytes")
+            if not isinstance(value, bytes):
+                raise TypeError("expected payloads must be bytes")
+        if not keys:
+            return []
+        pointers, lengths, owners = make_key_array(keys)
+        buffers = [ct.create_string_buffer(len(value) + 1) for value in expected]
+        data = (ct.c_void_p * len(keys))(*[ct.addressof(b) for b in buffers])
+        caps = (ct.c_uint64 * len(keys))(*[ct.sizeof(b) for b in buffers])
+        statuses = (ct.c_int * len(keys))(*([-999] * len(keys)))
+        sizes = (ct.c_uint64 * len(keys))()
+        function = getattr(self.lib, "dfkv_batch_get_auto_status", None)
+        legacy = function is None
+        if legacy:
+            function = self.lib.dfkv_batch_get_auto
+        rc = function(self.handle, pointers, lengths, data, caps, len(keys),
+                      statuses, sizes)
+        if rc != 0:
+            raise RuntimeError(f"batch GET failed: rc={rc}")
+        results = []
+        for index, (value, buffer, status, size) in enumerate(
+                zip(expected, buffers, statuses, sizes)):
+            result = {} if legacy else {"status": status}
+            try:
+                hit = status == (1 if legacy else 0)
+                if hit:
+                    check_read(value, 1, buffer.raw[:size], size)
+                    result["outcome"] = "get_hit"
+                elif size != 0:
+                    raise RuntimeError("failed batch GET returned a nonzero length")
+                elif legacy and status == 0:
+                    result["outcome"] = "get_unresolved"
+                elif not legacy and status == 1:  # DFKV_GET_NOT_FOUND only.
+                    result["outcome"] = "get_miss"
+                else:
+                    raise RuntimeError(f"batch GET failed: status={status}")
+            except RuntimeError as error:
+                result.update(outcome="client_error", error=f"batch_index={index}: {error}")
+            results.append(result)
+        return results
+
     def expect_missing(self, key):
         pointers, lengths, owners = make_key_array([key])
         buffer = ct.create_string_buffer(1)
@@ -216,6 +276,10 @@ def load_library(path):
         status_get.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint64,
                                ct.c_void_p, ct.c_uint64, size_array]
         status_get.restype = ct.c_int
+    batch_status_get = getattr(lib, "dfkv_batch_get_auto_status", None)
+    if batch_status_get is not None:
+        batch_status_get.argtypes = signatures["dfkv_batch_get_auto"][0]
+        batch_status_get.restype = ct.c_int
     return lib
 
 

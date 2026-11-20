@@ -323,3 +323,102 @@ SG/dedup 状态传播、真实服务新 C 符号的 RXE/io_uring 运行验证和
   `.omx/evidence/batch-cabi-status/20261119T101203Z-934d595/`；
   `commands.md`记录完整命令，`off-ctest.log/xml`、`final-direct.log/xml`为最终版本证据。
   未运行sanitizer、压力或正式A/B，未连接VM或对宿主`/mnt/disk1`施压。
+
+## 9. 第三小步闭环：批量 C ABI → Python → 受监督报告
+
+基线 `5e3b125`，仅验证工具接入；生产连接器、旧 `Client.read/read_outcome`、旧 C 符号、
+SG/dedup、淘汰默认参数及线协议均不改变。
+
+### Python 结果与兼容
+
+`disk_scenarios.Client.read_outcomes(keys, expected)` 一次调用一个真实 batch，返回原序 N 个
+`{outcome, optional status/error}`。新符号独立于 scalar 可选绑定：只有符号缺失才调用旧
+batch，一次调用不进行 scalar/EXIST/重试。新符号继承direct-only契约，
+即使开启opt-in dedup也绕过去重，可能比旧batch增加I/O，不宣称同等去重或性能。
+
+- 新接口仅 `NOT_FOUND=1` 且长度0为 `get_miss`；OK=0须完整长度/字节匹配，长度0仍是hit。
+- 错误/未知状态、非OK却长度非0、错误字节/长度为该项 `client_error`，保留数字状态，
+  不丢弃合法 sibling。初始化 sentinel 防止未写入的状态槽被默认0误判为OK。
+- C返回非0或异常为整批失败，不使用部分buffer推断结果；smoke记整个GET组为
+  `get_batch_error`。可能已有I/O，无回滚/远端取消保证。
+- 旧库的hit0仍为 `get_unresolved`，不能计明确miss；旧hit也要完整字节验证。
+  空输入不发起native调用；向量长度、bytes/key、关闭句柄先校验。
+- `TraceClient.execute_batch(ids)` 先校验全部ID唯一、GET且同namespace；共用原close锁，
+  同一次native调用和所有backing buffer都结束后才能close。先验证完整返回形状再发布整组，
+  缺项/坏项不会泄露“前几项已成功”的不完整结果。
+
+### 显式批量模式与验收
+
+原smoke默认scalar模型/顺序/报告保持不变。新增 `--batch-gets`，冻结config后选择独立
+`namespace-batched-real-client-correctness-only` 模型及独立验收器。
+GET连续窗口不跨PUT/phase，窗口内按namespace首次出现顺序分组；PUT仍单项。
+这会改变不同namespace之间的实际读取顺序，**不是固定到达/性能回放**，原scheduled_ns只作身份。
+初始objects=8时warmup确有两个4项组；measurement原轨迹交替PUT/GET，仍是singleton。
+
+所有组和逻辑请求都保留在账中：同组结果全部收齐后再执行严格门槛，任何miss/unresolved/error
+阻断后续组/阶段；同组合法hit仍保留，但不能据此宣布整轮通过。共享start/end只表示适配器
+整组调用区间，不是各项网络延迟；`get_adapter_calls` 不冒充native调用或NIC并发数。
+父验收器从冻结trace独立重建组计划，核对身份/组序/全组形状/共享时间/停止边界与计数。
+
+批量summary与父报告新增 `get_outcomes`：planned/attempted/completed，及get_hit/get_miss/
+get_unresolved/client_error/get_batch_error/not_attempted六类完整分母；另记GET适配器调用数及
+整组失败调用数。失败调用数与受影响逻辑项数不能相加。completed表示适配器终局记录，
+不证明远端操作全部终结。超时、崩溃、坏报告仍保留None/unknown，不能填0或伪计miss。
+strict smoke仍要求所有PUT ACK/GET hit；明确miss是完整的失败账，不是验收放宽。
+
+新增 `--tcp` 显式选择TCP并冻结 `DFKV_RDMA=0`，便于OFF库正确性复跑；原默认仍请求RDMA/rxe0，
+不允许失败后自动回退。父子config/命令/环境一致，仍限制单个loopback服务、fresh输出、
+8初始对象/4轮/4096B、精确子进程超时和回收，不连接生产服务。
+
+### 复跑入口
+
+在仓库根目录，已有专用scratch服务时（PORT替换为其TCP端口，输出路径必须不存在）：
+
+```bash
+python3 deploy/validation/eviction_trace.py generate /tmp/batch-trace-NEW.json \
+  --objects 8 --rounds 2 --length 17
+python3 deploy/validation/eviction_smoke.py /tmp/batch-trace-NEW.json /tmp/batch-result-NEW \
+  --lib "$PWD/build-test/libdfkv.so" --members n=127.0.0.1:PORT \
+  --batch-gets --tcp --process-timeout-sec 10
+```
+
+自动创建并清理tiny file/TCP服务的测试，无需准备服务或真实盘：
+
+```bash
+cmake --build build-test -j2
+DFKV_BUILD="$PWD/build-test" DFKV_LIB="$PWD/build-test/libdfkv.so" \
+  python3 -m unittest discover -s test/python -p test_eviction_batch.py
+```
+
+CMake将纯ledger/adapter测试单列 `python_eviction_batch`；真实ctypes三例并入原 `python_plugin`，
+继承现有ASan/TSan对stock Python dlopen的排除，不假称已在sanitizer验证native路径。
+缺构建产物/新符号时native测试明确skip；本轮提供当前OFF构建实际运行，不把skip当通过。
+
+### 本轮实际证据
+
+- 新method/optional binding缺失RED、批量报告module缺失RED均保留，随后通过。
+  Python adapter23例（新增9）、原scalar smoke17例、新batch16例（纯13＋native3）全部通过，
+  0失败/跳过；新batch独立复核同样16例通过。
+- 当前GCC13 RelWithDebInfo OFF/OFF完整build入口成功（C++未改，CMake重新配置后无待编译项）。
+  随后顺序142项相关CTest通过，0失败/跳过，68.19秒，包含新纯测试入口及原python_plugin中的
+  三个native测试。不是全量CTest或本轮ON/RXE验证。
+- 实际公共 `--tcp --batch-gets` 父子入口：20/20逻辑请求、10PUT ACK/170B、10GET hit/170B，
+  4次GET适配器调用，warmup确有两个4项批次，父报告校验通过并回收子进程。
+- 实际混合错误在**进程内run＋同一父验收器**验证，不冒充受监督负例子进程实测：
+  首namespace的4项为 `[OK, NOT_FOUND, INVALID, OK]`，完整保留2hit/1miss/1error，
+  下一namespace及measurement全部阻断。20计划/12尝试/12完成，24B trace ACK、6B hit，
+  GET完整分母10=2hit＋1miss＋1error＋6未尝试。fixture额外2REMOVE＋1PUT/5B独立记录，
+  不计trace写入；只是容量错误/丢失注入，不是淘汰收益证据。
+- 真实旧bool路径通过屏蔽当前库的新符号验证，其hit0仍unresolved；不是旧发行二进制实测。
+  真实停服返回逐项IO_ERROR4，不计miss。整批rc失败/异常、未知状态及坏报告为mock/受控子进程测试，
+  不冒充真实网络故障注入全部覆盖。
+- 初次OFF库配原默认RDMA=1得到预期setup failure，推动显式TCP选项；失败账保留。
+  测试自身None哨兵fixture修复、临时TCP bootstrap的历史green也保留，不把它当最终公共入口证明。
+  最终公共入口验证使用未mock的--tcp命令。所有owned tiny服务回收、临时数据清理；未使用VM/真实盘压力，
+  宿主`/mnt/disk1`继续禁止施压。
+- Python语法编译、CMake配置、diff及文档链接检查通过；本机无ruff/pyflakes/pylint，
+  未声称通过这些lint/typecheck，也未运行sanitizer。新C++无改动，不伪报本轮clang-tidy结果。
+
+证据 `.omx/evidence/python-batch-status/20261119T105424Z-5e3b125/`：
+`off-ctest.log/xml`、`report-green.log`、`binding-green.log`、`native/guarded-positive`和
+`native/mixed-failure`保留实际报告。SG/dedup状态传播、新Python模式RXE/uring实测及正式A/B仍后续处理。

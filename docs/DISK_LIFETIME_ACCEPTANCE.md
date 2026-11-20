@@ -1,5 +1,9 @@
 # 磁盘寿命淘汰：验收收敛与剩余实施清单
 
+最新增量：批量 C ABI → 验证用 Python → 受监督报告闭环已接通，显式batch模式保留完整逐项分母，
+旧库hit0仍unresolved、原scalar默认不变；新TCP模式仅用于明确选择的正确性冒烟。
+见[状态兼容方案第9节](CLIENT_GET_STATUS_COMPATIBILITY.md)，不扩大为SG/dedup/RXE或正式A/B放行。
+
 最新增量：新增兼容的批量 GET C ABI 状态接口，调用级失败与逐项结果分离，旧接口保持不变。
 Python 本轮尚未接入，SG/dedup 与正式 A/B 仍后续处理，见[状态兼容方案第8节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
 

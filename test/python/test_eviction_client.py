@@ -238,5 +238,140 @@ class TraceClientTest(unittest.TestCase):
         self.assertEqual(self.factory.call_count, 2)
 
 
+class BatchReadOutcomesTest(unittest.TestCase):
+    def setUp(self):
+        self.lib = Library()
+        self.client = driver.Client.__new__(driver.Client)
+        self.client.lib, self.client.handle = self.lib, 7
+        self.keys = [b"first\x00", b"second"]
+        self.values = [b"abc", b"def"]
+
+    def install_batch(self, statuses, *, values=None, lengths=None, rc=0,
+                      legacy=False):
+        payloads = self.values if values is None else values
+        def get(handle, keys, key_lens, data, caps, count, output, sizes):
+            self.lib.calls.append("legacy_batch" if legacy else "status_batch")
+            self.assertEqual(handle, 7)
+            self.assertEqual(count, len(statuses))
+            self.assertEqual([ct.string_at(keys[i], key_lens[i]) for i in range(count)],
+                             self.keys)
+            self.assertEqual(list(output), [-999] * count)
+            self.assertEqual(list(sizes), [0] * count)
+            for i, status in enumerate(statuses):
+                output[i] = status
+                hit = status == (1 if legacy else 0)
+                sizes[i] = (len(payloads[i]) if hit else 0) if lengths is None else lengths[i]
+                if hit:
+                    ct.memmove(data[i], payloads[i], min(len(payloads[i]), caps[i]))
+            return rc
+        setattr(self.lib, "dfkv_batch_get_auto" if legacy else "dfkv_batch_get_auto_status", get)
+
+    def test_mixed_statuses_keep_order_and_valid_siblings(self):
+        statuses = [0, 1, 2, 3, 4, 5, 6, 7, 8, 999, -999]
+        self.keys = [i.to_bytes(2, "big") for i in range(len(statuses))]
+        self.values = [b"abc"] * len(statuses)
+        self.install_batch(statuses)
+        results = self.client.read_outcomes(self.keys, self.values)
+        self.assertEqual([r["outcome"] for r in results],
+                         ["get_hit", "get_miss"] + ["client_error"] * 9)
+        self.assertEqual([r["status"] for r in results], statuses)
+        self.assertTrue(all(r["error"] for r in results[2:]))
+        self.assertEqual(self.lib.calls, ["status_batch"])
+
+    def test_binary_keys_empty_payload_and_empty_batch(self):
+        self.values = [b"", b"def"]
+        self.install_batch([0, 0])
+        self.assertEqual(self.client.read_outcomes(self.keys, self.values),
+                         [{"outcome": "get_hit", "status": 0}] * 2)
+        self.assertEqual(self.client.read_outcomes([], []), [])
+        self.assertEqual(self.lib.calls, ["status_batch"])
+
+    def test_invalid_inputs_fail_before_any_native_call(self):
+        for keys, values in ((self.keys, [b"abc"]), ([b""], [b"a"]),
+                             (["text"], [b"a"]), ([b"k"], ["text"]),
+                             ([None], [b"a"])):
+            with self.subTest(keys=keys, values=values):
+                with self.assertRaises((TypeError, ValueError)):
+                    self.client.read_outcomes(keys, values)
+        self.client.handle = None
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            self.client.read_outcomes([], [])
+        self.assertEqual(self.lib.calls, [])
+
+    def test_bad_lengths_and_payloads_are_slot_errors_not_whole_batch(self):
+        cases = [([0, 0], [b"bad", b"def"], [3, 3]),
+                 ([0, 0], [b"ab", b"def"], [2, 3]),
+                 ([0, 0], [b"abc", b"def"], [999, 3]),
+                 ([1, 0], self.values, [1, 3]),
+                 ([4, 0], self.values, [999, 3])]
+        for statuses, values, lengths in cases:
+            with self.subTest(statuses=statuses, lengths=lengths):
+                self.install_batch(statuses, values=values, lengths=lengths)
+                result = self.client.read_outcomes(self.keys, self.values)
+                self.assertEqual(result[0]["outcome"], "client_error")
+                self.assertTrue(result[0]["error"])
+                self.assertEqual(result[1], {"outcome": "get_hit", "status": 0})
+        self.assertEqual(self.lib.calls, ["status_batch"] * len(cases))
+
+    def test_entire_call_failure_and_exception_never_fall_back(self):
+        self.install_batch([0, 1], rc=-1)
+        with self.assertRaisesRegex(RuntimeError, "rc=-1"):
+            self.client.read_outcomes(self.keys, self.values)
+        self.lib.dfkv_batch_get_auto_status = mock.Mock(side_effect=RuntimeError("native failed"))
+        with self.assertRaisesRegex(RuntimeError, "native failed"):
+            self.client.read_outcomes(self.keys, self.values)
+        self.assertEqual(self.lib.calls, ["status_batch"])
+
+    def test_unwritten_native_slots_remain_errors_not_default_ok(self):
+        def partial(handle, keys, key_lens, data, caps, count, statuses, sizes):
+            self.lib.calls.append("partial_status_batch")
+            statuses[0], sizes[0] = 0, 3
+            ct.memmove(data[0], b"abc", 3)
+            return 0
+        self.lib.dfkv_batch_get_auto_status = partial
+        self.assertEqual(self.client.read_outcomes(self.keys, self.values), [
+            {"outcome": "get_hit", "status": 0},
+            {"outcome": "client_error", "status": -999,
+             "error": "batch_index=1: batch GET failed: status=-999"}])
+        self.assertEqual(self.lib.calls, ["partial_status_batch"])
+
+    def test_legacy_no_hit_is_unresolved_not_miss(self):
+        self.install_batch([1, 0], legacy=True)
+        self.assertEqual(self.client.read_outcomes(self.keys, self.values),
+                         [{"outcome": "get_hit"}, {"outcome": "get_unresolved"}])
+        self.assertEqual(self.lib.calls, ["legacy_batch"])
+
+    def test_legacy_invalid_results_keep_valid_siblings_and_rc_failure_raises(self):
+        for hits, lengths in (([2, 1], [0, 3]), ([0, 1], [99, 3]),
+                              ([1, 1], [2, 3])):
+            with self.subTest(hits=hits, lengths=lengths):
+                self.install_batch(hits, lengths=lengths, legacy=True)
+                result = self.client.read_outcomes(self.keys, self.values)
+                self.assertEqual(result[0]["outcome"], "client_error")
+                self.assertEqual(result[1], {"outcome": "get_hit"})
+                self.assertNotIn("status", result[0])
+        self.install_batch([1, 0], legacy=True, rc=-1)
+        with self.assertRaisesRegex(RuntimeError, "rc=-1"):
+            self.client.read_outcomes(self.keys, self.values)
+        self.assertNotIn("exist", self.lib.calls)
+
+    def test_optional_batch_symbol_is_bound_independently_of_scalar(self):
+        required = ["dfkv_open_v2", "dfkv_close", "dfkv_transport_mode",
+                    "dfkv_remove", "dfkv_exist", "dfkv_batch_put", "dfkv_batch_get_auto"]
+        for scalar, batch in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(scalar=scalar, batch=batch):
+                lib = mock.Mock(spec=required + (["dfkv_get_auto_status"] if scalar else []) +
+                                (["dfkv_batch_get_auto_status"] if batch else []))
+                with mock.patch.object(driver.ct, "CDLL", return_value=lib):
+                    self.assertIs(driver.load_library("unused-test-path"), lib)
+                if batch:
+                    function = lib.dfkv_batch_get_auto_status
+                    self.assertEqual(function.restype, ct.c_int)
+                    self.assertEqual(function.argtypes, [ct.c_void_p,
+                        ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_uint64),
+                        ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_uint64), ct.c_int,
+                        ct.POINTER(ct.c_int), ct.POINTER(ct.c_uint64)])
+
+
 if __name__ == "__main__":
     unittest.main()

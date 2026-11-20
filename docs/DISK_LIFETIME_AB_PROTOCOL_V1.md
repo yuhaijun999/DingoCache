@@ -540,3 +540,15 @@ lifetime read_success=12。两例均正常退出0、端口释放。停服后额�
 复用C++直接批量核心并绕过去重，旧C符号不变；Python/SG/dedup状态接入另行处理。
 完整契约及本轮验证见[状态兼容方案第8节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
 这不是正式A/B、性能、物理HCA或生产默认切换放行。
+
+
+## 20. 批量状态的 Python 与受监督报告闭环
+
+新增验证用read_outcomes/TraceClient.execute_batch和显式--batch-gets；缺新符号才使用旧batch，
+旧hit0保留unresolved，不使用scalar/EXIST重试。新模式按连续GET窗口/namespace分组，
+同组结果全保留后才停止后续组，父进程从冻结配置选择独立组计划验收器。
+报告区分明确miss、逐项错误、整组失败、未尝试，超时/坏报告计数仍unknown；严格hit门槛不放宽。
+--tcp显式冻结TCP环境，默认仍RDMA/rxe0，不失败自动回退；实际调用顺序不同于scalar模式，
+共享组时间不等于单项传输延迟，不用于固定到达或性能对比。
+完整契约、复跑和验证见[状态兼容方案第9节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
+本轮是tiny file/TCP正确性闭环，不证明新Python路径RXE/uring、SG/dedup或正式A/B已通过。

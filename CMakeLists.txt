@@ -232,7 +232,7 @@ if(DFKV_BUILD_TESTS)
   find_program(PYTHON3 python3)
   if(PYTHON3)
     add_test(NAME python_plugin
-      COMMAND ${PYTHON3} -m unittest test_dfkv_identity test_dfkv_hicache
+      COMMAND ${PYTHON3} -m unittest test_dfkv_identity test_dfkv_hicache test_eviction_batch.NativeBatchTest
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_plugin PROPERTIES
       ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so;DFKV_STORE_ENGINE=file;DFKV_SLAB_WRITE=buffered;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
@@ -275,6 +275,13 @@ if(DFKV_BUILD_TESTS)
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
               -p test_eviction_smoke.py)
     set_tests_properties(python_eviction_smoke PROPERTIES TIMEOUT 30)
+    # Pure ledger/adapter tests also run under sanitizer builds. Native ctypes
+    # cases share python_plugin's existing stock-Python sanitizer exclusion.
+    add_test(NAME python_eviction_batch
+      COMMAND ${PYTHON3} -m unittest test_eviction_batch.BatchSmokeTest
+              test_eviction_batch.BatchAdapterTest
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
+    set_tests_properties(python_eviction_batch PROPERTIES TIMEOUT 30)
     add_test(NAME python_quick_eviction
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
