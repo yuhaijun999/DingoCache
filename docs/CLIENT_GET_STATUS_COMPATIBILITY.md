@@ -562,3 +562,19 @@ ON、C11和静态命令，原始日志/XML、独立审查与失败尝试分开�
 这些均不算测试通过或生产故障。首次LLVM17生产tidy parser崩溃(-11)，原因未定，
 冻结源码后逐文件重跑tidy通过（359.38秒，修改行无诊断；旧/系统头诊断过滤保留），
 不掩盖首次失败。
+
+
+## 12. SG 状态链路的实际隔离验证与自动复跑
+
+新增验证专用sg_validation.py及guest-only run_sg_validation.py，不是公共Python SG绑定。
+两策略legacy/lifetime各live/stopped实际RXE＋io_uring四组匹配固定诊断预期：
+每策略4PUT321B、17live GET＋4stopped GET；runtime29宽度下129非空段完整字节正确。
+错误/未命中/旧bool不确定结果分开；每策略11PULL＝9grant＋2NF、client hit7，容量不足grant仍计热。
+63项guest C++、80个Python方法与宿主162相关CTest通过/无跳过；独立纯测试23通过。
+旧接口、评分/计热、wire、默认配置未改，详见[SG验证说明](SG_STATUS_VALIDATION.md)。
+
+补充第11节边界：零容量/无段是合法描述符形状，不表示后端一定能读取；RDMA whole-object
+容量0直接Invalid，缺失也不查询；TCP非空零容量现有行为为IO_ERROR而非容量Invalid。
+TCP验证将该限制单列在最后，保留首次错误预期失败账，不把它当miss；TCP与RDMA矩阵分母不同。
+验收器初版的隐藏setup.error/schema和stopped-open账问题已补回归并修复，未放宽RDMA预期。
+本轮passed是诊断预期符合，不替代既有全hit业务门槛，不构成SG/dedup性能或正式A/B放行。

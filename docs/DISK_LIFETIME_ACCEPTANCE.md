@@ -1,5 +1,10 @@
 # 磁盘寿命淘汰：验收收敛与剩余实施清单
 
+最新增量：SG C ABI新链路已补guest-only可复跑矩阵，legacy/lifetime的live/stopped四组实际
+RXE/uring预期符合；63 guest C++、80 Python方法及162宿主相关CTest无失败/跳过。
+TCP零容量既有限制、严格schema回归与温控/清理原账保留；非正式A/B或默认切换放行。
+详见[SG验证与复跑](SG_STATUS_VALIDATION.md)、[状态接口第12节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
+
 最新增量：SG 批量 GET 新增 C++ → C ABI 的 direct-only、single-pass 状态链路；
 旧 SG bool/dedup/重试路径保留，Python SG 与真实设备验证未包含。
 契约与本轮验证见[状态接口第11节](CLIENT_GET_STATUS_COMPATIBILITY.md)，不构成正式 A/B 放行。

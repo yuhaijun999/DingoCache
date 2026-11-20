@@ -232,10 +232,16 @@ if(DFKV_BUILD_TESTS)
   find_program(PYTHON3 python3)
   if(PYTHON3)
     add_test(NAME python_plugin
-      COMMAND ${PYTHON3} -m unittest test_dfkv_identity test_dfkv_hicache test_eviction_batch.NativeBatchTest
+      COMMAND ${PYTHON3} -m unittest test_dfkv_identity test_dfkv_hicache test_eviction_batch.NativeBatchTest test_sg_validation.NativeSgTest
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_plugin PROPERTIES
       ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so;DFKV_STORE_ENGINE=file;DFKV_SLAB_WRITE=buffered;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    # Pure SG oracle/guest-runner tests stay enabled in sanitizer builds;
+    # native ctypes coverage inherits python_plugin's existing exclusions.
+    add_test(NAME python_sg_validation
+      COMMAND ${PYTHON3} -m unittest test_sg_validation.PureSgTest test_sg_validation_runner.RunnerTest
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
+    set_tests_properties(python_sg_validation PROPERTIES TIMEOUT 30)
     add_test(NAME python_disk_validation
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python

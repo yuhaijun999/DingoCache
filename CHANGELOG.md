@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add bounded SG C ABI probes and a guest-only two-policy RXE/io_uring matrix
+  with strict per-item byte/status verification, owned-process cleanup and
+  repeatable reports; retain the diagnosed TCP zero-capacity limitation.
+
 - Add direct-only, single-pass SG batch GET status APIs in C++ and C, preserving
   per-item failures and lengths without changing legacy SG retry/dedup behavior;
   keep Python SG, dedup status propagation and formal A/B as separate work.

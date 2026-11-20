@@ -571,3 +571,13 @@ lifetime read_success=12。两例均正常退出0、端口释放。停服后额�
 rendezvous，不走旧 SG 少数失败重试；旧接口保留。不能将新旧 I/O、命中率、时延直接视为等价。
 见[状态兼容方案第11节](CLIENT_GET_STATUS_COMPATIBILITY.md)。Python SG、dedup、
 真实设备 SG 状态验证及正式 A/B 仍需单独安排；本轮不改变冻结负载、数值门槛和生产默认配置。
+
+
+## 23. SG 实际链路与自动复跑前置证据
+
+新SG状态C ABI经验证专用子进程与guest-only两策略矩阵实测RXE/uring；四组诊断预期匹配，
+完整分母、状态/字节、有效grant与client hit分别记录。63 guest C++/80 Python方法和162宿主相关CTest
+无失败/跳过；过程及局限见[SG验证说明](SG_STATUS_VALIDATION.md)。
+本轮diagnostic passed允许预声明的错误/旧bool unresolved，不替代业务全hit或正式A/B门槛；
+TCP额外零容量限制用例与RDMA分母不同，不能直接对比性能。公共Python SG、dedup状态、
+物理HCA/GPU/目标资源和正式A/B仍后续处理，生产默认值及冻结门槛未变。

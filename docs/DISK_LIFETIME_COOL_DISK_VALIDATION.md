@@ -427,3 +427,32 @@ legacy/lifetime各正常/混合/旧符号/停服4组共8场景预期符合。
 **不要在VM运行时删除宿主qcow/raw文件或整层父目录**，其中包含正在使用的VM资产。
 本轮保留全部失败账：初次构建权限、runner传输shell误解释、一次未启动单测的FD一致性预检失败，
 按状态接口第10节说明恢复，不把无完成标记或失败预检算作通过。
+
+
+## 16. SG 新链路隔离矩阵与保留路径（2026-11-20）
+
+基线f35df95＋5工作树覆盖，392组合源SHA匹配；ON315步完整构建成功，63项C++与80个Python方法
+无失败/跳过。新sg_validation/run_sg_validation两工具和单测提供可复跑入口，详见
+[SG验证说明](SG_STATUS_VALIDATION.md)，宿主禁压disk1约束不变。
+两策略live/stopped四组实际rdma预期符合，合计50逻辑操作、8PUT642B、42GET完整账；
+每策略runtime width29，129非空段字节正确，11PULL=9uringgrant+2NF，ring9，L热成功/applied9而G0。
+两个capacity失败grant与client hit7不同；停服IO不计miss，旧符号false仍unresolved。
+两个服务exit0、4探针child回收、端口空闲、无runner；VM留空闲、监控正常停止。
+94SMART样本最高42/41℃，warning0/maxgap10.219s；非压力/性能或热故障注入。
+
+本轮宿主结果（仅此新子目录，不得删除其VM资产父目录）：
+`/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/sg-runtime-20261120T034220Z-f35df95/`。
+results.tgz只含两guest结果目录，不含镜像、密钥或backing；42条目安全校验、SHA保留。
+
+Guest保留：
+- `/data/disk1/results/sg-runtime-20261120T034220Z-f35df95/`（matrix、两策略各live/stopped、server日志/指标）。
+- `/data/disk1/results/sg-tests-20261120T034220Z-f35df95/`（63 C++ XML/日志与五个Python测试日志）。
+- `/data/disk1/cases/sg-20261120T034220Z-f35df95-legacy`、`/data/disk1/cases/sg-20261120T034220Z-f35df95-lifetime`。
+- `/data/disk2/cases/sg-20261120T034220Z-f35df95-legacy`、`/data/disk2/cases/sg-20261120T034220Z-f35df95-lifetime`。
+- `/data/disk3/cases/sg-20261120T034220Z-f35df95-legacy`、`/data/disk3/cases/sg-20261120T034220Z-f35df95-lifetime`。
+- `/tmp/dfkv-sg-units-20261120T034220Z-f35df95.py`、`/tmp/dfkv-sg-matrix-20261120T034220Z-f35df95.py`（本轮证据包装脚本）。
+
+Guest/data/disk1的backing实际在宿主disk2，另两个在宿主disk3；不是宿主禁压的/mnt/disk1。
+数据/报告不自动删除；以后使用新TAG与新目录，先重新证明VM/挂载/monitor身份及fresh样本，
+再用版本化guest矩阵工具，不盲目复用历史PID/start/watch脚本。不得fallback默认Docker daemon。
+证据 `.omx/evidence/sg-runtime/20261120T034220Z-f35df95/`，原始失败尝试和TCP零容量边界同样保留。
