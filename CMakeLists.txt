@@ -232,7 +232,7 @@ if(DFKV_BUILD_TESTS)
   find_program(PYTHON3 python3)
   if(PYTHON3)
     add_test(NAME python_plugin
-      COMMAND ${PYTHON3} -m unittest test_dfkv_identity test_dfkv_hicache test_eviction_batch.NativeBatchTest test_sg_validation.NativeSgTest
+      COMMAND ${PYTHON3} -m unittest test_dfkv_identity test_dfkv_hicache test_eviction_batch.NativeBatchTest test_sg_validation.NativeSgTest test_eviction_dedup.NativeCpuDedupTest
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_plugin PROPERTIES
       ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so;DFKV_STORE_ENGINE=file;DFKV_SLAB_WRITE=buffered;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
@@ -288,6 +288,11 @@ if(DFKV_BUILD_TESTS)
               test_eviction_batch.BatchAdapterTest
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_eviction_batch PROPERTIES TIMEOUT 30)
+    add_test(NAME python_eviction_dedup
+      COMMAND ${PYTHON3} -m unittest test_eviction_dedup.CpuDedupTest
+              test_eviction_dedup.CpuDedupAdapterTest
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
+    set_tests_properties(python_eviction_dedup PROPERTIES TIMEOUT 30)
     add_test(NAME python_quick_eviction
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python

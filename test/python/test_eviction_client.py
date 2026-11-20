@@ -247,10 +247,11 @@ class BatchReadOutcomesTest(unittest.TestCase):
         self.values = [b"abc", b"def"]
 
     def install_batch(self, statuses, *, values=None, lengths=None, rc=0,
-                      legacy=False):
+                      legacy=False, deduplicated=False):
         payloads = self.values if values is None else values
         def get(handle, keys, key_lens, data, caps, count, output, sizes):
-            self.lib.calls.append("legacy_batch" if legacy else "status_batch")
+            self.lib.calls.append("deduplicated_batch" if deduplicated else
+                                  "legacy_batch" if legacy else "status_batch")
             self.assertEqual(handle, 7)
             self.assertEqual(count, len(statuses))
             self.assertEqual([ct.string_at(keys[i], key_lens[i]) for i in range(count)],
@@ -264,7 +265,9 @@ class BatchReadOutcomesTest(unittest.TestCase):
                 if hit:
                     ct.memmove(data[i], payloads[i], min(len(payloads[i]), caps[i]))
             return rc
-        setattr(self.lib, "dfkv_batch_get_auto" if legacy else "dfkv_batch_get_auto_status", get)
+        symbol = ("dfkv_batch_get_auto_deduplicated_status" if deduplicated else
+                  "dfkv_batch_get_auto" if legacy else "dfkv_batch_get_auto_status")
+        setattr(self.lib, symbol, get)
 
     def test_mixed_statuses_keep_order_and_valid_siblings(self):
         statuses = [0, 1, 2, 3, 4, 5, 6, 7, 8, 999, -999]
@@ -354,6 +357,115 @@ class BatchReadOutcomesTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "rc=-1"):
             self.client.read_outcomes(self.keys, self.values)
         self.assertNotIn("exist", self.lib.calls)
+
+    def test_explicit_dedup_uses_only_new_symbol_and_preserves_direct_selection(self):
+        self.install_batch([0, 1], deduplicated=True)
+        self.install_batch([1, 0])
+        self.assertEqual(self.client.read_deduplicated_outcomes(self.keys, self.values),
+                         [{"outcome": "get_hit", "status": 0},
+                          {"outcome": "get_miss", "status": 1}])
+        self.assertEqual(self.client.read_outcomes(self.keys, self.values),
+                         [{"outcome": "get_miss", "status": 1},
+                          {"outcome": "get_hit", "status": 0}])
+        self.assertEqual(self.lib.calls, ["deduplicated_batch", "status_batch"])
+
+    def test_explicit_dedup_missing_symbol_never_uses_direct_or_legacy(self):
+        self.install_batch([0, 0])
+        self.install_batch([1, 1], legacy=True)
+        for keys, values in ((self.keys, self.values), ([], [])):
+            with self.assertRaisesRegex(RuntimeError, "deduplicated.*unavailable"):
+                self.client.read_deduplicated_outcomes(keys, values)
+        self.assertEqual(self.lib.calls, [])
+
+    def test_explicit_dedup_mixed_errors_and_unknown_keep_valid_siblings(self):
+        statuses = [0, 1, 2, 3, 4, 5, 6, 7, 8, 999, -999]
+        self.keys = [i.to_bytes(2, "big") for i in range(len(statuses))]
+        self.values = [b"a\x00c"] * len(statuses)
+        self.install_batch(statuses, deduplicated=True)
+        results = self.client.read_deduplicated_outcomes(self.keys, self.values)
+        self.assertEqual([r["outcome"] for r in results],
+                         ["get_hit", "get_miss"] + ["client_error"] * 9)
+        self.assertEqual([r["status"] for r in results], statuses)
+        self.assertTrue(all(r["error"] for r in results[2:]))
+        self.assertEqual(self.lib.calls, ["deduplicated_batch"])
+
+    def test_explicit_dedup_bad_lengths_and_bytes_are_not_hits_or_misses(self):
+        for statuses, values, lengths in (
+                ([0, 0], [b"bad", b"def"], [3, 3]),
+                ([0, 0], [b"ab", b"def"], [2, 3]),
+                ([0, 0], self.values, [999, 3]),
+                ([1, 0], self.values, [1, 3]),
+                ([4, 0], self.values, [999, 3])):
+            with self.subTest(statuses=statuses, lengths=lengths):
+                self.install_batch(statuses, values=values, lengths=lengths,
+                                   deduplicated=True)
+                result = self.client.read_deduplicated_outcomes(self.keys, self.values)
+                self.assertEqual(result[0]["outcome"], "client_error")
+                self.assertTrue(result[0]["error"])
+                self.assertEqual(result[1], {"outcome": "get_hit", "status": 0})
+        self.assertEqual(self.lib.calls, ["deduplicated_batch"] * 5)
+
+    def test_explicit_dedup_rc_failure_and_exception_never_retry_or_fall_back(self):
+        self.install_batch([0, 0])
+        self.install_batch([1, 1], legacy=True)
+        self.install_batch([0, 1], rc=-1, deduplicated=True)
+        with self.assertRaisesRegex(RuntimeError, "rc=-1"):
+            self.client.read_deduplicated_outcomes(self.keys, self.values)
+        self.lib.dfkv_batch_get_auto_deduplicated_status = mock.Mock(
+            side_effect=RuntimeError("dedup native failed"))
+        with self.assertRaisesRegex(RuntimeError, "dedup native failed"):
+            self.client.read_deduplicated_outcomes(self.keys, self.values)
+        self.assertEqual(self.lib.calls, ["deduplicated_batch"])
+
+    def test_explicit_dedup_binary_empty_payload_and_input_validation(self):
+        self.values = [b"", b"d\x00f"]
+        self.install_batch([0, 0], deduplicated=True)
+        self.assertEqual(self.client.read_deduplicated_outcomes(iter(self.keys), iter(self.values)),
+                         [{"outcome": "get_hit", "status": 0}] * 2)
+        self.assertEqual(self.client.read_deduplicated_outcomes([], []), [])
+        for keys, values in ((self.keys, [b"abc"]), ([b""], [b"a"]),
+                             (["text"], [b"a"]), ([b"k"], ["text"]),
+                             ([None], [b"a"])):
+            with self.subTest(keys=keys, values=values):
+                with self.assertRaises((TypeError, ValueError)):
+                    self.client.read_deduplicated_outcomes(keys, values)
+        self.client.handle = None
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            self.client.read_deduplicated_outcomes([], [])
+        self.assertEqual(self.lib.calls, ["deduplicated_batch"])
+
+    def test_optional_dedup_symbol_is_independent_of_direct_and_scalar(self):
+        required = ["dfkv_open_v2", "dfkv_close", "dfkv_transport_mode",
+                    "dfkv_remove", "dfkv_exist", "dfkv_batch_put", "dfkv_batch_get_auto"]
+        for scalar in (False, True):
+            for direct in (False, True):
+                for dedup in (False, True):
+                    with self.subTest(scalar=scalar, direct=direct, dedup=dedup):
+                        optional = (["dfkv_get_auto_status"] if scalar else [])
+                        optional += (["dfkv_batch_get_auto_status"] if direct else [])
+                        optional += (["dfkv_batch_get_auto_deduplicated_status"] if dedup else [])
+                        lib = mock.Mock(spec=required + optional)
+                        with mock.patch.object(driver.ct, "CDLL", return_value=lib):
+                            self.assertIs(driver.load_library("unused-test-path"), lib)
+                        if dedup:
+                            function = lib.dfkv_batch_get_auto_deduplicated_status
+                            self.assertEqual(function.restype, ct.c_int)
+                            self.assertEqual(function.argtypes, [ct.c_void_p,
+                                ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_uint64),
+                                ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_uint64), ct.c_int,
+                                ct.POINTER(ct.c_int), ct.POINTER(ct.c_uint64)])
+
+    def test_optional_metrics_snapshot_is_bound_once_at_library_load(self):
+        required = ["dfkv_open_v2", "dfkv_close", "dfkv_transport_mode",
+                    "dfkv_remove", "dfkv_exist", "dfkv_batch_put", "dfkv_batch_get_auto"]
+        for present in (False, True):
+            lib = mock.Mock(spec=required + (["dfkv_stats_snapshot"] if present else []))
+            with mock.patch.object(driver.ct, "CDLL", return_value=lib):
+                self.assertIs(driver.load_library("unused-test-path"), lib)
+            if present:
+                function = lib.dfkv_stats_snapshot
+                self.assertEqual(function.argtypes, [ct.c_void_p, ct.c_void_p, ct.c_uint64])
+                self.assertEqual(function.restype, ct.c_uint64)
 
     def test_optional_batch_symbol_is_bound_independently_of_scalar(self):
         required = ["dfkv_open_v2", "dfkv_close", "dfkv_transport_mode",

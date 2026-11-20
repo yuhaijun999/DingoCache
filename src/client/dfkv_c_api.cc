@@ -121,6 +121,51 @@ std::string CopyKey(const void* ptr, uint64_t size) {
   return std::string(static_cast<const char*>(ptr), static_cast<size_t>(size));
 }
 
+int BatchGetAutoStatus(dfkv_client_t c, const void* const* keys,
+                       const uint64_t* key_lens, void** ptrs,
+                       const uint64_t* caps, int n, int* out_status,
+                       uint64_t* out_len, bool deduplicate) {
+  // Initialize before validation; a negative count must not touch any output.
+  for (int i = 0; i < n; ++i) {
+    if (out_status != nullptr) out_status[i] = DFKV_GET_INVALID;
+    if (out_len != nullptr) out_len[i] = 0;
+  }
+  return NoThrow(-1, [&] {
+    if (c == nullptr || n < 0) return -1;
+    if (n > 0 && (keys == nullptr || key_lens == nullptr || ptrs == nullptr ||
+                  caps == nullptr || out_status == nullptr)) {
+      return -1;
+    }
+    // Publish no partial results if allocation or the C++ call throws. Reads
+    // may already have happened: this boundary provides no rollback/cancel.
+    for (int i = 0; i < n; ++i) out_status[i] = DFKV_GET_INTERNAL_ERROR;
+    const size_t count = static_cast<size_t>(n);
+    std::vector<dfkv::KvGetItem> items(count);
+    for (size_t i = 0; i < count; ++i) {
+      if (ValidKey(keys[i], key_lens[i]) && ValidBuffer(ptrs[i], caps[i])) {
+        items[i] = {CopyKey(keys[i], key_lens[i]), ptrs[i],
+                    static_cast<size_t>(caps[i])};
+      }
+      // Empty-key placeholders retain input order and the public N-key metric;
+      // the C++ core rejects them without routing, but runs valid siblings.
+    }
+    std::vector<size_t> lengths;
+    KVClient* const client = static_cast<KVClient*>(c);
+    const std::vector<dfkv::Status> statuses =
+        deduplicate
+            ? client->BatchGetAutoDeduplicatedWithStatus(items, &lengths)
+            : client->BatchGetAutoWithStatus(items, &lengths);
+    if (statuses.size() != count || lengths.size() != count) return -1;
+    for (size_t i = 0; i < count; ++i) {
+      out_status[i] = ToCGetStatus(statuses[i]);
+      if (statuses[i] == dfkv::Status::kOk && out_len != nullptr) {
+        out_len[i] = static_cast<uint64_t>(lengths[i]);
+      }
+    }
+    return 0;
+  });
+}
+
 template <class T>
 void ZeroArray(T* output, int n) {
   if (!output || n <= 0) return;
@@ -394,42 +439,18 @@ int dfkv_batch_get_auto_status(dfkv_client_t c, const void* const* keys,
                                const uint64_t* key_lens, void** ptrs,
                                const uint64_t* caps, int n, int* out_status,
                                uint64_t* out_len) {
-  // Initialize before validation; a negative count must not touch any output.
-  for (int i = 0; i < n; ++i) {
-    if (out_status != nullptr) out_status[i] = DFKV_GET_INVALID;
-    if (out_len != nullptr) out_len[i] = 0;
-  }
-  return NoThrow(-1, [&] {
-    if (c == nullptr || n < 0) return -1;
-    if (n > 0 && (keys == nullptr || key_lens == nullptr || ptrs == nullptr ||
-                  caps == nullptr || out_status == nullptr)) {
-      return -1;
-    }
-    // Publish no partial results if allocation or the C++ call throws. Reads
-    // may already have happened: this boundary provides no rollback/cancel.
-    for (int i = 0; i < n; ++i) out_status[i] = DFKV_GET_INTERNAL_ERROR;
-    const size_t count = static_cast<size_t>(n);
-    std::vector<dfkv::KvGetItem> items(count);
-    for (size_t i = 0; i < count; ++i) {
-      if (ValidKey(keys[i], key_lens[i]) && ValidBuffer(ptrs[i], caps[i])) {
-        items[i] = {CopyKey(keys[i], key_lens[i]), ptrs[i],
-                    static_cast<size_t>(caps[i])};
-      }
-      // Empty-key placeholders retain input order and the public N-key metric;
-      // the C++ core rejects them without routing, but runs valid siblings.
-    }
-    std::vector<size_t> lengths;
-    const std::vector<dfkv::Status> statuses =
-        static_cast<KVClient*>(c)->BatchGetAutoWithStatus(items, &lengths);
-    if (statuses.size() != count || lengths.size() != count) return -1;
-    for (size_t i = 0; i < count; ++i) {
-      out_status[i] = ToCGetStatus(statuses[i]);
-      if (statuses[i] == dfkv::Status::kOk && out_len != nullptr) {
-        out_len[i] = static_cast<uint64_t>(lengths[i]);
-      }
-    }
-    return 0;
-  });
+  return BatchGetAutoStatus(c, keys, key_lens, ptrs, caps, n, out_status,
+                            out_len, false);
+}
+
+int dfkv_batch_get_auto_deduplicated_status(dfkv_client_t c,
+                                            const void* const* keys,
+                                            const uint64_t* key_lens,
+                                            void** ptrs, const uint64_t* caps,
+                                            int n, int* out_status,
+                                            uint64_t* out_len) {
+  return BatchGetAutoStatus(c, keys, key_lens, ptrs, caps, n, out_status,
+                            out_len, true);
 }
 
 int dfkv_batch_exist(dfkv_client_t c, const void* const* keys,

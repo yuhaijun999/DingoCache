@@ -179,6 +179,23 @@ class Client:
         The new symbol is direct-only: it bypasses opt-in dedup and may issue
         more I/O than the legacy batch API. No dedup/performance equivalence.
         """
+        return self._read_outcomes(keys, expected, deduplicated=False)
+
+    def read_deduplicated_outcomes(self, keys, expected):
+        """Explicit CPU rendezvous status batch; never silently choose direct I/O.
+
+        The new C symbol is required, including for an empty batch. The existing
+        CPU dedup environment switch still controls whether the native method
+        shares successful payloads. Errors are not negative-cached: waiters may
+        perform bounded direct fallback and report that read's actual status.
+        A missing symbol or failed whole call raises without any compatibility
+        fallback; callers must not label requested dedup as proven merge activity.
+        """
+        return self._read_outcomes(keys, expected, deduplicated=True)
+
+    def _read_outcomes(self, keys, expected, *, deduplicated):
+        # Shared validation/ownership/decoding keeps both APIs' failure rules
+        # identical; only the explicit symbol selection differs.
         if not self.handle:
             raise RuntimeError("client is closed")
         keys, expected = list(keys), list(expected)
@@ -191,6 +208,16 @@ class Client:
                 raise ValueError("batch keys must be non-empty bytes")
             if not isinstance(value, bytes):
                 raise TypeError("expected payloads must be bytes")
+        if deduplicated:
+            function = getattr(self.lib, "dfkv_batch_get_auto_deduplicated_status", None)
+            if function is None:
+                raise RuntimeError("explicit CPU deduplicated GET status symbol unavailable")
+            legacy = False
+        elif keys:
+            function = getattr(self.lib, "dfkv_batch_get_auto_status", None)
+            legacy = function is None
+            if legacy:
+                function = self.lib.dfkv_batch_get_auto
         if not keys:
             return []
         pointers, lengths, owners = make_key_array(keys)
@@ -199,10 +226,6 @@ class Client:
         caps = (ct.c_uint64 * len(keys))(*[ct.sizeof(b) for b in buffers])
         statuses = (ct.c_int * len(keys))(*([-999] * len(keys)))
         sizes = (ct.c_uint64 * len(keys))()
-        function = getattr(self.lib, "dfkv_batch_get_auto_status", None)
-        legacy = function is None
-        if legacy:
-            function = self.lib.dfkv_batch_get_auto
         rc = function(self.handle, pointers, lengths, data, caps, len(keys),
                       statuses, sizes)
         if rc != 0:
@@ -276,10 +299,15 @@ def load_library(path):
         status_get.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint64,
                                ct.c_void_p, ct.c_uint64, size_array]
         status_get.restype = ct.c_int
-    batch_status_get = getattr(lib, "dfkv_batch_get_auto_status", None)
-    if batch_status_get is not None:
-        batch_status_get.argtypes = signatures["dfkv_batch_get_auto"][0]
-        batch_status_get.restype = ct.c_int
+    for name in ("dfkv_batch_get_auto_status", "dfkv_batch_get_auto_deduplicated_status"):
+        batch_status_get = getattr(lib, name, None)
+        if batch_status_get is not None:
+            batch_status_get.argtypes = signatures["dfkv_batch_get_auto"][0]
+            batch_status_get.restype = ct.c_int
+    stats = getattr(lib, "dfkv_stats_snapshot", None)
+    if stats is not None:
+        stats.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint64]
+        stats.restype = ct.c_uint64
     return lib
 
 

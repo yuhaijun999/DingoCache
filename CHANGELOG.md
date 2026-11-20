@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Expose explicit CPU-deduplicated batch GET statuses through additive C and
+  validation Python APIs and opt-in guarded smoke reports, with observed
+  enablement, isolated backend namespaces and no direct-API fallback/change.
+
 - Add an explicit C++ CPU-deduplicated batch GET status API with successful
   payload reuse, bounded authoritative fallback on failure, claim cleanup and
   once-only logical metrics; retain direct-only C/Python APIs and shm layout.

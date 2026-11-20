@@ -629,3 +629,13 @@ ON/ON目标重编译及同14项fake/TCP测试通过，不能当作实际RXE/urin
 首次测试夹具异常、tidy崩溃及实际include/const诊断均保留，修正后以冻结源码重跑为准。
 证据目录 `.omx/evidence/cpu-dedup-status/20261120T061812Z-429ee47/`，含commands.md、
 XML/日志、源码SHA、独立review.md和完整失败尝试；本轮不自动提交或推送。
+
+## 14. 显式 CPU dedup 的 C ABI / Python / 报告链路
+
+新增 `dfkv_batch_get_auto_deduplicated_status` 及验证用Python
+`Client.read_deduplicated_outcomes`，共享既有逐项状态与调用级失败契约；缺失新符号不回退。
+新 `--batch-gets --cpu-dedup` 冒烟记录隔离后的真实后端namespace、已观察启用的CPU
+指标和完整读取分母，父进程独立校验，不仅凭环境开关宣称成功。
+直读C++/C/Python原接口保留；没有GPU/SG、默认/wire/shm格式改变或正式A/B放行。
+复跑方法、TTL/回源边界、namespace路由变化和shm保留清理范围见
+[CPU状态链路验证说明](CPU_DEDUP_STATUS_VALIDATION.md)。

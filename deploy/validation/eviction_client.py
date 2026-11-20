@@ -14,7 +14,8 @@ class TraceClient:
     inferred from a successful PUT: the external server setup must prove those.
     """
 
-    def __init__(self, document, lib, members, namespace, *, client_factory=None):
+    def __init__(self, document, lib, members, namespace, *, client_factory=None,
+                 cpu_dedup_token=None):
         trace.validate(document)
         self._rows = [dict(row) for row in document["requests"]]
         if type(namespace) is not bytes or namespace.hex() not in {
@@ -27,6 +28,11 @@ class TraceClient:
         self._namespace = namespace.hex()
         self._lock = threading.Lock()
         self._closed = False
+        self._cpu_dedup = cpu_dedup_token is not None
+        self._lib = lib
+        if self._cpu_dedup:
+            from eviction_dedup import namespace as backend_namespace
+            namespace = backend_namespace(cpu_dedup_token, namespace)
         self._client = client_factory(lib, members, namespace)
         self.transport = self._client.transport
 
@@ -75,7 +81,9 @@ class TraceClient:
         with self._lock:
             if self._closed:
                 raise RuntimeError("trace client is closed")
-            results = self._client.read_outcomes(
+            read = (self._client.read_deduplicated_outcomes if self._cpu_dedup
+                    else self._client.read_outcomes)
+            results = read(
                 [bytes.fromhex(row["key_hex"]) for row in rows],
                 [trace.payload(row) for row in rows])
             # Check the complete shape before exposing even the first sibling.
@@ -85,6 +93,14 @@ class TraceClient:
             for result in results:
                 check_outcome(result)
             return [dict(result) for result in results]
+
+    def cpu_dedup_metrics(self):
+        """Observe enabled CPU shm, under the same native-handle lifetime lock."""
+        with self._lock:
+            if self._closed or not self._cpu_dedup:
+                raise RuntimeError("CPU dedup metrics require an open explicit handle")
+            from eviction_dedup import snapshot
+            return snapshot(self._lib, self._client.handle)
 
     def close(self):
         # Never close a handle while a native call still owns its buffers.

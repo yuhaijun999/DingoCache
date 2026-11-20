@@ -9,6 +9,7 @@ import time
 import eviction_trace as trace
 
 MODEL = "namespace-batched-real-client-correctness-only"
+DEDUP_MODEL = "namespace-batched-cpu-dedup-correctness-only"
 SCHEDULE = "namespace-batched-unpaced"
 GET_TERMINALS = ("get_hit", "get_miss", "get_unresolved", "client_error",
                  "get_batch_error", "not_attempted")
@@ -106,7 +107,7 @@ def summary(rows, groups):
 
 def verify(document, result, config):
     """Independently regenerate groups, identities, stop gates and counters."""
-    if (not isinstance(result, dict) or result.get("model") != MODEL
+    if (not isinstance(result, dict) or result.get("model") != (DEDUP_MODEL if config.get("cpu_dedup") else MODEL)
             or result.get("schedule_mode") != SCHEDULE
             or result.get("trace_sha256") != document["sha256"]
             or trace.encode(result.get("config")) != trace.encode(config)):
@@ -181,6 +182,9 @@ def verify(document, result, config):
             or any("started_ns" in row for row in rows) and len(transports) != len(namespaces)):
         raise ValueError("invalid transport ledger")
     counts = summary(rows, groups)
+    if config.get("cpu_dedup"):
+        from eviction_dedup import verify as verify_dedup
+        counts["cpu_dedup_observations"] = verify_dedup(document, result, config)
     passed = not errors and all(row["terminal"] == ("put_ack" if row["op"] == "put" else "get_hit") for row in rows)
     if (trace.encode(result.get("summary")) != trace.encode(counts)
             or type(result.get("passed")) is not bool or result["passed"] != passed):

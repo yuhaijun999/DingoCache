@@ -11,10 +11,12 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eviction_trace as trace
 import eviction_batch as batch
+import eviction_dedup as dedup
 from eviction_client import TraceClient
 from eviction_guard import _stop
 
@@ -32,9 +34,16 @@ def _bounded(document):
     return counts
 
 
-def _config(lib, members, *, batch_gets=False, tcp=False):
-    if type(batch_gets) is not bool or type(tcp) is not bool:
+def _config(lib, members, *, batch_gets=False, tcp=False, cpu_dedup=False,
+            cpu_dedup_token=None):
+    if any(type(value) is not bool for value in (batch_gets, tcp, cpu_dedup)):
         raise ValueError("batch_gets and tcp must be bool")
+    if cpu_dedup:
+        if not batch_gets:
+            raise ValueError("CPU dedup requires --batch-gets")
+        dedup.namespace(cpu_dedup_token, b"")
+    elif cpu_dedup_token is not None:
+        raise ValueError("unexpected CPU dedup token")
     match = re.fullmatch(r"[A-Za-z0-9_-]+=127\.0\.0\.1:([0-9]{1,5})", members)
     if match is None or not 1 <= int(match[1]) <= 65535:
         raise ValueError("smoke requires one explicit loopback member: name=127.0.0.1:port")
@@ -45,6 +54,9 @@ def _config(lib, members, *, batch_gets=False, tcp=False):
               "members": members, "client_environment": dict(CLIENT_ENV, DFKV_RDMA="0") if tcp else CLIENT_ENV}
     if batch_gets:
         config["batch_gets"] = True
+    if cpu_dedup:
+        config.update(cpu_dedup=True, cpu_dedup_token=cpu_dedup_token)
+        config["client_environment"] = dict(config["client_environment"], **dedup.ENV)
     return config
 
 
@@ -72,6 +84,11 @@ def run(document, config, *, library_loader=None, client_factory=TraceClient):
         result.update(model=batch.MODEL, schedule_mode=batch.SCHEDULE,
                       groups=[{"group_id": index, "request_ids": ids, "state": "not_attempted"}
                               for index, ids in enumerate(batch.plan(document))])
+    cpu_dedup = config.get("cpu_dedup", False)
+    if cpu_dedup:
+        result.update(model=batch.DEDUP_MODEL,
+                      cpu_dedup=[dict(item, before=None, after=None) for item in
+                                 dedup.identities(document, config["cpu_dedup_token"])])
     origin = time.monotonic_ns()
     try:
         if library_loader is None:
@@ -79,7 +96,8 @@ def run(document, config, *, library_loader=None, client_factory=TraceClient):
             from disk_scenarios import load_library
             library_loader = load_library
         if _config(config["lib"], config["members"], batch_gets=batch_gets,
-                   tcp=config["client_environment"].get("DFKV_RDMA") == "0") != config:
+                   tcp=config["client_environment"].get("DFKV_RDMA") == "0",
+                   cpu_dedup=cpu_dedup, cpu_dedup_token=config.get("cpu_dedup_token")) != config:
             raise ValueError("library/config changed before loading")
         with ExitStack() as stack:
             clients = {}
@@ -87,9 +105,16 @@ def run(document, config, *, library_loader=None, client_factory=TraceClient):
                 # Load once, and close all already-opened handles on setup failure.
                 if not clients:
                     library = library_loader(config["lib"])
-                client = stack.enter_context(client_factory(document, library, config["members"], bytes.fromhex(namespace)))
+                options = {"cpu_dedup_token": config["cpu_dedup_token"]} if cpu_dedup else {}
+                client = stack.enter_context(client_factory(document, library, config["members"],
+                                                            bytes.fromhex(namespace), **options))
                 clients[namespace] = client
                 result["transports"].append({"namespace_hex": namespace, "mode": client.transport})
+                if cpu_dedup:
+                    entry = result["cpu_dedup"][len(clients) - 1]
+                    entry["before"] = client.cpu_dedup_metrics()
+                    if any(entry["before"].values()):
+                        raise ValueError("CPU dedup counters nonzero before workload")
             if batch_gets:
                 batch.execute(rows, clients, result["groups"], origin)
             else:
@@ -102,9 +127,14 @@ def run(document, config, *, library_loader=None, client_factory=TraceClient):
                     row["completed_ns"] = time.monotonic_ns() - origin
                     if row["terminal"] != ("put_ack" if row["op"] == "put" else "get_hit"):
                         break  # Failure also blocks the rest of the current phase.
+            if cpu_dedup:
+                for entry in result["cpu_dedup"]:
+                    entry["after"] = clients[entry["namespace_hex"]].cpu_dedup_metrics()
     except Exception as error:
         result["errors"].append(f"{type(error).__name__}: {error}")
     result["summary"] = batch.summary(rows, result["groups"]) if batch_gets else _summary(rows)
+    if cpu_dedup:
+        result["summary"]["cpu_dedup_observations"] = dedup.observations(result["cpu_dedup"])
     result["passed"] = not result["errors"] and all(
         row["terminal"] == ("put_ack" if row["op"] == "put" else "get_hit") for row in rows)
     result["elapsed_ns"] = time.monotonic_ns() - origin
@@ -174,17 +204,24 @@ def _command(source, result, config):
                "--lib", config["lib"], "--members", config["members"], "--child"]
     if config.get("batch_gets") is True:
         command.append("--batch-gets")
+    if config.get("cpu_dedup") is True:
+        command.extend(["--cpu-dedup", "--cpu-dedup-token", config["cpu_dedup_token"]])
     if config["client_environment"]["DFKV_RDMA"] == "0":
         command.append("--tcp")
     return command
 
 
-def supervise(source, output, *, lib, members, process_timeout_sec=10, batch_gets=False, tcp=False):
+def supervise(source, output, *, lib, members, process_timeout_sec=10, batch_gets=False,
+              tcp=False, cpu_dedup=False):
     if (type(process_timeout_sec) not in (int, float) or not math.isfinite(process_timeout_sec)
             or not .05 <= process_timeout_sec <= 30):
         raise ValueError("process timeout must be finite in [0.05, 30] seconds")
     document = trace.load(source)
-    counts, config = _bounded(document), _config(lib, members, batch_gets=batch_gets, tcp=tcp)
+    counts, config = _bounded(document), _config(
+        lib, members, batch_gets=batch_gets, tcp=tcp, cpu_dedup=cpu_dedup,
+        cpu_dedup_token=uuid.uuid4().hex if cpu_dedup else None)
+    if cpu_dedup:
+        dedup.require_fresh(document, config["cpu_dedup_token"])
     output = Path(output).absolute()
     output.mkdir()  # New owned directory only, no overwrite/retry or server reset.
     frozen, raw = output / "trace.json", output / "child-result.json"
@@ -197,6 +234,10 @@ def supervise(source, output, *, lib, members, process_timeout_sec=10, batch_get
               "returncode": None, "reaped": False, "command": _command(frozen, raw, config)}
     if batch_gets:
         report.update(get_outcomes=None, get_adapter_calls=None, get_failed_adapter_calls=None)
+    if cpu_dedup:
+        report.update(cpu_dedup_observations=None,
+                      possible_retained_shm_paths=[item["possible_shm_path"] for item in
+                                                   dedup.identities(document, config["cpu_dedup_token"])])
     child, interruption = None, None
     started = time.monotonic_ns()
     env = {key: value for key, value in os.environ.items() if not key.startswith("DFKV_")}
@@ -227,6 +268,8 @@ def supervise(source, output, *, lib, members, process_timeout_sec=10, batch_get
             if not report["reaped"]:
                 report.update(previous_status=report["status"], status="cleanup_failed")
         report["elapsed_ns"] = time.monotonic_ns() - started
+    if cpu_dedup:
+        report["shm_cleanup"] = "not_attempted_no_exclusive_creator_proof"
     if report["status"] == "pending":
         if report["returncode"] not in (0, 1):
             report["status"] = "child_exit"
@@ -242,6 +285,8 @@ def supervise(source, output, *, lib, members, process_timeout_sec=10, batch_get
                 if batch_gets:
                     report.update({key: summary[key] for key in
                                    ("get_outcomes", "get_adapter_calls", "get_failed_adapter_calls")})
+                if cpu_dedup:
+                    report["cpu_dedup_observations"] = summary["cpu_dedup_observations"]
             except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError) as error:
                 report.update(status="invalid_result", error=f"{type(error).__name__}: {error}")
     (output / "report.json").write_bytes(trace.encode(report))
@@ -259,17 +304,23 @@ def main(argv=None):
     parser.add_argument("--process-timeout-sec", type=float, default=10)
     parser.add_argument("--tcp", action="store_true", help="explicit TCP correctness smoke; default still requests RDMA/rxe0")
     parser.add_argument("--batch-gets", action="store_true", help="opt-in namespace-batched correctness mode; not arrival/performance replay")
+    parser.add_argument("--cpu-dedup", action="store_true", help="explicit CPU status path; requires --batch-gets; remaps backend namespaces")
+    parser.add_argument("--cpu-dedup-token", help=argparse.SUPPRESS)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
+        if args.cpu_dedup_token is not None and not args.child:
+            raise ValueError("CPU dedup token is parent-generated, not a replay option")
         if args.child:
             document = trace.load(args.trace)
-            result = run(document, _config(args.lib, args.members, batch_gets=args.batch_gets, tcp=args.tcp))
+            result = run(document, _config(args.lib, args.members, batch_gets=args.batch_gets, tcp=args.tcp,
+                                           cpu_dedup=args.cpu_dedup, cpu_dedup_token=args.cpu_dedup_token))
             with Path(args.output).open("xb") as output:
                 output.write(trace.encode(result))
         else:
             result = supervise(args.trace, args.output, lib=args.lib, members=args.members,
-                               process_timeout_sec=args.process_timeout_sec, batch_gets=args.batch_gets, tcp=args.tcp)
+                               process_timeout_sec=args.process_timeout_sec, batch_gets=args.batch_gets,
+                               tcp=args.tcp, cpu_dedup=args.cpu_dedup)
         print(trace.encode(result).decode("ascii"), end="")
         return 0 if result["passed"] else 1
     except (OSError, ValueError, TypeError, UnicodeError, RecursionError) as error:

@@ -593,3 +593,13 @@ TCP额外零容量限制用例与RDMA分母不同，不能直接对比性能。�
 共享内存命中有既有 TTL 陈旧边界，可能减少服务端 grant/计热；不能将该接口直接替换
 已冻结的 direct-only 负载并沿用 A/B 口径。真实 RXE 去重及跨语言显式选择仍需后续验证。
 本轮正确性测试不满足正式 A/B 运行、性能、物理 HCA/GPU 或默认切换门槛。
+
+## 25. CPU dedup 的跨语言与报告前置边界
+
+显式C++ CPU入口已扩展到新C ABI、验证用Python和guarded报告；旧直读接口保持原样。
+新模式要求观察到CPU dedup指标，并冻结单次token/后端namespace映射、逐项状态及完整分母。
+新namespace改变tenant/routing，TTL复用可减少服务器grant/计热，不能视为旧trace原路由
+或沿用direct-only正式A/B的I/O口径。共享段没有独占创建所有权证明，保留精确路径而非
+自动unlink；不引入失败广播或即时唤醒。
+见[CPU链路验证说明](CPU_DEDUP_STATUS_VALIDATION.md)。本轮不解除正式A/B业务输入、
+基线、资源、独立职责与数值门槛，也不证明真实RXE/uring CPU去重或物理HCA/GPU性能。

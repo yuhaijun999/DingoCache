@@ -298,3 +298,8 @@ C ABI/Python/批量去重仍待分步接入，不能宣称真实A/B miss计量�
 新增显式 C++ 成功数据合并与失败有界直读回退入口；旧 direct-only C ABI/Python、
 SG/GPU 与共享内存格式不变。该接口不代表负结果共享、失败即时唤醒或正式 A/B 放行；
 实际测试证据见该节交付记录，真实 RXE 去重和跨语言显式选择仍独立安排。
+
+最新CPU跨语言前置：[CPU状态链路验证说明](CPU_DEDUP_STATUS_VALIDATION.md)补显式C ABI、
+验证用Python及guarded报告，保留直读兼容性；严格区分已观察启用与仅请求开关。
+后端namespace隔离改变路由，保留shm路径，不自动清理其他进程共享段；真实RXE去重、
+正式A/B与生产默认切换仍需独立验收。

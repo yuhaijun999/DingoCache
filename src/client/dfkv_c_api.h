@@ -133,6 +133,22 @@ int dfkv_batch_get_auto_status(dfkv_client_t c, const void* const* keys,
                                const uint64_t* key_lens, void** ptrs,
                                const uint64_t* caps, int n, int* out_status,
                                uint64_t* out_len);
+// Explicit CPU-deduplicated variant with the same argument, output, status and
+// whole-call failure contract as dfkv_batch_get_auto_status above. CPU sharing
+// requires DFKV_CLIENT_NODE_DEDUP=1 when opening the client; otherwise direct.
+// Reuses successful payloads under the existing TTL/freshness rules, not a
+// coherent cache or proof that the server is currently reachable. Non-OK
+// statuses are not shared: waiters use the existing per-item bounded wait,
+// then return their own direct read's status. Abort is not immediate wakeup;
+// multiple waits may accumulate. No batch-wide deadline/cancel is introduced.
+// Device destinations bypass CPU shm; this does not enable GPU dedup or SG.
+// Existing direct-only and legacy symbols retain their behavior.
+int dfkv_batch_get_auto_deduplicated_status(dfkv_client_t c,
+                                            const void* const* keys,
+                                            const uint64_t* key_lens,
+                                            void** ptrs, const uint64_t* caps,
+                                            int n, int* out_status,
+                                            uint64_t* out_len);
 int dfkv_batch_exist(dfkv_client_t c, const void* const* keys,
                      const uint64_t* key_lens, int n, int* out_exist);
 int dfkv_batch_remove(dfkv_client_t c, const void* const* keys,
