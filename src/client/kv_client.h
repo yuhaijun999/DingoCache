@@ -128,6 +128,23 @@ class KVClient {
   // SG or dedup status propagation.
   std::vector<Status> BatchGetAutoWithStatus(
       const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens);
+  // Explicit CPU rendezvous variant of BatchGetAutoWithStatus. The existing
+  // direct-only methods and C ABI are unchanged. Without opt-in CPU dedup,
+  // this is the direct status batch; device buffers always bypass CPU shm.
+  // Reuses successful bytes with the same TTL/freshness as BatchGetAuto, not
+  // a coherent cache. Only owners publish validated kOk payloads. Non-Ok
+  // results are not shared: waiters use the existing per-item bounded wait,
+  // then perform a direct read and return that read's status (not the owner's).
+  // Abort does not wake waiters immediately. Multiple waits can add latency;
+  // no whole-batch deadline, failure fanout or cancellation is introduced.
+  // Exactly one logical GET metric covers all items, including fallback I/O.
+  // Invalid buffers/keys are rejected before shm access; failed destinations
+  // must be discarded. out_lens is optional, exactly N and zero unless kOk,
+  // including on propagated exceptions. It must not alias input item storage;
+  // destinations must be live, non-overlapping and host/device classified as
+  // for other GET APIs. Owned claims are aborted on exceptional exits.
+  std::vector<Status> BatchGetAutoDeduplicatedWithStatus(
+      const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens);
   std::vector<bool> BatchExist(const std::vector<std::string>& keys);
   // Batched remove, fanned out across owning nodes (grouped per node). Per-item
   // result like BatchExist: true iff the owning node confirmed the op.

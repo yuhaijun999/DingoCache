@@ -581,3 +581,15 @@ rendezvous，不走旧 SG 少数失败重试；旧接口保留。不能将新旧
 本轮diagnostic passed允许预声明的错误/旧bool unresolved，不替代业务全hit或正式A/B门槛；
 TCP额外零容量限制用例与RDMA分母不同，不能直接对比性能。公共Python SG、dedup状态、
 物理HCA/GPU/目标资源和正式A/B仍后续处理，生产默认值及冻结门槛未变。
+
+## 24. CPU dedup 状态兼容前置边界
+
+新增显式 C++ `BatchGetAutoDeduplicatedWithStatus`，仅在既有 CPU dedup 开关启用时
+复用成功 payload；失败释放 claim，等待者有界等待后直读并保留自己的真实状态。
+不引入失败负缓存、失败状态广播或即时唤醒；多项等待不是一个 batch 总截止时间。
+稳定 direct-only C++/C ABI/Python 入口、SG/GPU、共享内存格式及磁盘默认配置不变。
+见[状态兼容方案第13节](CLIENT_GET_STATUS_COMPATIBILITY.md#13-显式-cpu-dedup-状态入口)。
+
+共享内存命中有既有 TTL 陈旧边界，可能减少服务端 grant/计热；不能将该接口直接替换
+已冻结的 direct-only 负载并沿用 A/B 口径。真实 RXE 去重及跨语言显式选择仍需后续验证。
+本轮正确性测试不满足正式 A/B 运行、性能、物理 HCA/GPU 或默认切换门槛。

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add an explicit C++ CPU-deduplicated batch GET status API with successful
+  payload reuse, bounded authoritative fallback on failure, claim cleanup and
+  once-only logical metrics; retain direct-only C/Python APIs and shm layout.
+
 - Add bounded SG C ABI probes and a guest-only two-policy RXE/io_uring matrix
   with strict per-item byte/status verification, owned-process cleanup and
   repeatable reports; retain the diagnosed TCP zero-capacity limitation.

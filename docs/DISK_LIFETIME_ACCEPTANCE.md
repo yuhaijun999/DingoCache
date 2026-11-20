@@ -293,3 +293,8 @@ RXE＋io_uring指标闭合，停服负例失败。无淘汰压力，不当性能
 最新前置小步：[真实GET状态兼容方案](CLIENT_GET_STATUS_COMPATIBILITY.md)与C++单键
 状态入口已落地，明确区分权威NotFound和非miss错误，旧bool保留。
 C ABI/Python/批量去重仍待分步接入，不能宣称真实A/B miss计量全链路已修复。
+
+最新 CPU dedup 前置：[状态兼容方案第13节](CLIENT_GET_STATUS_COMPATIBILITY.md#13-显式-cpu-dedup-状态入口)
+新增显式 C++ 成功数据合并与失败有界直读回退入口；旧 direct-only C ABI/Python、
+SG/GPU 与共享内存格式不变。该接口不代表负结果共享、失败即时唤醒或正式 A/B 放行；
+实际测试证据见该节交付记录，真实 RXE 去重和跨语言显式选择仍独立安排。

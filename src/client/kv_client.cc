@@ -31,6 +31,7 @@
 
 #include "client/group_shard.h"
 #include "client/key_map.h"
+#include "client/node_dedup.h"
 #include "client/op_metrics.h"
 #include "client/read_scheduler.h"
 #include "utils/log.h"
@@ -1145,6 +1146,110 @@ std::vector<Status> KVClient::BatchGetAutoWithStatus(
   std::vector<size_t> lengths;
   std::vector<Status> statuses = BatchGetAutoStatusDirect(items, &lengths);
   for (size_t i = 0; i < statuses.size(); ++i) {
+    if (statuses[i] == Status::kOk) {
+      ++metric.hits;
+      metric.bytes += lengths[i];
+    }
+  }
+  if (out_lens != nullptr) *out_lens = std::move(lengths);
+  return statuses;
+}
+
+std::vector<Status> KVClient::BatchGetAutoDeduplicatedWithStatus(
+    const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens) {
+  if (dedup_ == nullptr) return BatchGetAutoWithStatus(items, out_lens);
+  OpMetrics::Scope metric = op_stats_.Begin(OpMetrics::kGet);
+  const size_t count = items.size();
+  metric.keys = count;
+  if (out_lens != nullptr) out_lens->assign(count, 0);
+  std::vector<Status> statuses(count, Status::kIOError);
+  std::vector<size_t> lengths(count, 0);
+  std::vector<BlockKey> keys(count);
+  std::vector<uint64_t> tokens(count, 0);
+  // A claim must not survive allocation/classification/transport exceptions.
+  // Abort checks the ownership generation, so cleanup cannot erase a peer's
+  // newer claim or an already published payload. This does not change shm ABI.
+  struct Claims {
+    NodeDedup* dedup;
+    const std::vector<BlockKey>& keys;
+    const std::vector<uint64_t>& tokens;
+    ~Claims() {
+      for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] != 0)
+          dedup->Abort(keys[i], NodeDedup::Kind::kData, tokens[i]);
+      }
+    }
+  };
+  const Claims claims{dedup_.get(), keys, tokens};
+  std::vector<KvGetItem> fetch_items;
+  std::vector<size_t> fetch_map;
+  std::vector<size_t> wait_list;
+  fetch_items.reserve(count);
+  fetch_map.reserve(count);
+  wait_list.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    const KvGetItem& item = items[i];
+    if (item.key.empty() || !ValidBuffer(item.out, item.n)) {
+      statuses[i] = Status::kInvalid;
+      continue;
+    }
+    // CPU shm must never memcpy a device address. Zero capacity is handled by
+    // the direct backend, including its existing empty-object semantics.
+    if (item.n == 0 || ClassifyDestination(item.out, item.n) ==
+                           DestinationMemoryKind::kDevice) {
+      fetch_items.push_back(item);
+      fetch_map.push_back(i);
+      continue;
+    }
+    keys[i] = ToBlockKey(key_namespace_, item.key);
+    size_t length = 0;
+    switch (dedup_->ClaimAuto(keys[i], item.n, static_cast<char*>(item.out),
+                              &length, &tokens[i])) {
+      case NodeDedup::Role::kHit:
+        statuses[i] = Status::kOk;
+        lengths[i] = length;
+        break;
+      case NodeDedup::Role::kFetch:
+        fetch_items.push_back(item);
+        fetch_map.push_back(i);
+        break;
+      case NodeDedup::Role::kWait:
+        wait_list.push_back(i);
+        break;
+    }
+  }
+  if (!fetch_items.empty()) {
+    std::vector<size_t> fetched_lengths;
+    const std::vector<Status> fetched =
+        BatchGetAutoStatusDirect(fetch_items, &fetched_lengths);
+    for (size_t m = 0; m < fetch_map.size(); ++m) {
+      const size_t i = fetch_map[m];
+      statuses[i] = fetched[m];
+      lengths[i] = fetched_lengths[m];
+      if (tokens[i] != 0) {
+        if (statuses[i] == Status::kOk) {
+          dedup_->Publish(keys[i], NodeDedup::Kind::kData, tokens[i],
+                          static_cast<const char*>(items[i].out), lengths[i]);
+        } else {
+          dedup_->Abort(keys[i], NodeDedup::Kind::kData, tokens[i]);
+        }
+        tokens[i] = 0;
+      }
+    }
+  }
+  for (const size_t i : wait_list) {
+    if (dedup_->WaitCopyAuto(keys[i], items[i].n,
+                             static_cast<char*>(items[i].out), &lengths[i])) {
+      statuses[i] = Status::kOk;
+    } else {
+      // Shared memory stores successful bytes, not failure statuses. A failed
+      // owner/timeout is not proof of absence: preserve this fallback's actual
+      // status. Use the private core to avoid counting the logical GET twice.
+      statuses[i] = GetAutoStatusDirect(items[i].key, items[i].out, items[i].n,
+                                        &lengths[i]);
+    }
+  }
+  for (size_t i = 0; i < count; ++i) {
     if (statuses[i] == Status::kOk) {
       ++metric.hits;
       metric.bytes += lengths[i];

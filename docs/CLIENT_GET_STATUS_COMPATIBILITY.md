@@ -578,3 +578,54 @@ ON、C11和静态命令，原始日志/XML、独立审查与失败尝试分开�
 TCP验证将该限制单列在最后，保留首次错误预期失败账，不把它当miss；TCP与RDMA矩阵分母不同。
 验收器初版的隐藏setup.error/schema和stopped-open账问题已补回归并修复，未放宽RDMA预期。
 本轮passed是诊断预期符合，不替代既有全hit业务门槛，不构成SG/dedup性能或正式A/B放行。
+
+## 13. 显式 CPU dedup 状态入口
+
+新增 C++ `BatchGetAutoDeduplicatedWithStatus(items, out_lens)`，显式选择 CPU
+rendezvous；仍需现有 `DFKV_CLIENT_NODE_DEDUP=1` 才启用共享内存。关闭/打开失败时
+等价于 direct 状态批量读取。**既有 `BatchGetAutoWithStatus`、C ABI/Python 和 SG
+状态入口保持 direct-only**，旧 bool dedup 代码不改，不引入新环境变量或共享内存版本。
+
+| 路径 | 状态、长度与重试边界 |
+|---|---|
+| 无效 key / 非零容量空 buffer | Claim 前返回 Invalid/0，不访问共享内存 |
+| CPU READY hit / 等待复制成功 | Ok＋完整长度，复用已校验成功 payload |
+| owner 远程成功 | 发布成功数据，返回 Ok＋完整长度 |
+| owner 远程失败 / malformed metadata / 执行器捕获异常 | 保留 direct 核心对应状态、长度0；Abort 占用，不发布负结果 |
+| waiter 超时、owner 失败或数据不可用 | 私有状态直读回退，保留**此次回退**的真实状态，不推断 miss |
+| device destination / 容量0 / arena 无法承接 | 走原 direct 状态核心，不从 CPU shm memcpy 到设备地址 |
+| 异常传播出方法 | out_lens 入口已有N个0；RAII清理已取得的 generation token，不清除其他代次 |
+
+只将明确 NotFound 计作缓存未命中。共享内存 v4 没有 Status 字段，因而本轮是
+**成功数据合并＋失败有界回退**，不是失败状态广播，也不是 owner 失败后即时唤醒：
+现有 WaitCopyAuto 每项最多等待配置的 wait_ms，然后回源；多个等待项可能累加延迟，
+不提供整个 batch 的截止时间或远程取消。owner IOError 后 waiter 可以得到 Ok 或
+NotFound；其结果来自自己的读取，不继承 owner 错误。peer 冷却也可能使回退本地
+返回 IOError、未实际发新 I/O。没有自动 minority-miss retry。
+
+与旧 CPU dedup 共享同一成功 payload 空间，具有相同 TTL、takeover、arena、Remove
+失效 fencing 和陈旧读取边界，**不是强一致缓存**。READY 成功数据可在路由暂不可用、peer 冷却或服务已停止时继续复用，
+Ok 不证明此次服务端仍可达。TTL 内可能不发远程请求，因而不能把
+其服务端 grant/计热/网络调用量等同于 direct-only 路径。不同 key/namespace 隔离，
+同 key 同批重复项可复用第一次成功发布；失败不做负缓存。成功长度超过目标容量不会
+截断后冒充命中，而是直读按既有容量规则返回结果。
+
+公开调用只记录一次逻辑 GET、N keys、最终 Ok 的 hit/bytes；fetch 和 waiter fallback
+调用私有核心，不重复计量。这不是传输调用数指标。buffer/描述符必须在同步调用期间
+有效；各目标不得重叠，输出长度 vector 不得别名输入存储；失败 buffer 丢弃。
+
+本轮不新增 C ABI/Python 去重选择入口、不接 GPU dedup、不跑真实盘压测，也不改变
+默认配置、磁盘计热和正式 A/B 门槛。C ABI/Python 显式接入及真实 RXE 去重验证是后续
+独立工作，不能把本轮 CPU fake/TCP 单测称为该完整跨语言/真实设备验证。
+
+本轮验证（2026-11-20，基线429ee47＋工作区改动）：新增14项真实执行的CMake/GTest用例，
+含确定性两客户端在途合并、READY命中、失败回退、超时/token隔离、非法/容量/零长度、
+namespace隔离、异常清理、一次计量及真实TCP/file二进制数据和Remove失效。
+GCC13 OFF/OFF完整构建及176相关CTest通过，0失败/跳过（69.16秒，非全量CTest）；
+ON/ON目标重编译及同14项fake/TCP测试通过，不能当作实际RXE/uring去重证据。
+独立Debug TSan OFF/OFF目标重编译后10轮、140项执行通过；不代表跨进程共享内存
+竞态被完全证明。LLVM17新测试完整format/tidy、生产diff格式/修改行tidy与独立审查通过，
+旧/系统头诊断仍过滤，不宣称全仓静态clean。真实GPU地址分类、分配失败注入未覆盖。
+首次测试夹具异常、tidy崩溃及实际include/const诊断均保留，修正后以冻结源码重跑为准。
+证据目录 `.omx/evidence/cpu-dedup-status/20261120T061812Z-429ee47/`，含commands.md、
+XML/日志、源码SHA、独立review.md和完整失败尝试；本轮不自动提交或推送。
