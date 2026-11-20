@@ -1,5 +1,9 @@
 # 磁盘寿命淘汰：验收收敛与剩余实施清单
 
+最新增量：新批量C ABI/Python链路已完成隔离RXE/io_uring复核，完整ON构建、44目标C++、
+56个Python方法及两策略8组场景预期符合。direct-only链路证据已补齐，SG/dedup和正式A/B仍后续处理。
+见[状态接口第10节](CLIENT_GET_STATUS_COMPATIBILITY.md)及[冷盘说明第15节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
+
 最新增量：批量 C ABI → 验证用 Python → 受监督报告闭环已接通，显式batch模式保留完整逐项分母，
 旧库hit0仍unresolved、原scalar默认不变；新TCP模式仅用于明确选择的正确性冒烟。
 见[状态兼容方案第9节](CLIENT_GET_STATUS_COMPATIBILITY.md)，不扩大为SG/dedup/RXE或正式A/B放行。

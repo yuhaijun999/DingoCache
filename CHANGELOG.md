@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Document rebuilt RXE/io_uring batch GET C/Python/report validation, including
+  mixed outcomes, legacy-symbol fallback and stopped-service failure ledgers;
+  retain separate server-grant metrics and unchanged formal A/B/default gates.
+
 - Connect optional batch GET C status results through the validation Python
   client to opt-in namespace-batched smoke reports; retain legacy no-hit as
   unresolved, preserve strict gates and add explicit TCP correctness mode.

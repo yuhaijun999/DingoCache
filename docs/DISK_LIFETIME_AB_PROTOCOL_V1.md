@@ -552,3 +552,13 @@ lifetime read_success=12。两例均正常退出0、端口释放。停服后额�
 共享组时间不等于单项传输延迟，不用于固定到达或性能对比。
 完整契约、复跑和验证见[状态兼容方案第9节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
 本轮是tiny file/TCP正确性闭环，不证明新Python路径RXE/uring、SG/dedup或正式A/B已通过。
+
+## 21. 新批量 C ABI/Python 状态链路的 RXE/io_uring 证据
+
+源码4709a1f已在重新取证且fresh温控的既有冷盘VM中完整ON构建，386文件SHA一致。
+44项C++与56个Python方法通过；两策略各正常/混合/隐藏新符号/停服，共8组预期符合。
+正常使用公共--batch-gets，负例使用明确记录的证据wrapper与同一父验收器，保留完整失败账、
+不缩分母、不把旧hit0/IO_ERROR当miss；server grant热度与client最终hit继续分开。
+本轮VM backing与guest诊断落盘仅宿主disk2/3，服务/子进程回收、端口空闲；未修改生产默认配置。
+详见[状态接口第10节](CLIENT_GET_STATUS_COMPATIBILITY.md)与[冷盘说明第15节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
+这是direct-only批量状态正确性证据；SG/dedup、物理HCA、性能和正式A/B仍未放行。

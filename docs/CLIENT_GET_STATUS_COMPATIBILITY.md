@@ -422,3 +422,65 @@ CMake将纯ledger/adapter测试单列 `python_eviction_batch`；真实ctypes三�
 证据 `.omx/evidence/python-batch-status/20261119T105424Z-5e3b125/`：
 `off-ctest.log/xml`、`report-green.log`、`binding-green.log`、`native/guarded-positive`和
 `native/mixed-failure`保留实际报告。SG/dedup状态传播、新Python模式RXE/uring实测及正式A/B仍后续处理。
+
+## 10. 新批量 C ABI/Python 链路的隔离 RXE＋io_uring 复核
+
+基线 `4709a1f`，本轮只验证，不修改生产代码、Python接口、默认策略或线协议。
+既有冷盘VM重新核验六个实际FD/路径/dev/inode/size、PID/start/uid及独立netns，
+所有backing在宿主disk2/3；guest `/data/disk1` 是宿主disk2上的虚拟盘，**不是禁用的宿主disk1**。
+386个生产/测试/绑定/构建文件与提交逐项SHA匹配后，GCC13.3 Debug ON/ON完整311项构建成功，
+384.54秒。新库SHA `a2f52ec6b418602780ac1c9e36972f5a47c23e42f87ce59f38128c9ca24af836`，
+新旧batch C符号均导出；server SHA仍 `280bd55b880db94ceeefb9a9e7d7c376ef9d5bb9fc1c83895a1b533e5675bf54`，
+服务端源码未改，不把相同server二进制说成新增服务端行为。
+
+### 测试与实际场景
+
+44项目标C++全部通过，0失败/跳过，0.66秒：scalar17＋batch21＋实际RXE回环1＋kernel uring5。
+Python23＋17＋16＝56个方法通过，0失败/跳过；其中native单测仍是TCP，不能代替下述真实RXE场景。
+不是全量CTest；本轮未重跑历史OFF142，也未运行sanitizer。
+
+legacy/lifetime各使用fresh三虚拟盘slab服务，RAMoff、diskACK、buffered、uring=1，
+12GiB诊断几何（每虚拟盘4GiB），不是压力。每策略4种场景如下；所有client实际transport为rdma：
+
+| 场景 | 逻辑计划/尝试/完成 | GET结果 | trace ACK / hit bytes |
+|---|---|---|---|
+| 正常公共--batch-gets入口 | 20/20/20 | 10hit；warm两个4项组＋measure两个singleton | 170B / 170B |
+| 混合新状态 | 20/12/12 | 首4项[OK,NotFound,Invalid,OK]；后续6GET未尝试 | 24B / 6B |
+| 隐藏新batch符号 | 20/12/12 | bool[1,0,1,1]→3hit＋1unresolved；后续6GET未尝试 | 24B / 9B |
+| 停服 | 20/12/12 | 首4项均IO_ERROR4→client_error；后续6GET未尝试 | 24B / 0B |
+
+正常场景执行未改的公共父子入口；后三类使用**证据专用wrapper**包围已提交的
+TraceClient/run及同一父验收器，父报告记录注入command并确认为workload_failed/rc1，
+complete_child_ledger已知账，不是invalid/unknown、也不是放宽门槛的通过。
+混合/旧符号各分别先REMOVE2＋PUT5B、REMOVE1，注入动作单列，不计trace ACK。
+旧符号场景是当前新库隐藏可选符号的兼容路径验证，非旧发行二进制实测。
+停服在首GET组前核对自有server PID/start/cmd-tag，先保存metrics再SIGTERM并等退出；
+IO_ERROR可含本地冷却/路由拒绝，不能宣称4次新网络I/O或停服后server错误计数增加。
+所有组sibling完整保留后阻断后续组；真实案例get_failed_adapter_calls为0，
+逐项错误不是整批rc异常实测。全局异常/坏形状的证明仍来自目标单测。
+
+两策略合计：160计划、112尝试/完成，68个trace PUT ACK/484B；额外2PUT/10B＋6REMOVE＋2TERM单列，
+所以实际70PUT/494B。44个已尝试逻辑GET＝30hit/370B＋2miss＋2unresolved＋10逐项错误；
+另36GET未尝试。未尝试的PUT12个与GET36个合计48，完整计划分母不缩减。
+每策略server PULL18＝uring有效grant16＋not_found2，ring read/completion各16，
+实际PUT35/247B；健康1，error/fallback/inflight/evict0。lifetime热度success/applied16，legacy0。
+容量错误的有效grant仍按spec服务端口径计热，不得改成客户端hit15；READ/RELEASE不重新定义计热点。
+
+两服务正常exit0、8子进程回收、端口空闲、无遗留runner。73条SMART样本，宿主nvme2最高42℃、
+nvme0最高41℃、critical_warning全0、最大间隔10.221秒；fresh结束样本后监控正常退出，VM留空闲。
+65℃是本次诊断停止线，不是厂家阈值；本轮未触发真实过热/监控故障，不冒充故障注入证明。
+本轮不是物理HCA、性能、压力、SG/dedup、正式A/B或默认切换放行。
+
+### 未掩盖的尝试与证据
+
+初次普通guest用户构建因root-owned cmake.verify_globs写权限失败；改用guest sudo构建成功。
+初次runner传输的stdin被远端login shell当bash解释，无完成标记、rc2，未执行工作负载；
+改tar传输后三个脚本逐项SHA核验通过。units前一次原始FD/dev/inode/size一致性预检失败，
+未启动guest单测；未捕获初次差异，原因未定，不能断言是qcow增长。**未放宽检查**，
+原样重取证六FD一致后继续，结束复核同样通过。构建17个既有告警来自旧cache/transport测试，
+原账保留，不声称warning-clean或拿这些环境/脚本问题算生产缺陷。
+
+证据 `.omx/evidence/rxe-python-batch/20261120T014037Z-4709a1f/`，
+包含完整命令、源码/二进制SHA、ON构建、44/56测试日志、八场景父子报告、负例逐项native-call、
+注入/指标/退出/温控及失败尝试账。保留路径和复跑约束见[冷盘说明第15节](DISK_LIFETIME_COOL_DISK_VALIDATION.md)。
+下一步再单独梳理SG状态契约，dedup另行处理，不能把direct-only状态闭环说成两者已贯通。

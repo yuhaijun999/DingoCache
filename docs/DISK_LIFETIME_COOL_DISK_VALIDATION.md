@@ -377,3 +377,53 @@ legacy/lifetime各一个fresh slab服务，RAM关闭、disk ACK、buffered/uring
 该次无完成标记、判失败并保留；改为只读nm输出后重新确认无server、端口空闲、新库符号/哈希。
 不把该脚本权限错误算生产缺陷或已通过验证。复跑仍按第13节顺序先证明归属、换新TAG/目录，
 冻结source/probe并启动fresh温控，不续跑/覆盖旧数据。未做压力、物理HCA、全量CTest、sanitizer或正式A/B。
+
+## 15. 新批量 C ABI → Python → 报告的 RXE/io_uring 复核
+
+本轮源提交 `4709a1f`；全量ON构建和44目标C++、56个Python方法通过，
+legacy/lifetime各正常/混合/旧符号/停服4组共8场景预期符合。
+仅正常场景passed；负例保留完整已知失败账且阻断后续组。
+数值、wrapper与公共入口的边界见[状态接口第10节](CLIENT_GET_STATUS_COMPATIBILITY.md)。
+不涉及生产代码/默认切换，也不是正式A/B、物理HCA、性能或真实盘压力。
+
+本轮复用了重新取证的独立VM（6vCPU/8GiB，Ubuntu24.04.5/kernel6.8.0-147/GCC13.3），
+没有启动默认Docker，也没有拷贝/读取旧宿主disk1资产。guest RXE是软件设备，不是真实HCA。
+本轮六个backing与前文同一套：root/base/seed/data1在宿主disk2目录，data2/data3在disk3。
+**guest `/data/disk1` 映射宿主 `/mnt/disk2/.../data1.raw`，不是禁用的宿主 `/mnt/disk1`。**
+温控73样本nvme2最高42℃、nvme0最高41℃、warning0、最大间隔10.221秒，
+归档/结束核验后取得fresh样本才正常停止；两服务exit0、所有case子进程回收、端口空闲，VM留空闲。
+没有实际过热或监控故障注入。用户的宿主disk1禁压约束继续有效。
+
+本轮文件保留，未自动删除：
+- 宿主结果目录：
+  `/mnt/disk2/dfkv-validation/20261118t063414z-c9bbdca/rxe-python-batch-20261120T014037Z-4709a1f/`，
+  `results.tgz`仅两个新结果目录，不包含VM资产或密钥；含温控与各operation原始log。
+- guest场景结果：`/data/disk1/results/rxe-python-batch-20261120T014037Z-4709a1f/`。
+- guest单测结果：`/data/disk1/results/rxe-python-batch-tests-20261120T014037Z-4709a1f/`。
+- guest六个数据目录：
+  `/data/disk{1,2,3}/cases/rxe-python-batch-20261120T014037Z-4709a1f-{legacy,lifetime}`。
+- guest证据专用脚本：
+  `/tmp/dfkv-rxe-python-batch-fault-20261120T014037Z-4709a1f.py`、
+  `/tmp/dfkv-rxe-python-batch-units-20261120T014037Z-4709a1f.py`、
+  `/tmp/dfkv-rxe-python-batch-experiment-20261120T014037Z-4709a1f.py`。
+- 本地证据：`.omx/evidence/rxe-python-batch/20261120T014037Z-4709a1f/`；
+  `results/`解包原始结果，archive.sha256校验宿主归档，commands.md列实际顺序。
+
+复跑步骤仍以第13节的安全流程为准：
+1. 重新证明当前VM实际PID/start/uid/netns和全部FD/backing，不把旧PID或本页历史归档当当前权威。
+   不使用默认Docker或宿主disk1；VM不存在/归属不能证明时先停止，不盲用其他环境。
+2. 选fresh TAG/宿主结果/guest六目录与两结果目录，不覆盖或续跑旧文件。
+   证据脚本是单次使用，**不能原样执行本轮TAG**；同步修改全部脚本、传输目标及proof标签后冻结SHA。
+3. 启动fresh温控，监测两允许盘的所有有效sensor、warning；>=65℃、warning非0、采集失败停止，
+   监控失活/样本>25秒的watchdog先证明同一自有VM再终止，不按进程名广杀。
+4. 冻结提交并逐文件校验guest源码；完整ON构建完成后，再顺序运行目标单测及两策略场景。
+   已有build由root所有时使用guest sudo，不修改宿主权限/ulimit；进程memlock只在guest runner内设定。
+5. 正常场景用公共`--batch-gets`、不传`--tcp`；混合/旧符号/停服的wrapper只用于专用scratch服务，
+   记录额外动作及native返回，不用于业务流量。即使ssh rc0也必须核验完成marker与原始账。
+6. 核对完整逻辑分母与server PULL/grant，停服仅用停前snapshot；不把客户端hit、server热度混算。
+   最后回收精确子进程、核验端口/runner、归档、fresh结束温控样本，再正常停止monitor。
+
+后续如清理，仅删除确认无在途服务的本轮guest cases/results/证据脚本；
+**不要在VM运行时删除宿主qcow/raw文件或整层父目录**，其中包含正在使用的VM资产。
+本轮保留全部失败账：初次构建权限、runner传输shell误解释、一次未启动单测的FD一致性预检失败，
+按状态接口第10节说明恢复，不把无完成标记或失败预检算作通过。
