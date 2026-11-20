@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add opt-in cross-process CPU dedup runtime validation for controlled sharing,
+  owner failure and dead-owner recovery; document the separate proposed GPU
+  status contract without changing production APIs or defaults.
+
 - Add repeatable guest-only CPU dedup RXE/io_uring validation, controlled native
   waiter/fallback tests and same-handle stopped-service TTL checks, with frozen
   byte/status/metric oracles and explicit retained-resource/safety boundaries.

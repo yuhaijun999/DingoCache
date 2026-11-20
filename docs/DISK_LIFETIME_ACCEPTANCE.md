@@ -307,3 +307,9 @@ SG/GPU 与共享内存格式不变。该接口不代表负结果共享、失败�
 最新CPU运行时前置：[CPU新链路隔离验证与自动复跑](CPU_DEDUP_RUNTIME_VALIDATION.md)
 已覆盖两策略真实RXE/io_uring、受控在途waiter/失败回源及停服TTL边界，保留完整状态/字节分母。
 宿主189相关CTest、guest88Cpp/126Python通过，无skip；不是正式A/B或默认切换门禁放行。
+
+### 跨进程 CPU 与 GPU 状态契约
+
+- [CPU运行时复跑说明](CPU_DEDUP_RUNTIME_VALIDATION.md)：独立 exec 进程与原同进程证据分开。
+- [GPU状态兼容契约](GPU_DEDUP_STATUS_CONTRACT.md)：现状/拟定新增接口/验证门槛，非已实现链路。
+- 正式 A/B、真实 GPU/HCA、性能与默认切换仍需独立验收。

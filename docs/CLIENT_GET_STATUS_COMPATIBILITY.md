@@ -647,3 +647,12 @@ XML/日志、源码SHA、独立review.md和完整失败尝试；本轮不自动�
 新Python探针、完整trace父报告和同handle TTL边界通过；server17grant与client22hit每策略
 分开登记，不改变磁盘server成功计热点。详情及复跑入口见
 [CPU运行时验证说明](CPU_DEDUP_RUNTIME_VALIDATION.md)。默认、wire、shm格式和旧直读行为不变。
+
+## 16. 跨进程 CPU 验证与 GPU 状态边界
+
+CPU 运行时验证增加独立 exec 进程的 owner/waiter 门控、失败回退和 dead-owner 接管；
+原同进程双 client 证据保留，不能互相替代。复跑及实际证据见
+[CPU运行时验证说明](CPU_DEDUP_RUNTIME_VALIDATION.md)。
+GPU-capable 旧 bool SG 与 direct-only 状态 SG 仍是两条不同路径；
+[GPU状态兼容契约](GPU_DEDUP_STATUS_CONTRACT.md) 明确现状、成功发布/失败回退、
+批量等待、token 清理和未来验证门槛。本轮不实现 GPU 状态接口、不迁移生产连接器。

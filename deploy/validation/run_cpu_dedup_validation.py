@@ -28,7 +28,7 @@ import quick_eviction as quick
 import run_sg_validation as common
 
 
-def check_metrics(before, after, policy):
+def check_metrics(before, after, policy, *, cross_process=False):
     # Frozen independently: native3=7pull(5grant2NF), probe=4(3grant1NF),
     # trace=8grant, boundarywarm=1grant. Local READY/cold-after-stop aren't I/O.
     expected = {'dfkv_cache_put_total': 19, 'dfkv_bytes_written_total': 746,
@@ -36,6 +36,13 @@ def check_metrics(before, after, policy):
                 'dfkv_rdma_pull_requests_terminal_total': 20,
                 'dfkv_uring_reads_total': 17, 'dfkv_uring_completions_total': 17,
                 'dfkv_slab_lifetime_read_success_total': 17 if policy == 'lifetime' else 0}
+    if cross_process:
+        # Extra process suite: 6 PUT/384B, 7 actual grants, no not-found.
+        expected.update(dfkv_cache_put_total=25, dfkv_bytes_written_total=1130,
+                        dfkv_rdma_pull_requests_dispatched_total=27,
+                        dfkv_rdma_pull_requests_terminal_total=27,
+                        dfkv_uring_reads_total=24, dfkv_uring_completions_total=24,
+                        dfkv_slab_lifetime_read_success_total=24 if policy == 'lifetime' else 0)
     if policy not in ('legacy', 'lifetime'):
         raise ValueError('unknown policy')
     result = {}
@@ -45,7 +52,7 @@ def check_metrics(before, after, policy):
             raise ValueError(f'{name}: expected {wanted}, got {result[name]}')
     old = dict(quick.samples(before, 'dfkv_rdma_pull_requests_terminal_total'))
     for labels, value in quick.samples(after, 'dfkv_rdma_pull_requests_terminal_total'):
-        wanted = (17 if 'path="uring"' in labels and 'result="success_nonempty"' in labels
+        wanted = ((24 if cross_process else 17) if 'path="uring"' in labels and 'result="success_nonempty"' in labels
                   else 3 if 'path="uring"' in labels and 'result="not_found"' in labels else 0)
         if value - old.get(labels, 0) != wanted:
             raise ValueError('wrong PULL terminal path/result: ' + labels)
@@ -59,14 +66,14 @@ def check_metrics(before, after, policy):
     return result
 
 
-def check_native(path):
+def _native_properties(path, expected, classname):
     cases = ET.parse(path).getroot().findall('.//testcase')
-    # Case names are frozen below after source discovery, never supplied by XML.
-    expected = NATIVE_CASES
+    # Case names and values are frozen below, never supplied by XML.
+    result = {}
     if len(cases) != len(expected) or {case.get('name') for case in cases} != set(expected):
         raise ValueError('native suite membership changed')
     for case in cases:
-        if (case.get('classname') != 'CpuDedupRuntime' or case.get('status') != 'run'
+        if (case.get('classname') != classname or case.get('status') != 'run'
                 or case.get('result') != 'completed'):
             raise ValueError('native execution identity invalid')
         if case.find('failure') is not None or case.find('error') is not None or case.find('skipped') is not None:
@@ -80,10 +87,64 @@ def check_native(path):
         for name, value in expected[case.get('name')].items():
             if properties.get(name) != str(value):
                 raise ValueError('native oracle property mismatch')
+        result[case.get('name')] = properties
+    return result
+
+
+def check_native(path):
+    return len(_native_properties(path, NATIVE_CASES, 'CpuDedupRuntime'))
+
+
+def check_process_native(path, parent_pid):
+    cases = _native_properties(path, PROCESS_CASES, 'CpuDedupProcessRuntime')
+    for name, properties in cases.items():
+        fields = ['parent_pid', 'owner_pid', 'waiter_pid']
+        if PROCESS_CASES[name]['killed_owner_count']:
+            fields.append('recovery_pid')
+        elif 'recovery_pid' in properties:
+            raise ValueError('unexpected recovery child')
+        pids = []
+        for field in fields:
+            value = properties.get(field, '')
+            if (not value.isascii() or not value.isdecimal() or not 0 < int(value) <= 2147483647
+                    or str(int(value)) != value):
+                raise ValueError('invalid native process identity')
+            pids.append(int(value))
+        if pids[0] != parent_pid or len(set(pids)) != len(pids):
+            raise ValueError('native clients are not distinct owned exec processes')
     return len(cases)
 
 
-def boundary_stop(library, members, output, tag, env, server, before, policy, case):
+def run_process_native(binary, case, env):
+    report = {'passed': False, 'reaped': False, 'timeout_sec': 45, 'logical_counts': None,
+              'command': [str(binary), '--gtest_output=xml:' + str(case / 'process-native.xml')]}
+    child = None
+    started = time.monotonic()
+    try:
+        with (case / 'process-native.log').open('x') as log:
+            child = subprocess.Popen(report['command'], env=env, stdin=subprocess.DEVNULL,
+                                     stdout=log, stderr=subprocess.STDOUT)
+            report['pid'] = child.pid
+            child.wait(timeout=45)
+            if child.returncode != 0:
+                raise RuntimeError('process native suite failed: ' + str(child.returncode))
+            report['cases'] = check_process_native(case / 'process-native.xml', child.pid)
+            # Frozen logical denominator, never inferred from an incomplete run.
+            report['logical_counts'] = {
+                'put_ack': 6, 'put_bytes': 384, 'get_attempted': 11, 'get_completed': 10,
+                'get_hit': 9, 'get_hit_bytes': 576, 'get_error': 1, 'get_inflight_killed': 1}
+            report['passed'] = True
+    finally:
+        if child is not None:
+            if child.poll() is None:
+                report['cleanup_actions'] = _stop(child)
+            report.update(returncode=child.poll(), reaped=child.returncode is not None)
+        report['elapsed_sec'] = time.monotonic() - started
+        (case / 'process-native-report.json').write_bytes(trace.encode(report))
+    return report
+
+
+def boundary_stop(library, members, output, tag, env, server, before, policy, case, *, cross_process=False):
     output.mkdir()
     token = uuid.uuid4().hex
     original = b'cpu-stop-boundary\0' + tag.encode('ascii')
@@ -120,7 +181,7 @@ def boundary_stop(library, members, output, tag, env, server, before, policy, ca
                 raise ValueError('wrong boundary readiness proof')
             after = common.scrape()
             (case / 'before-stop.prom').write_text(after)
-            result['server_delta'] = check_metrics(before, after, policy)
+            result['server_delta'] = check_metrics(before, after, policy, cross_process=cross_process)
             common.stop_owned(server)
             result['server_exit'] = server.returncode
             (output / 'stop-ack.json').write_bytes(trace.encode({'config': cfg, 'owned_server_reaped': True}))
@@ -140,18 +201,22 @@ def boundary_stop(library, members, output, tag, env, server, before, policy, ca
     return result
 
 
-def run(build, roots, output, tag):
+def run(build, roots, output, tag, *, cross_process=False):
     if not isinstance(tag, str) or len(tag) > 55:
         raise ValueError("matrix tag must fit 55 characters before policy suffix")
     roots, output = common.guest_paths(roots, output, tag, case_prefix='cpu')
     build = Path(build).resolve(strict=True)
     binaries = [build / name for name in ('dfkv_server', 'libdfkv.so', 'cpu_dedup_runtime_test')]
+    if cross_process:
+        binaries.append(build / 'cpu_dedup_process_runtime_test')
     if any(not path.is_file() for path in binaries):
         raise ValueError('requires server, shared library and native runtime test')
     output.mkdir()
     hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in binaries}
     result = {'model': 'cpu-dedup-two-policy-correctness-v1', 'formal_ab': False,
               'passed': False, 'build_sha256': hashes, 'policies': [], 'errors': []}
+    if cross_process:
+        result['cross_process'] = True
     env = {k: v for k, v in os.environ.items() if not k.startswith('DFKV_')}
     env.update(smoke.CLIENT_ENV, DFKV_RAM_TIER='0', DFKV_PUT_ACK_MODE='disk',
                DFKV_SLAB_RECLAIM_MS='50', DFKV_SERVER_URING='1')
@@ -201,6 +266,8 @@ def run(build, roots, output, tag):
                         subprocess.run([str(binaries[2]), '--gtest_output=xml:' + str(case / 'native.xml')],
                                        env=native_env, stdout=native_log, stderr=subprocess.STDOUT, check=True, timeout=30)
                     row['native_cases'] = check_native(case / 'native.xml')
+                    if cross_process:
+                        row['process_native'] = run_process_native(binaries[3], case, native_env)
                     row['live'] = probe.supervise(case / 'live', lib=str(binaries[1]), members='n=127.0.0.1:12001',
                                                    tag=tag + '-' + policy, mode='live', process_timeout_sec=20)
                     if not row['live']['passed']:
@@ -213,7 +280,8 @@ def run(build, roots, output, tag):
                     if not row['trace']['passed']:
                         raise ValueError('full CPU C/Python/report chain failed')
                     row['boundary'] = boundary_stop(binaries[1], 'n=127.0.0.1:12001', case / 'boundary',
-                                                      tag + '-' + policy, env, server, before, policy, case)
+                                                      tag + '-' + policy, env, server, before, policy, case,
+                                                      cross_process=cross_process)
                     row['server_exit'] = server.returncode
                     if not row['boundary']['passed'] or not row['boundary']['reaped']:
                         raise ValueError('CPU TTL/stopped boundary failed')
@@ -254,6 +322,24 @@ NATIVE_CASES = {
         'injected_local_owner_errors': 0}}
 
 
+# Independent oracle for the additional exec-process suite; XML cannot choose it.
+PROCESS_CASES = {
+    'CrossProcessWaiterSharesPublishedBytes': {
+        'expected_server_puts': 2, 'expected_server_put_bytes': 128,
+        'expected_server_pulls': 2, 'expected_server_grants': 2, 'expected_server_not_found': 0,
+        'injected_local_owner_errors': 0, 'killed_owner_count': 0, 'owned_children_reaped': 2,
+        'child_launch': 'posix_spawn_exec', 'claim_schedule': 'owner_then_waiter_marker'},
+    'OwnerLocalErrorFallsBackAcrossProcesses': {
+        'expected_server_puts': 2, 'expected_server_put_bytes': 128,
+        'expected_server_pulls': 2, 'expected_server_grants': 2, 'expected_server_not_found': 0,
+        'injected_local_owner_errors': 1, 'killed_owner_count': 0, 'owned_children_reaped': 2,
+        'child_launch': 'posix_spawn_exec', 'claim_schedule': 'owner_then_waiter_marker'},
+    'KilledOwnerFallsBackThenLaterClaimTakesOver': {
+        'expected_server_puts': 2, 'expected_server_put_bytes': 128,
+        'expected_server_pulls': 3, 'expected_server_grants': 3, 'expected_server_not_found': 0,
+        'injected_local_owner_errors': 0, 'killed_owner_count': 1, 'owned_children_reaped': 3,
+        'child_launch': 'posix_spawn_exec', 'claim_schedule': 'owner_then_waiter_marker'}}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -261,8 +347,10 @@ def main():
     parser.add_argument('--data-root', required=True, action='append', type=Path)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--tag', required=True)
+    parser.add_argument('--cross-process', action='store_true',
+                        help='also verify distinct exec clients, owner death and recovery')
     args = parser.parse_args()
-    result = run(args.build, args.data_root, args.output, args.tag)
+    result = run(args.build, args.data_root, args.output, args.tag, cross_process=args.cross_process)
     print(json.dumps({'passed': result['passed'], 'output': str(args.output)}))
     return 0 if result['passed'] else 1
 

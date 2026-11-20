@@ -612,3 +612,12 @@ CPU C ABI→Python→父报告已在隔离RXE/io_uring上以fresh legacy/lifetim
 细节、复跑、安全及注入范围见[CPU运行时验证说明](CPU_DEDUP_RUNTIME_VALIDATION.md)。
 该固定正确性诊断包含预声明error，非原正式A/B trace/routing、性能或全hit业务放行；GPU dedup、
 真实HCA、业务/基线/目标资源/独立职责及数值门槛仍待独立安排，生产默认不变。
+
+## 27. 跨进程 CPU 与 GPU 契约前置边界
+
+新增 CPU owner/waiter 的独立 exec 进程正确性验证，接入 opt-in 两策略矩阵；
+与原单进程双 client、CPU TTL 和 C/Python 报告证据分开登记。
+见[运行时说明](CPU_DEDUP_RUNTIME_VALIDATION.md)和[GPU契约](GPU_DEDUP_STATUS_CONTRACT.md)。
+GPU 状态链路仅梳理，尚未实现或完成真实 GPU 证明；CPU/RXE不能替代 CUDA IPC。
+上述正确性诊断不冻结正式 A/B 业务权重/资源/基线/独立审批/数值门槛，
+不改变现有 direct-only 负载或磁盘计热点，生产默认配置未变。
