@@ -22,7 +22,9 @@ import quick_eviction as quick
 import sg_validation as sg
 
 
-def guest_paths(roots, output, tag):
+def guest_paths(roots, output, tag, *, case_prefix="sg"):
+    if case_prefix not in ("sg", "cpu"):
+        raise ValueError("unknown case prefix")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", tag):
         raise ValueError("tag must contain 1..64 ASCII letters/digits/_/-")
     if not Path('/etc/dfkv-validation-guest').is_file():
@@ -39,12 +41,14 @@ def guest_paths(roots, output, tag):
             raise ValueError("data root crosses a nested mount")
     if len({root.stat().st_dev for root in resolved}) != 3:
         raise ValueError("three distinct guest data filesystems required")
+    if os.path.lexists(output):
+        raise ValueError("output is occupied")
     out = Path(output).resolve()
     out.relative_to(Path('/data/disk1/results'))
     if out.exists() or not out.parent.is_dir():
         raise ValueError("output must be new, with an existing parent")
     for policy in ('legacy', 'lifetime'):
-        if any((root / f'sg-{tag}-{policy}').exists() for root in resolved):
+        if any(os.path.lexists(root / f'{case_prefix}-{tag}-{policy}') for root in resolved):
             raise ValueError("case data already exists; use a fresh tag")
     return resolved, out
 

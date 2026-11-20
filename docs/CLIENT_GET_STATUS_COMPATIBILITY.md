@@ -639,3 +639,11 @@ XML/日志、源码SHA、独立review.md和完整失败尝试；本轮不自动�
 直读C++/C/Python原接口保留；没有GPU/SG、默认/wire/shm格式改变或正式A/B放行。
 复跑方法、TTL/回源边界、namespace路由变化和shm保留清理范围见
 [CPU状态链路验证说明](CPU_DEDUP_STATUS_VALIDATION.md)。
+
+## 15. CPU新链路的实际RXE/io_uring与受控等待验证
+
+显式CPU状态入口已在fresh legacy/lifetime服务实测：测试专用委托Transport控制claim时序，
+实际成功与NF仍走选中的真实RDMA；owner本地IO注入与真实缺失/停服IO分别标记，不混称网络故障。
+新Python探针、完整trace父报告和同handle TTL边界通过；server17grant与client22hit每策略
+分开登记，不改变磁盘server成功计热点。详情及复跑入口见
+[CPU运行时验证说明](CPU_DEDUP_RUNTIME_VALIDATION.md)。默认、wire、shm格式和旧直读行为不变。

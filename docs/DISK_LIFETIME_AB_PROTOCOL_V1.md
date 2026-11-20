@@ -603,3 +603,12 @@ TCP额外零容量限制用例与RDMA分母不同，不能直接对比性能。�
 自动unlink；不引入失败广播或即时唤醒。
 见[CPU链路验证说明](CPU_DEDUP_STATUS_VALIDATION.md)。本轮不解除正式A/B业务输入、
 基线、资源、独立职责与数值门槛，也不证明真实RXE/uring CPU去重或物理HCA/GPU性能。
+
+## 26. CPU dedup实际链路与自动复跑前置证据
+
+CPU C ABI→Python→父报告已在隔离RXE/io_uring上以fresh legacy/lifetime运行；新增native可控
+在途合并/失败回源、成功数据隔离与same-handle停服TTL边界。固定98操作完整分母、40PULL
+及34有效grant/6NF核验通过，client44hit与servergrant不能等同；不改变规格计热点。
+细节、复跑、安全及注入范围见[CPU运行时验证说明](CPU_DEDUP_RUNTIME_VALIDATION.md)。
+该固定正确性诊断包含预声明error，非原正式A/B trace/routing、性能或全hit业务放行；GPU dedup、
+真实HCA、业务/基线/目标资源/独立职责及数值门槛仍待独立安排，生产默认不变。

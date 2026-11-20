@@ -119,3 +119,10 @@ finalaudit精确三段路径/每段1114144字节列于该JSON；重复测试另�
 shm-observed-inventory.json只列当前同UID可观察文件元数据，**不推断所有权或删除权限**。
 缺失接口RED、metrics绑定RED、静态夹具诊断均保留；首次新模块16测试包含3个导入旧用例的
 重复收集，已修正，最终新模块明确14项。未用重复收集虚增覆盖，也未放宽严格成功门槛。
+
+## 6. 后续隔离实测与自动复跑
+
+本链路已通过实际RXE＋io_uring两策略验证，补充受控在途owner/waiter、失败回源、
+namespace隔离、停服后的同handle TTL与冷keyIO边界；新增可重复guest矩阵和独立验收。
+完整分母、server grant与client hit差异、宿主安全条件、资源保留和实测局限见
+[CPU运行时验证说明](CPU_DEDUP_RUNTIME_VALIDATION.md)。不是正式A/B或生产默认切换依据。

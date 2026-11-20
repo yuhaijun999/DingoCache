@@ -288,6 +288,10 @@ if(DFKV_BUILD_TESTS)
               test_eviction_batch.BatchAdapterTest
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_eviction_batch PROPERTIES TIMEOUT 30)
+    add_test(NAME python_cpu_dedup_runtime
+      COMMAND ${PYTHON3} -m unittest test_cpu_dedup_validation test_cpu_dedup_runner
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
+    set_tests_properties(python_cpu_dedup_runtime PROPERTIES TIMEOUT 30)
     add_test(NAME python_eviction_dedup
       COMMAND ${PYTHON3} -m unittest test_eviction_dedup.CpuDedupTest
               test_eviction_dedup.CpuDedupAdapterTest

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add repeatable guest-only CPU dedup RXE/io_uring validation, controlled native
+  waiter/fallback tests and same-handle stopped-service TTL checks, with frozen
+  byte/status/metric oracles and explicit retained-resource/safety boundaries.
+
 - Expose explicit CPU-deduplicated batch GET statuses through additive C and
   validation Python APIs and opt-in guarded smoke reports, with observed
   enablement, isolated backend namespaces and no direct-API fallback/change.

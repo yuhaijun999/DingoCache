@@ -303,3 +303,7 @@ SG/GPU 与共享内存格式不变。该接口不代表负结果共享、失败�
 验证用Python及guarded报告，保留直读兼容性；严格区分已观察启用与仅请求开关。
 后端namespace隔离改变路由，保留shm路径，不自动清理其他进程共享段；真实RXE去重、
 正式A/B与生产默认切换仍需独立验收。
+
+最新CPU运行时前置：[CPU新链路隔离验证与自动复跑](CPU_DEDUP_RUNTIME_VALIDATION.md)
+已覆盖两策略真实RXE/io_uring、受控在途waiter/失败回源及停服TTL边界，保留完整状态/字节分母。
+宿主189相关CTest、guest88Cpp/126Python通过，无skip；不是正式A/B或默认切换门禁放行。

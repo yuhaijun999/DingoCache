@@ -89,6 +89,8 @@ class RunnerTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(Path, 'resolve', autospec=True, side_effect=resolve))
             stack.enter_context(mock.patch.object(Path, 'exists', autospec=True,
                                                   side_effect=lambda path: str(path) == existing))
+            stack.enter_context(mock.patch.object(runner.os.path, 'lexists',
+                                                  side_effect=lambda path: str(path) == existing))
             stack.enter_context(mock.patch.object(Path, 'stat', autospec=True, side_effect=device))
             stack.enter_context(mock.patch.object(runner.os.path, 'ismount', return_value=mounted))
             yield

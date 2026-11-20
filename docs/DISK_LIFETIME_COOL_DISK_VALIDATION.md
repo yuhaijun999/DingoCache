@@ -456,3 +456,14 @@ Guest/data/disk1的backing实际在宿主disk2，另两个在宿主disk3；不�
 数据/报告不自动删除；以后使用新TAG与新目录，先重新证明VM/挂载/monitor身份及fresh样本，
 再用版本化guest矩阵工具，不盲目复用历史PID/start/watch脚本。不得fallback默认Docker daemon。
 证据 `.omx/evidence/sg-runtime/20261120T034220Z-f35df95/`，原始失败尝试和TCP零容量边界同样保留。
+
+## 17. CPU dedup新链路实际隔离验证
+
+基线0471f59＋验证工作区，使用此前已证明全在宿主disk2/3的可丢弃VM，不创建默认Docker资源。
+fresh两策略各native3/live探针/完整trace/停服TTL边界/stopped探针，固定oracle第一次实际运行通过；
+每策略19PUT746B、30GET（22hit938B/3NF/5预期error），20PULL＝17uringgrant＋3NF，Lheat17/G0。
+6个受控native case实际rdma，owner本地IO注入不是网络故障，native本地默认TCP可单测重跑。
+Guest88Cpp/126Python无skip，宿主189相关CTest通过；3×3 TSan通过。83温控样本最高42/41°C、
+warning0；after402源文件SHA/六FD/空闲端口通过，服务/客户端回收，monitor正常停止，VM留空闲。
+说明、精确目录/清理边界及复跑方法见[CPU运行时验证说明](CPU_DEDUP_RUNTIME_VALIDATION.md)。
+未进行真实盘压力/热故障注入/HCA/GPU/正式A/B，继续禁止压测宿主/mnt/disk1，默认配置未变。
