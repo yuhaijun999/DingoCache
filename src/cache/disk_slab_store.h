@@ -51,6 +51,29 @@ class DiskSlabStoreTestPeer;
 class DiskSlabStore : public StoreEngine {
 
  public:
+  // Runtime slots.tbl operations only; startup/rebuild/epoch I/O is excluded.
+  enum class MetadataIoPath : unsigned char {
+    kRecordWrite = 0,  // Valid PUT or explicit/deferred invalidation record.
+    kForegroundEvict = 1,  // Foreground class invalidation writes.
+    kBackgroundEvict = 2,  // Background class invalidation writes.
+    kWatermarkEvict = 3,   // Global watermark slot/extent clears.
+    kExtentBind = 4,  // Initial/recovery binding wipe, not donor selection.
+    kDonorBind = 5,   // Selected cross-class donor wipe.
+    kTableSync = 6,   // Ordinary runtime slots.tbl fdatasync.
+    kBindSync = 7,    // Inline initial/recovery binding fdatasync.
+    kDonorSync = 8    // Inline selected-donor fdatasync.
+  };
+  static constexpr size_t kMetadataIoPaths = 9;
+  struct MetadataIoStats {
+    uint64_t attempts = 0;
+    uint64_t completed = 0;
+    // Bytes actually accepted by pwrite, including progress before failure.
+    // Sync operations always report zero bytes; not physical device traffic.
+    uint64_t bytes = 0;
+    uint64_t errors = 0;
+    uint64_t elapsed_ns = 0;
+  };
+
   struct Options {
     std::string dir;
     uint64_t capacity_bytes = (1ull << 30);
@@ -282,6 +305,9 @@ class DiskSlabStore : public StoreEngine {
 
     uint64_t dio_write_fallbacks = 0;
     uint64_t dio_read_fallbacks = 0;
+    std::array<MetadataIoStats, kMetadataIoPaths> metadata_io{};
+    std::array<SlabAllocator::LifetimeReclaimLockStats, 4>
+        lifetime_reclaim_locks{};
     uint64_t table_syncs = 0;
     uint64_t bind_wipes = 0;
     uint64_t steals = 0;
@@ -579,6 +605,13 @@ class DiskSlabStore : public StoreEngine {
   bool SyncPayloads();
   bool WriteRecord(const SlabAllocator::SlotRef& r, const BlockKey& key,
                    uint32_t payload_len, bool valid);
+  MetadataIoPath EvictionIoPath() const;
+  bool WipeExtent(uint32_t extent, bool donor);
+  bool WriteTable(const void* data, size_t length, uint64_t offset,
+                  MetadataIoPath path);
+  bool SyncTableIo(MetadataIoPath path);
+  void FinishMetadataIo(MetadataIoPath path, bool completed, size_t bytes,
+                        uint64_t elapsed_ns);
   bool SyncTable(uint64_t seen);
   bool FailMetadata();
   bool WritePayload(const SlabAllocator::SlotRef& r, const void* data, size_t len);
@@ -778,6 +811,14 @@ class DiskSlabStore : public StoreEngine {
   uint64_t deferred_remove_total_ = 0;  // under mu_
   std::atomic<uint64_t> dio_write_fallbacks_{0};
   std::atomic<uint64_t> dio_read_fallbacks_{0};
+  struct AtomicMetadataIoStats {
+    std::atomic<uint64_t> attempts{0};
+    std::atomic<uint64_t> completed{0};
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> errors{0};
+    std::atomic<uint64_t> elapsed_ns{0};
+  };
+  std::array<AtomicMetadataIoStats, kMetadataIoPaths> metadata_io_{};
   std::atomic<uint64_t> table_syncs_{0};
   std::atomic<uint64_t> bind_wipes_{0};
   std::atomic<uint64_t> metadata_io_errors_{0};
@@ -801,6 +842,8 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> watermark_freed_slot_bytes_{0};
   // Under mu_: shared callbacks count global-selector pwrite completions only.
   bool watermark_selector_call_ = false;
+  // Under mu_, true only while a background allocator class call runs.
+  bool background_selector_call_ = false;
   // slots.tbl sync thread (see Options::table_sync_ms): fdatasync only when
   uint64_t rebuild_corrupt_records_ = 0;
   uint64_t rebuild_rejected_records_ = 0;

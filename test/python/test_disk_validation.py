@@ -1327,9 +1327,11 @@ class ConcurrentDriverTest(unittest.TestCase):
         self.assertLessEqual(timing["call_started_sec"], lib.called_at)
         self.assertLess(lib.called_at, timing["call_finished_sec"])
 
-    def run_memory(self, output, failure=None):
+    def run_memory(self, output, failure=None, *, startup_probe=None):
         storage, handles = {}, []
-        first_reads = threading.Barrier(8, timeout=3)
+        first_reads_ready = (threading.Event() if startup_probe is None
+                             else startup_probe["first_reads_ready"])
+        first_reads = threading.Barrier(8, action=first_reads_ready.set, timeout=3)
         reader_failed = threading.Event()
         class IndependentClient(MemoryClient):
             def __init__(self, storage, members, namespace):
@@ -1344,12 +1346,21 @@ class ConcurrentDriverTest(unittest.TestCase):
                     raise AssertionError("close while native call active")
                 self.closed = True
             def put(self, keys, values):
+                cold_write = self.number == 0 and int.from_bytes(keys[0][-8:], "big") >= 4608
+                if cold_write and failure in (None, "miss"):
+                    # The accelerated fake writer can finish before a released
+                    # reader gets scheduled. Hold it until all first fake GETs
+                    # have entered; do not change production pacing/deadlines.
+                    if not first_reads_ready.wait(3):
+                        raise RuntimeError("fixture readers did not enter first GET")
                 if failure == "writer-and-corrupt" and int.from_bytes(keys[0][-8:], "big") >= 4608:
                     if not reader_failed.wait(3):
                         raise RuntimeError("fixture reader never reached corruption")
                     super().put(keys, values)
                     raise RuntimeError("writer PUT failed concurrently")
                 super().put(keys, values)
+                if cold_write and startup_probe is not None:
+                    startup_probe["writer_acked"].set()
                 if failure == "writer" and self.number == 1 and int.from_bytes(keys[0][-8:], "big") >= 4608:
                     raise RuntimeError("writer PUT failed after uncertain completion")
             def read(self, keys, values, *, allow_miss=False, call_timing=None):
@@ -1362,6 +1373,10 @@ class ConcurrentDriverTest(unittest.TestCase):
                 try:
                     if self.number == 9 and failure == "corrupt-last-start":
                         driver.check_read(values[0], 1, b"x" * len(values[0]), len(values[0]))
+                    if self.number == 9 and self.calls == 0 and startup_probe is not None:
+                        startup_probe["last_reader_waiting"].set()
+                        if not startup_probe["release_last_reader"].wait(3):
+                            raise RuntimeError("fixture last reader was not released")
                     if self.calls == 0 and failure not in ("deadline", "submit"):
                         first_reads.wait()
                     self.calls += 1
@@ -1397,6 +1412,45 @@ class ConcurrentDriverTest(unittest.TestCase):
                 error = caught
         self.assertTrue(all(handle.closed and not handle.active for handle in handles))
         return outcome, handles, error
+
+    def test_fake_writer_waits_for_delayed_last_reader_before_ack(self):
+        probe = {name: threading.Event() for name in (
+            "writer_waiting", "writer_acked", "last_reader_waiting", "release_last_reader",
+            "first_reads_ready")}
+        results, failures = [], []
+        original_wait = probe["first_reads_ready"].wait
+        def observe_writer_wait(timeout):
+            probe["writer_waiting"].set()
+            return original_wait(timeout)
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+                probe["first_reads_ready"], "wait", side_effect=observe_writer_wait):
+            def run():
+                try:
+                    results.append(self.run_memory(Path(temp) / "case", startup_probe=probe))
+                except BaseException as error:
+                    failures.append(error)
+            worker = threading.Thread(target=run)
+            worker.start()
+            try:
+                self.assertTrue(probe["last_reader_waiting"].wait(3))
+                self.assertTrue(probe["writer_waiting"].wait(3))
+                # The last reader is positively held outside the eight-party
+                # rendezvous, so this is not a negative sleep-based assertion.
+                self.assertFalse(probe["writer_acked"].is_set())
+            finally:
+                probe["release_last_reader"].set()
+                worker.join(10)
+            self.assertFalse(worker.is_alive())
+            if failures:
+                raise failures[0]
+            self.assertEqual(len(results), 1)
+            result, handles, error = results[0]
+            self.assertIsNone(error)
+            self.assertEqual(result["status"], "passed")
+            self.assertTrue(probe["writer_acked"].is_set())
+            self.assertEqual(len(handles), 10)
+            self.assertTrue(all(row["batches"] for row in result["concurrency"]["readers"]))
+            self.assertEqual(len(result["concurrency"]["writer_steps"]), 200)
 
     def test_full_fixed_schedule_uses_ten_handles_and_real_thread_overlap(self):
         for mode in (None, "miss"):

@@ -127,7 +127,25 @@ uint32_t Crc32(const uint8_t* p, size_t n) {
   return crc ^ 0xFFFFFFFFu;
 }
 
-bool PwriteAll(int fd, const void* buf, size_t n, uint64_t off) {
+// Store D is held throughout this scope; restore before any yield/unlock.
+class MetadataSelectorScope {
+ public:
+  explicit MetadataSelectorScope(bool& active)
+      : active_(active), previous_(active) {
+    active_ = true;
+  }
+  ~MetadataSelectorScope() { active_ = previous_; }
+  MetadataSelectorScope(const MetadataSelectorScope&) = delete;
+  MetadataSelectorScope& operator=(const MetadataSelectorScope&) = delete;
+
+ private:
+  bool& active_;
+  const bool previous_;
+};
+
+bool PwriteAll(int fd, const void* buf, size_t n, uint64_t off,
+               size_t* progress = nullptr) {
+  if (progress != nullptr) *progress = 0;
   const char* p = static_cast<const char*>(buf);
   size_t done = 0;
   while (done < n) {
@@ -135,6 +153,7 @@ bool PwriteAll(int fd, const void* buf, size_t n, uint64_t off) {
     if (w < 0) { if (errno == EINTR) continue; return false; }
     if (w == 0) { errno = EIO; return false; }
     done += static_cast<size_t>(w);
+    if (progress != nullptr) *progress = done;
   }
   return true;
 }
@@ -728,22 +747,19 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   // allocator lock is acceptable.
   // Work admitted before a deferred invalidation failed may reach these
   // callbacks later. Recheck isolation here before clearing/reusing residents.
-  ao.on_extent_bind = [this](uint32_t e) {
-    if (!Healthy()) return false;
-    if (!PwriteAll(table_fd_, zero_extent_records_.data(),
-                   zero_extent_records_.size(), TableOffset(e, 0)))
-      return FailMetadata();
-    if (::fdatasync(table_fd_) != 0) return FailMetadata();
-    bind_wipes_.fetch_add(1, std::memory_order_relaxed);
-    return true;
+  ao.on_extent_bind = [this](uint32_t extent) {
+    return WipeExtent(extent, false);
+  };
+  ao.on_extent_rebind = [this](uint32_t extent) {
+    return WipeExtent(extent, true);
   };
   ao.on_extent_evict =
       [this](uint32_t extent, uint32_t, uint32_t residents) {
         if (!Healthy()) return false;
-        if (!PwriteAll(table_fd_, zero_extent_records_.data(),
-                       zero_extent_records_.size(),
-                       TableOffset(extent, 0)))
-          return FailMetadata();
+        if (!WriteTable(zero_extent_records_.data(),
+                        zero_extent_records_.size(), TableOffset(extent, 0),
+                        EvictionIoPath()))
+          return false;
         record_writes_.fetch_add(std::max<uint32_t>(residents, 1),
                                  std::memory_order_relaxed);
         eviction_record_clears_.fetch_add(residents,
@@ -758,9 +774,9 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   ao.on_slot_evict = [this](const SlabAllocator::SlotRef& ref) {
     if (!Healthy()) return false;
     const uint8_t zero[kRecBytes] = {0};
-    if (!PwriteAll(table_fd_, zero, sizeof(zero),
-                   TableOffset(ref.extent, ref.slot)))
-      return FailMetadata();
+    if (!WriteTable(zero, sizeof(zero), TableOffset(ref.extent, ref.slot),
+                    EvictionIoPath()))
+      return false;
     record_writes_.fetch_add(1, std::memory_order_relaxed);
     eviction_record_clears_.fetch_add(1, std::memory_order_relaxed);
     if (watermark_selector_call_) {
@@ -1566,9 +1582,70 @@ bool DiskSlabStore::FailMetadata() {
   return false;
 }
 
+DiskSlabStore::MetadataIoPath DiskSlabStore::EvictionIoPath() const {
+  if (watermark_selector_call_) return MetadataIoPath::kWatermarkEvict;
+  if (background_selector_call_) return MetadataIoPath::kBackgroundEvict;
+  return MetadataIoPath::kForegroundEvict;
+}
+
+bool DiskSlabStore::WipeExtent(uint32_t extent, bool donor) {
+  if (!Healthy()) return false;
+  const MetadataIoPath write_path =
+      donor ? MetadataIoPath::kDonorBind : MetadataIoPath::kExtentBind;
+  const MetadataIoPath sync_path =
+      donor ? MetadataIoPath::kDonorSync : MetadataIoPath::kBindSync;
+  if (!WriteTable(zero_extent_records_.data(), zero_extent_records_.size(),
+                  TableOffset(extent, 0), write_path))
+    return false;
+  if (!SyncTableIo(sync_path)) return false;
+  bind_wipes_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+void DiskSlabStore::FinishMetadataIo(MetadataIoPath path, bool completed,
+                                     size_t bytes, uint64_t elapsed_ns) {
+  AtomicMetadataIoStats& counters = metadata_io_[static_cast<size_t>(path)];
+  counters.bytes.fetch_add(bytes, std::memory_order_relaxed);
+  counters.elapsed_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+  if (completed)
+    counters.completed.fetch_add(1, std::memory_order_relaxed);
+  else
+    counters.errors.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool DiskSlabStore::WriteTable(const void* data, size_t length, uint64_t offset,
+                               MetadataIoPath path) {
+  metadata_io_[static_cast<size_t>(path)].attempts.fetch_add(
+      1, std::memory_order_relaxed);
+  const std::chrono::steady_clock::time_point started =
+      std::chrono::steady_clock::now();
+  size_t bytes = 0;
+  const bool completed = PwriteAll(table_fd_, data, length, offset, &bytes);
+  const uint64_t elapsed = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started)
+          .count());
+  FinishMetadataIo(path, completed, bytes, elapsed);
+  return completed || FailMetadata();
+}
+
+bool DiskSlabStore::SyncTableIo(MetadataIoPath path) {
+  metadata_io_[static_cast<size_t>(path)].attempts.fetch_add(
+      1, std::memory_order_relaxed);
+  const std::chrono::steady_clock::time_point started =
+      std::chrono::steady_clock::now();
+  const bool completed = ::fdatasync(table_fd_) == 0;
+  const uint64_t elapsed = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started)
+          .count());
+  FinishMetadataIo(path, completed, 0, elapsed);
+  return completed || FailMetadata();
+}
+
 bool DiskSlabStore::SyncTable(uint64_t seen) {
   if (!Healthy()) return false;
-  if (::fdatasync(table_fd_) != 0) return FailMetadata();
+  if (!SyncTableIo(MetadataIoPath::kTableSync)) return false;
   synced_marker_ = seen;
   table_syncs_.fetch_add(1, std::memory_order_relaxed);
   return true;
@@ -1591,8 +1668,9 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
   net::PutU64(reinterpret_cast<char*>(rec) + 36, key.tenant_hash);
   const uint32_t crc = Crc32(rec + 8, kRecBytes - 8);
   net::PutU32(reinterpret_cast<char*>(rec) + 4, crc);
-  if (!PwriteAll(table_fd_, rec, kRecBytes, TableOffset(r.extent, r.slot)))
-    return FailMetadata();
+  if (!WriteTable(rec, kRecBytes, TableOffset(r.extent, r.slot),
+                  MetadataIoPath::kRecordWrite))
+    return false;
   record_writes_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
@@ -2718,10 +2796,13 @@ bool DiskSlabStore::ReclaimLifetimeClass(size_t cls_index, size_t target_free,
     if (!CanStartReclaim()) return false;
     const uint64_t before = scan.visits;
     const SlabAllocator::LifetimeDonorAgeStats age = scan.age;
-    const SlabAllocator::LifetimeReclaimResult result =
-        alloc_->ReclaimLifetimeClass(cls_index, target_free,
-                                     std::min<size_t>(128, remaining), scan,
-                                     &evicted);
+    SlabAllocator::LifetimeReclaimResult result;
+    {
+      const MetadataSelectorScope metadata_scope(background_selector_call_);
+      result = alloc_->ReclaimLifetimeClass(cls_index, target_free,
+                                            std::min<size_t>(128, remaining),
+                                            scan, &evicted);
+    }
     lifetime_background_scan_visits_ += scan.visits - before;
     ++lifetime_background_scan_slices_;
     RecordEvictionGhostLocked(evicted);
@@ -2912,41 +2993,43 @@ void DiskSlabStore::ReclaimTick(
       auto& evicted = watermark_evicted_;
       evicted.clear();
       const uint64_t used_before = alloc_->UsedBytes();
-      watermark_selector_call_ = true;
-      if (opt_.lifetime_class_eviction) {
-        SlabAllocator::LifetimeWatermarkStats stats;
-        alloc_->EvictLifetimeToTarget(
-            evict_low_bytes_, evict_max_victims_per_tick_,
-            *opt_.lifetime_config, *opt_.lifetime_clock, &evicted, &stats);
-        lifetime_watermark_budget_exhausted_ += stats.budget_exhausted;
-        lifetime_watermark_no_candidate_ += stats.no_candidate;
-        lifetime_watermark_pin_skips_ += stats.pin_skips;
-        lifetime_watermark_protected_victims_ += stats.protected_victims;
-        for (size_t bucket = 0; bucket < stats.age.buckets.size(); ++bucket) {
-          lifetime_watermark_age_.buckets[bucket] += stats.age.buckets[bucket];
-          lifetime_watermark_age_.recovered_boot_age_buckets[bucket] +=
-              stats.age.recovered_boot_age_buckets[bucket];
+      {
+        const MetadataSelectorScope metadata_scope(watermark_selector_call_);
+        if (opt_.lifetime_class_eviction) {
+          SlabAllocator::LifetimeWatermarkStats stats;
+          alloc_->EvictLifetimeToTarget(
+              evict_low_bytes_, evict_max_victims_per_tick_,
+              *opt_.lifetime_config, *opt_.lifetime_clock, &evicted, &stats);
+          lifetime_watermark_budget_exhausted_ += stats.budget_exhausted;
+          lifetime_watermark_no_candidate_ += stats.no_candidate;
+          lifetime_watermark_pin_skips_ += stats.pin_skips;
+          lifetime_watermark_protected_victims_ += stats.protected_victims;
+          for (size_t bucket = 0; bucket < stats.age.buckets.size(); ++bucket) {
+            lifetime_watermark_age_.buckets[bucket] +=
+                stats.age.buckets[bucket];
+            lifetime_watermark_age_.recovered_boot_age_buckets[bucket] +=
+                stats.age.recovered_boot_age_buckets[bucket];
+          }
+          lifetime_watermark_age_.total_sec += stats.age.total_sec;
+          lifetime_watermark_age_.history_unknown += stats.age.history_unknown;
+          lifetime_watermark_age_.recovered_boot_age_total_sec +=
+              stats.age.recovered_boot_age_total_sec;
+          for (size_t bucket = 0;
+               bucket < stats.score.nonnegative_buckets.size(); ++bucket) {
+            lifetime_watermark_score_.nonnegative_buckets[bucket] +=
+                stats.score.nonnegative_buckets[bucket];
+            lifetime_watermark_score_.negative_magnitude_buckets[bucket] +=
+                stats.score.negative_magnitude_buckets[bucket];
+          }
+          lifetime_watermark_score_.nonnegative_total_sec +=
+              stats.score.nonnegative_total_sec;
+          lifetime_watermark_score_.negative_magnitude_total_sec +=
+              stats.score.negative_magnitude_total_sec;
+        } else {
+          alloc_->EvictColdToTarget(evict_low_bytes_,
+                                    evict_max_victims_per_tick_, &evicted);
         }
-        lifetime_watermark_age_.total_sec += stats.age.total_sec;
-        lifetime_watermark_age_.history_unknown += stats.age.history_unknown;
-        lifetime_watermark_age_.recovered_boot_age_total_sec +=
-            stats.age.recovered_boot_age_total_sec;
-        for (size_t bucket = 0; bucket < stats.score.nonnegative_buckets.size();
-             ++bucket) {
-          lifetime_watermark_score_.nonnegative_buckets[bucket] +=
-              stats.score.nonnegative_buckets[bucket];
-          lifetime_watermark_score_.negative_magnitude_buckets[bucket] +=
-              stats.score.negative_magnitude_buckets[bucket];
-        }
-        lifetime_watermark_score_.nonnegative_total_sec +=
-            stats.score.nonnegative_total_sec;
-        lifetime_watermark_score_.negative_magnitude_total_sec +=
-            stats.score.negative_magnitude_total_sec;
-      } else {
-        alloc_->EvictColdToTarget(evict_low_bytes_, evict_max_victims_per_tick_,
-                                  &evicted);
       }
-      watermark_selector_call_ = false;
       const uint64_t used_after = alloc_->UsedBytes();
       if (used_after < used_before)
         watermark_freed_slot_bytes_.fetch_add(used_before - used_after,
@@ -3047,6 +3130,7 @@ void DiskSlabStore::ReclaimTick(
       {
         std::lock_guard<std::mutex> lk(mu_);
         if (!CanStartReclaim()) return;
+        const MetadataSelectorScope metadata_scope(background_selector_call_);
         got = alloc_->ReclaimClass(i, target, batch, &evicted);
         for (const BlockKey& key : evicted)
           evicted_bytes_ += ErasePayloadLocked(key.Filename());
@@ -3298,6 +3382,16 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
       dio_write_fallbacks_.load(std::memory_order_relaxed);
   st.dio_read_fallbacks =
       dio_read_fallbacks_.load(std::memory_order_relaxed);
+  for (size_t path = 0; path < kMetadataIoPaths; ++path) {
+    const AtomicMetadataIoStats& counters = metadata_io_[path];
+    st.metadata_io[path] = {
+        counters.attempts.load(std::memory_order_relaxed),
+        counters.completed.load(std::memory_order_relaxed),
+        counters.bytes.load(std::memory_order_relaxed),
+        counters.errors.load(std::memory_order_relaxed),
+        counters.elapsed_ns.load(std::memory_order_relaxed)};
+  }
+  if (alloc_) st.lifetime_reclaim_locks = alloc_->ReclaimLockStats();
   st.table_syncs = table_syncs_.load(std::memory_order_relaxed);
   st.bind_wipes = bind_wipes_.load(std::memory_order_relaxed);
   st.metadata_io_errors =

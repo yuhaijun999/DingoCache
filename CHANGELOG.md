@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Account runtime slab metadata writes, partial progress, failures and syncs by
+  operation/eviction origin, and expose scoped lifetime allocator lock timing;
+  preserve existing metric meanings, eviction decisions and production defaults.
+- Add explicit-lifetime RXE Serve regressions for grant-before-client-read,
+  duplicate release, failed preparation and queued cancellation; separate O5
+  functional closeout from unfulfilled formal acceptance and GPU exclusions.
+
 - Add opt-in cross-process CPU dedup runtime validation for controlled sharing,
   owner failure and dead-owner recovery; document the separate proposed GPU
   status contract without changing production APIs or defaults.

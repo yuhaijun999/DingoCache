@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -23,6 +24,43 @@
 
 namespace dfkv {
 namespace {
+
+// Owns the same single mutex as the replaced lock_guard. The final sample
+// settles under A before unlock, including early returns and failed callbacks.
+// It neither acquires a second lock nor measures other callers' D-lock time.
+class ScopedReclaimLock {
+ public:
+  ScopedReclaimLock(std::mutex& mutex,
+                    SlabAllocator::LifetimeReclaimLockStats& stats,
+                    bool enabled)
+      : enabled_(enabled),
+        started_(enabled ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{}),
+        lock_(mutex),
+        acquired_(enabled ? std::chrono::steady_clock::now() : started_),
+        stats_(stats) {}
+
+  ~ScopedReclaimLock() {
+    if (!enabled_) return;
+    const std::chrono::steady_clock::time_point ended =
+        std::chrono::steady_clock::now();
+    ++stats_.calls;
+    stats_.wait_ns += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(acquired_ -
+                                                             started_)
+            .count());
+    stats_.held_ns += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(ended - acquired_)
+            .count());
+  }
+
+ private:
+  const bool enabled_;
+  const std::chrono::steady_clock::time_point started_;
+  const std::unique_lock<std::mutex> lock_;
+  const std::chrono::steady_clock::time_point acquired_;
+  SlabAllocator::LifetimeReclaimLockStats& stats_;
+};
 
 uint64_t AlignUp(uint64_t x, uint64_t a) {
   if (a <= 1) return x;
@@ -1477,7 +1515,9 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
 
   // The durable extent wipe happens before any resident is forgotten.
   if (!ReclaimAllowed(reclaim_denied)) return ExtentBindResult::kReclaimDenied;
-  if (opt_.on_extent_bind && !opt_.on_extent_bind(extent_index))
+  const std::function<bool(uint32_t)>& persist =
+      opt_.on_extent_rebind ? opt_.on_extent_rebind : opt_.on_extent_bind;
+  if (persist && !persist(extent_index))
     return ExtentBindResult::kPersistenceError;
   while (extent.resident_head != kNoSlot) {
     const uint32_t index = extent.resident_head;
@@ -1567,7 +1607,8 @@ bool SlabAllocator::StealFrom(size_t donor_cls, size_t target_cls,
 SlabAllocator::ExtentBindResult SlabAllocator::StealFromResult(
     size_t donor_cls, size_t target_cls, std::vector<BlockKey>* evicted,
     size_t min_donor_extents) {
-  const std::lock_guard<std::mutex> lock(mu_);
+  const ScopedReclaimLock lock(mu_, lifetime_reclaim_locks_[3],
+                               opt_.lifetime_donor_config != nullptr);
   if (donor_cls == target_cls || donor_cls >= classes_.size() ||
       target_cls >= classes_.size() || classes_[target_cls].slots_per_extent == 0)
     return ExtentBindResult::kUnavailable;
@@ -1610,7 +1651,8 @@ bool SlabAllocator::PutImpl(const BlockKey& key, size_t len, SlotRef* out,
                             std::vector<BlockKey>* evicted,
                             SlotHandle* out_handle, bool* reclaim_denied,
                             LifetimeScan* scan) {
-  std::lock_guard<std::mutex> lock(mu_);
+  const ScopedReclaimLock lock(mu_, lifetime_reclaim_locks_[0],
+                               opt_.lifetime_donor_config != nullptr);
   bool local_denied = false;
   if (reclaim_denied == nullptr) reclaim_denied = &local_denied;
   *reclaim_denied = false;
@@ -1862,7 +1904,8 @@ size_t SlabAllocator::ReclaimClass(size_t cls_index, size_t target_free,
 SlabAllocator::LifetimeReclaimResult SlabAllocator::ReclaimLifetimeClass(
     size_t cls_index, size_t target_free, size_t max_victims,
     LifetimeScan& scan, std::vector<BlockKey>* evicted) {
-  const std::lock_guard<std::mutex> lock(mu_);
+  const ScopedReclaimLock lock(mu_, lifetime_reclaim_locks_[1],
+                               opt_.lifetime_donor_config != nullptr);
   LifetimeReclaimResult result;
   scan.score = LifetimeDonorScoreStats{};
   if (cls_index >= classes_.size() || max_victims == 0) return result;
@@ -1898,7 +1941,8 @@ size_t SlabAllocator::EvictLifetimeToTarget(uint64_t target_bytes,
                                             const DiskLifetimeClock& clock,
                                             std::vector<BlockKey>* evicted,
                                             LifetimeWatermarkStats* stats) {
-  const std::lock_guard<std::mutex> lock(mu_);
+  const ScopedReclaimLock lock(mu_, lifetime_reclaim_locks_[2],
+                               opt_.lifetime_donor_config != nullptr);
   if (stats != nullptr) *stats = LifetimeWatermarkStats{};
   if (!opt_.track_lifetime_state || max_victims == 0) return 0;
   const size_t limit = max_victims > SIZE_MAX / 4 ? SIZE_MAX : 4 * max_victims;
@@ -2154,6 +2198,12 @@ uint64_t SlabAllocator::ColdSteals() const {
   std::lock_guard<std::mutex> lock(mu_);
   return cold_steals_;
 }
+std::array<SlabAllocator::LifetimeReclaimLockStats, 4>
+SlabAllocator::ReclaimLockStats() const {
+  const std::lock_guard<std::mutex> lock(mu_);
+  return lifetime_reclaim_locks_;
+}
+
 SlabAllocator::LifetimeDonorStats SlabAllocator::DonorStats() const {
   const std::lock_guard<std::mutex> lock(mu_);
   return lifetime_donor_stats_;

@@ -1053,6 +1053,66 @@ std::string KvNodeServer::MetricsText() const {
            "Successful read notifications skipped by disk I/O isolation");
     header("dfkv_slab_disk_lifetime_read_state_unavailable_total", "counter",
            "Matching residents with unavailable or invalid lifetime state");
+    // Fixed path labels keep runtime table work separate from payload I/O.
+    auto metadata_io_samples = [&](const DiskSlabStore::Stats& stats,
+                                   const std::string& prefix,
+                                   const std::string& labels) {
+      constexpr std::array kPaths{
+          "record_write",    "foreground_evict", "background_evict",
+          "watermark_evict", "extent_bind",      "donor_bind",
+          "table_sync",      "bind_sync",        "donor_sync"};
+      static_assert(kPaths.size() == DiskSlabStore::kMetadataIoPaths,
+                    "Every metadata path must have exactly one label");
+      constexpr std::array<const char*, 5> kCounters{
+          "attempts", "completed", "bytes", "errors", "elapsed_ns"};
+      for (size_t path = 0; path < kPaths.size(); ++path) {
+        const DiskSlabStore::MetadataIoStats& io = stats.metadata_io[path];
+        const std::array<uint64_t, 5> values{
+            io.attempts, io.completed, io.bytes, io.errors, io.elapsed_ns};
+        const std::string path_labels = labels + (labels.empty() ? "" : ",") +
+                                        "path=\"" + kPaths[path] + "\"";
+        for (size_t counter = 0; counter < kCounters.size(); ++counter) {
+          const std::string name = prefix + kCounters[counter] + "_total";
+          s += name + braces(path_labels) + " " +
+               std::to_string(values[counter]) + "\n";
+        }
+      }
+    };
+    auto reclaim_lock_samples = [&](const DiskSlabStore::Stats& stats,
+                                    const std::string& prefix,
+                                    const std::string& labels) {
+      constexpr std::array<const char*, 4> kPaths{"allocate", "class_slice",
+                                                  "watermark", "donor"};
+      constexpr std::array<const char*, 3> kCounters{"calls", "wait_ns",
+                                                     "held_ns"};
+      for (size_t path = 0; path < kPaths.size(); ++path) {
+        const SlabAllocator::LifetimeReclaimLockStats& locks =
+            stats.lifetime_reclaim_locks[path];
+        const std::array<uint64_t, 3> values{locks.calls, locks.wait_ns,
+                                             locks.held_ns};
+        const std::string path_labels = labels + (labels.empty() ? "" : ",") +
+                                        "path=\"" + kPaths[path] + "\"";
+        for (size_t counter = 0; counter < kCounters.size(); ++counter) {
+          s += prefix + kCounters[counter] + "_total" + braces(path_labels) +
+               " " + std::to_string(values[counter]) + "\n";
+        }
+      }
+    };
+    for (const char* prefix : {"dfkv_slab_lifetime_reclaim_lock_",
+                               "dfkv_slab_disk_lifetime_reclaim_lock_"}) {
+      for (const char* counter : {"calls", "wait_ns", "held_ns"}) {
+        const std::string name = std::string(prefix) + counter + "_total";
+        header(name.c_str(), "counter", "Lifetime allocator lock intervals");
+      }
+    }
+    for (const char* prefix :
+         {"dfkv_slab_metadata_ops_", "dfkv_slab_disk_metadata_ops_"}) {
+      for (const char* counter :
+           {"attempts", "completed", "bytes", "errors", "elapsed_ns"}) {
+        const std::string name = std::string(prefix) + counter + "_total";
+        header(name.c_str(), "counter", "Runtime slots.tbl I/O by operation");
+      }
+    }
     for (size_t i = 0; i < group_.DiskCount(); ++i) {
       const auto st = group_.DiskWatermarkObservation(i);
       const std::string labels =
@@ -1189,6 +1249,9 @@ std::string KvNodeServer::MetricsText() const {
         }
       }
       const DiskSlabStore::Stats disk = group_.DiskSlabStats(i);
+      metadata_io_samples(disk, "dfkv_slab_disk_metadata_ops_", labels);
+      reclaim_lock_samples(disk, "dfkv_slab_disk_lifetime_reclaim_lock_",
+                           labels);
       sample("dfkv_slab_disk_lifetime_watermark_protected_victims_total",
              disk.lifetime_watermark_protected_victims);
       sample("dfkv_slab_disk_sync_payload_read_syscalls_total",
@@ -1491,6 +1554,8 @@ std::string KvNodeServer::MetricsText() const {
            std::to_string(bucket_protected_estimate) + "\n";
     }
     const auto ss = group_.SlabStats();
+    metadata_io_samples(ss, "dfkv_slab_metadata_ops_", "");
+    reclaim_lock_samples(ss, "dfkv_slab_lifetime_reclaim_lock_", "");
     metric("dfkv_slab_sync_payload_read_syscalls_total", "counter",
            "Completed synchronous payload pread attempts, including retries",
            ss.sync_payload_reads.syscalls);

@@ -1,5 +1,31 @@
 # 磁盘寿命淘汰：验收收敛与剩余实施清单
 
+## 当前收口状态（2026-11-20，基线 `8fba940`，本轮功能收尾完成）
+
+本节优先于下方历史增量中的“下一步/后置/待接入”。历史结果仍只证明当时版本，
+不能将后续完成情况回填为历史通过。本轮已完成 O5 **功能与观测收尾**，不是整体正式验收。
+
+- CPU 继续纳入；GPU 相关实现、真实复制、CUDA IPC、性能验证均按用户要求排除，
+  状态为“不在本轮范围/未验证”，不是通过，也不是本轮阻塞项。
+- O09 的必要实现已补齐：runtime `slots.tbl` 按来源的写操作/字节/失败与回收 A 锁等待/持有账；
+  原 `record_writes` 是逻辑记录变更，不是实际写调用数。新增指标使用独立 `metadata_ops_*`，
+  保留旧 `metadata_io_errors_total` 的名称/语义/查询，命名兼容红→绿及最终完整非 GPU 回归通过。
+- O12/O13/S10 不再整体标为“硬件后置”：已有实际 RXE/io_uring 成功、终局及客户端
+  状态链路证据。本轮已补**显式 lifetime 生效**的 Serve 授权前失败、队列取消、
+  授权后未 READ/未发送、重复 RELEASE 与热度/lease 联核，不能用 helper 或成功冒烟代替。
+- scalar、batch、SG direct-only 与显式 CPU dedup 的状态链路和隔离复跑已经完成；
+  跨 OS 进程 CPU dedup 成功/owner 失败/owner 被杀后的回源与接管见
+  [CPU 运行时验证](CPU_DEDUP_RUNTIME_VALIDATION.md)。不再把这些列为待开发。
+- 禁止压测宿主 `/mnt/disk1`；仅使用已授权隔离环境及宿主 disk2/disk3 承载的测试数据。
+  不改生产默认策略，不启动正式 A/B，不自动提交、推送或部署。
+
+逐项结论、最终命令/日志与静态检查未完成项见[O5 收口报告](DISK_LIFETIME_O5_CLOSEOUT.md)。
+完整动态内存/恢复峰值、成本与业务收益仍需实测；业务 trace/权重/重算 token/TTFT、
+可比旧基线、独立职责、F01–F05 数值冻结和正式交替样本保持未完成。
+**功能补齐不能自动关闭这些门禁；目前不得宣称 O5/E4 整体验收或默认切换获准。**
+
+## 历史增量（以下按原轮次保留）
+
 最新增量：SG C ABI新链路已补guest-only可复跑矩阵，legacy/lifetime的live/stopped四组实际
 RXE/uring预期符合；63 guest C++、80 Python方法及162宿主相关CTest无失败/跳过。
 TCP零容量既有限制、严格schema回归与温控/清理原账保留；非正式A/B或默认切换放行。
@@ -125,11 +151,11 @@ DOC6 操作说明已集中整理至 [操作入口](DISK_LIFETIME_R45.md)；这�
 | O06 真实 W/R/O1/O2/3+ 与 R 到期滞后 | allocator read-class ledger、Store 观察时排空；`slab_lifetime_read_class_test.cc`、`disk_lifetime_read_class_test.cc`；METRICS 的 Logical read-class observations | 已有功能；R 逻辑截止含等号，桶宽导致有界观测滞后，不物理迁评分链。恢复虚拟读不算实际读，饱和分类不能证明无重复应用。 |
 | O07 budget→前台 CacheFull / 同key完成、fallback/零进展 | typed Cache/flush 结果，Store PutFlight，RAM retry；`ram_tier_test.cc`、`ram_tier_wiring_test.cc`、`disk_cache_group_test.cc` | **O5bf命名观测接缝**：后台RAM已dispatch item的single/batch终局（completed/cancelled/retained）、前台三个RAM等待API的owner/duplicate返回、Store真实flight follower attached/completed公开账分别分区，保留CacheFull细因与IOError。三者分母不可相加；不是完整Node PUT或所有传输分母，正式分母/阈值仍未登记。 |
 | O08 跨class整条、受保护损失、归还完整extent | donor/bucket/reclaim 统计；`slab_lifetime_donor_test.cc`、`slab_lifetime_background_test.cc`；精确选择最多8条/8192 resident | 已有有界选择/失败不释放测试；全 E 粗扫、选中后整条清表与sync成本仍需分别测量，不能藏入8192预算。 |
-| O09 元数据I/O/回收耗时/锁等待与持有 | Store table I/O、allocator 路径统计；Node notification wait/body/held 与 sampled completion；METRICS 对应小节 | **部分实现/需定界**：已有record_writes/table_syncs/bind_wipes/metadata_io_errors及部分路径耗时，不是所有互斥路径完整syscall/byte/lock账，也不代表成本验收。采样/嵌套口径不能累加为总耗时；GET/PUT p99、全 E/整条sync锁成本仍 open。 |
+| O09 元数据I/O/回收耗时/锁等待与持有 | Store table I/O、allocator 路径统计；Node notification wait/body/held 与 sampled completion；METRICS 对应小节 | **功能计量已补齐，成本验收仍 open**：本轮新增 runtime slots.tbl 的9来源操作/实际写进度/失败/sync/耗时和4入口 A 锁等待/持有账；不是 syscall、全部元数据文件、全部锁或物理写放大。旧 record_writes 等语义保留，donor selection/persistence 复用；GET/PUT p99、全 E/整条sync与完整资源阈值仍待验收。见 O5 收口报告。 |
 | O10 RAM前台/后台、单/批预算与真实IO、ACK/最终丢弃 | `src/cache/ram_tier.cc` typed flush；Node `dfkv_ram_post_ack_flush_failures_total`；`RamTier.TypedFlushFailureReasonsControlRetryAndHealth`、`WriteBackFlushFailureIsPostAckAndUnhealthy` | 已有真实 publisher/健康回归；预算失败不是IO故障、未ACK失败不是ACK后丢失。新模式 RAM write-back 必须显式disk ACK，告警不能替代闸门。 |
 | O11 ACK后丢失立即可见且保留通用告警 | `deploy/observability/alerts.yml` 的 `DfkvRamPostAckDataLoss`：counter>0、无for；`alerts.test.yml` 与 Python contract，O5bc 原始日志 | 已有专用规则与真实promtool测试；“立即”是成功scrape后的首次匹配eval。外部Alertmanager通知/事件留存未验收，reset/stale不等于丢失恢复。 |
-| O12 RAM/disk、合并leader/follower、传输完成路径的逻辑读 | Node `RecordSyncReadResult` 两API终局6分类；真实TCP两新case及refusal增强见O5bb；PreparedSource/PULL grant子分区，物理pread/uring独立统计 | **O5bg实现已解码/进入Serve调度的PULL独立终局账，整体验收仍未关闭**：sync/uring分区，授权成功/最终错误/未决定取消一次结算，决定后未PostSend独立注记。排除未解码原始WC FIFO/非法frame/RELEASE/客户端完成；不是所有传输分母。CPU生产账本测试不证明实际Serve；真实Serve回归硬件后置，不将skip或grant helper计为通过，见METRICS终局表。 |
-| O13 通知接受/无副本/未绑定/错代/race_lost/重复 | Store `NotifyLifetimeReadSuccess` 相关核验/原因分区；`disk_lifetime_read_test.cc`、`ram_tier_wiring_test.cc`、`prepared_read_test.cc`、CPU PULL测试 | 已有身份/时序回归；unbound不证明无副本，applied/success不证明所有适用请求都发通知。需独立完成账+同代来源资格联核，真实PULL硬件仍后置。 |
+| O12 RAM/disk、合并leader/follower、传输完成路径的逻辑读 | Node `RecordSyncReadResult` 两API终局6分类；真实TCP两新case及refusal增强见O5bb；PreparedSource/PULL grant子分区，物理pread/uring独立统计 | **O5bg实现已解码/进入Serve调度的PULL独立终局账，整体验收仍未关闭**：sync/uring分区，授权成功/最终错误/未决定取消一次结算，决定后未PostSend独立注记。排除未解码原始WC FIFO/非法frame/RELEASE/客户端完成；不是所有传输分母。CPU生产账本测试不证明实际Serve；已有历史实际 RXE Serve 成功/终局证据，本轮补显式 lifetime 的失败/取消/重复释放热度联核，结果见收口报告。仍不将 skip/helper 或受控 CQE 当作内核 ring 读，见 METRICS 终局表。 |
+| O13 通知接受/无副本/未绑定/错代/race_lost/重复 | Store `NotifyLifetimeReadSuccess` 相关核验/原因分区；`disk_lifetime_read_test.cc`、`ram_tier_wiring_test.cc`、`prepared_read_test.cc`、CPU PULL测试 | 已有身份/时序回归；unbound不证明无副本，applied/success不证明所有适用请求都发通知。需独立完成账+同代来源资格联核；实际 RXE 成功路径已执行，本轮新增明确来源/完成采样的 Serve 边界联核，见收口报告，不代表全部业务覆盖率已验收。 |
 | O14 completed→applied、通知锁成本 | `disk_lifetime_read_completion_test.cc`、wiring；METRICS 的 Logical completion to lifetime application / Sampled notification processing cost | 已有采样及排除原因；没有形成通知开销的性能放行结论。锁耗时与该延迟不是同一变量，禁止拼接均值/max。 |
 | O15 恢复数量、真实零读W、评分档、连续重启存活 | `disk_lifetime_public_test.cc` 的 `ConsecutiveCleanRestartsResetOnlyVirtualHistory`、`ImmediateWatermarkCannotResurrectRecoveredKeys`、`ImmediateDonorRebindDoesNotResurrectOldClass`；O5ax/O5ay回放与恢复boot-age | 已有状态/短轨迹验证；boot-age不是跨进程连续生存年龄。没有全负载连续存活/过度保留业务验收，虚拟两读绝不加入真实读数。 |
 | O16 成功受害者年龄/unknown、正负分、KEEP保护比例 | class/watermark/donor/background final pre-wipe快照；`SlabLifetimeWatermark.AgeExcludesRecoveredHistoryEvenAfterRealRead`、`ProtectedCountUsesFinalPreWipeTime`、`ScoreBinsSeparateSignsIncludingZero` | 已有功能与边界；失败不计成功，unknown不伪造历史年龄，正负分分开；显示bin不是放行阈值。 |
@@ -153,7 +179,7 @@ DOC6 操作说明已集中整理至 [操作入口](DISK_LIFETIME_R45.md)；这�
 | S07 KEEP0合法、H>INT32_MAX拒启、anchor运行上界安全停接排空 | lifetime config/math/clock；`disk_lifetime_math_test.cc`、`disk_lifetime_clock_test.cc`、public/admission tests；U1–U3/E0 | 不wrap、不静默切legacy；H与UINT32_MAX-H边界、统一boot origin、干净重启归0必须共同满足。 |
 | S08 legacy/inactive/file隔离；新模式RAMwriteback显式diskACK | config/parser/startup + `DiskLifetimePublicTest.RamWritebackRequiresDiskAckBeforeDirectories`；U0/I6 | legacy非法LIFE数值不阻断，file N/A，不把仅lifetime ACK闸门扩散；默认仍legacy。 |
 | S09 单/批budget与IO分项；纯budget CacheFull不虚假ACK、不unhealthy/MarkBad、不丢ACK脏数据 | RAM typed结果、Group/Node/client status；`ram_tier_test.cc`、wiring、`disk_cache_group_test.cc`、`test/client/kv_client_health_test.cc`；I4 | 连续超旧重试次数、混合IO、同keyfollowers、关闭取消均需真实终局；IO仍按自己的失败契约隔离并告警。 |
-| S10 格式/旧策略/RAM CLOCK兼容；全部成功路径安全 | public模式重启、legacy allocator/RAM套件；I3/I5/I6 | CPU功能与回归已有证据，但真实RDMA/RXE＋io_uring授权/取消/READY/断连/重复RELEASE仍需实际路径验证，缺硬件保持open。 |
+| S10 格式/旧策略/RAM CLOCK兼容；全部成功路径安全 | public模式重启、legacy allocator/RAM套件；I3/I5/I6 | CPU功能/格式兼容与实际 RXE 成功/终局已有证据；本轮增加显式 lifetime Serve 的 READY无READ、重复RELEASE、EOF失败与队列取消联核。按收口报告逐项区分真实RXE、受控CQE与内核ring；HCA/跨物理机性能及正式组合验收未完成。 |
 
 ## 4. §11 的完整实验与资源要求
 

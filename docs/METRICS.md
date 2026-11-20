@@ -263,7 +263,7 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_watermark_evictions_total` / `dfkv_slab_watermark_slot_removals_total` | counter | 全局水位回收移除的对象数，包含最后一个 resident 经整 extent 回调清除的对象；不再以 extent 为单位 |
 | `dfkv_slab_watermark_extent_clears_total` | counter | 成功的整 extent 元数据清除写入数，不等于对象数或 fdatasync 次数 |
 | `dfkv_slab_watermark_ticks_total` / `dfkv_slab_watermark_active` | counter / gauge | bounded eviction tick 数 / hysteresis 是否仍在 drain |
-| `dfkv_slab_watermark_last_tick_us` / `max_tick_us` | gauge | 最近 / 进程最大 watermark 锁区间微秒数 |
+| `dfkv_slab_watermark_last_tick_us` / `max_tick_us` | gauge | 最近 / 进程最大 active watermark tick 微秒数，包含取得 Store 锁前的等待，不是锁持有时间 |
 | `dfkv_slab_watermark_max_victims_per_tick` / `dfkv_slab_watermark_max_visits_per_tick` | gauge | 每盘每 tick 的 slot 移除上限 / 扫描上限；替代旧 max-extents gauge |
 | `dfkv_slab_watermark_slot_record_clears_total` / `dfkv_slab_watermark_record_clear_bytes_total` | counter | 全局回收成功的单 slot tombstone 写入数 / 单 slot 与整 extent 元数据写入字节；不代表同步持久化或物理写放大 |
 | `dfkv_slab_watermark_freed_slot_bytes_total` / `dfkv_slab_watermark_scan_visits_total` | counter | 全局回收释放的分配字节 / 扫描位置次数 |
@@ -1902,3 +1902,63 @@ ledger CPU tests and hardware-gated real Serve regressions are separate evidence
 layers; hardware-deferred/skipped cases do not establish actual Serve runtime
 coverage or close O12 acceptance. Real RDMA/RXE+io_uring validation remains a
 later gate; no performance or default-flip acceptance follows from these metrics.
+
+### Runtime slots.tbl operation ledger
+
+`dfkv_slab_metadata_ops_{attempts,completed,bytes,errors,elapsed_ns}_total`
+and per-disk `dfkv_slab_disk_metadata_ops_{attempts,completed,bytes,errors,elapsed_ns}_total`
+are counters labelled by fixed `path`: `record_write`, `foreground_evict`,
+`background_evict`, `watermark_evict`, `extent_bind`, `donor_bind`, `table_sync`,
+`bind_sync`, `donor_sync`. Per-disk series additionally carry the
+existing `disk` / `disk_index` labels; global series add the same per-path values.
+
+The `metadata_ops` family is deliberately separate from the existing unlabelled
+`dfkv_slab_metadata_io_errors_total` broad failure counter. That old name,
+HELP/TYPE declaration and sample retain their meaning; no `path` samples are
+added to it, so existing dashboard sums do not double-count operation errors.
+
+These account runtime slots.tbl operations: valid/invalidation records, mutually
+exclusive foreground/background/watermark eviction writes (both slot and
+whole-extent invalidation), initial binding wipes versus selected-donor rebind
+wipes, ordinary table sync and initial-bind versus donor inline sync. Background
+origin is scoped to the D-locked allocator call and reset before unlocking/yield;
+newly interleaved foreground work cannot inherit it. Initial/recovery binding
+never uses the donor callback. Explicit Remove belongs to `record_write`, not an
+eviction origin. An attempt is one logical write-all/fdatasync call,
+**not** a pwrite syscall count; retries do not add attempts. At quiescence
+`attempts = completed + errors`. Live snapshots may see an in-flight attempt or
+independently sampled atomic fields. A write's bytes are actual pwrite progress,
+including progress before failure; sync bytes remain zero. They are not payload
+bytes, device/NAND writes, durable bytes, or physical write amplification.
+`elapsed_ns` accumulates operation wall time including retries and failed calls,
+not lock waiting or a latency quantile. No key/request labels are introduced.
+
+Startup/rebuild/repair/header/epoch I/O and payload files are excluded. A health
+rejection or test-only pre-I/O failure adds no attempted I/O; the existing broader
+`metadata_io_errors` still includes such metadata failures. `record_writes`,
+`table_syncs`, `bind_wipes` and watermark byte counters keep their old scopes:
+record_writes can be resident-weighted, table_syncs excludes inline initial-bind/donor sync,
+so neither is an alias of this operation ledger. Counters reset on reconstruction.
+No alert threshold or performance/acceptance gate is inferred from these totals.
+
+
+### Lifetime allocator reclaim lock intervals
+
+`dfkv_slab_lifetime_reclaim_lock_{calls,wait_ns,held_ns}_total` and per-disk
+`dfkv_slab_disk_lifetime_reclaim_lock_{calls,wait_ns,held_ns}_total` are fixed-path
+counters (`allocate`, `class_slice`, `watermark`, `donor`). They measure the
+allocator mutex A, not Store mutex D, RAM locks, or total request latency.
+`allocate` includes normal allocation and possible foreground reclaim in PutImpl;
+`class_slice` covers each ReclaimLifetimeClass call, `watermark` each lifetime
+watermark call, and `donor` direct StealFromResult calls. Nested donor stages
+within an already-held allocation/class/watermark lock do not add another lock
+interval. No-progress, failure and early-return intervals count too.
+
+Only lifetime-configured allocators collect timing. Disabled legacy/RAM allocators
+report zero without timing clock calls. Totals reset on reconstruction; global
+series sum per-disk snapshots. Wait ends on acquisition, held time ends before
+bookkeeping/unlocking. These are wall-clock totals, not p99, a hard time bound,
+per-victim cost, complete mutex accounting or performance acceptance. Existing
+donor selection/persistence times remain nested work costs and must not be added
+to these held totals as if disjoint. Allocator lock fields share one A-locked per-disk snapshot; independently
+sampled disks and other Store counters do not form one atomic live snapshot.

@@ -67,6 +67,9 @@ class SlabAllocator {
     // (slot_size - aligned_len) stays below this fraction.
     double max_waste = 0.25;
     std::function<bool(uint32_t extent)> on_extent_bind;
+    // Optional donor-specific persistence callback, with the same durability
+    // and failure contract. Empty preserves on_extent_bind for existing users.
+    std::function<bool(uint32_t extent)> on_extent_rebind;
     // A last-resident eviction may clear the whole extent in one write.
     // Partial eviction requires on_slot_evict when persistence is configured.
     std::function<bool(uint32_t extent, uint32_t total_slots,
@@ -217,6 +220,18 @@ class SlabAllocator {
     uint64_t unscored_victims = 0;
   };
   LifetimeDonorStats DonorStats() const;
+
+  // Four disjoint public A-lock ingress scopes: PutImpl allocation (including
+  // possible reclaim), background class slice, watermark, direct donor steal.
+  // Not whole-request/D-lock latency. Nested donor selection/persistence are
+  // already included, not additional acquisitions. Disabled paths read no
+  // clock.
+  struct LifetimeReclaimLockStats {
+    uint64_t calls = 0;
+    uint64_t wait_ns = 0;
+    uint64_t held_ns = 0;
+  };
+  std::array<LifetimeReclaimLockStats, 4> ReclaimLockStats() const;
 
   // Fixed display bounds, independent of P, KEEP and scoring configuration.
   static constexpr std::array<uint32_t, 7> kLifetimeReadIntervalBoundsSec = {
@@ -717,6 +732,7 @@ class SlabAllocator {
   uint64_t class_rotation_bytes_ = 0;
   uint64_t class_free_slot_bytes_ = 0;
   LifetimeDonorStats lifetime_donor_stats_;
+  std::array<LifetimeReclaimLockStats, 4> lifetime_reclaim_locks_{};
   uint64_t watermark_evictions_ = 0;
   uint64_t watermark_scan_steps_ = 0;
   uint64_t extent_returns_ = 0;

@@ -1042,6 +1042,24 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.uring_payload_reads.bytes += st.uring_payload_reads.bytes;
     sum.uring_payload_reads.errors += st.uring_payload_reads.errors;
     sum.uring_payload_reads.short_reads += st.uring_payload_reads.short_reads;
+    for (size_t path = 0; path < DiskSlabStore::kMetadataIoPaths; ++path) {
+      const DiskSlabStore::MetadataIoStats& source = st.metadata_io[path];
+      DiskSlabStore::MetadataIoStats& total = sum.metadata_io[path];
+      total.attempts += source.attempts;
+      total.completed += source.completed;
+      total.bytes += source.bytes;
+      total.errors += source.errors;
+      total.elapsed_ns += source.elapsed_ns;
+    }
+    for (size_t path = 0; path < sum.lifetime_reclaim_locks.size(); ++path) {
+      const SlabAllocator::LifetimeReclaimLockStats& source =
+          st.lifetime_reclaim_locks[path];
+      SlabAllocator::LifetimeReclaimLockStats& total =
+          sum.lifetime_reclaim_locks[path];
+      total.calls += source.calls;
+      total.wait_ns += source.wait_ns;
+      total.held_ns += source.held_ns;
+    }
     sum.table_syncs += st.table_syncs;
     sum.bind_wipes += st.bind_wipes;
     sum.steals += st.steals;

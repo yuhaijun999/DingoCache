@@ -6320,3 +6320,96 @@ TEST_F(LifetimeGhostMetricsTest,
     EXPECT_EQ(stats.completed[1], DiskWriteTerminalCounts{});
   }
 }
+
+TEST(Metrics, RuntimeMetadataOperationsAggregateExactlyAcrossDisks) {
+  const ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  const ScopedEnv sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+  const fs::path root = fs::temp_directory_path() / "dfkv_metadata_io_metrics";
+  fs::remove_all(root);
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {(root / "a").string(), (root / "b").string()};
+  options.capacity_bytes = 4ULL << 30;
+  options.engine = "slab";
+  options.eviction_policy = "lifetime";
+  {
+    KvNodeServer server(options);
+    ASSERT_TRUE(server.Healthy());
+    DiskCacheGroup& group = KvNodeServerTestPeer::Group(server);
+    std::array<bool, 2> populated{};
+    for (uint64_t id = 1; id < 10000 && !(populated[0] && populated[1]); ++id) {
+      const BlockKey key{id, 0};
+      const size_t disk = DiskCacheGroupTestPeer::RouteIndex(group, key);
+      if (populated[disk]) continue;
+      ASSERT_EQ(group.Cache(key, "abc", 3), Status::kOk);
+      populated[disk] = true;
+    }
+    ASSERT_TRUE(populated[0] && populated[1]);
+    constexpr std::array kPaths{
+        "record_write",    "foreground_evict", "background_evict",
+        "watermark_evict", "extent_bind",      "donor_bind",
+        "table_sync",      "bind_sync",        "donor_sync"};
+    static_assert(kPaths.size() == DiskSlabStore::kMetadataIoPaths,
+                  "Every metadata path must have exactly one label");
+    const DiskSlabStore::Stats sum = group.SlabStats();
+    const std::string text = server.MetricsText();
+    // The broad pre-existing error counter must not acquire operation labels
+    // or duplicate HELP/TYPE declarations from the new operation ledger.
+    const std::string old_help = "# HELP dfkv_slab_metadata_io_errors_total ";
+    const std::string old_type =
+        "# TYPE dfkv_slab_metadata_io_errors_total counter\n";
+    EXPECT_NE(text.find(old_help), std::string::npos);
+    EXPECT_EQ(text.find(old_help), text.rfind(old_help));
+    EXPECT_NE(text.find(old_type), std::string::npos);
+    EXPECT_EQ(text.find(old_type), text.rfind(old_type));
+    EXPECT_EQ(text.find("dfkv_slab_metadata_io_errors_total{"),
+              std::string::npos);
+    EXPECT_NE(text.find("dfkv_slab_metadata_io_errors_total 0\n"),
+              std::string::npos);
+
+    for (size_t path = 0; path < kPaths.size(); ++path) {
+      uint64_t attempts = 0;
+      uint64_t completed = 0;
+      uint64_t bytes = 0;
+      for (size_t disk = 0; disk < 2; ++disk) {
+        const DiskSlabStore::Stats stats = group.DiskSlabStats(disk);
+        attempts += stats.metadata_io[path].attempts;
+        completed += stats.metadata_io[path].completed;
+        bytes += stats.metadata_io[path].bytes;
+        const std::string sample =
+            "dfkv_slab_disk_metadata_ops_bytes_total{disk=\"" +
+            options.cache_dirs[disk] + "\",disk_index=\"" +
+            std::to_string(disk) + "\",path=\"" + kPaths[path] + "\"} " +
+            std::to_string(stats.metadata_io[path].bytes) + "\n";
+        EXPECT_NE(text.find(sample), std::string::npos) << sample;
+      }
+      EXPECT_EQ(sum.metadata_io[path].attempts, attempts);
+      EXPECT_EQ(sum.metadata_io[path].completed, completed);
+      EXPECT_EQ(sum.metadata_io[path].bytes, bytes);
+      EXPECT_NE(text.find(std::string("dfkv_slab_metadata_ops_errors_total{") +
+                          "path=\"" + kPaths[path] + "\"} 0\n"),
+                std::string::npos);
+
+      EXPECT_NE(text.find(std::string("dfkv_slab_metadata_ops_bytes_total{") +
+                          "path=\"" + kPaths[path] + "\"} " +
+                          std::to_string(bytes) + "\n"),
+                std::string::npos);
+    }
+    EXPECT_EQ(sum.lifetime_reclaim_locks[0].calls, 2U);
+    EXPECT_NE(text.find("dfkv_slab_lifetime_reclaim_lock_calls_total"
+                        "{path=\"allocate\"} 2\n"),
+              std::string::npos);
+    for (size_t disk = 0; disk < 2; ++disk) {
+      const std::string sample =
+          "dfkv_slab_disk_lifetime_reclaim_lock_calls_total{disk=\"" +
+          options.cache_dirs[disk] + "\",disk_index=\"" + std::to_string(disk) +
+          "\",path=\"allocate\"} 1\n";
+      EXPECT_NE(text.find(sample), std::string::npos) << sample;
+    }
+    EXPECT_EQ(sum.metadata_io[0].completed, 2U);
+    EXPECT_GT(sum.metadata_io[4].bytes, 0U);
+    EXPECT_EQ(sum.metadata_io[7].completed, sum.bind_wipes);
+  }
+  fs::remove_all(root);
+}

@@ -1775,12 +1775,22 @@ struct RdmaNode {
                     std::function<void(ibv_wc*, int*, size_t)> reorder = {},
                     std::function<void(size_t, size_t, size_t)> observe = {},
                     std::function<void(size_t)> after_rearm = {},
-                    const std::function<void(RdmaServer&)>& configure = {}) {
+                    const std::function<void(RdmaServer&)>& configure = {},
+                    bool lifetime = false) {
     ConfigureTestRecvSegment();
     dir = fs::temp_directory_path() / ("dfkv_rdma_" + tag);
     fs::remove_all(dir);
     fs::create_directories(dir);
-    srv = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
+    if (lifetime) {
+      DiskCacheGroup::Options options;
+      options.cache_dirs = {dir.string()};
+      options.capacity_bytes = 1ull << 30;
+      options.engine = "slab";
+      options.eviction_policy = "lifetime";
+      srv = std::make_unique<KvNodeServer>(options);
+    } else {
+      srv = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
+    }
     EXPECT_EQ(srv->Start(0), Status::kOk);  // TCP listener owns the cache group
     rsrv = std::make_unique<RdmaServer>(
         [this](uint8_t op, const BlockKey& key, uint64_t off, uint64_t len,
@@ -1843,6 +1853,18 @@ struct RdmaNode {
                  PreparedRead* out) {
             return srv->RamPinnedHitForKey(key, off, len, out);
           });
+    }
+    if (lifetime) {
+      rsrv->SetPullReadSuccessWithCompletionHandler(
+          [this](const BlockKey& key, const DiskResidentIdentity& identity,
+                 size_t bytes, PreparedRead::Source source,
+                 const DiskLifetimeReadCompletion& completion) {
+            srv->NotifyLifetimeReadSuccessForKey(key, identity, bytes, source,
+                                                 completion);
+          },
+          srv->TracksLifetimeState());
+      rsrv->SetRestartRequiredHandler(
+          [this] { return srv->LifetimeRestartRequired(); });
     }
     if (configure) configure(*rsrv);
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
@@ -3624,19 +3646,21 @@ bool PinnedExists(PinnedPullPeer& peer, const BlockKey& key) {
          status == Status::kOk;
 }
 
-TEST(RdmaPullTerminalServeTest, SyncDecisionsPartitionDecodedPulls) {
-  if (!HaveRdma()) {
-    GTEST_SKIP() << "real Serve requires an RDMA device";
-  }
+void CheckPullTerminalSync(bool lifetime) {
   const ScopedEnv uring("DFKV_SERVER_URING", "0");
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
   const ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
   std::atomic<bool> refuse{false};
-  RdmaNode node("pull-terminals-sync", kMaxMsg, false, false, {}, {}, {}, {},
-                [&](RdmaServer& server) {
-                  server.SetRestartRequiredHandler(
-                      [&] { return refuse.load(std::memory_order_acquire); });
-                });
+  RdmaNode node(
+      "pull-terminals-sync", kMaxMsg, false, false, {}, {}, {}, {},
+      [&](RdmaServer& server) {
+        server.SetRestartRequiredHandler(
+            [&] { return refuse.load(std::memory_order_acquire); });
+      },
+      lifetime);
+  if (lifetime) {
+    ASSERT_TRUE(KvNodeServerTestPeer::TracksPullHeat(*node.srv));
+  }
   const BlockKey key{99831, 0}, absent{99832, 0};
   std::string ignored;
   ASSERT_EQ(node.srv->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
@@ -3661,11 +3685,33 @@ TEST(RdmaPullTerminalServeTest, SyncDecisionsPartitionDecodedPulls) {
   };
   rdma::DynamicPullReady ready;
   ASSERT_TRUE(peer.Prepare(key, 0, 5, &ready));
-  std::string output;
-  ASSERT_TRUE(peer.Read(ready, &output));
-  EXPECT_EQ(output, "value");
+  if (lifetime) {
+    // A READY grant, not a client RDMA READ or RELEASE, is the heat boundary.
+    const DiskSlabStore::Stats stats =
+        KvNodeServerTestPeer::PullHeatStats(*node.srv);
+    EXPECT_EQ(stats.lifetime_reads.successful, 1U);
+    EXPECT_EQ(stats.lifetime_reads.applied, 1U);
+    EXPECT_EQ(stats.lifetime_reads.no_binding, 0U);
+    EXPECT_EQ(stats.lifetime_reads.source_transport_grant, 1U);
+  } else {
+    std::string output;
+    ASSERT_TRUE(peer.Read(ready, &output));
+    EXPECT_EQ(output, "value");
+  }
   EXPECT_EQ(request(key, 0, 5, 0), Status::kCacheFull);
   ASSERT_TRUE(peer.Release(key, ready));
+  if (lifetime) {
+    EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kPullRelease,
+                     key, 0, ready.slot_generation, ready.slot_index + 1);
+    Status release_status = Status::kOk;
+    uint64_t release_bytes = 0;
+    ASSERT_TRUE(peer.Exchange(kReqPrefix, &release_status, &release_bytes));
+    EXPECT_EQ(release_status, Status::kInvalid);
+    EXPECT_EQ(release_bytes, 0U);
+    EXPECT_EQ(
+        KvNodeServerTestPeer::PullHeatStats(*node.srv).lifetime_reads.applied,
+        1U);
+  }
   ASSERT_TRUE(peer.Prepare(key, 5, 0, &ready));
   EXPECT_EQ(ready.data_len, 0U);
   ASSERT_TRUE(peer.Release(key, ready));
@@ -3675,11 +3721,41 @@ TEST(RdmaPullTerminalServeTest, SyncDecisionsPartitionDecodedPulls) {
   EXPECT_EQ(request(key, 0, 5, 0), Status::kIOError);
   node.rsrv->Stop();  // Join before asserting complete relaxed snapshots.
   ExpectPullRequestStats(*node.rsrv, {6, 0}, {1, 1, 1, 1, 1, 0, 1, 0, 0}, {});
-  // No success observer was installed. This ledger is not an alias of the
-  // old notification family, and successful RELEASEs were not new PULLs.
-  EXPECT_NE(node.rsrv->MetricsText().find(
-                "dfkv_rdma_pull_read_notification_no_observer_total 1\n"),
-            std::string::npos);
+  if (lifetime) {
+    const DiskSlabStore::Stats stats =
+        KvNodeServerTestPeer::PullHeatStats(*node.srv);
+    EXPECT_EQ(stats.lifetime_reads.successful, 1U);
+    EXPECT_EQ(stats.lifetime_reads.applied, 1U);
+    EXPECT_EQ(stats.lifetime_reads.no_binding, 0U);
+    EXPECT_EQ(stats.lifetime_reads.completion_missing, 0U);
+    EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 1U);
+  } else {
+    // The legacy fixture has no success observer; RELEASE is not a new PULL.
+    EXPECT_NE(node.rsrv->MetricsText().find(
+                  "dfkv_rdma_pull_read_notification_no_observer_total 1\n"),
+              std::string::npos);
+  }
+}
+
+TEST(RdmaPullTerminalServeTest, SyncDecisionsPartitionDecodedPulls) {
+  if (!HaveRdma()) GTEST_SKIP() << "real Serve requires an RDMA device";
+  CheckPullTerminalSync(false);
+}
+
+TEST(RdmaPullTerminalServeTest, LifetimeSyncGrantHeatsBeforeReadExactlyOnce) {
+  if (!HaveRdma()) GTEST_SKIP() << "real Serve requires an RDMA device";
+  ASSERT_EXIT(
+      {
+        ::alarm(20);
+        const ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
+        const ScopedEnv buffered("DFKV_SLAB_WRITE", "buffered");
+        const ScopedEnv ack("DFKV_PUT_ACK_MODE", "disk");
+        const ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+        const ScopedEnv sync("DFKV_SLAB_TABLE_SYNC_MS", "0");
+        CheckPullTerminalSync(true);
+        ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
 }
 
 TEST(RdmaLoopback, LegacyDynamicHandshakeReadReleaseAndLiveProof) {
@@ -6795,18 +6871,27 @@ struct RdmaUringNode {
   std::vector<std::unique_ptr<ControlledRdmaUringBackend>> backends;
 #endif
 
-
   explicit RdmaUringNode(
       const std::string& tag, size_t max_msg = kMaxMsg
 #ifdef DFKV_WITH_URING
       ,
       std::function<void(ControlledRdmaUringBackend*)> backend_configure = {}
 #endif
-      ) {
+      ,
+      bool lifetime = false) {
     dir = fs::temp_directory_path() / ("dfkv_uring_" + tag);
     fs::remove_all(dir);
     fs::create_directories(dir);
-    srv = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
+    if (lifetime) {
+      DiskCacheGroup::Options options;
+      options.cache_dirs = {dir.string()};
+      options.capacity_bytes = 1ull << 30;
+      options.engine = "slab";
+      options.eviction_policy = "lifetime";
+      srv = std::make_unique<KvNodeServer>(options);
+    } else {
+      srv = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
+    }
     EXPECT_EQ(srv->Start(0), Status::kOk);
     rsrv = std::make_unique<RdmaServer>(
         [this](uint8_t op, const BlockKey& key, uint64_t off, uint64_t len,
@@ -6841,6 +6926,18 @@ struct RdmaUringNode {
           }
           return srv->PrepareReadForKey(key, off, len, staging, cap);
         });
+    if (lifetime) {
+      rsrv->SetPullReadSuccessWithCompletionHandler(
+          [this](const BlockKey& key, const DiskResidentIdentity& identity,
+                 size_t bytes, PreparedRead::Source source,
+                 const DiskLifetimeReadCompletion& completion) {
+            srv->NotifyLifetimeReadSuccessForKey(key, identity, bytes, source,
+                                                 completion);
+          },
+          srv->TracksLifetimeState());
+      rsrv->SetRestartRequiredHandler(
+          [this] { return srv->LifetimeRestartRequired(); });
+    }
 #ifdef DFKV_WITH_URING
     if (backend_configure)
       InstallControlledBackendFactory(std::move(backend_configure));
@@ -6948,7 +7045,7 @@ struct RdmaUringNode {
 
 #ifdef DFKV_WITH_URING
 namespace {
-void CheckPullTerminalQueueTeardown() {
+void CheckPullTerminalQueueTeardown(bool lifetime = false) {
   const ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
   const ScopedEnv buffered("DFKV_SLAB_WRITE", "buffered");
   const ScopedEnv disk_reclaim("DFKV_SLAB_RECLAIM_MS", "0");
@@ -6963,8 +7060,12 @@ void CheckPullTerminalQueueTeardown() {
   const ScopedEnv reclaim("DFKV_RAM_RECLAIM_MS", "0");
   const ScopedEnv writearound("DFKV_RAM_WRITE_MODE", "writearound");
   std::atomic<bool> all_dispatched{false};
-  RdmaUringNode node("pull-terminals-queue-stop", kMaxMsg,
-                     [](ControlledRdmaUringBackend*) {});
+  RdmaUringNode node(
+      "pull-terminals-queue-stop", kMaxMsg, [](ControlledRdmaUringBackend*) {},
+      lifetime);
+  if (lifetime) {
+    ASSERT_TRUE(KvNodeServerTestPeer::TracksPullHeat(*node.srv));
+  }
   const BlockKey cold{99841, 0}, warm{99842, 0};
   const std::string value(4096, 'c');
   std::string ignored;
@@ -6972,7 +7073,17 @@ void CheckPullTerminalQueueTeardown() {
                                            cold, 0, 0, value.data(),
                                            value.size(), &ignored),
             Status::kOk);
-  ASSERT_TRUE(KvNodeServerTestPeer::Ram(*node.srv).PutDurable(warm, "warm", 4));
+  if (lifetime) {
+    const DiskWriteResult binding =
+        KvNodeServerTestPeer::PersistPullSource(*node.srv, warm);
+    ASSERT_EQ(binding.status, Status::kOk);
+    ASSERT_TRUE(binding.identity.valid());
+    ASSERT_TRUE(KvNodeServerTestPeer::Ram(*node.srv).PutDurable(
+        warm, "value", 5, binding.identity));
+  } else {
+    ASSERT_TRUE(
+        KvNodeServerTestPeer::Ram(*node.srv).PutDurable(warm, "warm", 4));
+  }
   RdmaServerTestPeer::SetCqHooks(
       *node.rsrv, {}, [&](size_t pending, size_t free, size_t) {
         if (pending == 0 && free == 0) {
@@ -7001,7 +7112,7 @@ void CheckPullTerminalQueueTeardown() {
   // C defers a mutation, so D is an admitted PULL still waiting for execution
   // within the async scheduler. Raw pending-receive FIFO is not this cohort.
   EncodeReqVersion(peer.ep.sbuf(1), kNativeProtoRdmaV2, WireOp::kPullRange,
-                   warm, 0, 4, rdma::kPullPrepareBytes);
+                   warm, 0, lifetime ? 5 : 4, rdma::kPullPrepareBytes);
   rdma::PullPrepareControl warm_control;
   warm_control.slot_index = 1;
   rdma::EncodePullPrepareControl(warm_control, peer.ep.sbuf(1) + kReqPrefix);
@@ -7026,6 +7137,13 @@ void CheckPullTerminalQueueTeardown() {
   }
   ASSERT_TRUE(all_dispatched.load(std::memory_order_acquire));
   ExpectPullRequestStats(*node.rsrv, {0, 3}, {}, {1, 0, 0, 0, 0, 0, 0, 0, 0});
+  if (lifetime) {
+    const DiskSlabStore::Stats stats =
+        KvNodeServerTestPeer::PullHeatStats(*node.srv);
+    EXPECT_EQ(stats.lifetime_reads.successful, 1U);
+    EXPECT_EQ(stats.lifetime_reads.applied, 1U);
+    EXPECT_EQ(stats.lifetime_reads.no_binding, 0U);
+  }
   std::thread stopping([&] { node.rsrv->Stop(); });
   // Wait for actual Drain entry, not merely a Stop-thread-started flag. A disk
   // CQE supplied earlier could still turn A into a grant before loop exit.
@@ -7039,6 +7157,18 @@ void CheckPullTerminalQueueTeardown() {
   EXPECT_EQ(node.rsrv->ActiveConns(), 0U);
   ExpectPullRequestStats(*node.rsrv, {0, 3}, {}, {1, 0, 0, 0, 0, 0, 0, 2, 0},
                          {0, 1});
+  if (lifetime) {
+    // The already-decided bound RAM grant heats once even without a posted
+    // response. Drain/teardown of undecided disk reads establishes no grant.
+    const DiskSlabStore::Stats stats =
+        KvNodeServerTestPeer::PullHeatStats(*node.srv);
+    EXPECT_EQ(stats.lifetime_reads.successful, 1U);
+    EXPECT_EQ(stats.lifetime_reads.applied, 1U);
+    EXPECT_EQ(stats.lifetime_reads.no_binding, 0U);
+    EXPECT_EQ(stats.lifetime_reads.source_transport_grant, 1U);
+    EXPECT_EQ(stats.lifetime_reads.completion_missing, 0U);
+    EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 1U);
+  }
 }
 }  // namespace
 
@@ -7056,8 +7186,20 @@ TEST(RdmaPullTerminalServeTest,
       ::testing::ExitedWithCode(0), "");
 }
 
+TEST(RdmaPullTerminalServeTest, LifetimeUringTeardownHeatsOnlyQueuedGrant) {
+  if (!HaveRdma()) GTEST_SKIP() << "real Serve requires an RDMA device";
+  ASSERT_EXIT(
+      {
+        ::alarm(20);
+        const ScopedEnv ack("DFKV_PUT_ACK_MODE", "disk");
+        CheckPullTerminalQueueTeardown(true);
+        ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+}
+
 namespace {
-void CheckPullTerminalShortRead() {
+void CheckPullTerminalShortRead(bool lifetime = false) {
   const ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
   const ScopedEnv buffered("DFKV_SLAB_WRITE", "buffered");
   const ScopedEnv disk_reclaim("DFKV_SLAB_RECLAIM_MS", "0");
@@ -7065,8 +7207,12 @@ void CheckPullTerminalShortRead() {
   const ScopedEnv uring("DFKV_SERVER_URING", "1");
   const ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
   const ScopedEnv ram("DFKV_RAM_TIER", "0");
-  RdmaUringNode node("pull-terminals-short", kMaxMsg,
-                     [](ControlledRdmaUringBackend*) {});
+  RdmaUringNode node(
+      "pull-terminals-short", kMaxMsg, [](ControlledRdmaUringBackend*) {},
+      lifetime);
+  if (lifetime) {
+    ASSERT_TRUE(KvNodeServerTestPeer::TracksPullHeat(*node.srv));
+  }
   const BlockKey key{99843, 0};
   const std::string value(4096, 's');
   std::string ignored;
@@ -7103,6 +7249,11 @@ void CheckPullTerminalShortRead() {
   // A real residual submission proves Serve consumed the short CQE. It is
   // still one admitted request with no terminal until the following EOF.
   ExpectPullRequestStats(*node.rsrv, {0, 1}, {}, {});
+  if (lifetime) {
+    EXPECT_EQ(KvNodeServerTestPeer::PullHeatStats(*node.srv)
+                  .lifetime_reads.successful,
+              0U);
+  }
   ASSERT_TRUE(backend->Complete(residual[1].token, 0));
   bool sent = false, received = false;
   while (!sent || !received) {
@@ -7125,6 +7276,14 @@ void CheckPullTerminalShortRead() {
   }
   node.rsrv->Stop();
   ExpectPullRequestStats(*node.rsrv, {0, 1}, {}, {0, 0, 0, 0, 0, 1, 0, 0, 0});
+  if (lifetime) {
+    const DiskSlabStore::Stats stats =
+        KvNodeServerTestPeer::PullHeatStats(*node.srv);
+    EXPECT_EQ(stats.lifetime_reads.successful, 0U);
+    EXPECT_EQ(stats.lifetime_reads.applied, 0U);
+    EXPECT_EQ(stats.lifetime_reads.source_transport_grant, 0U);
+    EXPECT_EQ(stats.lifetime_read_completion_to_apply.samples, 0U);
+  }
 }
 }  // namespace
 
@@ -7138,6 +7297,18 @@ TEST(RdmaPullTerminalServeTest, UringShortReadWaitsForEofBeforeIoTerminal) {
       {
         ::alarm(20);
         CheckPullTerminalShortRead();
+        ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+}
+
+TEST(RdmaPullTerminalServeTest, LifetimeUringShortReadEofDoesNotHeat) {
+  if (!HaveRdma()) GTEST_SKIP() << "real Serve requires an RDMA device";
+  ASSERT_EXIT(
+      {
+        ::alarm(20);
+        const ScopedEnv ack("DFKV_PUT_ACK_MODE", "disk");
+        CheckPullTerminalShortRead(true);
         ::_exit(::testing::Test::HasFailure() ? 1 : 0);
       },
       ::testing::ExitedWithCode(0), "");
