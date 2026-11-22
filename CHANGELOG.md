@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add immutable A/B preparation bundles, supervised fake-run evidence audits and
+  repeatable two-policy TCP/slab correctness smoke; keep formal sampling blocked,
+  GPU excluded and production defaults unchanged.
+
 - Account runtime slab metadata writes, partial progress, failures and syncs by
   operation/eviction origin, and expose scoped lifetime allocator lock timing;
   preserve existing metric meanings, eviction decisions and production defaults.

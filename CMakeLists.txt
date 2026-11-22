@@ -232,7 +232,7 @@ if(DFKV_BUILD_TESTS)
   find_program(PYTHON3 python3)
   if(PYTHON3)
     add_test(NAME python_plugin
-      COMMAND ${PYTHON3} -m unittest test_dfkv_identity test_dfkv_hicache test_eviction_batch.NativeBatchTest test_sg_validation.NativeSgTest test_eviction_dedup.NativeCpuDedupTest
+      COMMAND ${PYTHON3} -m unittest test_dfkv_identity test_dfkv_hicache test_eviction_batch.NativeBatchTest test_sg_validation.NativeSgTest test_eviction_dedup.NativeCpuDedupTest test_eviction_baseline_smoke.NativeBaselineSmokeTest
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_plugin PROPERTIES
       ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so;DFKV_STORE_ENGINE=file;DFKV_SLAB_WRITE=buffered;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
@@ -248,6 +248,16 @@ if(DFKV_BUILD_TESTS)
               -p test_disk_validation.py)
     set_tests_properties(python_disk_validation PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_eviction_ab_prepare
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
+              -p test_eviction_ab_prepare.py)
+    set_tests_properties(python_eviction_ab_prepare PROPERTIES TIMEOUT 60)
+    # Native ctypes coverage follows python_plugin's sanitizer exclusions.
+    add_test(NAME python_eviction_baseline_smoke
+      COMMAND ${PYTHON3} -m unittest test_eviction_baseline_smoke.BaselineSmokeTest
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
+    set_tests_properties(python_eviction_baseline_smoke PROPERTIES TIMEOUT 30)
     add_test(NAME python_eviction_trace
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
