@@ -189,6 +189,50 @@ class BaselineSmokeTest(unittest.TestCase):
                 baseline._ready(child, 1234, log, 'lifetime')
 
 
+    def test_legacy_metric_oracle_rejects_missing_wrong_and_unexpected_errors(self):
+        counts = trace.validate(trace.generate(objects=2, rounds=2, length=128))
+        expected = {'dfkv_cache_put_total': 4, 'dfkv_cache_hit_total': 4,
+                    'dfkv_cache_miss_total': 0, 'dfkv_bytes_written_total': 512,
+                    'dfkv_bytes_read_total': 512, 'dfkv_evictions_total': 0,
+                    'dfkv_errors_total': 0, 'dfkv_disk_objects': 4}
+        before = ''.join(f'{name} 0\n' for name in expected)
+        after = ''.join(f'{name} {value}\n' for name, value in expected.items())
+        self.assertEqual(baseline._legacy_metric_deltas(before, after, counts), expected)
+        for name in expected:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                baseline._legacy_metric_deltas(before, after.replace(f'{name} {expected[name]}\n',
+                                               f'{name} {expected[name] + 1}\n'), counts)
+        with self.assertRaises(RuntimeError):
+            baseline._legacy_metric_deltas('', after, counts)
+
+    def test_legacy_arrival_rejects_invalid_options_before_creating_output(self):
+        for options in ({'fixed_arrival_legacy': 'yes'},
+                        {'fixed_arrival_legacy': True, 'workers': True},
+                        {'fixed_arrival_legacy': True, 'process_timeout_sec': 31},
+                        {'workers': 3}, {'timeout_ns': 42},
+                        {'trace_path': self.base / 'not-read.json'}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                baseline.run(self.build, self.base / 'out', **options)
+        self.assertFalse((self.base / 'out').exists())
+
+    def test_old_smoke_cli_rejects_explicit_arrival_limits_before_running(self):
+        with mock.patch.object(baseline, 'run') as run:
+            with self.assertRaises(SystemExit) as caught:
+                baseline.main(['--build', str(self.build), '--workers', '2', str(self.base / 'out')])
+            self.assertEqual(caught.exception.code, 2)
+            run.assert_not_called()
+
+    def test_legacy_arrival_spawn_failure_only_plans_legacy_and_keeps_unknowns(self):
+        with mock.patch.object(baseline.subprocess, 'Popen', side_effect=OSError('spawn failed')) as popen:
+            result = baseline.run(self.build, self.base / 'out', fixed_arrival_legacy=True)
+        self.assertFalse(result['passed'])
+        self.assertEqual([row['policy'] for row in result['policies']], ['legacy'])
+        self.assertEqual(result['model'], 'legacy-fixed-arrival-diagnostic-v1')
+        self.assertEqual(popen.call_count, 1)
+        self.assertIsNone(result['policies'][0]['completed_requests'])
+        self.assertFalse(result['formal_ab'])
+
+
 class NativeBaselineSmokeTest(unittest.TestCase):
     def test_same_native_binary_two_explicit_slab_policies_full_byte_ledger(self):
         build = Path(os.environ.get('DFKV_BUILD', ROOT / 'build')).resolve()
@@ -215,6 +259,53 @@ class NativeBaselineSmokeTest(unittest.TestCase):
                 self.assertEqual(len(ledger['requests']), 8)
                 self.assertTrue((output / row['policy'] / 'before.prom').is_file())
                 self.assertTrue((output / row['policy'] / 'after.prom').is_file())
+
+
+    def test_native_legacy_fixed_arrivals_stages_and_frozen_trace_full_ledger(self):
+        build = Path(os.environ.get('DFKV_BUILD', ROOT / 'build')).resolve()
+        if not (build / 'dfkv_server').is_file() or not (build / 'libdfkv.so').is_file():
+            self.skipTest('requires built dfkv_server and libdfkv.so')
+        with tempfile.TemporaryDirectory(prefix='dfkv-legacy-arrival-native-') as temp:
+            root = Path(temp)
+            source = root / 'input.json'
+            document = trace.generate(objects=2, rounds=2, length=137, interval_ns=80000000)
+            source.write_bytes(trace.encode(document))
+            result = baseline.run(build, root / 'run', fixed_arrival_legacy=True,
+                                  trace_path=source, workers=2)
+            self.assertTrue(result['passed'], result['errors'])
+            self.assertEqual([r['policy'] for r in result['policies']], ['legacy'])
+            self.assertEqual(result['model'], 'legacy-fixed-arrival-diagnostic-v1')
+            self.assertFalse(result['performance_baseline'])
+            self.assertFalse(result['formal_ab'])
+            self.assertEqual(result['build_sha256'], result['build_sha256_after'])
+            row = result['policies'][0]
+            self.assertEqual((row['server_exit'], row['server_reaped']), (0, True))
+            self.assertEqual(row['lifetime_read_success_delta'], 0)
+            self.assertEqual(row['metric_deltas']['dfkv_cache_put_total'], 4)
+            self.assertEqual(row['metric_deltas']['dfkv_bytes_written_total'], 548)
+            self.assertEqual(row['client']['completed_requests'], 8)
+            self.assertEqual(row['client']['acked_put_bytes'], 548)
+            self.assertEqual(row['client']['hit_get_bytes'], 548)
+            self.assertTrue(row['client']['reaped'])
+            child = trace.load(root / 'run/legacy/client/child-result.json')
+            ledger = child['ledger']
+            self.assertEqual(child['state_scope'], 'acknowledged-logical-shadow-not-residency')
+            self.assertEqual(ledger['model'], 'monotonic-real-client-arrival-v1')
+            self.assertEqual([p['status'] for p in ledger['phases']], ['passed'] * 3)
+            self.assertEqual(ledger['summary']['planned'], 8)
+            self.assertEqual(ledger['summary']['completed'], 8)
+            self.assertEqual([r['scheduled_ns'] for r in ledger['requests']],
+                             [r['scheduled_ns'] for r in document['requests']])
+            self.assertEqual(ledger['config']['workers'], 2)
+            self.assertNotIn('residents', ledger['phases'][0]['start_state'])
+            self.assertEqual(ledger['phases'][0]['start_state']['acknowledged_objects'], 0)
+            for request in ledger['requests']:
+                self.assertIn(request['terminal'], ('put_ack', 'get_hit'))
+                self.assertEqual(request['deadline_ns'], request['effective_scheduled_ns'] + 1000000000)
+                self.assertEqual(request['latency_ns'],
+                                 request['completed_ns'] - request['effective_scheduled_ns'])
+                self.assertEqual(request['service_ns'], request['completed_ns'] - request['started_ns'])
+
 
 
 if __name__ == '__main__':

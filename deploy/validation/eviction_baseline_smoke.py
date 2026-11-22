@@ -4,11 +4,14 @@
 Only fresh outputs outside /mnt are accepted. Each policy has its own empty
 1-GiB sparse-capacity slab; the workload writes only four 128-byte payloads.
 The native TCP listener uses its existing bind behavior; clients use loopback.
+--fixed-arrival-legacy reuses the same launcher with only explicit legacy and a
+process-guarded native staged scheduler; no lifetime performance is collected.
 """
 
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -22,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eviction_smoke as smoke
 import eviction_trace as trace
 import quick_eviction as quick
+from eviction_replay import integer
 
 
 def _artifact(path):
@@ -148,7 +152,50 @@ def _new_output(output):
     return output
 
 
-def run(build, output):
+
+def _legacy_metric_deltas(before, after, counts):
+    """Exact tiny-run server observations, not a device-I/O or business metric."""
+    expected = {'dfkv_cache_put_total': counts['put_requests'],
+                'dfkv_cache_hit_total': counts['get_requests'],
+                'dfkv_cache_miss_total': 0,
+                'dfkv_bytes_written_total': counts['put_payload_bytes'],
+                'dfkv_bytes_read_total': counts['requested_get_bytes'],
+                'dfkv_evictions_total': 0, 'dfkv_errors_total': 0,
+                'dfkv_disk_objects': counts['put_requests']}
+    deltas = {}
+    for name, wanted in expected.items():
+        delta = quick.total(after, name) - quick.total(before, name)
+        if delta != wanted:
+            raise ValueError(f'legacy diagnostic metric {name}: expected {wanted}, got {delta}')
+        deltas[name] = delta
+    return deltas
+
+
+def run(build, output, *, fixed_arrival_legacy=False, trace_path=None,
+        workers=2, queue_capacity=16, timeout_ns=1000000000,
+        process_timeout_sec=10):
+    if type(fixed_arrival_legacy) is not bool:
+        raise ValueError('fixed_arrival_legacy must be boolean')
+    if not fixed_arrival_legacy and (workers != 2 or queue_capacity != 16
+                                     or timeout_ns != 1000000000 or process_timeout_sec != 10):
+        raise ValueError('scheduler options require fixed-arrival legacy mode')
+    if trace_path is not None and not fixed_arrival_legacy:
+        raise ValueError('custom trace requires fixed-arrival legacy mode')
+    for name, value, low, high in (('workers', workers, 1, 16),
+                                   ('queue_capacity', queue_capacity, 0, 1024),
+                                   ('timeout_ns', timeout_ns, 1, 5000000000)):
+        integer(name, value, low, high)
+    if (type(process_timeout_sec) not in (int, float) or not math.isfinite(process_timeout_sec)
+            or not .05 <= process_timeout_sec <= 30):
+        raise ValueError('invalid process timeout')
+    original_trace = _artifact(trace_path) if trace_path is not None else None
+    original_trace_sha = file_sha(original_trace) if original_trace is not None else None
+    document = (trace.load(original_trace) if original_trace is not None else
+                trace.generate(objects=2, rounds=2, length=128, interval_ns=80000000))
+    counts = smoke._bounded(document)
+    if document['requests'][-1]['scheduled_ns'] > 5000000000:
+        raise ValueError('arrival trace is limited to a 5-second planned span')
+    policies = ('legacy',) if fixed_arrival_legacy else ('legacy', 'lifetime')
     output = _new_output(output)
     build = _artifact(build).resolve(strict=True)
     binaries = [_artifact(build / name) for name in ('dfkv_server', 'libdfkv.so')]
@@ -156,21 +203,27 @@ def run(build, output):
         raise ValueError('build must contain dfkv_server and libdfkv.so')
     hashes = {name: file_sha(path) for name, path in zip(('dfkv_server', 'libdfkv.so'), binaries)}
     output.mkdir()
-    document = trace.generate(objects=2, rounds=2, length=128, interval_ns=80000000)
     source = output / 'trace.json'
     source.write_bytes(trace.encode(document))
-    result = {'model': 'two-policy-tcp-slab-correctness-only-v1', 'passed': False,
+    result = {'model': ('legacy-fixed-arrival-diagnostic-v1' if fixed_arrival_legacy else
+                        'two-policy-tcp-slab-correctness-only-v1'), 'passed': False,
               'formal_ab': False, 'performance_baseline': False,
               'build': str(build), 'build_sha256': hashes,
-              'trace_file_sha256': file_sha(source), 'planned_per_policy': 8,
+              'trace_file_sha256': file_sha(source), 'planned_per_policy': counts['requests'],
               'policies': [{'policy': policy, 'status': 'not_attempted', 'passed': False,
                             'request_outcomes': 'unknown', 'completed_requests': None,
                             'server_exit': None, 'server_reaped': False}
-                           for policy in ('legacy', 'lifetime')],
+                           for policy in policies],
               'errors': [], 'gpu': 'excluded',
               'common': {'engine': 'slab', 'ack': 'disk', 'ram': False,
                          'coalescing': False, 'capacity_bytes': 1 << 30,
                          'slab_write': 'buffered', 'slot_granularity': 1 << 20}}
+    if fixed_arrival_legacy:
+        result['replay_settings'] = dict(workers=workers, queue_capacity=queue_capacity,
+                                         timeout_ns=timeout_ns, process_timeout_sec=process_timeout_sec)
+        result['source_trace'] = ({'path': str(original_trace), 'sha256': original_trace_sha}
+                                  if original_trace is not None else None)
+        result['scope'] = 'synthetic-legacy-fixed-arrival-correctness-not-formal-baseline'
     interruption = None
     try:
         for row in result['policies']:
@@ -215,20 +268,34 @@ def run(build, output):
                         if quick.total(before, name) != 1:
                             raise ValueError('storage unhealthy')
                     (case / 'before.prom').write_text(before)
-                    live = smoke.supervise(source, case / 'client', lib=str(binaries[1]),
-                                            members=f'n=127.0.0.1:{port}', tcp=True,
-                                            process_timeout_sec=10)
+                    if fixed_arrival_legacy:
+                        # Native calls run in worker-owned handles outside the
+                        # scheduler condition; this child guards setup to close.
+                        import eviction_arrival as arrival
+                        live = arrival.supervise(
+                            source, case / 'client', lib=str(binaries[1]),
+                            members=f'n=127.0.0.1:{port}', tcp=True,
+                            workers=workers, queue_capacity=queue_capacity,
+                            timeout_ns=timeout_ns, process_timeout_sec=process_timeout_sec)
+                    else:
+                        live = smoke.supervise(source, case / 'client', lib=str(binaries[1]),
+                                                members=f'n=127.0.0.1:{port}', tcp=True,
+                                                process_timeout_sec=10)
                     row['client'] = live
                     row.update(request_outcomes=live['request_outcomes'],
                                completed_requests=live['completed_requests'])
-                    if not live['passed'] or live['completed_requests'] != 8 or live['acked_put_bytes'] != 512:
+                    if (not live['passed'] or live['completed_requests'] != counts['requests']
+                            or live['acked_put_bytes'] != counts['put_payload_bytes']
+                            or (fixed_arrival_legacy and live['hit_get_bytes'] != counts['requested_get_bytes'])):
                         raise ValueError('full tiny correctness ledger failed')
                     after = _scrape(metrics_port)
                     (case / 'after.prom').write_text(after)
                     for name in ('dfkv_storage_healthy', 'dfkv_slab_healthy'):
                         if quick.total(after, name) != 1:
                             raise ValueError('storage unhealthy after client')
-                    expected_heat = 4 if policy == 'lifetime' else 0
+                    if fixed_arrival_legacy:
+                        row['metric_deltas'] = _legacy_metric_deltas(before, after, counts)
+                    expected_heat = counts['get_requests'] if policy == 'lifetime' else 0
                     heat = quick.total(after, 'dfkv_slab_lifetime_read_success_total') - quick.total(before, 'dfkv_slab_lifetime_read_success_total')
                     if heat != expected_heat:
                         raise ValueError('effective lifetime heat oracle failed')
@@ -246,7 +313,7 @@ def run(build, output):
                     finally:
                         row.update(server_exit=server.poll(), server_reaped=server.returncode is not None)
                         server.stdout.close()
-        result['passed'] = len(result['policies']) == 2 and all(row['passed'] for row in result['policies'])
+        result['passed'] = len(result['policies']) == len(policies) and all(row['passed'] for row in result['policies'])
     except BaseException as error:
         result['passed'] = False
         result['errors'].append(f'{type(error).__name__}: {error}')
@@ -256,6 +323,9 @@ def run(build, output):
         try:
             after_hashes = {name: file_sha(path) for name, path in zip(('dfkv_server', 'libdfkv.so'), binaries)}
             result['build_sha256_after'] = after_hashes
+            if original_trace is not None and file_sha(original_trace) != original_trace_sha:
+                result['passed'] = False
+                result['errors'].append('input trace changed during run')
             if after_hashes != hashes or file_sha(source) != result['trace_file_sha256']:
                 result['passed'] = False
                 result['errors'].append('binary/library/trace changed during run')
@@ -271,10 +341,25 @@ def run(build, output):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', required=True)
+    parser.add_argument('--fixed-arrival-legacy', action='store_true',
+                        help='legacy-only staged fixed-arrival diagnostic; not formal A/B')
+    parser.add_argument('--trace', help='bounded immutable trace; requires --fixed-arrival-legacy')
+    parser.add_argument('--workers', type=int)
+    parser.add_argument('--queue-capacity', type=int)
+    parser.add_argument('--timeout-ns', type=int)
+    parser.add_argument('--process-timeout-sec', type=float)
     parser.add_argument('output', help='new retained directory outside /mnt')
     args = parser.parse_args(argv)
+    scheduler = {'workers': args.workers, 'queue_capacity': args.queue_capacity,
+                 'timeout_ns': args.timeout_ns, 'process_timeout_sec': args.process_timeout_sec}
+    if not args.fixed_arrival_legacy and any(value is not None for value in scheduler.values()):
+        parser.error('scheduler options require --fixed-arrival-legacy')
+    defaults = {'workers': 2, 'queue_capacity': 16, 'timeout_ns': 1000000000,
+                'process_timeout_sec': 10}
+    scheduler = {name: defaults[name] if value is None else value for name, value in scheduler.items()}
     try:
-        result = run(args.build, args.output)
+        result = run(args.build, args.output, fixed_arrival_legacy=args.fixed_arrival_legacy,
+                     trace_path=args.trace, **scheduler)
         print(json.dumps(result, sort_keys=True))
         return 0 if result['passed'] else 1
     except (OSError, ValueError, UnicodeError) as error:

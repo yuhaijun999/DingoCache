@@ -5,6 +5,13 @@
 依据：[协议](DISK_LIFETIME_AB_PROTOCOL_V1.md)、[阈值登记](DISK_LIFETIME_THRESHOLDS_TEMPLATE.md)、
 [报告模板](DISK_LIFETIME_AB_REPORT_TEMPLATE.md)、[功能收口](DISK_LIFETIME_O5_CLOSEOUT.md)。
 
+## 后续真实回放入口（2026-11-22）
+
+[真实固定到达与legacy诊断采集](DISK_LIFETIME_LEGACY_ARRIVAL.md)复用下方launcher，
+增加显式legacy-only模式；原双策略顺序smoke默认行为不变，不能把两种时间口径混算。
+调度/验证源码更新后，旧准备包的tool SHA检查应拒绝漂移；旧证据保留其历史版本意义，
+要用当前源码复跑请创建新包，不能修改旧manifest后沿用原冻结身份。
+
 ## 1. 本轮交付边界
 
 准备工作分成两条可运行链路，不能混称“正式基线已取得”：

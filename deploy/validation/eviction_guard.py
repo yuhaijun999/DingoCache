@@ -61,15 +61,15 @@ def _counts(rows, staged):
     return expected
 
 
-def _verify_phases(document, result):
+def _verify_phases(document, result, *, state_count_name="residents"):
     phases, rows = result.get("phases"), result["requests"]
     if result.get("schedule_mode") != "phase-relative-v1" or not isinstance(phases, list) or len(phases) != 3:
         raise ValueError("invalid staged schedule/phase proof")
     entries = sorted([r["namespace_hex"], r["key_hex"], r["length"], r["payload_sha256"]]
                      for r in document["requests"] if r["phase"] == "init")
-    initial = {"residents": len(entries), "payload_bytes": sum(e[2] for e in entries),
+    initial = {state_count_name: len(entries), "payload_bytes": sum(e[2] for e in entries),
                "sha256": hashlib.sha256(trace.encode(entries)).hexdigest()}
-    empty = {"residents": 0, "payload_bytes": 0,
+    empty = {state_count_name: 0, "payload_bytes": 0,
              "sha256": hashlib.sha256(trace.encode([])).hexdigest()}
     previous_finish, failed = 0, False
     for index, name in enumerate(("init", "warmup", "measure")):
@@ -118,12 +118,33 @@ def _verify_phases(document, result):
     return not failed
 
 
-def _verify(document, result, config):
-    """Minimum whole-ledger consistency, not independent performance acceptance."""
-    if not isinstance(result, dict) or result.get("model") != "monotonic-threaded-fake-only":
+def _verify(document, result, config, *, expected_model=None, expected_config=None,
+            state_count_name="residents", extra_terminals=()):
+    """Verify a ledger against the caller's frozen backend identity and state scope.
+
+    Defaults retain the standalone fake supervisor contract. Native callers must
+    supply their own model/config and logical-state count field; they must not
+    project native results into fake residency evidence. Extra failure terminals
+    never become GOOD outcomes.
+    """
+    if expected_model is None:
+        expected_model = "monotonic-threaded-fake-only"
+    if not isinstance(expected_model, str) or not expected_model:
+        raise ValueError("invalid expected model")
+    if (not isinstance(state_count_name, str) or not state_count_name
+            or state_count_name in {"payload_bytes", "sha256"}):
+        raise ValueError("invalid state count field")
+    if (not isinstance(extra_terminals, (tuple, list, set, frozenset))
+            or any(not isinstance(value, str) or not value for value in extra_terminals)):
+        raise ValueError("invalid extra failure terminals")
+    terminals = TERMINALS | set(extra_terminals)
+    if not isinstance(result, dict) or result.get("model") != expected_model:
         raise ValueError("wrong child result model")
     staged = config.get("staged", False)
-    expected_config = dict(config, durations={}, error_ids=[], miss_ids=[], corrupt_ids=[])
+    if expected_config is None:
+        expected_config = dict(config, durations={}, error_ids=[], miss_ids=[], corrupt_ids=[])
+    if not isinstance(expected_config, dict):
+        raise ValueError("expected configuration must be a dictionary")
     if (result.get("trace_sha256") != document["sha256"]
             or trace.encode(result.get("config")) != trace.encode(expected_config)):
         raise ValueError("child trace/config identity mismatch")
@@ -133,7 +154,7 @@ def _verify(document, result, config):
     for original, row in zip(document["requests"], rows):
         if not isinstance(row, dict) or trace.encode({k: row.get(k) for k in original}) != trace.encode(original):
             raise ValueError("child request identity mismatch")
-        if row.get("terminal") not in TERMINALS:
+        if row.get("terminal") not in terminals:
             raise ValueError("missing/invalid terminal")
         if row["terminal"] == "phase_blocked":
             if not staged:
@@ -175,7 +196,7 @@ def _verify(document, result, config):
     summary = result.get("summary")
     if not isinstance(summary, dict) or trace.encode({k: summary.get(k) for k in expected}) != trace.encode(expected):
         raise ValueError("child summary does not reconcile")
-    phases_passed = _verify_phases(document, result) if staged else True
+    phases_passed = _verify_phases(document, result, state_count_name=state_count_name) if staged else True
     passed = phases_passed and all(row["terminal"] in GOOD for row in rows) and expected["wrong_bytes"] == 0
     if type(result.get("passed")) is not bool or result["passed"] != passed:
         raise ValueError("child passed flag contradicts ledger")

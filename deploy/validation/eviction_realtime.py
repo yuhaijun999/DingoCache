@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monotonic-clock threaded fake replay. Never connects to a service."""
+"""Monotonic-clock scheduler; the standalone CLI uses only the fake backend."""
 
 import argparse
 import hashlib
@@ -17,16 +17,39 @@ from eviction_replay import FakeBackend, integer
 
 
 class SleepingFakeBackend(FakeBackend):
-    """Only simulated service waiting is outside the scheduler/store lock."""
+    """Backend seam: blocking work is outside the scheduler/store lock.
+
+    Subclasses may perform real calls in wait(), but complete() and snapshot()
+    must only do bounded bookkeeping. A real backend names its logical state
+    separately; an acknowledged-write shadow is not a server residency snapshot.
+    """
+
+    model = "monotonic-threaded-fake-only"
+    state_count_name = "residents"
+
+    def snapshot(self):
+        # Preserve the existing one-argument fake snapshot contract.
+        if self.state_count_name == "residents":
+            return _snapshot(self.store)
+        return _snapshot(self.store, self.state_count_name)
+
+    def report_config(self, scheduler_config):
+        return dict(scheduler_config, service_ns=self.service_ns,
+                    durations={str(k): v for k, v in self.durations.items()},
+                    error_ids=sorted(self.error_ids), miss_ids=sorted(self.miss_ids),
+                    corrupt_ids=sorted(self.corrupt_ids))
 
     def wait(self, row):
         time.sleep(self.durations.get(row["request_id"], self.service_ns) / 1e9)
 
 
-def _snapshot(store):
+def _snapshot(store, count_name="residents"):
+    if (not isinstance(count_name, str) or not count_name
+            or count_name in {"payload_bytes", "sha256"}):
+        raise ValueError("invalid snapshot count field")
     entries = sorted([namespace, key, len(value), hashlib.sha256(value).hexdigest()]
                      for (namespace, key), value in store.items())
-    return {"residents": len(entries), "payload_bytes": sum(entry[2] for entry in entries),
+    return {count_name: len(entries), "payload_bytes": sum(entry[2] for entry in entries),
             "sha256": hashlib.sha256(trace.encode(entries)).hexdigest()}
 
 
@@ -71,6 +94,11 @@ def run(document, backend, *, workers=1, queue_capacity=16, timeout_ns=100000000
     if (rows[-1]["scheduled_ns"] > 5000000000 or max(durations) > 1000000000
             or sum(durations) > 10000000000):
         raise ValueError("fake replay limited to 5s arrival span, 1s per call, 10s total waits")
+    if not isinstance(backend.model, str) or not backend.model:
+        raise ValueError("invalid backend model")
+    if (not isinstance(backend.state_count_name, str) or not backend.state_count_name
+            or backend.state_count_name in {"payload_bytes", "sha256"}):
+        raise ValueError("invalid backend state count field")
     backend.used = True
     condition = threading.Condition()
     waiting, reserved, running = deque(), set(), set()
@@ -84,7 +112,7 @@ def run(document, backend, *, workers=1, queue_capacity=16, timeout_ns=100000000
     phase_end = len(rows)
     entries = sorted([row["namespace_hex"], row["key_hex"], row["length"], row["payload_sha256"]]
                      for row in rows if staged and row["phase"] == "init")
-    expected_state = {"residents": len(entries), "payload_bytes": sum(entry[2] for entry in entries),
+    expected_state = {backend.state_count_name: len(entries), "payload_bytes": sum(entry[2] for entry in entries),
                       "sha256": hashlib.sha256(trace.encode(entries)).hexdigest()} if staged else None
 
     def planned(row):
@@ -156,7 +184,7 @@ def run(document, backend, *, workers=1, queue_capacity=16, timeout_ns=100000000
             nonlocal phase_end
             phase = phases[phase_index]
             members = [row for row in rows if row["phase"] == phase["phase"]]
-            state = _snapshot(backend.store)
+            state = backend.snapshot()
             offset, phase_origin = members[0]["scheduled_ns"], elapsed()
             phase.update(status="running", source_offset_ns=offset,
                          origin_ns=phase_origin, start_state=state)
@@ -172,7 +200,7 @@ def run(document, backend, *, workers=1, queue_capacity=16, timeout_ns=100000000
                 if staged and next_arrival == phase_end and not reserved and not waiting:
                     phase = phases[phase_index]
                     members = [row for row in rows if row["phase"] == phase["phase"]]
-                    state = _snapshot(backend.store)
+                    state = backend.snapshot()
                     required = {"put_ack"} if phase_index == 0 else {"get_hit"} if phase_index == 1 else {"put_ack", "get_hit", "get_miss"}
                     valid = all(row["terminal"] in required for row in members)
                     if phase_index < 2:
@@ -246,16 +274,15 @@ def run(document, backend, *, workers=1, queue_capacity=16, timeout_ns=100000000
             future.result()
     summary = dict(_counts(rows, staged), peak_reserved=peak_reserved,
                    peak_running=peak_running, peak_queue=peak_queue, drained_ns=elapsed())
-    result = {"model": "monotonic-threaded-fake-only", "trace_sha256": document["sha256"],
-            "config": {"workers": workers, "queue_capacity": queue_capacity,
-                       "timeout_ns": timeout_ns, "service_ns": backend.service_ns,
-                       "durations": {str(k): v for k, v in backend.durations.items()},
-                       "error_ids": sorted(backend.error_ids), "miss_ids": sorted(backend.miss_ids),
-                       "corrupt_ids": sorted(backend.corrupt_ids)},
+    scheduler_config = {"workers": workers, "queue_capacity": queue_capacity,
+                        "timeout_ns": timeout_ns}
+    if staged:
+        scheduler_config["staged"] = True
+    result = {"model": backend.model, "trace_sha256": document["sha256"],
+            "config": backend.report_config(scheduler_config),
             "passed": all(row["terminal"] in {"put_ack", "get_hit", "get_miss"} for row in rows),
             "summary": summary, "requests": rows}
     if staged:
-        result["config"]["staged"] = True
         result.update(schedule_mode="phase-relative-v1", phases=phases)
         result["passed"] = result["passed"] and all(phase["status"] == "passed" for phase in phases)
     return result

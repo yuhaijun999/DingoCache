@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Connect real scalar TCP clients to the bounded fixed-arrival scheduler, with
+  worker-owned handles, staged logical-state proofs and guarded raw-ledger
+  audits; add opt-in legacy-only collection without changing production defaults
+  or authorizing formal A/B sampling.
+
 - Add immutable A/B preparation bundles, supervised fake-run evidence audits and
   repeatable two-policy TCP/slab correctness smoke; keep formal sampling blocked,
   GPU excluded and production defaults unchanged.
