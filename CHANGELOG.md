@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add explicit RDMA fixed-arrival replay and a repeatable guest-only two-policy
+  matrix with strict transport, full-denominator and io_uring metric audits;
+  add isolated class-pressure checks and independently owned replay configs;
+  retain production defaults and separate diagnostic coverage from formal A/B.
+
 - Connect real scalar TCP clients to the bounded fixed-arrival scheduler, with
   worker-owned handles, staged logical-state proofs and guarded raw-ledger
   audits; add opt-in legacy-only collection without changing production defaults

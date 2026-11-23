@@ -266,7 +266,117 @@ def concurrent_metrics(client):
             'dfkv_cache_put_total 15616\ndfkv_bytes_written_total 63963136\n')
 
 
+def class_metrics():
+    text = good_metrics().replace('dfkv_slab_watermark_evictions_total 900',
+                                  'dfkv_slab_watermark_evictions_total 0').replace(
+                                      'dfkv_slab_reclaimed_total 4', 'dfkv_slab_reclaimed_total 0')
+    for suffix in ('watermark_high_bytes', 'watermark_low_bytes', 'reclaim_interval_ms'):
+        for index, disk in enumerate(('a', 'b', 'c')):
+            text += f'dfkv_slab_disk_{suffix}{{disk="{disk}",disk_index="{index}"}} 0\n'
+    for suffix, value in (('attempts', 904), ('completed', 904), ('errors', 0)):
+        text += f'dfkv_slab_metadata_ops_{suffix}_total{{path="foreground_evict"}} {value}\n'
+        text += f'dfkv_slab_metadata_ops_{suffix}_total{{path="record_write"}} 100\n'
+        for path in ('watermark_evict', 'background_evict'):
+            text += f'dfkv_slab_metadata_ops_{suffix}_total{{path="{path}"}} 0\n'
+    return text
+
+
 class QuickEvictionTest(unittest.TestCase):
+    def test_class_only_is_explicit_quick_pressure_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = self.arguments(Path(temp))
+            self.assertFalse(runner.parse_args(argv).class_only)
+            self.assertTrue(runner.parse_args(argv + ['--class-only']).class_only)
+            for scenario in ('sustained-pressure', 'mixed-pressure', 'arrivals-pressure',
+                             'multisize-pressure', 'concurrent-pressure'):
+                with self.subTest(scenario=scenario), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    runner.parse_args(argv + ['--class-only', '--scenario', scenario])
+
+    def test_class_only_requires_foreground_evidence_without_weakening_rdma_oracle(self):
+        for policy in ('legacy', 'lifetime'):
+            checked = runner.check_result(class_metrics(), good_client(), policy, class_only=True)
+            self.assertEqual(checked['class_foreground_evictions'], 904)
+            self.assertEqual(checked['watermark_evictions'], 0)
+        self.assertNotIn('class_foreground_evictions', runner.check_result(good_metrics(), good_client()))
+        for before, after in (
+                ('watermark_high_bytes{disk="a",disk_index="0"} 0', 'watermark_high_bytes{disk="a",disk_index="0"} 1'),
+                ('watermark_low_bytes{disk="b",disk_index="1"} 0', 'watermark_low_bytes{disk="b",disk_index="1"} 1'),
+                ('reclaim_interval_ms{disk="c",disk_index="2"} 0', 'reclaim_interval_ms{disk="c",disk_index="2"} 50'),
+                ('watermark_high_bytes{disk="b",disk_index="1"} 0', 'watermark_high_bytes{disk="a",disk_index="0"} 0'),
+                ('dfkv_slab_watermark_evictions_total 0', 'dfkv_slab_watermark_evictions_total 1'),
+                ('dfkv_slab_reclaimed_total 0', 'dfkv_slab_reclaimed_total 1'),
+                ('dfkv_slab_extent_steals_total 0', 'dfkv_slab_extent_steals_total 1'),
+                ('attempts_total{path="foreground_evict"} 904', 'attempts_total{path="foreground_evict"} 905'),
+                ('completed_total{path="foreground_evict"} 904', 'completed_total{path="foreground_evict"} 0'),
+                ('errors_total{path="foreground_evict"} 0', 'errors_total{path="foreground_evict"} 1'),
+                ('completed_total{path="foreground_evict"}', 'completed_total{path="foreground_evict",disk="a"}'),
+                ('dfkv_uring_inflight 0', 'dfkv_uring_inflight 1')):
+            with self.subTest(before=before), self.assertRaises(RuntimeError):
+                runner.check_result(class_metrics().replace(before, after), good_client(), class_only=True)
+        for extra in ('dfkv_slab_disk_watermark_high_bytes{disk="d"} 0\n',
+                      'dfkv_slab_metadata_ops_completed_total{path="foreground_evict"} 904\n'):
+            with self.assertRaises(RuntimeError):
+                runner.check_result(class_metrics() + extra, good_client(), class_only=True)
+        for flag, scenario in ((True, 'sustained-pressure'), (1, 'quick-pressure')):
+            with self.assertRaises(RuntimeError):
+                runner.check_result(class_metrics(), good_client(), scenario=scenario, class_only=flag)
+        with self.assertRaises(RuntimeError):
+            runner.check_result(class_metrics(), {**good_client(), 'transport_mode': ['tcp', 'tcp']}, class_only=True)
+
+    def test_class_only_rejects_foreign_gauge_ownership_and_hidden_competing_metadata(self):
+        lines = class_metrics().splitlines()
+        foreign = '\n'.join(line.replace('disk="a"', 'disk="x"').replace('disk="b"', 'disk="y"').replace('disk="c"', 'disk="z"')
+                            if line.startswith('dfkv_slab_disk_') else line for line in lines) + '\n'
+        for activity in (True, False):
+            with self.subTest(activity=activity), self.assertRaises(RuntimeError):
+                runner.check_class_only(foreign, activity=activity)
+        for path in ('watermark_evict', 'background_evict'):
+            for suffix in ('attempts', 'completed', 'errors'):
+                extra = f'dfkv_slab_metadata_ops_{suffix}_total{{path="{path}"}} 1\n'
+                with self.subTest(path=path, suffix=suffix), self.assertRaises(RuntimeError):
+                    runner.check_result(class_metrics() + extra, good_client(), class_only=True)
+
+    def test_class_only_run_freezes_disabled_background_and_cleans_up(self):
+        for invalid_config in (None, 'missing', 'foreign'):
+            with self.subTest(invalid_config=invalid_config), tempfile.TemporaryDirectory() as temp:
+                args = runner.parse_args(self.arguments(Path(temp)) + ['--class-only', '--data-name', 'class-case'])
+                server = mock.Mock(returncode=0)
+                server.poll.return_value = None
+                server.wait.return_value = 0
+                text = class_metrics()
+                for label, root in zip(('a', 'b', 'c'), args.data_root):
+                    text = text.replace('disk="' + label + '"', 'disk=' + json.dumps(str(root / 'class-case')))
+                if invalid_config == 'missing':
+                    text = text.replace('watermark_low_bytes{disk=', 'wrong_gauge{disk=')
+                elif invalid_config == 'foreign':
+                    text = '\n'.join(line if not line.startswith('dfkv_slab_disk_') else
+                                     line.replace('class-case', 'foreign-case') for line in text.splitlines()) + '\n'
+                response = mock.MagicMock()
+                response.__enter__.return_value.status = 200
+                response.__enter__.return_value.read.return_value = text.encode()
+                def complete(command, **kwargs):
+                    (args.output / 'trace').mkdir()
+                    (args.output / 'trace/result.json').write_text(json.dumps(good_client()))
+                    return subprocess.CompletedProcess(command, 0)
+                with mock.patch.object(runner, 'check_ports'), \
+                        mock.patch.object(runner.subprocess, 'Popen', return_value=server) as launch, \
+                        mock.patch.object(runner.subprocess, 'run', side_effect=complete) as client_run, \
+                        mock.patch.object(runner.urllib.request, 'urlopen', return_value=response):
+                    result = runner.run(args)
+                self.assertEqual(result['status'], 'failed' if invalid_config else 'passed')
+                env = launch.call_args.kwargs['env']
+                for name in ('DFKV_SLAB_EVICT_HIGH_PCT', 'DFKV_SLAB_EVICT_LOW_PCT', 'DFKV_SLAB_RECLAIM_MS'):
+                    self.assertEqual(env[name], '0')
+                case = json.loads((args.output / 'case.json').read_text())
+                self.assertIs(case['class_only'], True)
+                self.assertIs(result['class_only'], True)
+                if invalid_config:
+                    client_run.assert_not_called()
+                else:
+                    self.assertEqual(result['class_foreground_evictions'], 904)
+                    self.assertEqual(client_run.call_args.kwargs['env']['DFKV_RDMA'], '1')
+                server.terminate.assert_called_once()
+
     def test_concurrent_pressure_options_are_isolated(self):
         with tempfile.TemporaryDirectory() as temp:
             argv = self.arguments(Path(temp)) + ['--scenario', 'concurrent-pressure']

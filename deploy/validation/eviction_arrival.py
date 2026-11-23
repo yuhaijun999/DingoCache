@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded scalar TCP fixed-arrival diagnostics; not a formal A/B executor."""
+"""Bounded scalar TCP/RDMA fixed-arrival diagnostics; not a formal A/B executor."""
 
 import argparse
 import math
@@ -21,6 +21,7 @@ from eviction_replay import integer
 
 MODEL = 'monotonic-real-client-arrival-v1'
 TCP_MODE = 'tcp(rdma-not-requested)'
+RDMA_MODE = 'rdma'
 SCOPE = 'acknowledged-logical-shadow-not-residency'
 TOOLS = ('eviction_arrival.py', 'eviction_realtime.py', 'eviction_guard.py',
          'eviction_trace.py', 'eviction_replay.py', 'eviction_client.py',
@@ -52,9 +53,11 @@ def _bounded(document):
     return counts
 
 
-def _config(lib, members, *, workers=2, queue_capacity=16, timeout_ns=1000000000):
+def _config(lib, members, *, workers=2, queue_capacity=16, timeout_ns=1000000000, tcp=True):
     lib = _file(baseline._artifact(lib))
-    config = smoke._config(str(lib), members, tcp=True)
+    config = smoke._config(str(lib), members, tcp=tcp)
+    # Each frozen config owns its environment, not the shared RDMA template.
+    config['client_environment'] = dict(config['client_environment'])
     for name, value, low, high in (('workers', workers, 1, 16),
                                   ('queue_capacity', queue_capacity, 0, 1024),
                                   ('timeout_ns', timeout_ns, 1, 5000000000)):
@@ -69,9 +72,18 @@ def _same(left, right):
     return trace.encode(left) == trace.encode(right)
 
 
+def _transport(config):
+    # Freeze the requested mode separately from the observed native transport.
+    requested = config['client_environment']['DFKV_RDMA']
+    if requested not in ('0', '1'):
+        raise ValueError('explicit TCP/RDMA selection required')
+    return TCP_MODE if requested == '0' else RDMA_MODE
+
+
 def _validate_config(config):
     expected = _config(config['lib'], config['members'], workers=config['workers'],
-                       queue_capacity=config['queue_capacity'], timeout_ns=config['timeout_ns'])
+                       queue_capacity=config['queue_capacity'], timeout_ns=config['timeout_ns'],
+                       tcp=_transport(config) == TCP_MODE)
     if not _same(expected, config):
         raise ValueError('library, client configuration or replay sources changed')
 
@@ -150,8 +162,9 @@ def run(document, config, *, library_loader=None, client_factory=TraceClient):
                 result['handles'].append(metadata)
                 opened.append((client, metadata))
                 worker[namespace] = client
-                if client.transport != TCP_MODE:
-                    raise ValueError('fixed-arrival diagnostic requires observed TCP')
+                if client.transport != _transport(config):
+                    required = 'TCP' if _transport(config) == TCP_MODE else 'RDMA'
+                    raise ValueError(f'fixed-arrival diagnostic requires observed {required}; no transport fallback')
         result['execution_started'] = True
         backend = NativeBackend(config, clients)
         result['ledger'] = realtime.run(document, backend, workers=config['workers'],
@@ -179,6 +192,7 @@ def run(document, config, *, library_loader=None, client_factory=TraceClient):
 
 def _verify(document, result, config):
     _bounded(document)
+    _validate_config(config)
     if (not isinstance(result, dict) or result.get('model') != MODEL or result.get('state_scope') != SCOPE
             or result.get('formal_ab') is not False or result.get('gpu') != 'excluded'
             or not _same(result.get('config'), config) or result.get('trace_sha256') != document['sha256']
@@ -203,8 +217,8 @@ def _verify(document, result, config):
                 or type(handle['closed']) is not bool or not isinstance(handle['transport'], str)):
             raise ValueError('worker/namespace handle identity mismatch')
     if result['execution_started']:
-        if len(handles) != len(expected) or any(h['transport'] != TCP_MODE for h in handles) or result.get('setup_error') is not None:
-            raise ValueError('native scheduler started before complete TCP setup')
+        if len(handles) != len(expected) or any(h['transport'] != _transport(config) for h in handles) or result.get('setup_error') is not None:
+            raise ValueError('native scheduler started before complete requested transport setup')
         scheduler = {name: config[name] for name in ('workers', 'queue_capacity', 'timeout_ns', 'staged')}
         summary = guard._verify(document, result.get('ledger'), scheduler,
                                 expected_model=MODEL, expected_config=config,
@@ -274,14 +288,12 @@ def _hashes(directory):
 
 def supervise(source, output, *, lib, members, workers=2, queue_capacity=16,
               timeout_ns=1000000000, process_timeout_sec=10, tcp=True):
-    if tcp is not True:
-        raise ValueError('only explicit TCP supported in this bounded entry')
     if (type(process_timeout_sec) not in (int, float) or not math.isfinite(process_timeout_sec)
             or not .05 <= process_timeout_sec <= 30):
         raise ValueError('process timeout must be finite in [0.05,30]')
     document = load(source)
     counts = _bounded(document)
-    config = _config(lib, members, workers=workers, queue_capacity=queue_capacity, timeout_ns=timeout_ns)
+    config = _config(lib, members, workers=workers, queue_capacity=queue_capacity, timeout_ns=timeout_ns, tcp=tcp)
     output = baseline._new_output(output)
     output.mkdir()
     for name, value in (('trace.json', document), ('config.json', config)):
@@ -402,6 +414,7 @@ def main(argv=None):
     parser.add_argument('--members')
     parser.add_argument('--child', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--config', help=argparse.SUPPRESS)
+    parser.add_argument('--rdma', action='store_true', help='require observed RDMA; reject TCP fallback')
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--queue-capacity', type=int, default=16)
     parser.add_argument('--timeout-ns', type=int, default=1000000000)
@@ -418,7 +431,8 @@ def main(argv=None):
                 raise ValueError('--lib and --members required')
             result = supervise(args.trace, args.output, lib=args.lib, members=args.members,
                                workers=args.workers, queue_capacity=args.queue_capacity,
-                               timeout_ns=args.timeout_ns, process_timeout_sec=args.process_timeout_sec)
+                               timeout_ns=args.timeout_ns, process_timeout_sec=args.process_timeout_sec,
+                               tcp=not args.rdma)
         print(trace.encode(result).decode(), end='')
         return 0 if result['passed'] else 1
     except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError) as error:

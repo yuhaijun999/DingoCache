@@ -1,5 +1,8 @@
 # 真实固定到达回放与 legacy 诊断基线采集
 
+> 历史 TCP 工具与证据说明：后续实际服务验证仅走 RDMA，当前入口见
+> [RDMA 固定到达与扩展验证](DISK_LIFETIME_RDMA_ARRIVAL.md)。不要把本页 TCP 命令作为新一轮实测入口。
+
 状态：**DIAGNOSTIC_ONLY / FORMAL_RUN_BLOCKED**。CPU 纳入，GPU 全部排除。
 本轮把已有真实客户端和固定到达调度接起来，不再用无节奏 smoke 代替真实调度。
 这仍是有界合成正确性样本，不是目标业务/生产性能基线；不运行 lifetime 性能探索，

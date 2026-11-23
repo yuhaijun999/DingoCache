@@ -71,6 +71,13 @@ class Adapter:
             raise RuntimeError('controlled close failure')
 
 
+class RdmaAdapter(Adapter):
+    """Controlled RDMA label fixture, not an actual verbs execution."""
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.transport = 'rdma'
+
+
 class ArrivalTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='dfkv-arrival-test-')
@@ -92,16 +99,26 @@ class ArrivalTest(unittest.TestCase):
                            library_loader=lambda _: library if library is not None else SimpleNamespace(dfkv_get_auto_status=object()),
                            client_factory=Adapter)
 
+    def test_rdma_configs_do_not_alias_each_other_or_the_validation_template(self):
+        with mock.patch.object(arrival.smoke, 'CLIENT_ENV', dict(arrival.smoke.CLIENT_ENV)):
+            first = arrival._config(self.binary, 'n=127.0.0.1:12001', tcp=False)
+            second = arrival._config(self.binary, 'n=127.0.0.1:12001', tcp=False)
+            first['client_environment']['DFKV_RDMA_DEV'] = 'changed-device'
+            self.assertEqual(second['client_environment']['DFKV_RDMA_DEV'], 'rxe0')
+            self.assertEqual(arrival.smoke.CLIENT_ENV['DFKV_RDMA_DEV'], 'rxe0')
+            with self.assertRaises(ValueError):
+                arrival._validate_config(first)
+
     def supervise(self, command, **options):
         with mock.patch.object(arrival, '_command', return_value=command):
             return arrival.supervise(self.source, self.output, lib=self.binary,
                                       members='n=127.0.0.1:12000', **options)
 
-    def fixture_command(self, suffix='', exitcode=None):
+    def fixture_command(self, suffix='', exitcode=None, *, rdma=False):
         return [sys.executable, '-I', '-c', f'''
 import sys
 sys.path.insert(0,{str(Path(__file__).parent)!r})
-from test_eviction_arrival import Adapter
+from test_eviction_arrival import {'RdmaAdapter as Adapter' if rdma else 'Adapter'}
 import eviction_arrival as a
 import eviction_trace as t
 from pathlib import Path
@@ -130,6 +147,74 @@ sys.exit({exitcode!r} if {exitcode!r} is not None else (0 if r['passed'] else 1)
         self.assertIn('acknowledged_objects', result['ledger']['phases'][0]['start_state'])
         self.assertNotIn('residents', result['ledger']['phases'][0]['start_state'])
         self.assertEqual(before, trace.encode(self.document))
+
+    def test_rdma_config_success_and_strict_report_transport(self):
+        config = arrival._config(self.binary, 'n=127.0.0.1:12001', tcp=False)
+        self.assertEqual(config['client_environment']['DFKV_RDMA'], '1')
+        self.assertEqual(config['client_environment']['DFKV_RDMA_DEV'], 'rxe0')
+        result = arrival.run(self.document, config,
+                             library_loader=lambda _: SimpleNamespace(dfkv_get_auto_status=object()),
+                             client_factory=RdmaAdapter)
+        self.assertTrue(result['passed'])
+        self.assertEqual(arrival._verify(self.document, result, config)['completed'], 8)
+        self.assertTrue(all(h['closed'] and h['transport'] == 'rdma' for h in result['handles']))
+        for mode in ('tcp(rdma-failed)', arrival.TCP_MODE, 'rdma-fallback'):
+            forged = copy.deepcopy(result)
+            forged['handles'][0]['transport'] = mode
+            with self.assertRaises(ValueError):
+                arrival._verify(self.document, forged, config)
+        forged = copy.deepcopy(result)
+        forged['config']['client_environment']['DFKV_RDMA'] = '0'
+        with self.assertRaises(ValueError):
+            arrival._verify(self.document, forged, config)
+
+    def test_rdma_child_ledger_audit_and_transport_configuration_forgery(self):
+        report = self.supervise(self.fixture_command(rdma=True), tcp=False, process_timeout_sec=5)
+        self.assertTrue(report['passed'], report)
+        self.assertEqual(report['config']['client_environment']['DFKV_RDMA'], '1')
+        receipt = arrival.baseline.file_sha(self.output / 'report.json')
+        self.assertTrue(arrival.check(self.output, receipt)['passed'])
+        document = arrival.load(self.output / 'trace.json')
+        config = arrival.load(self.output / 'config.json')
+        result = arrival.load(self.output / 'child-result.json')
+        for value in ('0', 'invalid', None):
+            with self.subTest(value=value):
+                forged_config = copy.deepcopy(config)
+                forged_config['client_environment']['DFKV_RDMA'] = value
+                forged = copy.deepcopy(result)
+                # Rewrite all duplicated config fields, not only one envelope.
+                forged['config'] = forged_config
+                forged['ledger']['config'] = forged_config
+                with self.assertRaises(ValueError):
+                    arrival._verify(document, forged, forged_config)
+
+    def test_rdma_fallback_stops_before_any_request_and_closes_handle(self):
+        config = arrival._config(self.binary, 'n=127.0.0.1:12001', tcp=False)
+        result = self.run_client(config)
+        arrival._verify(self.document, result, config)
+        self.assertFalse(result['execution_started'])
+        self.assertFalse(result['passed'])
+        self.assertIn('observed RDMA', result['setup_error'])
+        self.assertEqual(result['summary']['offered'], 0)
+        self.assertEqual(result['summary']['planned'], 8)
+        self.assertEqual(len(Adapter.instances), 1)
+        self.assertTrue(Adapter.instances[0].closed)
+        self.assertEqual(Adapter.instances[0].threads, set())
+
+    def test_rdma_supervisor_environment_and_cli_forward_explicit_selection(self):
+        with mock.patch.object(arrival.subprocess, 'Popen', side_effect=OSError('controlled no service')) as launch:
+            report = arrival.supervise(self.source, self.output, lib=self.binary,
+                                        members='n=127.0.0.1:12001', tcp=False)
+        self.assertEqual(report['status'], 'supervisor_error')
+        self.assertEqual(launch.call_args.kwargs['env']['DFKV_RDMA'], '1')
+        with mock.patch.object(arrival, 'supervise', return_value={'passed': True}) as supervise:
+            self.assertEqual(arrival.main([str(self.source), str(self.base / 'cli'),
+                                          '--lib', str(self.binary), '--members',
+                                          'n=127.0.0.1:12001', '--rdma']), 0)
+        self.assertIs(supervise.call_args.kwargs['tcp'], False)
+        for tcp in (None, 0, 'rdma'):
+            with self.subTest(tcp=tcp), self.assertRaises(ValueError):
+                arrival._config(self.binary, 'n=127.0.0.1:12001', tcp=tcp)
 
     def test_two_independent_worker_handles_execute_concurrently(self):
         Adapter.entered = {0: threading.Event(), 1: threading.Event()}

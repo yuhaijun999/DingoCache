@@ -558,8 +558,50 @@ def check_multisize_watermarks(text):
         raise RuntimeError('multisize watermark disk ownership mismatch')
 
 
+def check_class_only(text, *, activity=True):
+    """Prove disabled competing reclaim paths, then exact foreground progress."""
+    identities = None
+    for suffix in ('watermark_high_bytes', 'watermark_low_bytes', 'reclaim_interval_ms'):
+        rows = samples(text, 'dfkv_slab_disk_' + suffix)
+        labels = {label for label, _ in rows}
+        if (len(rows) != 3 or len(labels) != 3 or any(value != 0 for _, value in rows)
+                or (identities is not None and labels != identities)):
+            raise RuntimeError('class-only effective configuration mismatch: ' + suffix)
+        identities = labels
+    disks, indices = set(), set()
+    for label in identities:
+        match = re.fullmatch(r'\{disk=("(?:[^"\\]|\\.)*"),disk_index="([012])"\}', label)
+        if not match:
+            raise RuntimeError('class-only disk identity mismatch')
+        disks.add(json.loads(match[1]))
+        indices.add(match[2])
+    objects = samples(text, 'dfkv_disk_objects')
+    if (len(disks) != 3 or indices != {'0', '1', '2'} or len(objects) != 3 or
+            {label for label, _ in objects} != {'{disk=' + json.dumps(disk, ensure_ascii=False) + '}' for disk in disks}):
+        raise RuntimeError('class-only disk ownership mismatch')
+    if not activity:
+        return {}
+    for name in ('dfkv_slab_watermark_evictions_total', 'dfkv_slab_reclaimed_total',
+                 'dfkv_slab_extent_steals_total'):
+        if total(text, name) != 0:
+            raise RuntimeError('class-only competing eviction activity: ' + name)
+    evictions = total(text, 'dfkv_evictions_total')
+    if evictions <= 0 or not evictions.is_integer():
+        raise RuntimeError('class-only foreground eviction progress missing')
+    for suffix, expected in (('attempts', evictions), ('completed', evictions), ('errors', 0)):
+        family = samples(text, 'dfkv_slab_metadata_ops_' + suffix + '_total')
+        for path, wanted in (('foreground_evict', expected), ('watermark_evict', 0), ('background_evict', 0)):
+            rows = [(labels, value) for labels, value in family if path in labels]
+            if rows != [('{path="' + path + '"}', wanted)]:
+                raise RuntimeError('class-only metadata mismatch: ' + path + '/' + suffix)
+    return {'class_foreground_evictions': int(evictions)}
+
+
 def check_result(text, client, policy='lifetime', scenario='quick-pressure', first_reuse_sec=0,
-                 refill_on_miss=False, multisize_watermark=False):
+                 refill_on_miss=False, multisize_watermark=False, class_only=False):
+    if type(class_only) is not bool or (class_only and scenario != 'quick-pressure'):
+        raise RuntimeError('class-only requires quick-pressure')
+    foreground = check_class_only(text) if class_only else {}
     if (type(multisize_watermark) is not bool or
             (multisize_watermark and scenario != 'multisize-pressure')):
         raise RuntimeError('multisize watermark mode mismatch')
@@ -655,7 +697,7 @@ def check_result(text, client, policy='lifetime', scenario='quick-pressure', fir
             raise RuntimeError('lifetime heat denominator mismatch')
         # Pressure can reclaim the original resident before its heat notification.
         heat = {'read_success': success, 'read_applied': applied}
-    return {**schedule, **refill, **heat, 'watermark_evictions': total(text, 'dfkv_slab_watermark_evictions_total'),
+    return {**schedule, **refill, **heat, **foreground, 'watermark_evictions': total(text, 'dfkv_slab_watermark_evictions_total'),
             'background_reclaimed': total(text, 'dfkv_slab_reclaimed_total'),
             'extent_steals': total(text, 'dfkv_slab_extent_steals_total'),
             'evictions': total(text, 'dfkv_evictions_total'), 'terminal_results': terminal,
@@ -708,7 +750,10 @@ def parse_args(argv=None):
                         help='arrivals-pressure: refill sampled first misses once and verify once')
     parser.add_argument('--multisize-watermark', action='store_true',
                         help='multisize-pressure: isolated low/high watermarks of 40/50 percent')
+    parser.add_argument('--class-only', action='store_true', help='quick-pressure: disable watermarks and background reclaim')
     args = parser.parse_args(argv)
+    if args.class_only and args.scenario != 'quick-pressure':
+        parser.error('class-only requires quick-pressure')
     if args.multisize_watermark and args.scenario != 'multisize-pressure':
         parser.error('multisize-watermark requires multisize-pressure')
     if args.refill_on_miss and args.scenario != 'arrivals-pressure':
@@ -741,10 +786,12 @@ def parse_args(argv=None):
 def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    watermark_override = {'low': 40, 'high': 50} if args.multisize_watermark else None
+    watermark_override = ({'low': 0, 'high': 0} if args.class_only else
+                          {'low': 40, 'high': 50} if args.multisize_watermark else None)
     result = {'status': 'failed', 'policy': args.policy, 'scenario': args.scenario,
               'first_reuse_sec': args.first_reuse_sec, 'multisize_watermark': args.multisize_watermark,
-              'watermark_pct_override': watermark_override}
+              'watermark_pct_override': watermark_override,
+              **({'class_only': True} if args.class_only else {})}
     server = None
     try:
         check_ports()
@@ -759,6 +806,8 @@ def run(args):
                    DFKV_RDMA_RECV_CHUNK_BYTES='8388608', DFKV_RDMA_MAX_PAYLOAD_BYTES='2097152',
                    DFKV_RDMA_MAX_BLOCK_BYTES='2097152', DFKV_SERVER_URING='1',
                    PYTHONPATH=str(source / 'integration/common/src'))
+        if args.class_only:
+            env['DFKV_SLAB_RECLAIM_MS'] = '0'
         if args.protect_sec is not None:
             env['DFKV_SLAB_PROTECT_SEC'] = str(args.protect_sec)
         if watermark_override is not None:
@@ -789,6 +838,7 @@ def run(args):
             'protect_sec_override': args.protect_sec, 'first_reuse_sec': args.first_reuse_sec,
             'refill_on_miss': args.refill_on_miss, 'multisize_watermark': args.multisize_watermark,
             'watermark_pct_override': watermark_override,
+            **({'class_only': True} if args.class_only else {}),
             'environment': {k: v for k, v in env.items() if k.startswith('DFKV_') or k == 'PYTHONPATH'}}, indent=2) + '\n')
         with (args.output / 'server.log').open('w') as server_log:
             server = subprocess.Popen(command, env=env, stdout=server_log, stderr=subprocess.STDOUT)
@@ -816,6 +866,8 @@ def run(args):
                                        for expected in expected_labels):
                 raise RuntimeError('metrics do not belong to this fresh server')
             (args.output / 'before.prom').write_text(before)
+            if args.class_only:
+                check_class_only(before, activity=False)
             if args.multisize_watermark:
                 check_multisize_watermarks(before)
             with (args.output / 'client.log').open('w') as log:
@@ -825,7 +877,7 @@ def run(args):
             after = scrape()
             (args.output / 'after.prom').write_text(after)
             checked = check_result(after, client, args.policy, args.scenario, args.first_reuse_sec,
-                                   args.refill_on_miss, args.multisize_watermark)
+                                   args.refill_on_miss, args.multisize_watermark, args.class_only)
             if args.scenario == 'concurrent-pressure':
                 checked.update(check_concurrent_watermarks(
                     (args.output / 'trace/phase-before-pressure.prom').read_text(),

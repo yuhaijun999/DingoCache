@@ -1,5 +1,12 @@
 # 磁盘寿命淘汰：验收收敛与剩余实施清单
 
+## 当前 RDMA 验证入口（2026-11-22）
+
+按用户要求，实际服务验证只走 RDMA，不接受 TCP 回退；
+见 [RDMA 固定到达与扩展验证](DISK_LIFETIME_RDMA_ARRIVAL.md)。
+历史 TCP 结果不计入本轮 RDMA 证据。GPU 排除、HOST `/mnt/disk1` 禁压、
+生产默认及正式 A/B 门禁均不变。
+
 ## 真实回放增量（2026-11-22）
 
 新增[真实固定到达与legacy诊断入口](DISK_LIFETIME_LEGACY_ARRIVAL.md)：
