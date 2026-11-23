@@ -82,6 +82,74 @@ class LongResidenceTest(unittest.TestCase):
         self.assertEqual(residence.profile('default')['protect_sec'], 180)
         self.assertEqual(residence.profile('default')['delays_sec'], [45, 185, 600])
 
+    def test_default_window_contract_and_full_planned_denominators(self):
+        frozen = residence.profile('default')
+        self.assertEqual(frozen, {
+            'name': 'default', 'protect_sec': 180, 'delays_sec': [45, 185, 600],
+            'steps': 1800, 'preage_sec': 240, 'interval_sec': 1,
+            'prefill': 6144, 'cohort_size': 32, 'arrival_batch': 64,
+            'length': 4096, 'seed': 0xD1A60051})
+        planned = residence.expected_counts(frozen)
+        self.assertEqual(planned, {
+            'initial_puts': 12288, 'arrival_puts': 230400, 'warm_gets': 256,
+            'preage_gets': 15360, 'ready_gets': 64, 'hot_gets': 115200,
+            'first_gets': 192, 'cooled_gets': 64})
+        self.assertEqual((planned['initial_puts'] + planned['arrival_puts']) *
+                         frozen['length'], 994050048)
+        self.assertEqual(sum(count for name, count in planned.items()
+                             if name.endswith('_gets')), 131136)
+        # Aggregate turnover is a workload descriptor, not a resident guarantee.
+        nominal_turnover = planned['initial_puts'] / (2 * frozen['arrival_batch'])
+        self.assertEqual(nominal_turnover, 96)
+        self.assertLess(frozen['delays_sec'][0], nominal_turnover)
+        self.assertTrue(all(delay > nominal_turnover
+                            for delay in frozen['delays_sec'][1:]))
+
+    def test_full_default_schedule_reaches_all_ack_relative_reuse_windows(self):
+        class ScheduleClient(Client):
+            """No storage or byte emulation; only schedule outcomes are controlled."""
+            def put(self, keys, values):
+                pass
+
+            def read_outcomes(self, keys, values):
+                return [{'outcome': 'get_hit', 'status': 0} for key in keys]
+
+            def read_outcome(self, key, value):
+                self.scalar.append(key)
+                return 'get_hit'
+
+        frozen = residence.profile('default')
+        clock = Clock()
+        clients = [ScheduleClient(), ScheduleClient()]
+        pressure_start = clock.now + frozen['preage_sec']
+        # Avoid allocating the nominal 994MB dataset in a timing-only unit test.
+        # Native status and byte correctness remain separate validation gates.
+        with mock.patch.object(residence.disk, 'payload', new=lambda *args: b'fixture'):
+            report = residence.run(clients, frozen, clock=clock, sleep=clock.sleep,
+                eviction_counter=lambda: max(0, int(clock.now - pressure_start) * 128))
+        counts = residence.check_report(report, frozen)
+        self.assertTrue(report['passed'])
+        self.assertEqual(report['preage_finished_sec'] - report['preage_started_sec'], 240)
+        self.assertEqual(report['measurement_elapsed_sec'], 1800)
+        self.assertEqual(counts['get_attempts'], 131136)
+        self.assertEqual(counts['put_acks'], 242688)
+        for delay in (45, 185, 600):
+            first = [row for row in report['rows']
+                     if row['kind'] == 'first' and row['target_age_sec'] == delay]
+            self.assertEqual(len(first), 64)
+            self.assertEqual({row['age_sec'] for row in first}, {delay})
+            self.assertEqual({row['lateness_sec'] for row in first}, {0})
+            self.assertTrue(all(row['eviction_delta_before_first'] > 0 for row in first))
+
+    def test_frozen_first_reuse_lateness_cannot_be_relaxed_in_report(self):
+        # The small fake-clock fixture exercises the shared oracle without
+        # allocating the full default dataset or sleeping for 30 minutes.
+        report, _ = self.run_case()
+        self.assertEqual(report['max_lateness_sec'], 2)
+        report['max_lateness_sec'] = 3
+        with self.assertRaises(ValueError):
+            residence.check_report(report, config())
+
     def test_complete_denominators_and_ack_ages(self):
         report, clients = self.run_case()
         counts = residence.check_report(report, config())
