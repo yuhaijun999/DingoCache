@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add RDMA-only long-residence and delayed-first-reuse diagnostics with distinct
+  hot/cooled/unread cohorts, explicit accelerated score parameters, ACK-aged
+  first outcomes, separate refill accounting and alternating fresh-policy runs;
+  retain production defaults and distinguish diagnostics from formal A/B.
+
 - Add explicit RDMA fixed-arrival replay and a repeatable guest-only two-policy
   matrix with strict transport, full-denominator and io_uring metric audits;
   add isolated class-pressure checks and independently owned replay configs;

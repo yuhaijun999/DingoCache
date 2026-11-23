@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""External RDMA-only long-residence diagnostic, not formal A/B or day-scale proof.
+
+An operator owns fresh capacity, effective policy, disk-ACK, thermal safeguards,
+server lifetime and process timeout. This tool never starts or resets a server.
+The accelerated workload uses seconds, not a claim of equivalent default aging.
+"""
+
+import argparse
+import json
+import math
+from pathlib import Path
+import sys
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'integration/common/src'))
+import disk_scenarios as disk
+import eviction_baseline_smoke as baseline
+import quick_eviction as quick
+
+
+def profile(name):
+    if name not in ('accelerated', 'default'):
+        raise ValueError('unknown residence profile')
+    return {'name': name, 'protect_sec': 12 if name == 'accelerated' else 180,
+            'delays_sec': [3, 13, 24] if name == 'accelerated' else [45, 185, 600],
+            'steps': 300 if name == 'accelerated' else 1800,
+            'preage_sec': 120 if name == 'accelerated' else 240,
+            'interval_sec': 1, 'prefill': 6144, 'cohort_size': 32,
+            'arrival_batch': 64, 'length': 4096, 'seed': 0xD1A60051}
+
+
+def validate(config):
+    if not isinstance(config, dict) or set(config) != set(profile('default')):
+        raise ValueError('invalid profile fields')
+    if config['name'] not in ('accelerated', 'default'):
+        raise ValueError('unknown residence profile')
+    for name, low, high in (('protect_sec', 1, 180), ('steps', 1, 1800),
+                            ('preage_sec', 1, 240), ('interval_sec', 1, 10), ('prefill', 6, 16384),
+                            ('cohort_size', 1, 128), ('arrival_batch', 1, 128),
+                            ('length', 1, 1048576), ('seed', 0, (1 << 64) - 1)):
+        if type(config[name]) is not int or not low <= config[name] <= high:
+            raise ValueError('invalid ' + name)
+    delays = config['delays_sec']
+    if (not isinstance(delays, list) or len(delays) != 3
+            or any(type(value) is not int or not 1 <= value <= 600 for value in delays)
+            or delays != sorted(set(delays))
+            or not delays[0] < config['protect_sec'] < delays[1]
+            or delays[-1] >= config['steps'] * config['interval_sec']
+            or config['prefill'] < 5 * config['cohort_size']):
+        raise ValueError('invalid delay/cohort schedule')
+    return dict(config, delays_sec=list(delays))
+
+
+def expected_counts(config):
+    config = validate(config)
+    return {'initial_puts': 2 * config['prefill'],
+            'arrival_puts': 2 * config['arrival_batch'] * config['steps'],
+            'warm_gets': 8 * config['cohort_size'],
+            'preage_gets': 2 * config['cohort_size'] * config['preage_sec'],
+            'ready_gets': 2 * config['cohort_size'],
+            'hot_gets': 2 * config['cohort_size'] * config['steps'],
+            'first_gets': 6 * config['cohort_size'],
+            'cooled_gets': 2 * config['cohort_size']}
+
+
+def run(clients, config, *, clock=time.monotonic, sleep=time.sleep, eviction_counter=None):
+    """Run two namespace-bound adapters, returning partial evidence on failure.
+
+    A batch ACK timestamps every key in that batch. Ages are client-observed ACK
+    ages, not disk commit ages. GET completion is never substituted for start.
+    Closed-loop steps do not catch up: overruns shift the next step and are
+    reported. No full-device occupation or throughput guarantee is inferred.
+    """
+    config = validate(config)
+    planned = expected_counts(config)
+    result = {'model': 'long-residence-rdma-v1', 'formal_ab': False,
+              'gpu': 'excluded', 'passed': False, 'config': config,
+              'planned': planned, 'actual': {key: 0 for key in planned},
+              'put_payload_bytes': 0, 'refill_puts': 0, 'refill_payload_bytes': 0,
+              'verify_gets': 0, 'verify_hits': 0, 'rows': [], 'errors': [],
+              'steps': [], 'preage_steps': [], 'pressure_samples': [], 'unresolved_operation': None,
+              'counter_scope': 'validated-terminals-and-acknowledged-PUTs-not-total-attempts',
+              'max_lateness_sec': 2, 'max_step_sec': 5,
+              'transport_modes': [], 'scope': 'closed-loop-client-ACK-aged-diagnostic'}
+    started = clock()
+    cohorts = []
+
+    def data(namespace, indexes):
+        keys = [disk.key_for(config['seed'], value) for value in indexes]
+        return keys, [disk.payload(config['seed'], namespace, key, 0, config['length'])
+                      for key in keys]
+
+    def write(client, namespace, indexes, counter):
+        keys, values = data(namespace, indexes)
+        result['unresolved_operation'] = {'kind': counter, 'namespace_hex': namespace.hex(),
+                                          'start_index': indexes[0], 'count': len(keys),
+                                          'terminal': 'unknown-if-native-call-fails'}
+        client.put(keys, values)
+        ack = clock()
+        result['unresolved_operation'] = None
+        result['actual'][counter] += len(keys)
+        result['put_payload_bytes'] += len(keys) * config['length']
+        result['rows'].append({'kind': counter, 'namespace_hex': namespace.hex(),
+                               'start_index': indexes[0], 'count': len(keys),
+                               'ack_sec': ack - started})
+        return ack
+
+    def read(client, namespace, indexes, kind, *, strict=False, step=0):
+        indexes = list(indexes)
+        begin = clock()
+        result['unresolved_operation'] = {'kind': kind, 'count': len(indexes),
+                                          'namespace_hex': namespace.hex(),
+                                          'terminal': 'unknown-if-native-call-fails'}
+        outcomes = client.read_outcomes(*data(namespace, indexes))
+        if (not isinstance(outcomes, list) or len(outcomes) != len(indexes)
+                or any(row.get('outcome') not in ('get_hit', 'get_miss')
+                       or row.get('status') != (0 if row['outcome'] == 'get_hit' else 1)
+                       for row in outcomes)):
+            raise RuntimeError('invalid/unresolved GET outcomes')
+        result['unresolved_operation'] = None
+        hits = sum(row['outcome'] == 'get_hit' for row in outcomes)
+        result['actual'][kind + '_gets'] += len(indexes)
+        result['rows'].append({'kind': kind, 'namespace_hex': namespace.hex(),
+                               'start_index': indexes[0], 'count': len(indexes), 'step': step,
+                               'started_sec': begin - started,
+                               'finished_sec': clock() - started,
+                               'hits': hits, 'misses': len(indexes) - hits})
+        if strict and hits != len(indexes):
+            raise RuntimeError('initial warmup miss invalidates initial state')
+
+    def sample_evictions(kind):
+        if eviction_counter is None:
+            raise RuntimeError('eviction counter callback required')
+        value = eviction_counter()
+        if (type(value) not in (int, float) or not math.isfinite(value)
+                or value < 0 or int(value) != value):
+            raise RuntimeError('invalid eviction counter')
+        result['pressure_samples'].append({'kind': kind, 'counter': value,
+                                           'sampled_sec': clock() - started})
+        return value
+
+    def first_reads():
+        due = any(clock() >= ack + cohort['delay_sec']
+                  for cohort in cohorts for _, ack in cohort['pending'])
+        if not due:
+            return
+        evictions = sample_evictions('before-first') - result['evictions_at_measurement_start']
+        if evictions <= 0:
+            raise RuntimeError('first reuse occurred without measured eviction pressure')
+        for cohort in cohorts:
+            client, namespace = clients[cohort['client_index']], cohort['namespace']
+            pending = []
+            for index, ack in cohort['pending']:
+                if clock() < ack + cohort['delay_sec']:
+                    pending.append((index, ack))
+                    continue
+                key, values = data(namespace, [index])
+                begin = clock()
+                age = begin - ack
+                if (age - cohort['delay_sec'] > result['max_lateness_sec']
+                        or (cohort['delay_sec'] < config['protect_sec']
+                            and age >= config['protect_sec'])):
+                    raise RuntimeError('first-reuse scheduling window missed')
+                result['unresolved_operation'] = {'kind': 'first', 'namespace_hex': namespace.hex(),
+                                                  'index': index, 'terminal': 'unknown-if-native-call-fails'}
+                outcome = client.read_outcome(key[0], values[0])
+                if outcome not in ('get_hit', 'get_miss'):
+                    raise RuntimeError('unresolved first GET')
+                result['unresolved_operation'] = None
+                result['actual']['first_gets'] += 1
+                row = {'kind': 'first', 'namespace_hex': namespace.hex(),
+                       'key_hex': key[0].hex(), 'index': index,
+                       'target_age_sec': cohort['delay_sec'], 'ack_sec': ack - started,
+                       'eviction_delta_before_first': evictions,
+                       'eviction_sample': len(result['pressure_samples']) - 1,
+                       'started_sec': begin - started, 'age_sec': begin - ack,
+                       'lateness_sec': begin - ack - cohort['delay_sec'],
+                       'outcome': outcome, 'refill_ack': False, 'verify_outcome': None}
+                result['rows'].append(row)
+                if outcome == 'get_miss':
+                    result['unresolved_operation'] = {'kind': 'refill', 'key_hex': key[0].hex(),
+                                                      'terminal': 'unknown-if-native-call-fails'}
+                    client.put(key, values)
+                    result['unresolved_operation'] = None
+                    result['refill_puts'] += 1
+                    result['refill_payload_bytes'] += config['length']
+                    row['refill_ack'] = True
+                    result['unresolved_operation'] = {'kind': 'verify', 'key_hex': key[0].hex(),
+                                                      'terminal': 'unknown-if-native-call-fails'}
+                    observed = client.read_outcome(key[0], values[0])
+                    result['unresolved_operation'] = None
+                    result['verify_gets'] += 1
+                    row['verify_outcome'] = observed
+                    if observed != 'get_hit':
+                        raise RuntimeError('refill verification failed')
+                    result['verify_hits'] += 1
+            cohort['pending'] = pending
+
+    try:
+        if len(clients) != len(disk.NAMESPACES):
+            raise ValueError('exactly two namespace clients required')
+        result['transport_modes'] = [client.transport for client in clients]
+        if result['transport_modes'] != ['rdma', 'rdma']:
+            raise RuntimeError('RDMA required; no TCP fallback')
+        size = config['cohort_size']
+        # Filler first: no cohort ages while a large initial dataset is built.
+        for client, namespace in zip(clients, disk.NAMESPACES):
+            for start in range(5 * size, config['prefill'], 16):
+                write(client, namespace, range(start, min(start + 16, config['prefill'])),
+                      'initial_puts')
+        def put_cohorts(groups):
+            for client_index, (client, namespace) in enumerate(zip(clients, disk.NAMESPACES)):
+                for group in groups:
+                    pending = []
+                    for start in range(group * size, (group + 1) * size, 16):
+                        indexes = list(range(start, min(start + 16, (group + 1) * size)))
+                        ack = write(client, namespace, indexes, 'initial_puts')
+                        pending.extend((index, ack) for index in indexes)
+                    if group >= 2:
+                        cohorts.append({'client_index': client_index, 'namespace': namespace,
+                                        'delay_sec': config['delays_sec'][group - 2],
+                                        'pending': pending})
+        put_cohorts(range(2))
+        for warm_round in range(2):
+            for client, namespace in zip(clients, disk.NAMESPACES):
+                read(client, namespace, range(2 * size), 'warm', strict=True, step=warm_round)
+        # Age existing residents BEFORE delayed objects arrive. Only the hot set
+        # is refreshed; the formerly hot set and untouched filler become cold.
+        result['preage_started_sec'] = clock() - started
+        for step in range(config['preage_sec']):
+            begin = clock()
+            for client, namespace in zip(clients, disk.NAMESPACES):
+                read(client, namespace, range(size), 'preage', strict=True, step=step)
+            remaining = begin + 1 - clock()
+            if remaining > 0:
+                sleep(remaining)
+            if clock() - begin > result['max_step_sec']:
+                raise RuntimeError('preage step/stall exceeded scheduling window')
+            result['preage_steps'].append({'step': step, 'started_sec': begin - started,
+                                           'finished_sec': clock() - started})
+        result['preage_finished_sec'] = clock() - started
+        put_cohorts(range(2, 5))
+        for client, namespace in zip(clients, disk.NAMESPACES):
+            read(client, namespace, range(size), 'ready', strict=True)
+        result['evictions_at_measurement_start'] = sample_evictions('measurement-start')
+        result['measurement_started_sec'] = clock() - started
+        for step in range(config['steps']):
+            step_start = clock()
+            first_reads()
+            start = config['prefill'] + step * config['arrival_batch']
+            for client, namespace in zip(clients, disk.NAMESPACES):
+                write(client, namespace, range(start, start + config['arrival_batch']), 'arrival_puts')
+                read(client, namespace, range(size), 'hot', step=step)
+            first_reads()
+            remaining = step_start + config['interval_sec'] - clock()
+            if clock() - step_start > result['max_step_sec']:
+                raise RuntimeError('measurement step exceeded bounded scheduling window')
+            if remaining > 0:
+                sleep(remaining)
+            if clock() - step_start > result['max_step_sec']:
+                raise RuntimeError('measurement sleep/stall exceeded scheduling window')
+            result['steps'].append({'step': step, 'started_sec': step_start - started,
+                                    'finished_sec': clock() - started})
+        first_reads()
+        for client, namespace in zip(clients, disk.NAMESPACES):
+            read(client, namespace, range(size, 2 * size), 'cooled')
+        if result['actual'] != planned or any(cohort['pending'] for cohort in cohorts):
+            raise RuntimeError('incomplete planned denominator')
+        result['passed'] = True
+    except Exception as error:
+        result['errors'].append(f'{type(error).__name__}: {error}')
+    finally:
+        # Both durations describe the same terminal instant, even if this
+        # thread is preempted while assigning the report fields.
+        finished = clock()
+        result['elapsed_sec'] = finished - started
+        result['measurement_elapsed_sec'] = (finished - started - result['measurement_started_sec']
+                                             if 'measurement_started_sec' in result else None)
+    return result
+
+
+def check_report(result, config):
+    """Validate complete diagnostic denominators; return metric-comparison totals."""
+    config = validate(config)
+    if (result.get('model') != 'long-residence-rdma-v1' or result.get('config') != config
+            or result.get('passed') is not True or result.get('errors')
+            or result.get('close_errors', []) or result.get('formal_ab') is not False
+            or result.get('unresolved_operation') is not None
+            or result.get('max_lateness_sec') != 2 or result.get('max_step_sec') != 5
+            or result.get('transport_modes') != ['rdma', 'rdma']):
+        raise ValueError('failed or mismatched residence report')
+    planned = expected_counts(config)
+    if result.get('planned') != planned or result.get('actual') != planned:
+        raise ValueError('incomplete planned denominators')
+    observed = dict.fromkeys(planned, 0)
+    first, write_indexes, read_ids = set(), set(), set()
+    acknowledgments = {}
+    get_hits = get_misses = refill_puts = verify_gets = verify_hits = 0
+    def seconds(value):
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise ValueError('invalid/nonfinite timing')
+        return value
+
+    pressure = result['pressure_samples']
+    if not pressure or pressure[0]['kind'] != 'measurement-start':
+        raise ValueError('missing pressure baseline')
+    for sample in pressure:
+        seconds(sample['sampled_sec'])
+        value = sample['counter']
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0 or int(value) != value:
+            raise ValueError('invalid pressure sample')
+    if pressure[0]['counter'] != result['evictions_at_measurement_start']:
+        raise ValueError('pressure baseline mismatch')
+    seconds(result['elapsed_sec'])
+    seconds(result['measurement_started_sec'])
+    seconds(result['measurement_elapsed_sec'])
+    previous = seconds(result['preage_started_sec'])
+    if len(result['preage_steps']) != config['preage_sec']:
+        raise ValueError('incomplete resident preaging')
+    for index, step in enumerate(result['preage_steps']):
+        begin, end = seconds(step['started_sec']), seconds(step['finished_sec'])
+        if (step['step'] != index or abs(begin - previous) > .01
+                or end - begin < 1 - 1e-6 or end - begin > result['max_step_sec']):
+            raise ValueError('preage continuity/stall violation')
+        previous = end
+    if (abs(previous - seconds(result['preage_finished_sec'])) > .01
+            or previous > result['measurement_started_sec']):
+        raise ValueError('preage lifecycle order violation')
+    previous = result['measurement_started_sec']
+    if len(result['steps']) != config['steps']:
+        raise ValueError('incomplete measurement steps')
+    for index, step in enumerate(result['steps']):
+        begin, end = seconds(step['started_sec']), seconds(step['finished_sec'])
+        if (step['step'] != index or abs(begin - previous) > .01
+                or end - begin < config['interval_sec'] - 1e-6
+                or end - begin > result['max_step_sec']):
+            raise ValueError('measurement continuity/stall violation')
+        previous = end
+    for row in result['rows']:
+        namespace = row['namespace_hex']
+        if namespace not in {value.hex() for value in disk.NAMESPACES}:
+            raise ValueError('unknown namespace')
+        kind = row['kind']
+        if kind in ('initial_puts', 'arrival_puts'):
+            start, count = row['start_index'], row['count']
+            ack = seconds(row['ack_sec'])
+            if type(start) is not int or type(count) is not int or count < 1:
+                raise ValueError('invalid PUT row')
+            for index in range(start, start + count):
+                identity = (namespace, index)
+                if identity in write_indexes:
+                    raise ValueError('duplicate initial/arrival PUT')
+                write_indexes.add(identity)
+                if kind == 'initial_puts':
+                    acknowledgments[identity] = ack
+            low, high = ((0, config['prefill']) if kind == 'initial_puts' else
+                         (config['prefill'], config['prefill'] +
+                          config['steps'] * config['arrival_batch']))
+            if not low <= start < start + count <= high:
+                raise ValueError('PUT indexes outside frozen workload')
+            if kind == 'initial_puts':
+                if (ack > result['measurement_started_sec']
+                        or (start < 2 * config['cohort_size'] and ack > result['preage_started_sec'])
+                        or (2 * config['cohort_size'] <= start < 5 * config['cohort_size']
+                            and ack < result['preage_finished_sec'])):
+                    raise ValueError('initial ACK after measurement start')
+            else:
+                step = (start - config['prefill']) // config['arrival_batch']
+                if (count != config['arrival_batch']
+                        or (start - config['prefill']) % config['arrival_batch']
+                        or not result['steps'][step]['started_sec'] <= ack <= result['steps'][step]['finished_sec']):
+                    raise ValueError('arrival ACK outside frozen measurement step')
+            observed[kind] += count
+        elif kind in ('warm', 'preage', 'ready', 'hot', 'cooled'):
+            hits, misses = row['hits'], row['misses']
+            begin, end = seconds(row['started_sec']), seconds(row['finished_sec'])
+            step = row['step']
+            identity = (namespace, kind, step)
+            expected_start = config['cohort_size'] if kind == 'cooled' else 0
+            step_count = {'warm': 2, 'preage': config['preage_sec'],
+                          'hot': config['steps'], 'ready': 1, 'cooled': 1}[kind]
+            if (type(step) is not int or identity in read_ids
+                    or not 0 <= step < step_count
+                    or row['start_index'] != expected_start
+                    or row['count'] != config['cohort_size'] * (2 if kind == 'warm' else 1)):
+                raise ValueError('duplicate/missing batch GET identity')
+            read_ids.add(identity)
+            if ((kind == 'warm' and end > result['preage_started_sec'])
+                    or (kind == 'ready' and not result['preage_finished_sec'] <= begin <= end <= result['measurement_started_sec'])
+                    or (kind == 'cooled' and begin < previous)):
+                raise ValueError('batch read outside lifecycle phase')
+            if kind == 'preage' and not (result['preage_steps'][step]['started_sec'] <= begin <= end
+                                                <= result['preage_steps'][step]['finished_sec']):
+                raise ValueError('hot refresh outside preage step')
+            if kind == 'hot' and not (result['steps'][step]['started_sec'] <= begin <= end
+                                             <= result['steps'][step]['finished_sec']):
+                raise ValueError('hot read outside measurement step')
+            if (end > result['elapsed_sec']
+                    or type(hits) is not int or type(misses) is not int or min(hits, misses) < 0
+                    or hits + misses != config['cohort_size'] * (2 if kind == 'warm' else 1)
+                    or row['finished_sec'] < row['started_sec']
+                    or (kind in ('warm', 'preage', 'ready') and misses)):
+                raise ValueError('invalid batch GET denominator')
+            observed[kind + '_gets'] += hits + misses
+            get_hits += hits
+            get_misses += misses
+        elif kind == 'first':
+            index = row['index']
+            if type(index) is not int:
+                raise ValueError('invalid first-reuse index')
+            for field in ('ack_sec', 'started_sec', 'age_sec', 'lateness_sec'):
+                seconds(row[field])
+            group = index // config['cohort_size'] - 2
+            if group not in (0, 1, 2):
+                raise ValueError('first reuse outside cohort')
+            identity = (namespace, index)
+            target = config['delays_sec'][group]
+            eviction_delta = row['eviction_delta_before_first']
+            sample_index = row['eviction_sample']
+            if type(sample_index) is not int or not 1 <= sample_index < len(pressure):
+                raise ValueError('invalid pressure sample identity')
+            sample = pressure[sample_index]
+            if (sample['kind'] != 'before-first' or sample['sampled_sec'] > row['started_sec']
+                    or sample['counter'] - pressure[0]['counter'] != eviction_delta):
+                raise ValueError('first pressure delta does not match sampled counter')
+            if (type(eviction_delta) not in (int, float)
+                    or not math.isfinite(eviction_delta) or eviction_delta <= 0):
+                raise ValueError('missing first-reuse pressure evidence')
+            if (identity in first or row['target_age_sec'] != target
+                    or row['key_hex'] != disk.key_for(config['seed'], index).hex()
+                    or not result['measurement_started_sec'] <= row['started_sec'] <= previous
+                    or row['age_sec'] < target
+                    or acknowledgments.get(identity) != row['ack_sec']
+                    or row['lateness_sec'] > result['max_lateness_sec']
+                    or (target < config['protect_sec'] and row['age_sec'] >= config['protect_sec'])
+                    or abs(row['started_sec'] - row['ack_sec'] - row['age_sec']) > 1e-6
+                    or abs(row['age_sec'] - target - row['lateness_sec']) > 1e-6
+                    or row['outcome'] not in ('get_hit', 'get_miss')):
+                raise ValueError('invalid first-reuse identity/age')
+            first.add(identity)
+            observed['first_gets'] += 1
+            miss = row['outcome'] == 'get_miss'
+            get_hits += not miss
+            get_misses += miss
+            if row['refill_ack'] is not miss or row['verify_outcome'] != ('get_hit' if miss else None):
+                raise ValueError('refill must be separate verified same-byte PUT')
+            refill_puts += miss
+            verify_gets += miss
+            verify_hits += miss
+        else:
+            raise ValueError('unknown ledger kind')
+    if observed != planned:
+        raise ValueError('ledger differs from denominators')
+    if (result['put_payload_bytes'] != (planned['initial_puts'] + planned['arrival_puts']) * config['length']
+            or result['refill_puts'] != refill_puts
+            or result['refill_payload_bytes'] != refill_puts * config['length']
+            or result['verify_gets'] != verify_gets or result['verify_hits'] != verify_hits
+            or result['measurement_elapsed_sec'] < config['steps'] * config['interval_sec']
+            or previous > result['elapsed_sec']
+            or abs(result['measurement_elapsed_sec'] + result['measurement_started_sec']
+                   - result['elapsed_sec']) > 1e-6):
+        raise ValueError('incomplete byte/refill/time denominator')
+    return {'put_acks': planned['initial_puts'] + planned['arrival_puts'] + refill_puts,
+            'put_bytes': result['put_payload_bytes'] + result['refill_payload_bytes'],
+            'get_hits': get_hits + verify_hits, 'get_misses': get_misses,
+            'get_attempts': get_hits + get_misses + verify_gets}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--lib', required=True)
+    parser.add_argument('--members', required=True)
+    parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--metrics-port', type=int, default=12010)
+    parser.add_argument('--profile', choices=('accelerated', 'default'), required=True)
+    args = parser.parse_args(argv)
+    if not 1 <= args.metrics_port <= 65535:
+        parser.error('invalid metrics port')
+    args.output.mkdir(parents=True, exist_ok=False)
+    config = profile(args.profile)
+    clients = []
+    result = {'passed': False, 'config': config, 'errors': [], 'close_errors': []}
+    try:
+        library = disk.load_library(args.lib)
+        if (getattr(library, 'dfkv_get_auto_status', None) is None
+                or getattr(library, 'dfkv_batch_get_auto_status', None) is None):
+            raise RuntimeError('scalar and batch status symbols required')
+        for namespace in disk.NAMESPACES:
+            clients.append(disk.Client(library, args.members, namespace))
+        metric_samples = []
+        def evictions():
+            begin = time.monotonic()
+            text = baseline._scrape(args.metrics_port)
+            name = f'metrics-{len(metric_samples):03d}.prom'
+            (args.output / name).write_text(text)
+            metric_samples.append({'file': name, 'sha256': baseline.file_sha(args.output / name),
+                                   'started_monotonic_sec': begin,
+                                   'finished_monotonic_sec': time.monotonic()})
+            (args.output / 'metrics-samples.json').write_text(json.dumps(metric_samples, indent=2) + '\n')
+            for metric in ('dfkv_storage_healthy', 'dfkv_slab_healthy'):
+                if quick.total(text, metric) != 1:
+                    raise RuntimeError('unhealthy server before first reuse')
+            return quick.total(text, 'dfkv_evictions_total')
+        result = run(clients, config, eviction_counter=evictions)
+        result['close_errors'] = []
+    except Exception as error:
+        result['errors'].append(f'{type(error).__name__}: {error}')
+    finally:
+        for client in reversed(clients):
+            try:
+                client.close()
+            except Exception as error:
+                result['close_errors'].append(f'{type(error).__name__}: {error}')
+                result['passed'] = False
+        (args.output / 'report.json').write_text(json.dumps(result, indent=2) + '\n')
+    return 0 if result['passed'] else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

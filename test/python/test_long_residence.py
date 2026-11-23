@@ -1,0 +1,311 @@
+"""Offline deterministic diagnostics; no service, native library or transport proof."""
+
+import copy
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'deploy/validation'))
+import long_residence as residence
+
+
+class Clock:
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, duration):
+        self.now += duration
+
+
+class Client:
+    """Controlled memory adapter, not an RDMA emulator."""
+    transport = 'rdma'
+
+    def __init__(self):
+        self.store = {}
+        self.miss_first = set()
+        self.first_seen = set()
+        self.fail = False
+        self.closed = False
+        self.scalar = []
+        self.batch = []
+
+    def put(self, keys, values):
+        if self.fail:
+            raise RuntimeError('controlled PUT failure')
+        self.store.update(zip(keys, values))
+
+    def read_outcomes(self, keys, values):
+        self.batch.append(list(keys))
+        return [{'outcome': 'get_hit', 'status': 0} for key in keys]
+
+    def read_outcome(self, key, value):
+        self.scalar.append(key)
+        if key in self.miss_first and key not in self.first_seen:
+            self.first_seen.add(key)
+            return 'get_miss'
+        if self.store.get(key) != value:
+            raise RuntimeError('controlled wrong bytes')
+        return 'get_hit'
+
+    def close(self):
+        self.closed = True
+
+
+def config():
+    value = residence.profile('accelerated')
+    value.update(protect_sec=2, delays_sec=[1, 3, 4], steps=6,
+                 prefill=10, cohort_size=2, arrival_batch=2, length=4, preage_sec=2)
+    return value
+
+
+class LongResidenceTest(unittest.TestCase):
+    def run_case(self, clients=None):
+        clients = clients or [Client(), Client()]
+        clock = Clock()
+        report = residence.run(clients, config(), clock=clock, sleep=clock.sleep,
+                               eviction_counter=lambda: max(0, sum(len(client.store) for client in clients) - 20))
+        return report, clients
+
+    def test_profiles_are_independent_and_default_not_scaled(self):
+        accelerated = residence.profile('accelerated')
+        accelerated['delays_sec'][0] = 99
+        self.assertEqual(residence.profile('accelerated')['delays_sec'], [3, 13, 24])
+        self.assertEqual(residence.profile('default')['steps'], 1800)
+        self.assertEqual(residence.profile('default')['protect_sec'], 180)
+        self.assertEqual(residence.profile('default')['delays_sec'], [45, 185, 600])
+
+    def test_complete_denominators_and_ack_ages(self):
+        report, clients = self.run_case()
+        counts = residence.check_report(report, config())
+        self.assertTrue(report['passed'])
+        self.assertEqual(counts, {'put_acks': 44, 'put_bytes': 176,
+                                 'get_hits': 68, 'get_misses': 0, 'get_attempts': 68})
+        first = [row for row in report['rows'] if row['kind'] == 'first']
+        self.assertEqual(len(first), 12)
+        self.assertEqual({row['age_sec'] for row in first}, {1, 3, 4})
+        self.assertEqual(report['measurement_elapsed_sec'], 6)
+        self.assertFalse(any(client.closed for client in clients))
+        # The workload borrows clients; its owner must close them after return.
+
+    def test_delayed_cohorts_never_read_in_warmup(self):
+        report, clients = self.run_case()
+        for client in clients:
+            warmed = set(client.batch[0] + client.batch[1])
+            delayed = {residence.disk.key_for(config()['seed'], index) for index in range(4, 10)}
+            self.assertFalse(warmed & delayed)
+            self.assertEqual(set(client.scalar), delayed)
+
+    def test_residents_are_preaged_while_only_persistent_hot_is_refreshed(self):
+        report, _ = self.run_case()
+        self.assertEqual(report['preage_finished_sec'] - report['preage_started_sec'], 2)
+        rows = [row for row in report['rows'] if row['kind'] == 'preage']
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row['start_index'] == 0 and row['count'] == 2 for row in rows))
+        delayed_puts = [row for row in report['rows'] if row['kind'] == 'initial_puts'
+                        and 4 <= row['start_index'] < 10]
+        self.assertTrue(all(row['ack_sec'] >= report['preage_finished_sec'] for row in delayed_puts))
+        for mutate in (lambda r: r['preage_steps'].pop(),
+                       lambda r: r['preage_steps'][0].update(finished_sec=8),
+                       lambda r: next(row for row in r['rows'] if row['kind'] == 'preage').update(start_index=2)):
+            forged = copy.deepcopy(report)
+            mutate(forged)
+            with self.assertRaises(ValueError):
+                residence.check_report(forged, config())
+
+    def test_miss_refill_does_not_change_first_result(self):
+        clients = [Client(), Client()]
+        key = residence.disk.key_for(config()['seed'], 4)
+        clients[0].miss_first.add(key)
+        report, _ = self.run_case(clients)
+        counts = residence.check_report(report, config())
+        row = next(row for row in report['rows'] if row['kind'] == 'first'
+                   and row['namespace_hex'] == residence.disk.NAMESPACES[0].hex()
+                   and row['index'] == 4)
+        self.assertEqual(row['outcome'], 'get_miss')
+        self.assertTrue(row['refill_ack'])
+        self.assertEqual(row['verify_outcome'], 'get_hit')
+        self.assertEqual(report['refill_payload_bytes'], 4)
+        self.assertEqual(counts['put_acks'], 45)
+        self.assertEqual(counts['get_misses'], 1)
+        self.assertEqual(counts['get_attempts'], 69)
+
+    def test_no_transport_fallback_or_writes(self):
+        clients = [Client(), Client()]
+        clients[1].transport = 'tcp(rdma-not-requested)'
+        report, _ = self.run_case(clients)
+        self.assertFalse(report['passed'])
+        self.assertEqual(sum(report['actual'].values()), 0)
+        self.assertFalse(clients[0].store)
+
+    def test_put_error_leaves_partial_denominators_not_false_success(self):
+        clients = [Client(), Client()]
+        clients[0].fail = True
+        report, _ = self.run_case(clients)
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['actual']['initial_puts'], 0)
+        self.assertEqual(report['unresolved_operation']['terminal'], 'unknown-if-native-call-fails')
+        self.assertEqual(report['unresolved_operation']['count'], 2)
+        with self.assertRaises(ValueError):
+            residence.check_report(report, config())
+
+    def test_unresolved_status_cannot_be_miss(self):
+        clients = [Client(), Client()]
+        clients[0].read_outcome = lambda *args: 'get_unresolved'
+        report, _ = self.run_case(clients)
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['actual']['first_gets'], 0)
+        self.assertEqual(report['refill_puts'], 0)
+
+    def test_batch_status_error_invalidates_initial_state(self):
+        clients = [Client(), Client()]
+        clients[0].read_outcomes = lambda keys, values: [{'outcome': 'client_error', 'status': 4}] * len(keys)
+        report, _ = self.run_case(clients)
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['actual']['warm_gets'], 0)
+
+    def test_miss_during_initial_warmup_is_failure(self):
+        clients = [Client(), Client()]
+        clients[0].read_outcomes = lambda keys, values: [{'outcome': 'get_miss', 'status': 1}] * len(keys)
+        report, _ = self.run_case(clients)
+        self.assertFalse(report['passed'])
+        self.assertIn('warmup miss', report['errors'][0])
+
+    def test_refill_failure_is_not_hidden(self):
+        clients = [Client(), Client()]
+        clients[0].read_outcome = lambda *args: 'get_miss'
+        report, _ = self.run_case(clients)
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['actual']['first_gets'], 1)
+        self.assertEqual(report['refill_puts'], 1)
+        self.assertEqual(report['verify_hits'], 0)
+
+    def test_invalid_configs_fail_before_io(self):
+        for name, value in [('steps', True), ('steps', 4), ('delays_sec', [1, 3, 3]),
+                            ('prefill', 9), ('protect_sec', 3), ('length', 0)]:
+            bad = config()
+            bad[name] = value
+            with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                residence.run([Client(), Client()], bad)
+
+    def test_checker_rejects_forged_denominators_ages_keys_and_refill(self):
+        report, _ = self.run_case()
+        mutations = [lambda r: r['actual'].update(first_gets=11),
+                     lambda r: r.update(refill_payload_bytes=4),
+                     lambda r: r.update(measurement_elapsed_sec=5),
+                     lambda r: r.update(elapsed_sec=float('nan')),
+                     lambda r: next(row for row in r['rows'] if row['kind'] == 'first').update(
+                         ack_sec=1, started_sec=2, age_sec=1, lateness_sec=0),
+                     lambda r: next(row for row in r['rows'] if row['kind'] == 'first').update(
+                         eviction_delta_before_first=0),
+                     lambda r: next(row for row in r['rows'] if row['kind'] == 'hot').update(
+                         namespace_hex=residence.disk.NAMESPACES[1].hex()),
+                     lambda r: next(row for row in r['rows'] if row['kind'] == 'warm').update(
+                         finished_sec=1),
+                     lambda r: next(row for row in r['rows'] if row['kind'] == 'cooled').update(
+                         started_sec=0),
+                     lambda r: r['rows'].append(copy.deepcopy(r['rows'][0])),
+                     lambda r: next(row for row in r['rows'] if row['kind'] == 'first').update(age_sec=0),
+                     lambda r: next(row for row in r['rows'] if row['kind'] == 'first').update(key_hex='00'),
+                     lambda r: next(row for row in r['rows'] if row['kind'] == 'first').update(refill_ack=True)]
+        for mutate in mutations:
+            forged = copy.deepcopy(report)
+            mutate(forged)
+            with self.assertRaises(ValueError):
+                residence.check_report(forged, config())
+
+    def test_no_eviction_before_first_is_not_pressure_validation(self):
+        clock = Clock()
+        report = residence.run([Client(), Client()], config(), clock=clock,
+                               sleep=clock.sleep, eviction_counter=lambda: 0)
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['actual']['first_gets'], 0)
+        self.assertIn('without measured eviction', report['errors'][0])
+
+    def test_scheduler_stall_invalidates_sample(self):
+        clock = Clock()
+        counts = iter(range(20))
+        report = residence.run([Client(), Client()], config(), clock=clock,
+                               sleep=lambda duration: clock.sleep(duration + 5),
+                               eviction_counter=lambda: next(counts))
+        self.assertFalse(report['passed'])
+        self.assertIn('stall', report['errors'][0])
+
+    def test_preprotection_first_cannot_silently_become_postprotection(self):
+        clock = Clock()
+        clients = [Client(), Client()]
+        original = clients[0].read_outcomes
+        def slow_warm(keys, values):
+            clock.now += 3
+            return original(keys, values)
+        clients[0].read_outcomes = slow_warm
+        counts = iter(range(20))
+        report = residence.run(clients, config(), clock=clock, sleep=clock.sleep,
+                               eviction_counter=lambda: next(counts))
+        self.assertFalse(report['passed'])
+        self.assertIn('scheduling window', report['errors'][0])
+
+    def test_final_durations_share_one_clock_sample(self):
+        class ClosingClock(Clock):
+            armed = False
+
+            def __call__(self):
+                if self.armed:
+                    self.now += .001
+                return self.now
+
+        clock = ClosingClock()
+        clients = [Client(), Client()]
+        original = clients[1].read_outcomes
+        cooled_first = residence.disk.key_for(config()['seed'], config()['cohort_size'])
+
+        def final_cooled(keys, values):
+            if keys[0] == cooled_first:
+                # Model clock progress or preemption only at finalization, not
+                # during the earlier synthetic scheduling and age assertions.
+                clock.armed = True
+            return original(keys, values)
+
+        clients[1].read_outcomes = final_cooled
+        report = residence.run(clients, config(), clock=clock, sleep=clock.sleep,
+            eviction_counter=lambda: max(0, sum(len(client.store) for client in clients) - 20))
+        self.assertTrue(report['passed'])
+        self.assertAlmostEqual(report['elapsed_sec'], report['measurement_started_sec'] +
+                               report['measurement_elapsed_sec'], places=9)
+        self.assertEqual(residence.check_report(report, config())['get_attempts'], 68)
+
+    def test_main_missing_symbols_writes_failure_and_never_opens(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / 'run'
+            with mock.patch.object(residence.disk, 'load_library', return_value=object()), \
+                    mock.patch.object(residence.disk, 'Client') as factory:
+                self.assertEqual(residence.main(['--lib', 'unused', '--members', 'unused',
+                    '--profile', 'accelerated', '--output', str(output)]), 1)
+                factory.assert_not_called()
+            report = json.loads((output / 'report.json').read_text())
+            self.assertFalse(report['passed'])
+            self.assertIn('status symbols', report['errors'][0])
+
+    def test_main_partial_open_closes_owned_first_handle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / 'run'
+            client = Client()
+            library = type('Library', (), {'dfkv_get_auto_status': True,
+                                          'dfkv_batch_get_auto_status': True})()
+            with mock.patch.object(residence.disk, 'load_library', return_value=library), \
+                    mock.patch.object(residence.disk, 'Client', side_effect=[client, RuntimeError('open failed')]):
+                self.assertEqual(residence.main(['--lib', 'unused', '--members', 'unused',
+                    '--profile', 'accelerated', '--output', str(output)]), 1)
+            self.assertTrue(client.closed)
+            self.assertFalse(json.loads((output / 'report.json').read_text())['passed'])
+
+
+if __name__ == '__main__':
+    unittest.main()
