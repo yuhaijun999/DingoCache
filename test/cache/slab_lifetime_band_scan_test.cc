@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -44,6 +45,25 @@ void Seed(SlabAllocator& allocator, uint64_t id, uint8_t reads,
   DiskLifetimeState state = RecoveredDiskLifetimeState(1);
   state.anchor = anchor;
   state.hstate = static_cast<uint8_t>(reads << 2);
+  SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(id), id, &state);
+  if (pin) {
+    ASSERT_TRUE(allocator.Pin(Key(id)));
+  }
+}
+
+// Build reachable NEW/read states for candidate-order diagnostics. Unlike
+// recovery, an unread NEW resident retains wa and its original put timestamp.
+void SeedReachable(SlabAllocator& allocator, uint64_t id, uint8_t reads,
+                   bool pin = false, uint32_t anchor = 0) {
+  SlabAllocator::SlotRef ref;
+  std::vector<BlockKey> evicted;
+  ASSERT_TRUE(allocator.Put(Key(id), 1, &ref, &evicted));
+  ASSERT_TRUE(evicted.empty());
+  DiskLifetimeState state = NewDiskLifetimeState(reads == 0 ? anchor : 0);
+  const DiskLifetimeConfig config;
+  for (uint8_t read = 0; read < reads; ++read) {
+    ASSERT_TRUE(ApplyDiskLifetimeRead(config, anchor, &state));
+  }
   SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(id), id, &state);
   if (pin) {
     ASSERT_TRUE(allocator.Pin(Key(id)));
@@ -230,6 +250,156 @@ TEST(SlabLifetimeBandScan, CachedCandidatesPayAgainBeforeEveryWinner) {
   EXPECT_EQ(allocator.Remove(Key(100)), SlabAllocator::RemoveResult::kRemoved);
   EXPECT_NO_FATAL_FAILURE(ExpectCounts(allocator.LifetimeBandScanStats(), 2,
                                        Path::kWatermark, 0, 3, 3, 0));
+}
+
+// These fixtures diagnose bounded selection, not a global-minimum contract.
+// Existing test-peer cursors expose the checked range without production hooks.
+TEST(SlabLifetimeBandScan, NonHeadCursorCanSkipALowerScorePrefix) {
+  SlabAllocator allocator(Options(3));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 1, 0, false, 0));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 2, 0, false, 400000));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 3, 1, false, 20000));
+  ASSERT_TRUE(SlabAllocatorTestPeer::PointLifetimeCursorsAt(allocator, Key(2)));
+  const DiskLifetimeConfig config;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&seconds] { return seconds; });
+  seconds = 500000;
+  ASSERT_LT(DiskLifetimeScore(config, 0, 0, false, true, seconds),
+            DiskLifetimeScore(config, 20000, 1, false, false, seconds));
+  ASSERT_LT(DiskLifetimeScore(config, 20000, 1, false, false, seconds),
+            DiskLifetimeScore(config, 400000, 0, false, true, seconds));
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  Scan scan(config, clock);
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                       &evicted, &denied));
+  EXPECT_FALSE(denied);
+  EXPECT_EQ(evicted, std::vector<BlockKey>{Key(3)});
+  EXPECT_EQ(scan.visits, 2U);
+  // Key 1 is colder than the victim but was outside this checked range.
+  EXPECT_EQ(SlabAllocatorTestPeer::LifetimeQueueKeys(allocator, 1, 0),
+            (std::vector<BlockKey>{Key(1), Key(2)}));
+  EXPECT_EQ(SlabAllocatorTestPeer::LifetimeCursorKey(allocator, 1, 0), Key(1));
+  EXPECT_NO_FATAL_FAILURE(ExpectCounts(allocator.LifetimeBandScanStats(), 2,
+                                       Path::kClass, 0, 1, 1, 0));
+  EXPECT_NO_FATAL_FAILURE(ExpectCounts(allocator.LifetimeBandScanStats(), 2,
+                                       Path::kClass, 1, 1, 1, 0));
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
+TEST(SlabLifetimeBandScan, ContinuousAppendCanDelayOldPrefixRevisit) {
+  SlabAllocator allocator(Options(32));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 1, 0, false, 0));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 2, 0, false, 400000));
+  ASSERT_TRUE(SlabAllocatorTestPeer::PointLifetimeCursorsAt(allocator, Key(2)));
+  const DiskLifetimeConfig config;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&seconds] { return seconds; });
+  seconds = 500000;
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  for (uint64_t round = 0; round < 8; ++round) {
+    SCOPED_TRACE(round);
+    ASSERT_NO_FATAL_FAILURE(
+        SeedReachable(allocator, 100 + round, 0, false, 400001 + round));
+    ASSERT_NO_FATAL_FAILURE(
+        SeedReachable(allocator, 200 + round, 1, false, 20000 + round));
+    Scan scan(config, clock);
+    ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                         &evicted, &denied));
+    EXPECT_FALSE(denied);
+    ASSERT_EQ(evicted.size(), round + 1);
+    EXPECT_EQ(evicted.back(), Key(200 + round));
+    EXPECT_EQ(scan.visits, 2U);
+    EXPECT_EQ(SlabAllocatorTestPeer::LifetimeCursorKey(allocator, 1, 0),
+              Key(100 + round));
+    EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeState(allocator, Key(1)));
+    EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+  }
+  // Every losing unread candidate advanced the cursor. Append did not reset it;
+  // eight old-prefix bypasses required neither pins nor a visit-budget cutoff.
+  EXPECT_NO_FATAL_FAILURE(ExpectCounts(allocator.LifetimeBandScanStats(), 2,
+                                       Path::kClass, 0, 8, 8, 0));
+  EXPECT_NO_FATAL_FAILURE(ExpectCounts(allocator.LifetimeBandScanStats(), 2,
+                                       Path::kClass, 1, 8, 8, 0));
+  // Once appends stop, crossing the tail permits the old prefix to return.
+  Scan tail(config, clock);
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, tail,
+                                                       &evicted, &denied));
+  EXPECT_EQ(evicted.back(), Key(107));
+  EXPECT_EQ(SlabAllocatorTestPeer::LifetimeCursorKey(allocator, 1, 0), Key(1));
+  Scan prefix(config, clock);
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, prefix,
+                                                       &evicted, &denied));
+  EXPECT_EQ(evicted.back(), Key(1));
+  EXPECT_EQ(tail.visits, 1U);
+  EXPECT_EQ(prefix.visits, 1U);
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
+TEST(SlabLifetimeBandScan, CappedReadRelinksAndRepairsBothCursors) {
+  SlabAllocator allocator(Options(3));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 1, 63, false, 10));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 2, 63, false, 20));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 3, 63, false, 30));
+  ASSERT_TRUE(SlabAllocatorTestPeer::PointLifetimeCursorsAt(allocator, Key(1)));
+  const DiskLifetimeConfig config;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&seconds] { return seconds; });
+  seconds = 40;
+  ASSERT_EQ(SlabAllocatorTestPeer::ApplyLifetimeRead(allocator, Key(1), 1,
+                                                     config, clock),
+            SlabAllocatorTestPeer::LifetimeReadResult::kApplied);
+  for (const size_t row : {0U, 1U}) {
+    EXPECT_EQ(SlabAllocatorTestPeer::LifetimeQueueKeys(allocator, row, 2),
+              (std::vector<BlockKey>{Key(2), Key(3), Key(1)}));
+    EXPECT_EQ(SlabAllocatorTestPeer::LifetimeCursorKey(allocator, row, 2),
+              Key(2));
+  }
+  const std::optional<DiskLifetimeState> refreshed =
+      SlabAllocatorTestPeer::LifetimeState(allocator, Key(1));
+  ASSERT_TRUE(refreshed.has_value());
+  EXPECT_EQ(refreshed->scoring_reads(), 63U);
+  EXPECT_EQ(refreshed->anchor, 40U);
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  Scan scan(config, clock);
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                       &evicted, &denied));
+  EXPECT_EQ(evicted, std::vector<BlockKey>{Key(2)});
+  EXPECT_FALSE(denied);
+  EXPECT_EQ(scan.visits, 1U);
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
+TEST(SlabLifetimeBandScan, PinnedPrefixPaysChecksBeforeLegalCandidate) {
+  SlabAllocator allocator(Options(3));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 1, 0, true, 0));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 2, 0, false, 1));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 3, 1, false, 20000));
+  const DiskLifetimeConfig config;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&seconds] { return seconds; });
+  seconds = 500000;
+  std::vector<BlockKey> evicted;
+  bool denied = false;
+  Scan scan(config, clock);
+  ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                       &evicted, &denied));
+  EXPECT_FALSE(denied);
+  EXPECT_EQ(evicted, std::vector<BlockKey>{Key(2)});
+  EXPECT_EQ(scan.visits, 3U);
+  EXPECT_NO_FATAL_FAILURE(ExpectCounts(allocator.LifetimeBandScanStats(), 2,
+                                       Path::kClass, 0, 2, 1, 1));
+  EXPECT_NO_FATAL_FAILURE(ExpectCounts(allocator.LifetimeBandScanStats(), 2,
+                                       Path::kClass, 1, 1, 1, 0));
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeState(allocator, Key(1)));
+  ASSERT_TRUE(allocator.Unpin(Key(1)));
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
 }
 
 TEST(SlabLifetimeBandScan, PersistenceFailureRetainsChecksButNotVictims) {

@@ -198,9 +198,9 @@ def check_pressure_samples(directory, report, dirs):
     return hashes
 
 
-def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair=0):
+def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair=0, hot_refill=False):
     cases = plan(pairs, start_pair)
-    config = workload.profile(profile)
+    config = workload.profile(profile, hot_refill=hot_refill)
     env = environment(profile)
     if not isinstance(tag, str) or re.fullmatch(r'[A-Za-z0-9_-]{1,40}', tag) is None:
         raise ValueError('tag must be 1..40 ASCII letters/digits/_/-')
@@ -241,6 +241,8 @@ def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair
             child_command = [sys.executable, str(Path(__file__).with_name('long_residence.py')),
                              '--lib', str(binaries[1]), '--members', 'n=127.0.0.1:12001',
                              '--output', str(case / 'client'), '--profile', profile, '--metrics-port', '12010']
+            if hot_refill:
+                child_command.append('--hot-refill')
             row.update(state='running', command=command, client_command=child_command,
                        client_timeout_sec=timeout, counts=None, client_state='not_attempted',
                        environment={key: value for key, value in env.items() if key.startswith('DFKV_')})
@@ -310,12 +312,14 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--tag', required=True)
     parser.add_argument('--profile', choices=('accelerated', 'default'), default='accelerated')
+    parser.add_argument('--hot-refill', action='store_true',
+                        help='enable separate verified hot-miss refills')
     parser.add_argument('--pairs', type=int, default=3)
     parser.add_argument('--start-pair', type=int, default=0)
     args = parser.parse_args(argv)
     try:
         result = run(args.build, args.data_root, args.output, args.tag, profile=args.profile,
-                     pairs=args.pairs, start_pair=args.start_pair)
+                     pairs=args.pairs, start_pair=args.start_pair, hot_refill=args.hot_refill)
         print(json.dumps({'passed': result['passed'], 'output': str(args.output)}))
         return 0 if result['passed'] else 1
     except (OSError, ValueError, TypeError) as error:

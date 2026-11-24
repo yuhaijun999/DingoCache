@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add opt-in hot-miss refill to RDMA residence diagnostics with per-key loss,
+  refill and subsequent-hit accounting, plus bounded candidate-selection tests;
+  keep existing request defaults and production eviction behavior unchanged.
+
 - Add RDMA-only long-residence and delayed-first-reuse diagnostics with distinct
   hot/cooled/unread cohorts, explicit accelerated score parameters, ACK-aged
   first outcomes, separate refill accounting and alternating fresh-policy runs;

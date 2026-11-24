@@ -74,6 +74,148 @@ class LongResidenceTest(unittest.TestCase):
                                eviction_counter=lambda: max(0, sum(len(client.store) for client in clients) - 20))
         return report, clients
 
+    def hot_case(self, *, fail_put=False, bad_verify=False, slow_refill=False, hot_refill=True):
+        frozen = config()
+        if hot_refill:
+            frozen['hot_refill'] = True
+        clock = Clock()
+        clients = [Client(), Client()]
+        client = clients[0]
+        original_batch, original_put, original_scalar = client.read_outcomes, client.put, client.read_outcome
+        hot_key = residence.disk.key_for(frozen['seed'], 0)
+        hot_batches = 0
+        refill_pending = False
+        def batch(keys, values):
+            nonlocal hot_batches, refill_pending
+            outcomes = original_batch(keys, values)
+            if len(keys) == frozen['cohort_size'] and keys[0] == hot_key:
+                hot_batches += 1
+                # Two preage reads and ready precede measurement. Lose the same
+                # key at measurement steps 0 and 2; later reads must be separate.
+                if hot_batches in (4, 6):
+                    outcomes[0] = {'outcome': 'get_miss', 'status': 1}
+                    refill_pending = True
+            return outcomes
+        def put(keys, values):
+            if refill_pending and keys == [hot_key]:
+                if fail_put:
+                    raise RuntimeError('hot refill PUT failed')
+                if slow_refill:
+                    clock.now += 6
+            return original_put(keys, values)
+        def scalar(key, value):
+            if bad_verify and refill_pending and key == hot_key:
+                return 'get_miss'
+            return original_scalar(key, value)
+        client.read_outcomes, client.put, client.read_outcome = batch, put, scalar
+        report = residence.run(clients, frozen, clock=clock, sleep=clock.sleep,
+            eviction_counter=lambda: max(0, sum(len(c.store) for c in clients) - 20))
+        return frozen, report
+
+    def test_hot_refill_is_opt_in_and_accounts_repeat_losses_and_later_reads(self):
+        frozen, report = self.hot_case()
+        self.assertTrue(report['passed'], report['errors'])
+        counts = residence.check_report(report, frozen)
+        self.assertEqual(report['hot_refill'], {
+            'distinct_lost_keys': 1, 'repeat_misses': 1, 'refill_puts': 2,
+            'refill_payload_bytes': 8, 'verify_gets': 2, 'verify_hits': 2,
+            'subsequent_hits': 4, 'subsequent_misses': 1})
+        self.assertEqual(counts, {'put_acks': 46, 'put_bytes': 184,
+                                 'get_hits': 68, 'get_misses': 2, 'get_attempts': 70})
+        self.assertEqual(report['refill_puts'], 0)  # Delayed-cohort refills only.
+        legacy, _ = self.run_case()
+        self.assertNotIn('hot_refill', legacy)
+        self.assertNotIn('hot_refill', residence.profile('default'))
+
+    def test_no_refill_reports_distinct_losses_without_put_or_verify_and_accepts_old_reports(self):
+        frozen, report = self.hot_case(hot_refill=False)
+        self.assertTrue(report['passed'])
+        counts = residence.check_report(report, frozen)
+        self.assertEqual(report['hot_read_summary'], {'distinct_lost_keys': 1, 'repeat_misses': 1})
+        self.assertNotIn('hot_refill', report)
+        self.assertEqual(counts, {'put_acks': 44, 'put_bytes': 176,
+                                 'get_hits': 66, 'get_misses': 2, 'get_attempts': 68})
+        old = copy.deepcopy(report)
+        old.pop('hot_read_summary')
+        for row in old['rows']:
+            row.pop('hot_outcomes', None)
+        self.assertEqual(residence.check_report(old, frozen), counts)
+        for remove in ('summary', 'row'):
+            partial = copy.deepcopy(report)
+            if remove == 'summary':
+                partial.pop('hot_read_summary')
+            else:
+                next(row for row in partial['rows'] if row['kind'] == 'hot').pop('hot_outcomes')
+            with self.assertRaises(ValueError):
+                residence.check_report(partial, frozen)
+
+    def test_hot_and_delayed_refill_totals_are_separate_but_full_metrics_include_both(self):
+        frozen = config()
+        frozen['hot_refill'] = True
+        clock = Clock()
+        clients = [Client(), Client()]
+        hot_key = residence.disk.key_for(frozen['seed'], 0)
+        delayed_key = residence.disk.key_for(frozen['seed'], 4)
+        for client in clients:
+            client.miss_first.add(delayed_key)
+            original = client.read_outcomes
+            batches = [0]
+            def controlled(keys, values, original=original, batches=batches):
+                outcomes = original(keys, values)
+                if len(keys) == frozen['cohort_size'] and keys[0] == hot_key:
+                    batches[0] += 1
+                    if batches[0] == 4:
+                        outcomes[0] = {'outcome': 'get_miss', 'status': 1}
+                return outcomes
+            client.read_outcomes = controlled
+        report = residence.run(clients, frozen, clock=clock, sleep=clock.sleep,
+            eviction_counter=lambda: max(0, sum(len(c.store) for c in clients) - 20))
+        counts = residence.check_report(report, frozen)
+        self.assertEqual(report['hot_read_summary'], {'distinct_lost_keys': 2, 'repeat_misses': 0})
+        self.assertEqual(report['hot_refill']['refill_puts'], 2)
+        self.assertEqual(report['refill_puts'], 2)
+        self.assertEqual(counts, {'put_acks': 48, 'put_bytes': 192,
+                                 'get_hits': 68, 'get_misses': 4, 'get_attempts': 72})
+
+    def test_hot_refill_failed_put_verify_and_stall_cannot_pass(self):
+        for option in ('fail_put', 'bad_verify', 'slow_refill'):
+            frozen, report = self.hot_case(**{option: True})
+            with self.subTest(option=option):
+                self.assertFalse(report['passed'])
+                with self.assertRaises(ValueError):
+                    residence.check_report(report, frozen)
+                if option == 'fail_put':
+                    self.assertEqual(report['unresolved_operation']['kind'], 'hot_refill')
+                    self.assertEqual(report['hot_refill']['refill_puts'], 0)
+                elif option == 'bad_verify':
+                    self.assertEqual(report['hot_refill']['verify_gets'], 1)
+                    self.assertEqual(report['hot_refill']['verify_hits'], 0)
+                else:
+                    self.assertIn('scheduling window', report['errors'][0])
+
+    def test_hot_refill_checker_rejects_forged_key_counts_phase_and_mode(self):
+        frozen, report = self.hot_case()
+        hot = next(i for i, row in enumerate(report['rows']) if row['kind'] == 'hot')
+        mutations = [lambda r: r['hot_refill'].update(distinct_lost_keys=2),
+                     lambda r: r['hot_refill'].update(subsequent_hits=5),
+                     lambda r: r['hot_refill'].update(refill_payload_bytes=0),
+                     lambda r: r['rows'][hot]['hot_outcomes'].pop(),
+                     lambda r: r['rows'][hot]['hot_outcomes'][0].update(index=1),
+                     lambda r: r['rows'][hot]['hot_outcomes'][0].update(refill_ack=False),
+                     lambda r: r['rows'][hot]['hot_outcomes'][0].update(verify_outcome='get_miss'),
+                     lambda r: r['rows'][hot]['hot_outcomes'][0].update(finished_sec=999),
+                     lambda r: r['rows'][hot]['hot_outcomes'][0].update(ack_sec=999),
+                     lambda r: r['config'].pop('hot_refill')]
+        for mutate in mutations:
+            forged = copy.deepcopy(report)
+            mutate(forged)
+            with self.assertRaises(ValueError):
+                residence.check_report(forged, frozen)
+        for value in (0, 1, 'yes', None):
+            invalid = dict(frozen, hot_refill=value)
+            with self.assertRaises(ValueError):
+                residence.validate(invalid)
+
     def test_profiles_are_independent_and_default_not_scaled(self):
         accelerated = residence.profile('accelerated')
         accelerated['delays_sec'][0] = 99
@@ -348,6 +490,18 @@ class LongResidenceTest(unittest.TestCase):
         self.assertAlmostEqual(report['elapsed_sec'], report['measurement_started_sec'] +
                                report['measurement_elapsed_sec'], places=9)
         self.assertEqual(residence.check_report(report, config())['get_attempts'], 68)
+
+    def test_main_hot_refill_flag_is_preserved_even_in_startup_failure_report(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / 'run'
+            with mock.patch.object(residence.disk, 'load_library', return_value=object()), \
+                    mock.patch.object(residence.disk, 'Client') as factory:
+                self.assertEqual(residence.main(['--lib', 'unused', '--members', 'unused',
+                    '--profile', 'default', '--hot-refill', '--output', str(output)]), 1)
+                factory.assert_not_called()
+            report = json.loads((output / 'report.json').read_text())
+            self.assertIs(report['config']['hot_refill'], True)
+            self.assertFalse(report['passed'])
 
     def test_main_missing_symbols_writes_failure_and_never_opens(self):
         with tempfile.TemporaryDirectory() as temp:

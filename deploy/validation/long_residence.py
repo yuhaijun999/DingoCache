@@ -19,20 +19,27 @@ import eviction_baseline_smoke as baseline
 import quick_eviction as quick
 
 
-def profile(name):
+def profile(name, *, hot_refill=False):
     if name not in ('accelerated', 'default'):
         raise ValueError('unknown residence profile')
-    return {'name': name, 'protect_sec': 12 if name == 'accelerated' else 180,
+    if type(hot_refill) is not bool:
+        raise ValueError('hot_refill must be bool')
+    config = {'name': name, 'protect_sec': 12 if name == 'accelerated' else 180,
             'delays_sec': [3, 13, 24] if name == 'accelerated' else [45, 185, 600],
             'steps': 300 if name == 'accelerated' else 1800,
             'preage_sec': 120 if name == 'accelerated' else 240,
             'interval_sec': 1, 'prefill': 6144, 'cohort_size': 32,
             'arrival_batch': 64, 'length': 4096, 'seed': 0xD1A60051}
+    if hot_refill:
+        config['hot_refill'] = True
+    return config
 
 
 def validate(config):
-    if not isinstance(config, dict) or set(config) != set(profile('default')):
+    if not isinstance(config, dict) or set(config) - {'hot_refill'} != set(profile('default')):
         raise ValueError('invalid profile fields')
+    if 'hot_refill' in config and type(config['hot_refill']) is not bool:
+        raise ValueError('hot_refill must be bool')
     if config['name'] not in ('accelerated', 'default'):
         raise ValueError('unknown residence profile')
     for name, low, high in (('protect_sec', 1, 180), ('steps', 1, 1800),
@@ -83,6 +90,14 @@ def run(clients, config, *, clock=time.monotonic, sleep=time.sleep, eviction_cou
               'counter_scope': 'validated-terminals-and-acknowledged-PUTs-not-total-attempts',
               'max_lateness_sec': 2, 'max_step_sec': 5,
               'transport_modes': [], 'scope': 'closed-loop-client-ACK-aged-diagnostic'}
+    hot_refill = config.get('hot_refill', False)
+    lost_hot = set()
+    result['hot_read_summary'] = {'distinct_lost_keys': 0, 'repeat_misses': 0}
+    if hot_refill:
+        result['hot_refill'] = dict.fromkeys((
+            'distinct_lost_keys', 'repeat_misses', 'refill_puts',
+            'refill_payload_bytes', 'verify_gets', 'verify_hits',
+            'subsequent_hits', 'subsequent_misses'), 0)
     started = clock()
     cohorts = []
 
@@ -121,11 +136,55 @@ def run(clients, config, *, clock=time.monotonic, sleep=time.sleep, eviction_cou
         result['unresolved_operation'] = None
         hits = sum(row['outcome'] == 'get_hit' for row in outcomes)
         result['actual'][kind + '_gets'] += len(indexes)
-        result['rows'].append({'kind': kind, 'namespace_hex': namespace.hex(),
-                               'start_index': indexes[0], 'count': len(indexes), 'step': step,
-                               'started_sec': begin - started,
-                               'finished_sec': clock() - started,
-                               'hits': hits, 'misses': len(indexes) - hits})
+        row = {'kind': kind, 'namespace_hex': namespace.hex(),
+               'start_index': indexes[0], 'count': len(indexes), 'step': step,
+               'started_sec': begin - started, 'finished_sec': clock() - started,
+               'hits': hits, 'misses': len(indexes) - hits}
+        result['rows'].append(row)
+        if kind == 'hot':
+            # Every hot key is observed in both modes. Refill verification is
+            # extra traffic, never a replacement for the original GET outcome.
+            row['hot_outcomes'] = []
+            summary = result.get('hot_refill')
+            for index, outcome in zip(indexes, outcomes):
+                terminal = outcome['outcome']
+                identity = (namespace, index)
+                seen = identity in lost_hot
+                if seen and hot_refill:
+                    summary['subsequent_hits' if terminal == 'get_hit' else 'subsequent_misses'] += 1
+                event = {'index': index, 'outcome': terminal,
+                         'refill_ack': False, 'ack_sec': None, 'verify_outcome': None,
+                         'started_sec': row['finished_sec'],
+                         'finished_sec': row['finished_sec']}
+                row['hot_outcomes'].append(event)
+                if terminal == 'get_miss':
+                    result['hot_read_summary']['repeat_misses' if seen else 'distinct_lost_keys'] += 1
+                    lost_hot.add(identity)
+                    if not hot_refill:
+                        continue
+                    summary['repeat_misses' if seen else 'distinct_lost_keys'] += 1
+                    keys, values = data(namespace, [index])
+                    event['started_sec'] = clock() - started
+                    result['unresolved_operation'] = {
+                        'kind': 'hot_refill', 'namespace_hex': namespace.hex(), 'index': index,
+                        'terminal': 'unknown-if-native-call-fails'}
+                    client.put(keys, values)
+                    result['unresolved_operation'] = None
+                    event['ack_sec'] = clock() - started
+                    summary['refill_puts'] += 1
+                    summary['refill_payload_bytes'] += config['length']
+                    event['refill_ack'] = True
+                    result['unresolved_operation'] = {
+                        'kind': 'hot_verify', 'namespace_hex': namespace.hex(), 'index': index,
+                        'terminal': 'unknown-if-native-call-fails'}
+                    observed = client.read_outcome(keys[0], values[0])
+                    result['unresolved_operation'] = None
+                    summary['verify_gets'] += 1
+                    event['verify_outcome'] = observed
+                    event['finished_sec'] = clock() - started
+                    if observed != 'get_hit':
+                        raise RuntimeError('hot refill verification failed')
+                    summary['verify_hits'] += 1
         if strict and hits != len(indexes):
             raise RuntimeError('initial warmup miss invalidates initial state')
 
@@ -297,6 +356,21 @@ def check_report(result, config):
     first, write_indexes, read_ids = set(), set(), set()
     acknowledgments = {}
     get_hits = get_misses = refill_puts = verify_gets = verify_hits = 0
+    hot_enabled = config.get('hot_refill', False)
+    # Old no-refill reports have no per-key ledger. Accept that complete old
+    # schema, but never a partially stripped new ledger or refill-mode report.
+    hot_ledger = 'hot_read_summary' in result
+    if hot_enabled and not hot_ledger:
+        raise ValueError('missing hot read summary')
+    hot_losses = {'distinct_lost_keys': 0, 'repeat_misses': 0}
+    hot_summary = dict.fromkeys((
+        'distinct_lost_keys', 'repeat_misses', 'refill_puts',
+        'refill_payload_bytes', 'verify_gets', 'verify_hits',
+        'subsequent_hits', 'subsequent_misses'), 0)
+    lost_hot = set()
+    hot_next_step = {namespace.hex(): 0 for namespace in disk.NAMESPACES}
+    if not hot_enabled and 'hot_refill' in result:
+        raise ValueError('unexpected hot refill mode')
     def seconds(value):
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise ValueError('invalid/nonfinite timing')
@@ -402,6 +476,48 @@ def check_report(result, config):
                     or row['finished_sec'] < row['started_sec']
                     or (kind in ('warm', 'preage', 'ready') and misses)):
                 raise ValueError('invalid batch GET denominator')
+            if kind == 'hot' and hot_ledger:
+                if step != hot_next_step[namespace]:
+                    raise ValueError('hot ledger reordered')
+                hot_next_step[namespace] += 1
+                events = row.get('hot_outcomes', [])
+                if len(events) != config['cohort_size']:
+                    raise ValueError('missing per-key hot outcomes')
+                event_hits = 0
+                cursor = end
+                for index, event in enumerate(events):
+                    terminal = event['outcome']
+                    begin_event, end_event = seconds(event['started_sec']), seconds(event['finished_sec'])
+                    miss = terminal == 'get_miss'
+                    refill = miss and hot_enabled
+                    ack = seconds(event['ack_sec']) if refill else event['ack_sec']
+                    if (type(event['index']) is not int or event['index'] != index
+                            or terminal not in ('get_hit', 'get_miss')
+                            or event['refill_ack'] is not refill
+                            or event['verify_outcome'] != ('get_hit' if refill else None)
+                            or (refill and not cursor <= begin_event <= ack <= end_event
+                                <= result['steps'][step]['finished_sec'])
+                            or (not refill and (ack is not None or begin_event != end or end_event != end))):
+                        raise ValueError('invalid hot identity/refill/phase')
+                    identity = (namespace, index)
+                    seen = identity in lost_hot
+                    if seen and hot_enabled:
+                        hot_summary['subsequent_misses' if miss else 'subsequent_hits'] += 1
+                    if miss:
+                        hot_losses['repeat_misses' if seen else 'distinct_lost_keys'] += 1
+                        lost_hot.add(identity)
+                    if refill:
+                        hot_summary['repeat_misses' if seen else 'distinct_lost_keys'] += 1
+                        hot_summary['refill_puts'] += 1
+                        hot_summary['refill_payload_bytes'] += config['length']
+                        hot_summary['verify_gets'] += 1
+                        hot_summary['verify_hits'] += 1
+                        cursor = end_event
+                    event_hits += not miss
+                if event_hits != hits:
+                    raise ValueError('hot outcomes disagree with batch totals')
+            elif 'hot_outcomes' in row:
+                raise ValueError('unexpected hot outcome ledger')
             observed[kind + '_gets'] += hits + misses
             get_hits += hits
             get_misses += misses
@@ -461,10 +577,16 @@ def check_report(result, config):
             or abs(result['measurement_elapsed_sec'] + result['measurement_started_sec']
                    - result['elapsed_sec']) > 1e-6):
         raise ValueError('incomplete byte/refill/time denominator')
-    return {'put_acks': planned['initial_puts'] + planned['arrival_puts'] + refill_puts,
-            'put_bytes': result['put_payload_bytes'] + result['refill_payload_bytes'],
-            'get_hits': get_hits + verify_hits, 'get_misses': get_misses,
-            'get_attempts': get_hits + get_misses + verify_gets}
+    if hot_ledger and (result['hot_read_summary'] != hot_losses
+                       or any(type(value) is not int for value in result['hot_read_summary'].values())):
+        raise ValueError('incomplete per-key hot loss denominator')
+    if hot_enabled and (result.get('hot_refill') != hot_summary
+                        or any(type(value) is not int for value in result['hot_refill'].values())):
+        raise ValueError('incomplete hot refill denominator')
+    return {'put_acks': planned['initial_puts'] + planned['arrival_puts'] + refill_puts + hot_summary['refill_puts'],
+            'put_bytes': result['put_payload_bytes'] + result['refill_payload_bytes'] + hot_summary['refill_payload_bytes'],
+            'get_hits': get_hits + verify_hits + hot_summary['verify_hits'], 'get_misses': get_misses,
+            'get_attempts': get_hits + get_misses + verify_gets + hot_summary['verify_gets']}
 
 
 def main(argv=None):
@@ -472,13 +594,15 @@ def main(argv=None):
     parser.add_argument('--lib', required=True)
     parser.add_argument('--members', required=True)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--hot-refill', action='store_true',
+                        help='refill hot misses and verify separately; diagnostic PUT bytes, not device amplification')
     parser.add_argument('--metrics-port', type=int, default=12010)
     parser.add_argument('--profile', choices=('accelerated', 'default'), required=True)
     args = parser.parse_args(argv)
     if not 1 <= args.metrics_port <= 65535:
         parser.error('invalid metrics port')
     args.output.mkdir(parents=True, exist_ok=False)
-    config = profile(args.profile)
+    config = profile(args.profile, hot_refill=args.hot_refill)
     clients = []
     result = {'passed': False, 'config': config, 'errors': [], 'close_errors': []}
     try:

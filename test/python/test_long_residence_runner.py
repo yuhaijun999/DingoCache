@@ -248,7 +248,7 @@ class LongResidenceRunnerTest(unittest.TestCase):
                 runner.check_pressure_samples(root, report, self.dirs)
 
     def _matrix(self, *, fail_child=False, bad_report=False, ready_fail=False,
-                mutate_build=False, mutate_tools=False, stop_fail=False, profile='accelerated'):
+                mutate_build=False, mutate_tools=False, stop_fail=False, profile='accelerated', hot_refill=False):
         root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         build = root / 'build'
         build.mkdir()
@@ -305,7 +305,7 @@ class LongResidenceRunnerTest(unittest.TestCase):
                 original(server)
                 raise RuntimeError('controlled stop error')
             self.stack.enter_context(mock.patch.object(runner.common, 'stop_owned', side_effect=stop))
-        result = runner.run(build, roots, output, 'tag', pairs=1, profile=profile)
+        result = runner.run(build, roots, output, 'tag', pairs=1, profile=profile, hot_refill=hot_refill)
         return result, output, processes, child_run
 
     def test_matrix_fresh_paths_rdma_bounded_child_and_normal_reaping(self):
@@ -326,6 +326,21 @@ class LongResidenceRunnerTest(unittest.TestCase):
         for process in processes:
             process.terminate.assert_called_once()
 
+    def test_hot_refill_mode_is_manifest_bound_and_forwarded_without_changing_server(self):
+        result, output, processes, child = self._matrix(hot_refill=True, profile='default')
+        self.assertTrue(result['passed'])
+        self.assertIs(result['profile']['hot_refill'], True)
+        self.assertIs(json.loads((output / 'matrix.json').read_text())['profile']['hot_refill'], True)
+        self.assertEqual(result['planned_per_case'],
+                         runner.workload.expected_counts(runner.workload.profile('default')))
+        self.assertEqual(child.call_count, 2)
+        for call, row in zip(child.call_args_list, result['cases']):
+            self.assertIn('--hot-refill', call.args[0])
+            self.assertNotIn('--hot-refill', row['command'])
+            self.assertEqual(row['client_timeout_sec'], 2160)
+            self.assertTrue(row['server_reaped'])
+        self.assertEqual(len(processes), 2)
+
     def test_default_matrix_keeps_full_window_and_2160_second_child_budget(self):
         result, _, processes, child = self._matrix(profile='default')
         self.assertTrue(result['passed'])
@@ -342,6 +357,7 @@ class LongResidenceRunnerTest(unittest.TestCase):
             self.assertEqual(len(row['data_dirs']), 3)
             command = call.args[0]
             self.assertEqual(command[command.index('--profile') + 1], 'default')
+            self.assertNotIn('--hot-refill', command)
             self.assertTrue(set(runner.ACCELERATED).isdisjoint(row['environment']))
             self.assertTrue(row['server_reaped'])
             self.assertEqual(row['server_exit'], 0)
