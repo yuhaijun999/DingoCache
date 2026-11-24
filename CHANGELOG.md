@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Document a tested but unadopted lifetime candidate-retention prototype and
+  retain cross-path selection diagnostics; preserve production eviction behavior
+  after default-profile RDMA results failed to establish a benefit.
+
 - Add opt-in hot-miss refill to RDMA residence diagnostics with per-key loss,
   refill and subsequent-hit accounting, plus bounded candidate-selection tests;
   keep existing request defaults and production eviction behavior unchanged.

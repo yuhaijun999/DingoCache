@@ -339,6 +339,139 @@ TEST(SlabLifetimeBandScan, ContinuousAppendCanDelayOldPrefixRevisit) {
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
 }
 
+// Diagnose the current selectors, not a new fairness or global-minimum
+// contract. All paths start naturally at the oldest NEW and use the same
+// reachable states.
+void ExpectCurrentCandidateBehaviorAcrossAppends(Path path) {
+  SlabAllocator allocator(Options(32));
+  ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 1, 0));
+  const DiskLifetimeConfig config;
+  uint64_t seconds = 0;
+  const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                [&seconds] { return seconds; });
+  std::vector<BlockKey> evicted;
+  const auto select_one = [&] {
+    const uint64_t before = allocator.WatermarkScanVisits();
+    if (path == Path::kWatermark) {
+      ASSERT_EQ(SlabAllocatorTestPeer::EvictLifetimeToTarget(
+                    allocator, 0, 1, config, clock, &evicted),
+                1U);
+      EXPECT_EQ(allocator.WatermarkScanVisits() - before, 2U);
+      return;
+    }
+    Scan scan(config, clock);
+    if (path == Path::kBackground) {
+      SetTickBudget(scan, 1);
+      const size_t target = allocator.Classes()[0].free_slots + 1;
+      const SlabAllocatorTestPeer::LifetimeReclaimResult result =
+          SlabAllocatorTestPeer::ReclaimLifetimeClass(allocator, 0, target, 1,
+                                                      scan, &evicted);
+      ASSERT_EQ(result.victims, 1U);
+    } else {
+      bool denied = false;
+      ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                           &evicted, &denied));
+      EXPECT_FALSE(denied);
+    }
+    EXPECT_EQ(scan.visits, 2U);
+  };
+  for (uint64_t round = 0; round < 6; ++round) {
+    SCOPED_TRACE(round);
+    seconds = 10 + round;
+    ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 100 + round, 0, false,
+                                          static_cast<uint32_t>(seconds)));
+    ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 200 + round, 2, false,
+                                          static_cast<uint32_t>(seconds)));
+    ASSERT_NO_FATAL_FAILURE(select_one());
+    ASSERT_EQ(evicted.size(), round + 1);
+    EXPECT_EQ(evicted.back(), Key(200 + round));
+    EXPECT_TRUE(allocator.Contains(Key(1)));
+    EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+  }
+  // At P the oldest NEW loses its BOOST. Class/background have advanced past
+  // it, while watermark has retained its losing candidate across selections.
+  // This records a path difference; it does not label either behavior a new
+  // spec.
+  seconds = config.protect_sec;
+  ASSERT_NO_FATAL_FAILURE(
+      SeedReachable(allocator, 199, 0, false, static_cast<uint32_t>(seconds)));
+  ASSERT_NO_FATAL_FAILURE(
+      SeedReachable(allocator, 299, 2, false, static_cast<uint32_t>(seconds)));
+  ASSERT_LT(DiskLifetimeScore(config, 0, 0, false, true, seconds),
+            DiskLifetimeScore(config, static_cast<uint32_t>(seconds), 2, false,
+                              false, seconds));
+  ASSERT_NO_FATAL_FAILURE(select_one());
+  ASSERT_EQ(evicted.size(), 7U);
+  const bool retained = path == Path::kWatermark;
+  EXPECT_EQ(evicted.back(), retained ? Key(1) : Key(299));
+  EXPECT_EQ(allocator.Contains(Key(1)), !retained);
+  EXPECT_EQ(allocator.Contains(Key(299)), retained);
+  EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+  EXPECT_NO_FATAL_FAILURE(
+      ExpectCounts(allocator.LifetimeBandScanStats(), 2, path, 0, 7, 7, 0));
+  EXPECT_NO_FATAL_FAILURE(
+      ExpectCounts(allocator.LifetimeBandScanStats(), 2, path, 2, 7, 7, 0));
+}
+
+TEST(SlabLifetimeBandScan,
+     ClassAdvancesPastLosingCandidateAcrossContinuousAppends) {
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectCurrentCandidateBehaviorAcrossAppends(Path::kClass));
+}
+
+TEST(SlabLifetimeBandScan,
+     BackgroundAdvancesPastLosingCandidateAcrossContinuousAppends) {
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectCurrentCandidateBehaviorAcrossAppends(Path::kBackground));
+}
+
+TEST(SlabLifetimeBandScan,
+     WatermarkRetainsLosingCandidateAcrossContinuousAppends) {
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectCurrentCandidateBehaviorAcrossAppends(Path::kWatermark));
+}
+
+TEST(SlabLifetimeBandScan,
+     WatermarkRetainedCandidateIsRecheckedAfterPinOrRemove) {
+  for (const bool remove : {false, true}) {
+    SCOPED_TRACE(remove);
+    SlabAllocator allocator(Options(4));
+    ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 1, 0));
+    ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 2, 0, false, 1));
+    ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 3, 2, false, 10));
+    const DiskLifetimeConfig config;
+    uint64_t seconds = 0;
+    const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                  [&seconds] { return seconds; });
+    seconds = 10;
+    std::vector<BlockKey> evicted;
+    ASSERT_EQ(SlabAllocatorTestPeer::EvictLifetimeToTarget(
+                  allocator, 0, 1, config, clock, &evicted),
+              1U);
+    ASSERT_EQ(evicted, std::vector<BlockKey>{Key(3)});
+    ASSERT_EQ(SlabAllocatorTestPeer::LifetimeCursorKey(allocator, 0, 0),
+              Key(1));
+    if (remove) {
+      ASSERT_EQ(allocator.Remove(Key(1)),
+                SlabAllocator::RemoveResult::kRemoved);
+    } else {
+      ASSERT_TRUE(allocator.Pin(Key(1)));
+    }
+    seconds = config.protect_sec + 1;
+    const uint64_t before = allocator.WatermarkScanVisits();
+    ASSERT_EQ(SlabAllocatorTestPeer::EvictLifetimeToTarget(
+                  allocator, 0, 1, config, clock, &evicted),
+              1U);
+    EXPECT_EQ(evicted, (std::vector<BlockKey>{Key(3), Key(2)}));
+    EXPECT_EQ(allocator.WatermarkScanVisits() - before, remove ? 1U : 2U);
+    EXPECT_EQ(allocator.Contains(Key(1)), !remove);
+    if (!remove) {
+      ASSERT_TRUE(allocator.Unpin(Key(1)));
+    }
+    EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+  }
+}
+
 TEST(SlabLifetimeBandScan, CappedReadRelinksAndRepairsBothCursors) {
   SlabAllocator allocator(Options(3));
   ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 1, 63, false, 10));
