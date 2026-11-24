@@ -8,6 +8,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -337,6 +338,122 @@ TEST(SlabLifetimeBandScan, ContinuousAppendCanDelayOldPrefixRevisit) {
   EXPECT_EQ(tail.visits, 1U);
   EXPECT_EQ(prefix.visits, 1U);
   EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+}
+
+// Both bands contain exactly one legal resident, so these outcomes diagnose
+// the score contract without an unchecked prefix or cursor fairness ambiguity.
+TEST(SlabLifetimeBandScan, NewWriteExpiryChangesTheCheckedVictim) {
+  for (const uint32_t protect_sec : {60U, 120U, 180U}) {
+    DiskLifetimeConfig config;
+    config.protect_sec = protect_sec;
+    std::string error;
+    ASSERT_TRUE(ValidateDiskLifetimeConfig(config, &error)) << error;
+    for (const uint32_t age : {protect_sec - 1, protect_sec, protect_sec + 1}) {
+      SCOPED_TRACE(protect_sec);
+      SCOPED_TRACE(age);
+      SlabAllocator allocator(Options(2));
+      ASSERT_NO_FATAL_FAILURE(SeedReachable(allocator, 1, 0));
+      SlabAllocator::SlotRef ref;
+      std::vector<BlockKey> evicted;
+      ASSERT_TRUE(allocator.Put(Key(2), 1, &ref, &evicted));
+      ASSERT_TRUE(evicted.empty());
+      DiskLifetimeState hot = NewDiskLifetimeState(0);
+      ASSERT_TRUE(ApplyDiskLifetimeRead(config, age, &hot));
+      ASSERT_TRUE(ApplyDiskLifetimeRead(config, age, &hot));
+      SlabAllocatorTestPeer::CommitGeneration(&allocator, Key(2), 2, &hot);
+      ASSERT_FALSE(hot.write_armed());
+      ASSERT_EQ(
+          DiskLifetimeBand(config, hot.scoring_reads(), hot.first_early_read()),
+          2U);
+      const int64_t unread_score =
+          DiskLifetimeScore(config, 0, 0, false, true, age);
+      const int64_t hot_score =
+          DiskLifetimeScore(config, hot.anchor, hot.scoring_reads(),
+                            hot.first_early_read(), hot.write_armed(), age);
+      ASSERT_EQ(hot_score, 1209600);
+      if (age < protect_sec) {
+        ASSERT_GT(unread_score, hot_score);
+      } else {
+        ASSERT_LT(unread_score, hot_score);
+      }
+      uint64_t seconds = 0;
+      const DiskLifetimeClock clock(DiskLifetimeHorizon(config),
+                                    [&seconds] { return seconds; });
+      seconds = age;
+      bool denied = false;
+      Scan scan(config, clock);
+      ASSERT_TRUE(SlabAllocatorTestPeer::ScanLifetimeClass(allocator, 0, scan,
+                                                           &evicted, &denied));
+      EXPECT_FALSE(denied);
+      EXPECT_EQ(evicted, std::vector<BlockKey>{Key(age < protect_sec ? 2 : 1)});
+      EXPECT_EQ(scan.visits, 2U);
+      EXPECT_NO_FATAL_FAILURE(ExpectCounts(allocator.LifetimeBandScanStats(), 2,
+                                           Path::kClass, 0, 1, 1, 0));
+      EXPECT_NO_FATAL_FAILURE(ExpectCounts(allocator.LifetimeBandScanStats(), 2,
+                                           Path::kClass, 2, 1, 1, 0));
+      EXPECT_TRUE(SlabAllocatorTestPeer::LifetimeIndexesValid(allocator));
+    }
+  }
+}
+
+TEST(SlabLifetimeBandScan, FirstEarlyReadWithdrawsBoostAndCapsReward) {
+  for (const uint32_t protect_sec : {60U, 120U, 180U}) {
+    SCOPED_TRACE(protect_sec);
+    DiskLifetimeConfig config;
+    config.protect_sec = protect_sec;
+    std::string error;
+    ASSERT_TRUE(ValidateDiskLifetimeConfig(config, &error)) << error;
+    DiskLifetimeState state = NewDiskLifetimeState(0);
+    const int64_t before = DiskLifetimeScore(config, 0, 0, false, true, 45);
+    ASSERT_TRUE(ApplyDiskLifetimeRead(config, 45, &state));
+    EXPECT_EQ(state.scoring_reads(), 1U);
+    EXPECT_TRUE(state.first_early_read());
+    EXPECT_FALSE(state.write_armed());
+    EXPECT_EQ(DiskLifetimeBand(config, state.scoring_reads(),
+                               state.first_early_read()),
+              2U);
+    const int64_t after =
+        DiskLifetimeScore(config, state.anchor, state.scoring_reads(),
+                          state.first_early_read(), state.write_armed(), 45);
+    EXPECT_EQ(after, 1209600);
+    EXPECT_GT(before, after);
+    for (uint32_t read = 1; read < 70; ++read) {
+      ASSERT_TRUE(ApplyDiskLifetimeRead(config, 45, &state));
+    }
+    EXPECT_EQ(state.scoring_reads(), 63U);
+    EXPECT_EQ(DiskLifetimeBand(config, state.scoring_reads(),
+                               state.first_early_read()),
+              2U);
+    EXPECT_EQ(
+        DiskLifetimeScore(config, state.anchor, state.scoring_reads(),
+                          state.first_early_read(), state.write_armed(), 45),
+        after);
+  }
+}
+
+TEST(SlabLifetimeBandScan,
+     ProtectOverrideAlsoChangesEarlyRewardAndAgingCredit) {
+  struct Case {
+    uint32_t protect_sec;
+    bool early_at_100;
+    int64_t unread_score_at_600;
+  };
+  for (const Case& test : {Case{60, false, 604245}, Case{120, true, 604290},
+                           Case{180, true, 604335}}) {
+    SCOPED_TRACE(test.protect_sec);
+    DiskLifetimeConfig config;
+    config.protect_sec = test.protect_sec;
+    std::string error;
+    ASSERT_TRUE(ValidateDiskLifetimeConfig(config, &error)) << error;
+    DiskLifetimeState state = NewDiskLifetimeState(0);
+    ASSERT_TRUE(ApplyDiskLifetimeRead(config, 100, &state));
+    EXPECT_EQ(state.first_early_read(), test.early_at_100);
+    EXPECT_EQ(DiskLifetimeBand(config, state.scoring_reads(),
+                               state.first_early_read()),
+              test.early_at_100 ? 2U : 1U);
+    EXPECT_EQ(DiskLifetimeScore(config, 0, 0, false, true, 600),
+              test.unread_score_at_600);
+  }
 }
 
 // Diagnose the current selectors, not a new fairness or global-minimum

@@ -216,6 +216,73 @@ class LongResidenceTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 residence.validate(invalid)
 
+    def test_pressure_presets_change_only_arrivals_window_and_optional_protection(self):
+        baseline = residence.profile('default')
+        for name, arrivals, protection in (('low', 16, 180), ('medium', 32, 180),
+                ('high', 64, 180), ('p60', 64, 60), ('p120', 64, 120)):
+            with self.subTest(case=name):
+                frozen = residence.profile('default', pressure_case=name, hot_refill=True)
+                expected = dict(baseline, steps=660, arrival_batch=arrivals,
+                                protect_sec=protection, hot_refill=True)
+                self.assertEqual(frozen, expected)
+                self.assertEqual(residence.validate(frozen), frozen)
+                counts = residence.expected_counts(frozen)
+                self.assertEqual(counts['arrival_puts'], 2 * arrivals * 660)
+                self.assertEqual(counts['hot_gets'], 42240)
+                self.assertEqual(counts['first_gets'], 192)
+                frozen['delays_sec'][0] = 1
+        self.assertEqual(residence.profile('default'), baseline)
+        self.assertNotIn('hot_refill', baseline)
+
+    def test_pressure_fake_replay_keeps_600_second_reuse_and_complete_ledger(self):
+        # Tiny payloads keep this an offline schedule/ledger test, not a disk
+        # capacity emulator or native pressure/benefit measurement.
+        frozen = residence.profile('default', pressure_case='p60', hot_refill=True)
+        frozen['length'] = 4
+        clients = [Client(), Client()]
+        clock = Clock()
+        report = residence.run(clients, frozen, clock=clock, sleep=clock.sleep,
+            eviction_counter=lambda: max(0, sum(len(client.store) for client in clients) - 12288))
+        self.assertTrue(report['passed'])
+        counts = residence.check_report(report, frozen)
+        self.assertEqual(report['measurement_elapsed_sec'], 660)
+        self.assertEqual(report['actual']['arrival_puts'], 84480)
+        self.assertEqual(report['actual']['hot_gets'], 42240)
+        self.assertEqual(counts['get_misses'], 0)
+        self.assertEqual({row['target_age_sec'] for row in report['rows'] if row['kind'] == 'first'},
+                         {45, 185, 600})
+        changed = dict(frozen, arrival_batch=16)
+        with self.assertRaises(ValueError):
+            residence.check_report(report, changed)
+
+    def test_pressure_selection_rejects_invalid_and_accelerated_before_io(self):
+        for selection in ('', 'LOW', 'unknown', True, 16, [], {}):
+            with self.subTest(selection=selection), self.assertRaises(ValueError):
+                residence.profile('default', pressure_case=selection)
+        with self.assertRaises(ValueError):
+            residence.profile('accelerated', pressure_case='low')
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(residence.disk, 'load_library') as load:
+            output = Path(temp) / 'run'
+            with self.assertRaises(SystemExit) as error:
+                residence.main(['--lib', 'unused', '--members', 'unused',
+                    '--profile', 'accelerated', '--pressure-case', 'low', '--output', str(output)])
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse(output.exists())
+            load.assert_not_called()
+
+    def test_main_pressure_selection_preserved_in_startup_failure_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / 'run'
+            with mock.patch.object(residence.disk, 'load_library', return_value=object()):
+                self.assertEqual(residence.main(['--lib', 'unused', '--members', 'unused',
+                    '--profile', 'default', '--pressure-case', 'p60', '--hot-refill',
+                    '--output', str(output)]), 1)
+            report = json.loads((output / 'report.json').read_text())
+            self.assertEqual(report['config'], residence.profile(
+                'default', pressure_case='p60', hot_refill=True))
+            self.assertFalse(report['passed'])
+
     def test_profiles_are_independent_and_default_not_scaled(self):
         accelerated = residence.profile('accelerated')
         accelerated['delays_sec'][0] = 99

@@ -40,8 +40,8 @@ def plan(pairs=3, start_pair=0):
                                           else ('lifetime', 'legacy'))]
 
 
-def environment(profile):
-    workload.profile(profile)
+def environment(profile, *, pressure_case=None):
+    config = workload.profile(profile, pressure_case=pressure_case)
     env = {key: value for key, value in os.environ.items() if not key.startswith('DFKV_')}
     env.update(smoke.CLIENT_ENV, DFKV_RAM_TIER='0', DFKV_PUT_ACK_MODE='disk',
                DFKV_SERVER_URING='1', DFKV_GET_MISS_RETRIES='0',
@@ -49,15 +49,17 @@ def environment(profile):
                DFKV_SLAB_EVICT_HIGH_PCT='0')
     if profile == 'accelerated':
         env.update(ACCELERATED)
+    elif pressure_case in ('p60', 'p120'):
+        env['DFKV_SLAB_PROTECT_SEC'] = str(config['protect_sec'])
     source = Path(__file__).resolve().parents[2]
     env['PYTHONPATH'] = str(source / 'integration/common/src')
     return env
 
 
 
-def check_startup(text, profile, policy):
+def check_startup(text, profile, policy, *, pressure_case=None):
     """Read back effective settings before sending any workload writes."""
-    workload.profile(profile)
+    config = workload.profile(profile, pressure_case=pressure_case)
     if policy not in ('legacy', 'lifetime'):
         raise ValueError('unknown policy')
     expected = {'DFKV_PUT_ACK_MODE': 'disk', 'DFKV_RAM_TIER': 'off',
@@ -66,7 +68,7 @@ def check_startup(text, profile, policy):
                 'disk_eviction_requested': policy, 'disk_eviction_effective': policy}
     scores = ACCELERATED if profile == 'accelerated' else {
         'DFKV_SLAB_LIFE_BASE_SEC': '604800', 'DFKV_SLAB_LIFE_READ_BONUS_SEC': '302400',
-        'DFKV_SLAB_LIFE_MAX_READS': '2', 'DFKV_SLAB_PROTECT_SEC': '180',
+        'DFKV_SLAB_LIFE_MAX_READS': '2', 'DFKV_SLAB_PROTECT_SEC': str(config['protect_sec']),
         'DFKV_SLAB_PROTECT_SLOWDOWN': '4', 'DFKV_SLAB_PROTECT_BOOST_SEC': '1209600',
         'DFKV_SLAB_KEEP_SCORE_SEC': '475200', 'DFKV_SLAB_BUCKET_SEC': '43200',
         'DFKV_SLAB_BUCKET_COUNT': '24'}
@@ -198,10 +200,11 @@ def check_pressure_samples(directory, report, dirs):
     return hashes
 
 
-def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair=0, hot_refill=False):
+def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair=0, hot_refill=False,
+        pressure_case=None):
     cases = plan(pairs, start_pair)
-    config = workload.profile(profile, hot_refill=hot_refill)
-    env = environment(profile)
+    config = workload.profile(profile, hot_refill=hot_refill, pressure_case=pressure_case)
+    env = environment(profile, pressure_case=pressure_case)
     if not isinstance(tag, str) or re.fullmatch(r'[A-Za-z0-9_-]{1,40}', tag) is None:
         raise ValueError('tag must be 1..40 ASCII letters/digits/_/-')
     if any(',' in str(Path(root).resolve()) for root in roots):
@@ -223,6 +226,8 @@ def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair
                   accelerated_scores=ACCELERATED if profile == 'accelerated' else None,
                   planned_per_case=workload.expected_counts(config),
                   scope='compact-capacity-turnover-not-production-scale-or-day-aging')
+    if pressure_case is not None:
+        result['pressure_case'] = pressure_case
     timeout = config['steps'] * config['interval_sec'] + config['preage_sec'] + 120
     try:
         for row in cases:
@@ -241,6 +246,8 @@ def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair
             child_command = [sys.executable, str(Path(__file__).with_name('long_residence.py')),
                              '--lib', str(binaries[1]), '--members', 'n=127.0.0.1:12001',
                              '--output', str(case / 'client'), '--profile', profile, '--metrics-port', '12010']
+            if pressure_case is not None:
+                child_command.extend(('--pressure-case', pressure_case))
             if hot_refill:
                 child_command.append('--hot-refill')
             row.update(state='running', command=command, client_command=child_command,
@@ -253,7 +260,8 @@ def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair
                     row['server_pid'] = server.pid
                     before = baseline._ready(server, 12010, case / 'server.log', row['policy'])
                     check_initial(before, row['data_dirs'])
-                    check_startup((case / 'server.log').read_text(), profile, row['policy'])
+                    check_startup((case / 'server.log').read_text(), profile, row['policy'],
+                                  pressure_case=pressure_case)
                     (case / 'before.prom').write_text(before)
                     row['client_state'] = 'running'
                     try:
@@ -312,6 +320,8 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--tag', required=True)
     parser.add_argument('--profile', choices=('accelerated', 'default'), default='accelerated')
+    parser.add_argument('--pressure-case', choices=workload.PRESSURE_CASES,
+                        help='opt-in 660-step default-score pressure/P diagnostic')
     parser.add_argument('--hot-refill', action='store_true',
                         help='enable separate verified hot-miss refills')
     parser.add_argument('--pairs', type=int, default=3)
@@ -319,7 +329,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         result = run(args.build, args.data_root, args.output, args.tag, profile=args.profile,
-                     pairs=args.pairs, start_pair=args.start_pair, hot_refill=args.hot_refill)
+                     pairs=args.pairs, start_pair=args.start_pair, hot_refill=args.hot_refill,
+                     pressure_case=args.pressure_case)
         print(json.dumps({'passed': result['passed'], 'output': str(args.output)}))
         return 0 if result['passed'] else 1
     except (OSError, ValueError, TypeError) as error:

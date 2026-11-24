@@ -123,6 +123,57 @@ class LongResidenceRunnerTest(unittest.TestCase):
                 with self.subTest(policy=policy, name=name), self.assertRaises(ValueError):
                     runner.check_startup(altered, 'default', policy)
 
+    def test_pressure_environment_overrides_only_selected_protection(self):
+        baseline = runner.environment('default')
+        for selection in ('low', 'medium', 'high'):
+            with self.subTest(selection=selection):
+                self.assertEqual(runner.environment('default', pressure_case=selection), baseline)
+        for selection, protection in (('p60', '60'), ('p120', '120')):
+            with self.subTest(selection=selection):
+                expected = dict(baseline, DFKV_SLAB_PROTECT_SEC=protection)
+                self.assertEqual(runner.environment('default', pressure_case=selection), expected)
+        self.assertEqual(runner.environment('default'), baseline)
+
+    def test_pressure_startup_checks_selected_protection_and_every_other_score(self):
+        scores = {'DFKV_SLAB_LIFE_BASE_SEC': '604800', 'DFKV_SLAB_LIFE_READ_BONUS_SEC': '302400',
+                  'DFKV_SLAB_LIFE_MAX_READS': '2', 'DFKV_SLAB_PROTECT_SEC': '60',
+                  'DFKV_SLAB_PROTECT_SLOWDOWN': '4', 'DFKV_SLAB_PROTECT_BOOST_SEC': '1209600',
+                  'DFKV_SLAB_KEEP_SCORE_SEC': '475200', 'DFKV_SLAB_BUCKET_SEC': '43200',
+                  'DFKV_SLAB_BUCKET_COUNT': '24'}
+        common = {'DFKV_PUT_ACK_MODE': 'disk', 'DFKV_RAM_TIER': 'off',
+                  'DFKV_SERVER_URING': 'on', 'DFKV_SLAB_RECLAIM_MS': '0',
+                  'DFKV_SLAB_EVICT_LOW_PCT': '0', 'DFKV_SLAB_EVICT_HIGH_PCT': '0'}
+        for policy in ('legacy', 'lifetime'):
+            values = dict(common, disk_eviction_requested=policy, disk_eviction_effective=policy)
+            values.update({name: value if policy == 'lifetime' else 'inactive'
+                           for name, value in scores.items()})
+            text = '\n'.join(name + ' = ' + value + ' (fixture)' for name, value in values.items())
+            runner.check_startup(text, 'default', policy, pressure_case='p60')
+            for name in scores:
+                with self.subTest(policy=policy, name=name), self.assertRaises(ValueError):
+                    runner.check_startup(text.replace(name + ' = ' + values[name], name + ' = 999'),
+                                         'default', policy, pressure_case='p60')
+            if policy == 'lifetime':
+                with self.assertRaises(ValueError):
+                    runner.check_startup(text, 'default', policy, pressure_case='high')
+
+    def test_main_forwards_pressure_selection_to_owned_runner(self):
+        with mock.patch.object(runner, 'run', return_value={'passed': True}) as run:
+            self.assertEqual(runner.main(['--build', '/unused/build', '--data-root', '/unused/disk',
+                '--output', '/unused/results', '--tag', 'fixture', '--profile', 'default',
+                '--pressure-case', 'p120', '--hot-refill', '--pairs', '1', '--start-pair', '1']), 0)
+            self.assertEqual(run.call_args.kwargs, dict(profile='default', pressure_case='p120',
+                                                       hot_refill=True, pairs=1, start_pair=1))
+
+    def test_invalid_pressure_selection_precedes_guest_paths_and_spawn(self):
+        with mock.patch.object(runner.common, 'guest_paths') as guest, \
+                mock.patch.object(runner.subprocess, 'Popen') as spawn:
+            for profile, selection in (('accelerated', 'low'), ('default', 'unknown')):
+                with self.subTest(profile=profile, selection=selection), self.assertRaises(ValueError):
+                    runner.run('/absent', [], '/unused', 'tag', profile=profile, pressure_case=selection)
+            guest.assert_not_called()
+            spawn.assert_not_called()
+
     def test_accelerated_score_relationships_and_horizon(self):
         env = runner.ACCELERATED
         base, bonus, cap, protect, slow, boost, keep, width, buckets = [int(env[name]) for name in
@@ -248,7 +299,8 @@ class LongResidenceRunnerTest(unittest.TestCase):
                 runner.check_pressure_samples(root, report, self.dirs)
 
     def _matrix(self, *, fail_child=False, bad_report=False, ready_fail=False,
-                mutate_build=False, mutate_tools=False, stop_fail=False, profile='accelerated', hot_refill=False):
+                mutate_build=False, mutate_tools=False, stop_fail=False, profile='accelerated', hot_refill=False,
+                pressure_case=None):
         root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         build = root / 'build'
         build.mkdir()
@@ -282,7 +334,7 @@ class LongResidenceRunnerTest(unittest.TestCase):
         self.stack.enter_context(mock.patch.object(runner.subprocess, 'Popen', side_effect=spawn))
         def child(command, **kwargs):
             self.assertEqual(kwargs['env']['DFKV_RDMA'], '1')
-            expected_profile = runner.workload.profile(profile)
+            expected_profile = runner.workload.profile(profile, pressure_case=pressure_case)
             self.assertEqual(kwargs['timeout'], expected_profile['steps'] * expected_profile['interval_sec']
                              + expected_profile['preage_sec'] + 120)
             path = Path(command[command.index('--output') + 1])
@@ -305,13 +357,15 @@ class LongResidenceRunnerTest(unittest.TestCase):
                 original(server)
                 raise RuntimeError('controlled stop error')
             self.stack.enter_context(mock.patch.object(runner.common, 'stop_owned', side_effect=stop))
-        result = runner.run(build, roots, output, 'tag', pairs=1, profile=profile, hot_refill=hot_refill)
+        result = runner.run(build, roots, output, 'tag', pairs=1, profile=profile, hot_refill=hot_refill,
+                            pressure_case=pressure_case)
         return result, output, processes, child_run
 
     def test_matrix_fresh_paths_rdma_bounded_child_and_normal_reaping(self):
         result, output, processes, child = self._matrix()
         self.assertTrue(result['passed'])
         self.assertFalse(result['formal_ab'])
+        self.assertNotIn('pressure_case', result)
         self.assertEqual(result['gpu'], 'excluded')
         self.assertEqual(result['planned_per_case'],
                          runner.workload.expected_counts(runner.workload.profile('accelerated')))
@@ -361,6 +415,27 @@ class LongResidenceRunnerTest(unittest.TestCase):
             self.assertTrue(set(runner.ACCELERATED).isdisjoint(row['environment']))
             self.assertTrue(row['server_reaped'])
             self.assertEqual(row['server_exit'], 0)
+
+    def test_pressure_matrix_binds_preset_to_child_manifest_and_complete_denominators(self):
+        for selection in ('low', 'medium', 'high', 'p60', 'p120'):
+            with self.subTest(selection=selection):
+                result, output, processes, child = self._matrix(
+                    profile='default', pressure_case=selection, hot_refill=True)
+                self.assertTrue(result['passed'])
+                expected = runner.workload.profile('default', pressure_case=selection, hot_refill=True)
+                self.assertEqual(result['profile'], expected)
+                self.assertEqual(result['pressure_case'], selection)
+                self.assertEqual(result['planned_per_case'], runner.workload.expected_counts(expected))
+                self.assertEqual(json.loads((output / 'matrix.json').read_text())['pressure_case'], selection)
+                self.assertEqual(len(processes), 2)
+                for call, row in zip(child.call_args_list, result['cases']):
+                    command = call.args[0]
+                    self.assertEqual(command[command.index('--pressure-case') + 1], selection)
+                    self.assertEqual(row['client_timeout_sec'], 1020)
+                    self.assertTrue(row['server_reaped'])
+                    protection = row['environment'].get('DFKV_SLAB_PROTECT_SEC')
+                    self.assertEqual(protection, str(expected['protect_sec']) if selection.startswith('p') else None)
+                runner.workload.check_report.assert_called_with({}, expected)
 
     def test_failure_is_failstop_reported_and_server_reaped(self):
         for option in ('fail_child', 'bad_report', 'stop_fail'):

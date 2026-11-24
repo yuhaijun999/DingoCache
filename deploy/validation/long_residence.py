@@ -19,17 +19,29 @@ import eviction_baseline_smoke as baseline
 import quick_eviction as quick
 
 
-def profile(name, *, hot_refill=False):
+# Each tuple is (new arrivals per namespace per step, P in seconds).
+# These bounded diagnostics do not change either existing profile by default.
+PRESSURE_CASES = {'low': (16, 180), 'medium': (32, 180), 'high': (64, 180),
+                  'p60': (64, 60), 'p120': (64, 120)}
+
+
+def profile(name, *, hot_refill=False, pressure_case=None):
     if name not in ('accelerated', 'default'):
         raise ValueError('unknown residence profile')
     if type(hot_refill) is not bool:
         raise ValueError('hot_refill must be bool')
+    if pressure_case is not None and (name != 'default' or type(pressure_case) is not str
+                                      or pressure_case not in PRESSURE_CASES):
+        raise ValueError('pressure_case requires default profile and a known preset')
     config = {'name': name, 'protect_sec': 12 if name == 'accelerated' else 180,
             'delays_sec': [3, 13, 24] if name == 'accelerated' else [45, 185, 600],
             'steps': 300 if name == 'accelerated' else 1800,
             'preage_sec': 120 if name == 'accelerated' else 240,
             'interval_sec': 1, 'prefill': 6144, 'cohort_size': 32,
             'arrival_batch': 64, 'length': 4096, 'seed': 0xD1A60051}
+    if pressure_case is not None:
+        config['arrival_batch'], config['protect_sec'] = PRESSURE_CASES[pressure_case]
+        config['steps'] = 660
     if hot_refill:
         config['hot_refill'] = True
     return config
@@ -598,11 +610,16 @@ def main(argv=None):
                         help='refill hot misses and verify separately; diagnostic PUT bytes, not device amplification')
     parser.add_argument('--metrics-port', type=int, default=12010)
     parser.add_argument('--profile', choices=('accelerated', 'default'), required=True)
+    parser.add_argument('--pressure-case', choices=PRESSURE_CASES,
+                        help='opt-in 660-step default-score pressure/P diagnostic')
     args = parser.parse_args(argv)
     if not 1 <= args.metrics_port <= 65535:
         parser.error('invalid metrics port')
+    try:
+        config = profile(args.profile, hot_refill=args.hot_refill, pressure_case=args.pressure_case)
+    except ValueError as error:
+        parser.error(str(error))
     args.output.mkdir(parents=True, exist_ok=False)
-    config = profile(args.profile, hot_refill=args.hot_refill)
     clients = []
     result = {'passed': False, 'config': config, 'errors': [], 'close_errors': []}
     try:

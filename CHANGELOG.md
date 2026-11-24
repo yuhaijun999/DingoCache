@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add opt-in bounded RDMA pressure/P diagnostics and actual C++ score-order
+  regressions; preserve production scoring and policy defaults.
+
 - Document a tested but unadopted lifetime candidate-retention prototype and
   retain cross-path selection diagnostics; preserve production eviction behavior
   after default-profile RDMA results failed to establish a benefit.
