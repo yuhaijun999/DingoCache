@@ -25,7 +25,7 @@ PRESSURE_CASES = {'low': (16, 180), 'medium': (32, 180), 'high': (64, 180),
                   'p60': (64, 60), 'p120': (64, 120)}
 
 
-def profile(name, *, hot_refill=False, pressure_case=None):
+def profile(name, *, hot_refill=False, pressure_case=None, pressure_steps=None):
     if name not in ('accelerated', 'default'):
         raise ValueError('unknown residence profile')
     if type(hot_refill) is not bool:
@@ -33,6 +33,9 @@ def profile(name, *, hot_refill=False, pressure_case=None):
     if pressure_case is not None and (name != 'default' or type(pressure_case) is not str
                                       or pressure_case not in PRESSURE_CASES):
         raise ValueError('pressure_case requires default profile and a known preset')
+    if pressure_steps is not None and (pressure_case is None or type(pressure_steps) is not int
+                                       or pressure_steps not in (660, 1800)):
+        raise ValueError('pressure_steps requires a pressure preset and must be 660 or 1800')
     config = {'name': name, 'protect_sec': 12 if name == 'accelerated' else 180,
             'delays_sec': [3, 13, 24] if name == 'accelerated' else [45, 185, 600],
             'steps': 300 if name == 'accelerated' else 1800,
@@ -41,7 +44,7 @@ def profile(name, *, hot_refill=False, pressure_case=None):
             'arrival_batch': 64, 'length': 4096, 'seed': 0xD1A60051}
     if pressure_case is not None:
         config['arrival_batch'], config['protect_sec'] = PRESSURE_CASES[pressure_case]
-        config['steps'] = 660
+        config['steps'] = 660 if pressure_steps is None else pressure_steps
     if hot_refill:
         config['hot_refill'] = True
     return config
@@ -611,12 +614,15 @@ def main(argv=None):
     parser.add_argument('--metrics-port', type=int, default=12010)
     parser.add_argument('--profile', choices=('accelerated', 'default'), required=True)
     parser.add_argument('--pressure-case', choices=PRESSURE_CASES,
-                        help='opt-in 660-step default-score pressure/P diagnostic')
+                        help='opt-in default-score pressure/P diagnostic (660 steps unless overridden)')
+    parser.add_argument('--pressure-steps', type=int, choices=(660, 1800),
+                        help='explicit measurement window; requires --pressure-case')
     args = parser.parse_args(argv)
     if not 1 <= args.metrics_port <= 65535:
         parser.error('invalid metrics port')
     try:
-        config = profile(args.profile, hot_refill=args.hot_refill, pressure_case=args.pressure_case)
+        config = profile(args.profile, hot_refill=args.hot_refill, pressure_case=args.pressure_case,
+                         pressure_steps=args.pressure_steps)
     except ValueError as error:
         parser.error(str(error))
     args.output.mkdir(parents=True, exist_ok=False)

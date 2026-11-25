@@ -201,9 +201,10 @@ def check_pressure_samples(directory, report, dirs):
 
 
 def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair=0, hot_refill=False,
-        pressure_case=None):
+        pressure_case=None, pressure_steps=None):
     cases = plan(pairs, start_pair)
-    config = workload.profile(profile, hot_refill=hot_refill, pressure_case=pressure_case)
+    config = workload.profile(profile, hot_refill=hot_refill, pressure_case=pressure_case,
+                              pressure_steps=pressure_steps)
     env = environment(profile, pressure_case=pressure_case)
     if not isinstance(tag, str) or re.fullmatch(r'[A-Za-z0-9_-]{1,40}', tag) is None:
         raise ValueError('tag must be 1..40 ASCII letters/digits/_/-')
@@ -228,6 +229,8 @@ def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair
                   scope='compact-capacity-turnover-not-production-scale-or-day-aging')
     if pressure_case is not None:
         result['pressure_case'] = pressure_case
+    if pressure_steps is not None:
+        result['pressure_steps'] = pressure_steps
     timeout = config['steps'] * config['interval_sec'] + config['preage_sec'] + 120
     try:
         for row in cases:
@@ -248,6 +251,8 @@ def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair
                              '--output', str(case / 'client'), '--profile', profile, '--metrics-port', '12010']
             if pressure_case is not None:
                 child_command.extend(('--pressure-case', pressure_case))
+            if pressure_steps is not None:
+                child_command.extend(('--pressure-steps', str(pressure_steps)))
             if hot_refill:
                 child_command.append('--hot-refill')
             row.update(state='running', command=command, client_command=child_command,
@@ -321,7 +326,9 @@ def main(argv=None):
     parser.add_argument('--tag', required=True)
     parser.add_argument('--profile', choices=('accelerated', 'default'), default='accelerated')
     parser.add_argument('--pressure-case', choices=workload.PRESSURE_CASES,
-                        help='opt-in 660-step default-score pressure/P diagnostic')
+                        help='opt-in default-score pressure/P diagnostic (660 steps unless overridden)')
+    parser.add_argument('--pressure-steps', type=int, choices=(660, 1800),
+                        help='explicit measurement window; requires --pressure-case')
     parser.add_argument('--hot-refill', action='store_true',
                         help='enable separate verified hot-miss refills')
     parser.add_argument('--pairs', type=int, default=3)
@@ -330,7 +337,7 @@ def main(argv=None):
     try:
         result = run(args.build, args.data_root, args.output, args.tag, profile=args.profile,
                      pairs=args.pairs, start_pair=args.start_pair, hot_refill=args.hot_refill,
-                     pressure_case=args.pressure_case)
+                     pressure_case=args.pressure_case, pressure_steps=args.pressure_steps)
         print(json.dumps({'passed': result['passed'], 'output': str(args.output)}))
         return 0 if result['passed'] else 1
     except (OSError, ValueError, TypeError) as error:

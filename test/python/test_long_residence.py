@@ -234,6 +234,71 @@ class LongResidenceTest(unittest.TestCase):
         self.assertEqual(residence.profile('default'), baseline)
         self.assertNotIn('hot_refill', baseline)
 
+    def test_explicit_pressure_windows_preserve_scores_and_complete_denominators(self):
+        for selection in ('high', 'p60'):
+            for steps in (660, 1800):
+                with self.subTest(selection=selection, steps=steps):
+                    config = residence.profile('default', pressure_case=selection,
+                                               pressure_steps=steps, hot_refill=True)
+                    expected = residence.profile('default', pressure_case=selection, hot_refill=True)
+                    expected['steps'] = steps
+                    self.assertEqual(config, expected)
+                    self.assertEqual(residence.validate(config), config)
+                    counts = residence.expected_counts(config)
+                    self.assertEqual(counts['hot_gets'], 64 * steps)
+                    self.assertEqual(counts['arrival_puts'], 128 * steps)
+                    self.assertEqual(counts['first_gets'], 192)
+
+    def test_long_pressure_fake_replay_accounts_for_full_window_not_660(self):
+        # Memory clients prove timing and ledger completeness only, not eviction
+        # policy, native RDMA or performance. Payload size is reduced for this test.
+        frozen = residence.profile('default', pressure_case='p60', pressure_steps=1800,
+                                   hot_refill=True)
+        frozen['length'] = 1
+        clients = [Client(), Client()]
+        clock = Clock()
+        report = residence.run(clients, frozen, clock=clock, sleep=clock.sleep,
+            eviction_counter=lambda: max(0, sum(len(client.store) for client in clients) - 12288))
+        self.assertTrue(report['passed'])
+        counts = residence.check_report(report, frozen)
+        self.assertEqual(report['measurement_elapsed_sec'], 1800)
+        self.assertEqual(report['actual']['hot_gets'], 115200)
+        self.assertEqual(report['actual']['arrival_puts'], 230400)
+        self.assertEqual(counts['get_misses'], 0)
+        first = [row for row in report['rows'] if row['kind'] == 'first']
+        self.assertEqual({row['target_age_sec'] for row in first}, {45, 185, 600})
+        with self.assertRaises(ValueError):
+            residence.check_report(report, dict(frozen, steps=660))
+
+    def test_invalid_pressure_windows_reject_before_output_or_native_loading(self):
+        for steps in (True, False, 0, 659, 661, 1801, 660.0, '1800', [], {}):
+            with self.subTest(steps=steps), self.assertRaises(ValueError):
+                residence.profile('default', pressure_case='high', pressure_steps=steps)
+        for name in ('default', 'accelerated'):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                residence.profile(name, pressure_steps=1800)
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(residence.disk, 'load_library') as load:
+            output = Path(temp) / 'run'
+            with self.assertRaises(SystemExit) as error:
+                residence.main(['--lib', 'unused', '--members', 'unused', '--profile', 'default',
+                                '--pressure-steps', '1800', '--output', str(output)])
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse(output.exists())
+            load.assert_not_called()
+
+    def test_explicit_pressure_window_is_recorded_before_native_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / 'run'
+            with mock.patch.object(residence.disk, 'load_library', return_value=object()):
+                self.assertEqual(residence.main(['--lib', 'unused', '--members', 'unused',
+                    '--profile', 'default', '--pressure-case', 'p60', '--pressure-steps', '1800',
+                    '--hot-refill', '--output', str(output)]), 1)
+            report = json.loads((output / 'report.json').read_text())
+            self.assertEqual(report['config'], residence.profile('default', pressure_case='p60',
+                                                               pressure_steps=1800, hot_refill=True))
+            self.assertFalse(report['passed'])
+
     def test_pressure_fake_replay_keeps_600_second_reuse_and_complete_ledger(self):
         # Tiny payloads keep this an offline schedule/ledger test, not a disk
         # capacity emulator or native pressure/benefit measurement.

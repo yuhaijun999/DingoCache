@@ -162,7 +162,7 @@ class LongResidenceRunnerTest(unittest.TestCase):
             self.assertEqual(runner.main(['--build', '/unused/build', '--data-root', '/unused/disk',
                 '--output', '/unused/results', '--tag', 'fixture', '--profile', 'default',
                 '--pressure-case', 'p120', '--hot-refill', '--pairs', '1', '--start-pair', '1']), 0)
-            self.assertEqual(run.call_args.kwargs, dict(profile='default', pressure_case='p120',
+            self.assertEqual(run.call_args.kwargs, dict(profile='default', pressure_case='p120', pressure_steps=None,
                                                        hot_refill=True, pairs=1, start_pair=1))
 
     def test_invalid_pressure_selection_precedes_guest_paths_and_spawn(self):
@@ -300,7 +300,7 @@ class LongResidenceRunnerTest(unittest.TestCase):
 
     def _matrix(self, *, fail_child=False, bad_report=False, ready_fail=False,
                 mutate_build=False, mutate_tools=False, stop_fail=False, profile='accelerated', hot_refill=False,
-                pressure_case=None):
+                pressure_case=None, pressure_steps=None):
         root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         build = root / 'build'
         build.mkdir()
@@ -334,7 +334,7 @@ class LongResidenceRunnerTest(unittest.TestCase):
         self.stack.enter_context(mock.patch.object(runner.subprocess, 'Popen', side_effect=spawn))
         def child(command, **kwargs):
             self.assertEqual(kwargs['env']['DFKV_RDMA'], '1')
-            expected_profile = runner.workload.profile(profile, pressure_case=pressure_case)
+            expected_profile = runner.workload.profile(profile, pressure_case=pressure_case, pressure_steps=pressure_steps)
             self.assertEqual(kwargs['timeout'], expected_profile['steps'] * expected_profile['interval_sec']
                              + expected_profile['preage_sec'] + 120)
             path = Path(command[command.index('--output') + 1])
@@ -358,7 +358,7 @@ class LongResidenceRunnerTest(unittest.TestCase):
                 raise RuntimeError('controlled stop error')
             self.stack.enter_context(mock.patch.object(runner.common, 'stop_owned', side_effect=stop))
         result = runner.run(build, roots, output, 'tag', pairs=1, profile=profile, hot_refill=hot_refill,
-                            pressure_case=pressure_case)
+                            pressure_case=pressure_case, pressure_steps=pressure_steps)
         return result, output, processes, child_run
 
     def test_matrix_fresh_paths_rdma_bounded_child_and_normal_reaping(self):
@@ -436,6 +436,48 @@ class LongResidenceRunnerTest(unittest.TestCase):
                     protection = row['environment'].get('DFKV_SLAB_PROTECT_SEC')
                     self.assertEqual(protection, str(expected['protect_sec']) if selection.startswith('p') else None)
                 runner.workload.check_report.assert_called_with({}, expected)
+
+    def test_explicit_long_pressure_window_binds_child_manifest_budget_and_scores(self):
+        for selection in ('high', 'p60'):
+            with self.subTest(selection=selection):
+                result, output, processes, child = self._matrix(profile='default',
+                    pressure_case=selection, pressure_steps=1800, hot_refill=True)
+                expected = runner.workload.profile('default', pressure_case=selection,
+                                                   pressure_steps=1800, hot_refill=True)
+                self.assertTrue(result['passed'])
+                self.assertEqual(result['profile'], expected)
+                self.assertEqual(result['pressure_steps'], 1800)
+                self.assertEqual(json.loads((output / 'matrix.json').read_text())['pressure_steps'], 1800)
+                self.assertEqual(result['planned_per_case']['hot_gets'], 115200)
+                self.assertEqual(result['planned_per_case']['arrival_puts'], 230400)
+                self.assertEqual(len(processes), 2)
+                for call, row in zip(child.call_args_list, result['cases']):
+                    command = call.args[0]
+                    self.assertEqual(command[command.index('--pressure-steps') + 1], '1800')
+                    self.assertEqual(row['client_timeout_sec'], 2160)
+                    self.assertTrue(row['server_reaped'])
+                    self.assertEqual(row['environment'], {key: value for key, value in
+                        runner.environment('default', pressure_case=selection).items()
+                        if key.startswith('DFKV_')})
+                runner.workload.check_report.assert_called_with({}, expected)
+
+    def test_invalid_pressure_windows_precede_guest_paths_and_spawn(self):
+        with mock.patch.object(runner.common, 'guest_paths') as guest, \
+                mock.patch.object(runner.subprocess, 'Popen') as spawn:
+            for selection, steps in ((None, 1800), ('high', True), ('high', 1801), ('high', '660')):
+                with self.subTest(selection=selection, steps=steps), self.assertRaises(ValueError):
+                    runner.run('/absent', [], '/unused', 'tag', profile='default',
+                               pressure_case=selection, pressure_steps=steps)
+            guest.assert_not_called()
+            spawn.assert_not_called()
+
+    def test_main_forwards_explicit_pressure_window(self):
+        with mock.patch.object(runner, 'run', return_value={'passed': True}) as run:
+            self.assertEqual(runner.main(['--build', '/unused/build', '--data-root', '/unused/disk',
+                '--output', '/unused/results', '--tag', 'fixture', '--profile', 'default',
+                '--pressure-case', 'p60', '--pressure-steps', '1800', '--pairs', '1']), 0)
+            self.assertEqual(run.call_args.kwargs['pressure_steps'], 1800)
+            self.assertEqual(run.call_args.kwargs['pressure_case'], 'p60')
 
     def test_failure_is_failstop_reported_and_server_reaped(self):
         for option in ('fail_child', 'bad_report', 'stop_fail'):

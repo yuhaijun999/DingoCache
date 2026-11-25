@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add explicit long-window reversed RDMA pressure diagnostics and offline
+  business-cost sensitivity with fully specified hypothetical weights; retain
+  production scoring and policy defaults.
+
 - Add opt-in bounded RDMA pressure/P diagnostics and actual C++ score-order
   regressions; preserve production scoring and policy defaults.
 
