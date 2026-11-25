@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add bounded synthetic prefix-chain traces, separate scripted fake lookup/load
+  replay and raw-ledger business accounting with fixed request denominators;
+  keep production policies unchanged and distinguish prefix reuse from key hits.
+
 - Add opt-in continuous delayed-reuse streams to RDMA arrival/hot-set diagnostics,
   with ACK-aged eligibility, explicit right-censoring and complete refill/native
   accounting; retain production scoring and policy defaults.

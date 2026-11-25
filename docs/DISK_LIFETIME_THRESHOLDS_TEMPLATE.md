@@ -6,6 +6,11 @@
 依据原规格 §11/§11.1；要求总表见[验收索引](DISK_LIFETIME_ACCEPTANCE.md)，
 结果填写[正式报告模板](DISK_LIFETIME_AB_REPORT_TEMPLATE.md)。
 
+F01 的请求资格、连续前缀、实际加载与未知状态定义，见
+[前缀链业务收益口径](DISK_LIFETIME_PREFIX_BUSINESS_ACCEPTANCE.md)。登记时明确主指标、
+本地/外部复用边界、请求等权与 token 加权、关键链分层与未知数据规则；
+不以独立 key 命中率或 lookup 存在率代替实际业务收益。数值仍全部待登记。
+
 ## 1. 版本、职责与样本隔离（先于首次新模式性能探索）
 
 以下“待填”均为未完成，不是默认值；实际登记必须替换并提供证据位置。

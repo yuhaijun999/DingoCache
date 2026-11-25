@@ -6,6 +6,17 @@ universal benefit. Production scoring, default policy, ABI, disk format and RAM
 behavior remain unchanged. GPU is excluded. Actual cache traffic is RDMA/RXE
 plus io_uring only, without TCP fallback.
 
+## Business interpretation update (2026-11-25)
+
+The user clarified that the business unit is a dependency-ordered prefix chain:
+only the contiguous prefix before the first missing block is reusable. This
+round modeled independent objects, not request chains or adopted token lengths.
+Its object-level results and costs remain valid, but cannot rank client prefix
+benefit or be retroactively converted into chain results. Neither policy has
+established superiority under that business metric. See the
+[prefix business acceptance contract](DISK_LIFETIME_PREFIX_BUSINESS_ACCEPTANCE.md).
+No historical results, production behavior or formal gates are changed.
+
 ## Frozen workload contract
 
 The previous test repeatedly read hot keys but read each initial delayed cohort

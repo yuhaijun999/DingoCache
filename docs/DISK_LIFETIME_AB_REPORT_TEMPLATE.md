@@ -5,6 +5,11 @@
 先完成[阈值登记与冻结](DISK_LIFETIME_THRESHOLDS_TEMPLATE.md)，再填写独立版本的
 报告；原要求与剩余缺口见[验收索引](DISK_LIFETIME_ACCEPTANCE.md)。
 
+F01 另附[前缀链业务收益口径](DISK_LIFETIME_PREFIX_BUSINESS_ACCEPTANCE.md)要求的请求级
+明细：有序逻辑块/token/代际及分片依赖、lookup 候选、实际采用、本地/外部贡献、
+首个断点、完整请求终局/未知/删失、关联回填成本。分母与权重按冻结版本，不在看到
+结果后调整；缺实际加载或引擎字段标未测，不用 KV 命中率填补。
+
 ## 1. 报告身份与开始条件
 
 | 项目 | 当前值 / 必填内容 |
