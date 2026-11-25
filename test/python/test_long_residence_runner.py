@@ -163,7 +163,7 @@ class LongResidenceRunnerTest(unittest.TestCase):
                 '--output', '/unused/results', '--tag', 'fixture', '--profile', 'default',
                 '--pressure-case', 'p120', '--hot-refill', '--pairs', '1', '--start-pair', '1']), 0)
             self.assertEqual(run.call_args.kwargs, dict(profile='default', pressure_case='p120', pressure_steps=None,
-                                                       hot_refill=True, pairs=1, start_pair=1))
+                                                       hot_refill=True, pairs=1, start_pair=1, continuous_reuse=False))
 
     def test_invalid_pressure_selection_precedes_guest_paths_and_spawn(self):
         with mock.patch.object(runner.common, 'guest_paths') as guest, \
@@ -300,7 +300,7 @@ class LongResidenceRunnerTest(unittest.TestCase):
 
     def _matrix(self, *, fail_child=False, bad_report=False, ready_fail=False,
                 mutate_build=False, mutate_tools=False, stop_fail=False, profile='accelerated', hot_refill=False,
-                pressure_case=None, pressure_steps=None):
+                pressure_case=None, pressure_steps=None, continuous_reuse=False):
         root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         build = root / 'build'
         build.mkdir()
@@ -358,8 +358,27 @@ class LongResidenceRunnerTest(unittest.TestCase):
                 raise RuntimeError('controlled stop error')
             self.stack.enter_context(mock.patch.object(runner.common, 'stop_owned', side_effect=stop))
         result = runner.run(build, roots, output, 'tag', pairs=1, profile=profile, hot_refill=hot_refill,
-                            pressure_case=pressure_case, pressure_steps=pressure_steps)
+                            pressure_case=pressure_case, pressure_steps=pressure_steps,
+                            continuous_reuse=continuous_reuse)
         return result, output, processes, child_run
+
+    def test_continuous_reuse_binds_manifest_child_and_leaves_server_unchanged(self):
+        result, output, processes, child = self._matrix(profile='default', hot_refill=True,
+            pressure_case='p60', pressure_steps=1800, continuous_reuse=True)
+        self.assertTrue(result['passed'])
+        self.assertTrue(result['profile']['continuous_reuse'])
+        self.assertTrue(json.loads((output / 'matrix.json').read_text())['profile']['continuous_reuse'])
+        for row in result['cases']:
+            self.assertIn('--continuous-reuse', row['client_command'])
+            self.assertIn('--hot-refill', row['client_command'])
+            self.assertNotIn('--continuous-reuse', row['command'])
+            self.assertEqual(row['client_timeout_sec'], 2160)
+
+    def test_main_forwards_continuous_reuse_without_native_loading(self):
+        with mock.patch.object(runner, 'run', return_value={'passed': True}) as run:
+            self.assertEqual(runner.main(['--build', '/unused/build', '--data-root', '/unused/disk',
+                '--output', '/unused/results', '--tag', 'fresh', '--continuous-reuse']), 0)
+        self.assertTrue(run.call_args.kwargs['continuous_reuse'])
 
     def test_matrix_fresh_paths_rdma_bounded_child_and_normal_reaping(self):
         result, output, processes, child = self._matrix()

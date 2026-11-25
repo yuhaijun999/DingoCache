@@ -112,6 +112,219 @@ class LongResidenceTest(unittest.TestCase):
             eviction_counter=lambda: max(0, sum(len(c.store) for c in clients) - 20))
         return frozen, report
 
+    def continuous_case(self, *, miss=False, bad=False, failed_put=False, verify_miss=False):
+        frozen = dict(config(), continuous_reuse=True, arrival_batch=3)
+        clock = Clock()
+        clients = [Client(), Client()]
+        selected = residence.disk.key_for(frozen['seed'], frozen['prefill'])
+        client = clients[0]
+        original, put = client.read_outcome, client.put
+        if miss:
+            client.miss_first.add(selected)
+        def read(key, value):
+            if key == selected and bad:
+                return 'io_error'
+            if key == selected and verify_miss and key in client.first_seen:
+                return 'get_miss'
+            return original(key, value)
+        def write(keys, values):
+            if failed_put and keys == [selected] and selected in client.first_seen:
+                raise RuntimeError('reuse refill failed')
+            return put(keys, values)
+        client.read_outcome, client.put = read, write
+        report = residence.run(clients, frozen, clock=clock, sleep=clock.sleep,
+            eviction_counter=lambda: max(0, sum(len(c.store) for c in clients) - 20))
+        return frozen, report
+
+    def test_continuous_reuse_exact_due_censors_and_complete_denominators(self):
+        frozen, report = self.continuous_case()
+        self.assertTrue(report['passed'], report['errors'])
+        counts = residence.check_report(report, frozen)
+        summary = report['continuous_reuse']
+        self.assertEqual(summary['enrolled'], 36)
+        # The final cutoff includes the source step 5 age-1 read exactly due.
+        self.assertEqual(summary['completed'], 26)
+        self.assertEqual(summary['censored'], 10)
+        self.assertEqual({k: v['completed'] for k, v in summary['by_delay'].items()},
+                         {'1': 12, '3': 8, '4': 6})
+        self.assertEqual(counts['get_attempts'], 94)
+        rows = [r for r in report['rows'] if r['kind'] == 'reuse']
+        self.assertEqual(len({(r['namespace_hex'], r['index']) for r in rows}), 26)
+        self.assertTrue(all(r['age_sec'] == r['target_age_sec'] for r in rows))
+        self.assertNotIn('continuous_reuse', residence.profile('default'))
+
+    def test_continuous_reuse_advancing_clock_preserves_cutoff_and_terminal_instant(self):
+        class AdvancingClock(Clock):
+            def __call__(self):
+                self.now += .000001
+                return self.now
+        frozen = dict(config(), continuous_reuse=True, arrival_batch=3)
+        clock = AdvancingClock()
+        clients = [Client(), Client()]
+        report = residence.run(clients, frozen, clock=clock, sleep=clock.sleep,
+            eviction_counter=lambda: max(0, sum(len(c.store) for c in clients) - 20))
+        self.assertTrue(report['passed'], report['errors'])
+        residence.check_report(report, frozen)
+        self.assertEqual(report['continuous_reuse']['cutoff_sec'], report['steps'][-1]['finished_sec'])
+        self.assertTrue(all(row['read_finished_sec'] == row['finished_sec']
+                            for row in report['rows'] if row['kind'] == 'reuse'))
+
+    def test_continuous_reuse_refill_verify_separate_from_original_read(self):
+        frozen, report = self.continuous_case(miss=True)
+        counts = residence.check_report(report, frozen)
+        summary = report['continuous_reuse']
+        self.assertEqual(summary['refill_puts'], 1)
+        self.assertEqual(summary['refill_payload_bytes'], 4)
+        self.assertEqual(summary['verify_gets'], 1)
+        self.assertEqual(summary['verify_hits'], 1)
+        self.assertEqual(summary['by_delay']['1']['misses'], 1)
+        self.assertEqual(counts['get_misses'], 1)
+        self.assertEqual(counts['get_attempts'], 95)
+        self.assertEqual(report['refill_puts'], 0)
+
+    def test_continuous_reuse_failure_never_becomes_a_miss(self):
+        for kwargs in ({'bad': True}, {'miss': True, 'failed_put': True},
+                       {'miss': True, 'verify_miss': True}):
+            frozen, report = self.continuous_case(**kwargs)
+            with self.subTest(kwargs=kwargs):
+                self.assertFalse(report['passed'])
+                with self.assertRaises(ValueError):
+                    residence.check_report(report, frozen)
+
+    def test_continuous_reuse_auditor_rejects_identity_age_censor_and_summary_tampering(self):
+        frozen, report = self.continuous_case(miss=True)
+        mutations = [lambda r: r['continuous_reuse'].update(completed=0),
+                     lambda r: r['continuous_reuse'].update(censored=0),
+                     lambda r: r['continuous_reuse']['by_delay']['1'].update(hits=0),
+                     lambda r: r['continuous_reuse']['censored_keys'].pop(),
+                     lambda r: next(x for x in r['rows'] if x['kind'] == 'reuse').update(index=0),
+                     lambda r: next(x for x in r['rows'] if x['kind'] == 'reuse').update(ack_sec=0),
+                     lambda r: next(x for x in r['rows'] if x['kind'] == 'reuse').update(age_sec=0),
+                     lambda r: next(x for x in r['rows'] if x['kind'] == 'reuse').update(verify_outcome=None)]
+        for mutate in mutations:
+            changed = copy.deepcopy(report)
+            mutate(changed)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                residence.check_report(changed, frozen)
+
+    def test_continuous_reuse_full_default_window_reconstructs_every_arrival_and_tail(self):
+        frozen = residence.profile('default', continuous_reuse=True, hot_refill=True,
+                                   pressure_case='p60', pressure_steps=1800)
+        frozen['length'] = 4
+        clock = Clock()
+        clients = [Client(), Client()]
+        report = residence.run(clients, frozen, clock=clock, sleep=clock.sleep,
+            eviction_counter=lambda: max(0, sum(len(c.store) for c in clients) - 12288))
+        self.assertTrue(report['passed'], report['errors'])
+        counts = residence.check_report(report, frozen)
+        summary = report['continuous_reuse']
+        self.assertEqual(summary['enrolled'], 10800)
+        self.assertEqual(summary['completed'], 9146)
+        self.assertEqual(summary['censored'], 1654)
+        self.assertEqual({delay: row['completed'] for delay, row in summary['by_delay'].items()},
+                         {'45': 3512, '185': 3232, '600': 2402})
+        self.assertEqual(counts['get_attempts'], 140282)
+        self.assertEqual(report['actual']['arrival_puts'], 230400)
+
+    def test_continuous_terminal_sweep_does_not_admit_keys_becoming_due_during_processing(self):
+        frozen = dict(config(), continuous_reuse=True, arrival_batch=3)
+        clock = Clock()
+        clients = [Client(), Client()]
+        original_put = clients[1].put
+        arrival_keys = {residence.disk.key_for(frozen['seed'], index) for index in
+                        range(frozen['prefill'], frozen['prefill'] + 18)}
+        def put(keys, values):
+            if keys[0] in arrival_keys:
+                clock.now += .1
+            return original_put(keys, values)
+        clients[1].put = put
+        original_read = clients[0].read_outcome
+        last = residence.disk.key_for(frozen['seed'], frozen['prefill'] + 15)
+        def read(key, value):
+            if key == last:
+                clock.now += .2
+            return original_read(key, value)
+        clients[0].read_outcome = read
+        report = residence.run(clients, frozen, clock=clock, sleep=clock.sleep,
+            eviction_counter=lambda: max(0, sum(len(c.store) for c in clients) - 20))
+        self.assertTrue(report['passed'], report['errors'])
+        residence.check_report(report, frozen)
+        summary = report['continuous_reuse']
+        pending = next(row for row in summary['censored_keys'] if row['index'] == frozen['prefill'] + 15)
+        self.assertGreater(pending['ack_sec'] + pending['target_age_sec'], summary['cutoff_sec'])
+        self.assertLess(pending['ack_sec'] + pending['target_age_sec'], report['elapsed_sec'])
+        changed = copy.deepcopy(report)
+        final = next(row for row in reversed(changed['rows']) if row['kind'] == 'reuse')
+        final['finished_sec'] = final['read_finished_sec'] = summary['cutoff_sec'] + 6
+        changed['elapsed_sec'] += 6
+        changed['measurement_elapsed_sec'] += 6
+        with self.assertRaises(ValueError):
+            residence.check_report(changed, frozen)
+
+    def test_continuous_and_hot_refills_are_separate_with_complete_combined_totals(self):
+        frozen = dict(config(), continuous_reuse=True, arrival_batch=3, hot_refill=True)
+        clock = Clock()
+        clients = [Client(), Client()]
+        clients[0].miss_first.add(residence.disk.key_for(frozen['seed'], frozen['prefill']))
+        original = clients[0].read_outcomes
+        hot_key = residence.disk.key_for(frozen['seed'], 0)
+        batches = 0
+        def batch(keys, values):
+            nonlocal batches
+            outcomes = original(keys, values)
+            if len(keys) == frozen['cohort_size'] and keys[0] == hot_key:
+                batches += 1
+                if batches == 4:
+                    outcomes[0] = {'outcome': 'get_miss', 'status': 1}
+            return outcomes
+        clients[0].read_outcomes = batch
+        report = residence.run(clients, frozen, clock=clock, sleep=clock.sleep,
+            eviction_counter=lambda: max(0, sum(len(c.store) for c in clients) - 20))
+        counts = residence.check_report(report, frozen)
+        self.assertEqual(report['continuous_reuse']['refill_puts'], 1)
+        self.assertEqual(report['hot_refill']['refill_puts'], 1)
+        self.assertEqual(report['refill_puts'], 0)
+        self.assertEqual(counts, {'put_acks': 58, 'put_bytes': 232,
+                                 'get_hits': 94, 'get_misses': 2, 'get_attempts': 96})
+
+    def test_continuous_reuse_cutoff_due_partition_cannot_drop_or_reclassify_reads(self):
+        frozen, report = self.continuous_case()
+        for mutation in ('cutoff', 'duplicate', 'drop', 'due_censor', 'censor_ack', 'wrong_delay'):
+            changed = copy.deepcopy(report)
+            reuse = next(row for row in changed['rows'] if row['kind'] == 'reuse')
+            if mutation == 'cutoff':
+                changed['continuous_reuse']['cutoff_sec'] += .1
+            elif mutation == 'duplicate':
+                changed['rows'].append(copy.deepcopy(reuse))
+            elif mutation == 'drop':
+                changed['rows'].remove(reuse)
+            elif mutation == 'due_censor':
+                changed['rows'].remove(reuse)
+                changed['continuous_reuse']['censored_keys'].append({key: reuse[key] for key in
+                    ('namespace_hex', 'index', 'source_step', 'target_age_sec', 'ack_sec')})
+            elif mutation == 'censor_ack':
+                changed['continuous_reuse']['censored_keys'][0]['ack_sec'] += 1
+            else:
+                reuse['target_age_sec'] = 3
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                residence.check_report(changed, frozen)
+
+    def test_continuous_reuse_main_records_opt_in_before_native_symbol_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / 'fresh'
+            with mock.patch.object(residence.disk, 'load_library', return_value=object()):
+                self.assertEqual(residence.main(['--lib', 'unused', '--members', 'unused',
+                    '--profile', 'default', '--continuous-reuse', '--output', str(output)]), 1)
+            self.assertTrue(json.loads((output / 'report.json').read_text())['config']['continuous_reuse'])
+
+    def test_continuous_reuse_config_is_strict_and_requires_disjoint_arrival_keys(self):
+        for value in (1, 'yes', None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                residence.profile('default', continuous_reuse=value)
+        with self.assertRaises(ValueError):
+            residence.validate(dict(config(), continuous_reuse=True))
+        self.assertTrue(residence.profile('default', continuous_reuse=True)['continuous_reuse'])
+
     def test_hot_refill_is_opt_in_and_accounts_repeat_losses_and_later_reads(self):
         frozen, report = self.hot_case()
         self.assertTrue(report['passed'], report['errors'])

@@ -25,6 +25,9 @@ def summarize(report):
     """Reject incomplete raw reports before deriving scheduled business counts."""
     try:
         config = report['config']
+        if config.get('continuous_reuse', False):
+            raise ValueError('continuous reuse requires its own per-stream analysis; '
+                             'the fixed-cohort cost model is not applicable')
         totals = residence.check_report(report, config)
         groups = {name: {'attempts': 0, 'hits': 0, 'misses': 0}
                   for name in ['hot', 'cooled'] + [f'first_{d}' for d in config['delays_sec']]}

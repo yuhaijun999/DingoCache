@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add opt-in continuous delayed-reuse streams to RDMA arrival/hot-set diagnostics,
+  with ACK-aged eligibility, explicit right-censoring and complete refill/native
+  accounting; retain production scoring and policy defaults.
+
 - Add explicit long-window reversed RDMA pressure diagnostics and offline
   business-cost sensitivity with fully specified hypothetical weights; retain
   production scoring and policy defaults.

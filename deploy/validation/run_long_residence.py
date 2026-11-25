@@ -201,10 +201,10 @@ def check_pressure_samples(directory, report, dirs):
 
 
 def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair=0, hot_refill=False,
-        pressure_case=None, pressure_steps=None):
+        pressure_case=None, pressure_steps=None, continuous_reuse=False):
     cases = plan(pairs, start_pair)
     config = workload.profile(profile, hot_refill=hot_refill, pressure_case=pressure_case,
-                              pressure_steps=pressure_steps)
+                              pressure_steps=pressure_steps, continuous_reuse=continuous_reuse)
     env = environment(profile, pressure_case=pressure_case)
     if not isinstance(tag, str) or re.fullmatch(r'[A-Za-z0-9_-]{1,40}', tag) is None:
         raise ValueError('tag must be 1..40 ASCII letters/digits/_/-')
@@ -255,6 +255,8 @@ def run(build, roots, output, tag, *, profile='accelerated', pairs=3, start_pair
                 child_command.extend(('--pressure-steps', str(pressure_steps)))
             if hot_refill:
                 child_command.append('--hot-refill')
+            if continuous_reuse:
+                child_command.append('--continuous-reuse')
             row.update(state='running', command=command, client_command=child_command,
                        client_timeout_sec=timeout, counts=None, client_state='not_attempted',
                        environment={key: value for key, value in env.items() if key.startswith('DFKV_')})
@@ -331,13 +333,16 @@ def main(argv=None):
                         help='explicit measurement window; requires --pressure-case')
     parser.add_argument('--hot-refill', action='store_true',
                         help='enable separate verified hot-miss refills')
+    parser.add_argument('--continuous-reuse', action='store_true',
+                        help='sample existing arrivals for continuous ACK-aged delayed first reuse')
     parser.add_argument('--pairs', type=int, default=3)
     parser.add_argument('--start-pair', type=int, default=0)
     args = parser.parse_args(argv)
     try:
         result = run(args.build, args.data_root, args.output, args.tag, profile=args.profile,
                      pairs=args.pairs, start_pair=args.start_pair, hot_refill=args.hot_refill,
-                     pressure_case=args.pressure_case, pressure_steps=args.pressure_steps)
+                     pressure_case=args.pressure_case, pressure_steps=args.pressure_steps,
+                     continuous_reuse=args.continuous_reuse)
         print(json.dumps({'passed': result['passed'], 'output': str(args.output)}))
         return 0 if result['passed'] else 1
     except (OSError, ValueError, TypeError) as error:

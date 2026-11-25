@@ -9,6 +9,7 @@ import random
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'deploy/validation'))
@@ -65,6 +66,15 @@ def report(*, lose_hot=False, lose_first=False):
 
 
 class BenefitSensitivityTest(unittest.TestCase):
+    def test_continuous_stream_cannot_silently_omit_business_reads(self):
+        value = report()
+        value['config']['continuous_reuse'] = True
+        # Even a validated new ledger cannot use this fixed-cohort cost model.
+        with mock.patch.object(residence, 'check_report') as validate:
+            with self.assertRaisesRegex(ValueError, 'continuous'):
+                benefit.summarize(value)
+            validate.assert_not_called()
+
     def test_complete_ledgers_separate_business_reads_from_verify(self):
         value = benefit.summarize(report(lose_first=True))
         self.assertEqual(value['groups']['hot'], {'attempts': 24, 'hits': 24, 'misses': 0})

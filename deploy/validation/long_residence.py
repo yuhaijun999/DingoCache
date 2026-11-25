@@ -25,9 +25,12 @@ PRESSURE_CASES = {'low': (16, 180), 'medium': (32, 180), 'high': (64, 180),
                   'p60': (64, 60), 'p120': (64, 120)}
 
 
-def profile(name, *, hot_refill=False, pressure_case=None, pressure_steps=None):
+def profile(name, *, hot_refill=False, pressure_case=None, pressure_steps=None,
+            continuous_reuse=False):
     if name not in ('accelerated', 'default'):
         raise ValueError('unknown residence profile')
+    if type(continuous_reuse) is not bool:
+        raise ValueError('continuous_reuse must be bool')
     if type(hot_refill) is not bool:
         raise ValueError('hot_refill must be bool')
     if pressure_case is not None and (name != 'default' or type(pressure_case) is not str
@@ -47,11 +50,13 @@ def profile(name, *, hot_refill=False, pressure_case=None, pressure_steps=None):
         config['steps'] = 660 if pressure_steps is None else pressure_steps
     if hot_refill:
         config['hot_refill'] = True
+    if continuous_reuse:
+        config['continuous_reuse'] = True
     return config
 
 
 def validate(config):
-    if not isinstance(config, dict) or set(config) - {'hot_refill'} != set(profile('default')):
+    if not isinstance(config, dict) or set(config) - {'hot_refill', 'continuous_reuse'} != set(profile('default')):
         raise ValueError('invalid profile fields')
     if 'hot_refill' in config and type(config['hot_refill']) is not bool:
         raise ValueError('hot_refill must be bool')
@@ -63,6 +68,9 @@ def validate(config):
                             ('length', 1, 1048576), ('seed', 0, (1 << 64) - 1)):
         if type(config[name]) is not int or not low <= config[name] <= high:
             raise ValueError('invalid ' + name)
+    if ('continuous_reuse' in config and type(config['continuous_reuse']) is not bool
+            or config.get('continuous_reuse', False) and config['arrival_batch'] < 3):
+        raise ValueError('continuous reuse requires bool and at least three arrival keys')
     delays = config['delays_sec']
     if (not isinstance(delays, list) or len(delays) != 3
             or any(type(value) is not int or not 1 <= value <= 600 for value in delays)
@@ -86,6 +94,17 @@ def expected_counts(config):
             'cooled_gets': 2 * config['cohort_size']}
 
 
+def reuse_summary(config):
+    """Fixed enrollment, with due outcomes and right-censoring counted separately."""
+    fields = ('enrolled', 'completed', 'censored', 'hits', 'misses', 'refill_puts',
+              'refill_payload_bytes', 'verify_gets', 'verify_hits')
+    result = dict.fromkeys(fields, 0)
+    result['by_delay'] = {str(delay): dict.fromkeys(fields, 0)
+                          for delay in config['delays_sec']}
+    result['censored_keys'] = []
+    return result
+
+
 def run(clients, config, *, clock=time.monotonic, sleep=time.sleep, eviction_counter=None):
     """Run two namespace-bound adapters, returning partial evidence on failure.
 
@@ -105,6 +124,10 @@ def run(clients, config, *, clock=time.monotonic, sleep=time.sleep, eviction_cou
               'counter_scope': 'validated-terminals-and-acknowledged-PUTs-not-total-attempts',
               'max_lateness_sec': 2, 'max_step_sec': 5,
               'transport_modes': [], 'scope': 'closed-loop-client-ACK-aged-diagnostic'}
+    continuous = config.get('continuous_reuse', False)
+    pending_reuse = []
+    if continuous:
+        result['continuous_reuse'] = reuse_summary(config)
     hot_refill = config.get('hot_refill', False)
     lost_hot = set()
     result['hot_read_summary'] = {'distinct_lost_keys': 0, 'repeat_misses': 0}
@@ -271,6 +294,67 @@ def run(clients, config, *, clock=time.monotonic, sleep=time.sleep, eviction_cou
                     result['verify_hits'] += 1
             cohort['pending'] = pending
 
+    def reuse_reads(cutoff):
+        # The sweep shares one pressure observation. In the terminal sweep the
+        # cutoff is frozen: processing time cannot admit more delayed keys.
+        due = [item for item in pending_reuse if item['ack_sec'] + item['target_age_sec'] <= cutoff]
+        if not due:
+            return
+        delta = sample_evictions('before-first') - result['evictions_at_measurement_start']
+        if delta <= 0:
+            raise RuntimeError('continuous reuse without measured eviction pressure')
+        for item in due:
+            client = clients[item['client_index']]
+            namespace = bytes.fromhex(item['namespace_hex'])
+            keys, values = data(namespace, [item['index']])
+            begin = clock() - started
+            age = begin - item['ack_sec']
+            if (age - item['target_age_sec'] > result['max_lateness_sec']
+                    or item['target_age_sec'] < config['protect_sec'] <= age):
+                raise RuntimeError('continuous reuse scheduling window missed')
+            row = {key: value for key, value in item.items() if key != 'client_index'}
+            row.update(kind='reuse', key_hex=keys[0].hex(), started_sec=begin,
+                       age_sec=age, lateness_sec=age - item['target_age_sec'],
+                       eviction_delta_before_first=delta,
+                       eviction_sample=len(result['pressure_samples']) - 1,
+                       refill_ack=False, refill_ack_sec=None, verify_outcome=None)
+            result['unresolved_operation'] = dict(kind='reuse', index=item['index'],
+                namespace_hex=item['namespace_hex'], terminal='unknown-if-native-call-fails')
+            outcome = client.read_outcome(keys[0], values[0])
+            if outcome not in ('get_hit', 'get_miss'):
+                raise RuntimeError('unresolved continuous GET')
+            result['unresolved_operation'] = None
+            row.update(outcome=outcome, read_finished_sec=clock() - started)
+            result['rows'].append(row)
+            summary = result['continuous_reuse']
+            counters = (summary, summary['by_delay'][str(item['target_age_sec'])])
+            for counter in counters:
+                counter['completed'] += 1
+                counter['hits' if outcome == 'get_hit' else 'misses'] += 1
+            if outcome == 'get_miss':
+                result['unresolved_operation'] = dict(kind='reuse_refill', index=item['index'],
+                    namespace_hex=item['namespace_hex'], terminal='unknown-if-native-call-fails')
+                client.put(keys, values)
+                result['unresolved_operation'] = None
+                row.update(refill_ack=True, refill_ack_sec=clock() - started)
+                for counter in counters:
+                    counter['refill_puts'] += 1
+                    counter['refill_payload_bytes'] += config['length']
+                result['unresolved_operation'] = dict(kind='reuse_verify', index=item['index'],
+                    namespace_hex=item['namespace_hex'], terminal='unknown-if-native-call-fails')
+                observed = client.read_outcome(keys[0], values[0])
+                result['unresolved_operation'] = None
+                row['verify_outcome'] = observed
+                for counter in counters:
+                    counter['verify_gets'] += 1
+                if observed != 'get_hit':
+                    raise RuntimeError('continuous refill verification failed')
+                for counter in counters:
+                    counter['verify_hits'] += 1
+            row['finished_sec'] = (clock() - started if outcome == 'get_miss'
+                                   else row['read_finished_sec'])
+            pending_reuse.remove(item)
+
     try:
         if len(clients) != len(disk.NAMESPACES):
             raise ValueError('exactly two namespace clients required')
@@ -322,11 +406,22 @@ def run(clients, config, *, clock=time.monotonic, sleep=time.sleep, eviction_cou
         for step in range(config['steps']):
             step_start = clock()
             first_reads()
+            if continuous:
+                reuse_reads(clock() - started)
             start = config['prefill'] + step * config['arrival_batch']
-            for client, namespace in zip(clients, disk.NAMESPACES):
-                write(client, namespace, range(start, start + config['arrival_batch']), 'arrival_puts')
+            for client_index, (client, namespace) in enumerate(zip(clients, disk.NAMESPACES)):
+                ack = write(client, namespace, range(start, start + config['arrival_batch']), 'arrival_puts')
+                if continuous:
+                    summary = result['continuous_reuse']
+                    for offset, delay in enumerate(config['delays_sec']):
+                        pending_reuse.append(dict(client_index=client_index, namespace_hex=namespace.hex(),
+                            index=start + offset, source_step=step, target_age_sec=delay, ack_sec=ack - started))
+                        summary['enrolled'] += 1
+                        summary['by_delay'][str(delay)]['enrolled'] += 1
                 read(client, namespace, range(size), 'hot', step=step)
             first_reads()
+            if continuous:
+                reuse_reads(clock() - started)
             remaining = step_start + config['interval_sec'] - clock()
             if clock() - step_start > result['max_step_sec']:
                 raise RuntimeError('measurement step exceeded bounded scheduling window')
@@ -336,6 +431,17 @@ def run(clients, config, *, clock=time.monotonic, sleep=time.sleep, eviction_cou
                 raise RuntimeError('measurement sleep/stall exceeded scheduling window')
             result['steps'].append({'step': step, 'started_sec': step_start - started,
                                     'finished_sec': clock() - started})
+        if continuous:
+            cutoff = result['steps'][-1]['finished_sec']
+            result['continuous_reuse']['cutoff_sec'] = cutoff
+            reuse_reads(cutoff)
+            if clock() - started - cutoff > result['max_step_sec']:
+                raise RuntimeError('continuous terminal sweep exceeded bounded window')
+            for item in pending_reuse:
+                censored = {key: value for key, value in item.items() if key != 'client_index'}
+                result['continuous_reuse']['censored_keys'].append(censored)
+                result['continuous_reuse']['censored'] += 1
+                result['continuous_reuse']['by_delay'][str(item['target_age_sec'])]['censored'] += 1
         first_reads()
         for client, namespace in zip(clients, disk.NAMESPACES):
             read(client, namespace, range(size, 2 * size), 'cooled')
@@ -352,6 +458,106 @@ def run(clients, config, *, clock=time.monotonic, sleep=time.sleep, eviction_cou
         result['measurement_elapsed_sec'] = (finished - started - result['measurement_started_sec']
                                              if 'measurement_started_sec' in result else None)
     return result
+
+
+def check_reuse(result, config, acknowledgments):
+    """Reconstruct every sampled arrival key, including the unobserved tail."""
+    summary = reuse_summary(config)
+    actual = result.get('continuous_reuse', {})
+    cutoff = actual.get('cutoff_sec')
+    def seconds(value):
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise ValueError('invalid continuous timing')
+        return value
+    seconds(cutoff)
+    if cutoff != result['steps'][-1]['finished_sec'] or cutoff > result['elapsed_sec']:
+        raise ValueError('continuous cutoff differs from terminal measurement boundary')
+    expected = {}
+    for namespace in disk.NAMESPACES:
+        for step in range(config['steps']):
+            for offset, delay in enumerate(config['delays_sec']):
+                index = config['prefill'] + step * config['arrival_batch'] + offset
+                identity = (namespace.hex(), index)
+                expected[identity] = dict(namespace_hex=namespace.hex(), index=index,
+                    source_step=step, target_age_sec=delay, ack_sec=acknowledgments[identity])
+                summary['enrolled'] += 1
+                summary['by_delay'][str(delay)]['enrolled'] += 1
+    seen = set()
+    previous_end = result['measurement_started_sec']
+    for row in result['rows']:
+        if row['kind'] != 'reuse':
+            continue
+        index = row['index']
+        if type(index) is not int:
+            raise ValueError('invalid continuous index')
+        identity = (row['namespace_hex'], index)
+        item = expected.get(identity)
+        if identity in seen or item is None or any(row.get(key) != value for key, value in item.items()):
+            raise ValueError('duplicate/unknown continuous identity or ACK')
+        if (type(row['source_step']) is not int or type(row['target_age_sec']) is not int
+                or type(row['ack_sec']) not in (int, float)):
+            raise ValueError('invalid continuous source step')
+        seen.add(identity)
+        begin, end = seconds(row['started_sec']), seconds(row['finished_sec'])
+        age, late = seconds(row['age_sec']), seconds(row['lateness_sec'])
+        read_end = seconds(row['read_finished_sec'])
+        due = item['ack_sec'] + item['target_age_sec']
+        if (row['key_hex'] != disk.key_for(config['seed'], index).hex()
+                or due > cutoff or begin < due or late > result['max_lateness_sec']
+                or not result['measurement_started_sec'] <= previous_end <= begin <= read_end <= end <= result['elapsed_sec']
+                or end > cutoff + result['max_step_sec']
+                or abs(begin - item['ack_sec'] - age) > 1e-6
+                or abs(age - item['target_age_sec'] - late) > 1e-6
+                or item['target_age_sec'] < config['protect_sec'] <= age):
+            raise ValueError('invalid continuous identity/age/phase')
+        previous_end = end
+        sample_index = row['eviction_sample']
+        if type(sample_index) is not int or not 1 <= sample_index < len(result['pressure_samples']):
+            raise ValueError('invalid continuous pressure identity')
+        sample = result['pressure_samples'][sample_index]
+        delta = row['eviction_delta_before_first']
+        if (sample['kind'] != 'before-first' or sample['sampled_sec'] > begin
+                or type(delta) not in (int, float) or not math.isfinite(delta) or delta <= 0
+                or delta != sample['counter'] - result['evictions_at_measurement_start']):
+            raise ValueError('invalid continuous pressure evidence')
+        outcome = row['outcome']
+        if outcome not in ('get_hit', 'get_miss'):
+            raise ValueError('unresolved continuous GET')
+        miss = outcome == 'get_miss'
+        if (row['refill_ack'] is not miss or row['verify_outcome'] != ('get_hit' if miss else None)
+                or miss and not read_end <= seconds(row['refill_ack_sec']) <= end
+                or not miss and (row['refill_ack_sec'] is not None or read_end != end)):
+            raise ValueError('invalid continuous refill/verify')
+        for counter in (summary, summary['by_delay'][str(item['target_age_sec'])]):
+            counter['completed'] += 1
+            counter['misses' if miss else 'hits'] += 1
+            counter['refill_puts'] += miss
+            counter['refill_payload_bytes'] += config['length'] if miss else 0
+            counter['verify_gets'] += miss
+            counter['verify_hits'] += miss
+    for row in actual.get('censored_keys', []):
+        index = row.get('index')
+        if (type(index) is not int or type(row.get('source_step')) is not int
+                or type(row.get('target_age_sec')) is not int
+                or type(row.get('ack_sec')) not in (int, float)):
+            raise ValueError('invalid censored identity')
+        identity = (row.get('namespace_hex'), index)
+        item = expected.get(identity)
+        if (identity in seen or item is None or row != item
+                or item['ack_sec'] + item['target_age_sec'] <= cutoff):
+            raise ValueError('invalid or already due right-censored key')
+        seen.add(identity)
+        summary['censored_keys'].append(item)
+        summary['censored'] += 1
+        summary['by_delay'][str(item['target_age_sec'])]['censored'] += 1
+    summary['cutoff_sec'] = cutoff
+    if seen != expected.keys() or actual != summary:
+        raise ValueError('incomplete continuous enrollment/outcome/censor denominator')
+    for counters in (actual, *actual['by_delay'].values()):
+        if any(type(value) is not int for key, value in counters.items()
+               if key not in ('by_delay', 'censored_keys', 'cutoff_sec')):
+            raise ValueError('invalid continuous counter types')
+    return summary
 
 
 def check_report(result, config):
@@ -441,8 +647,7 @@ def check_report(result, config):
                 if identity in write_indexes:
                     raise ValueError('duplicate initial/arrival PUT')
                 write_indexes.add(identity)
-                if kind == 'initial_puts':
-                    acknowledgments[identity] = ack
+                acknowledgments[identity] = ack
             low, high = ((0, config['prefill']) if kind == 'initial_puts' else
                          (config['prefill'], config['prefill'] +
                           config['steps'] * config['arrival_batch']))
@@ -536,6 +741,9 @@ def check_report(result, config):
             observed[kind + '_gets'] += hits + misses
             get_hits += hits
             get_misses += misses
+        elif kind == 'reuse':
+            if not config.get('continuous_reuse', False):
+                raise ValueError('unexpected continuous reuse ledger')
         elif kind == 'first':
             index = row['index']
             if type(index) is not int:
@@ -598,8 +806,17 @@ def check_report(result, config):
     if hot_enabled and (result.get('hot_refill') != hot_summary
                         or any(type(value) is not int for value in result['hot_refill'].values())):
         raise ValueError('incomplete hot refill denominator')
+    continuous_counts = check_reuse(result, config, acknowledgments) if config.get('continuous_reuse', False) else None
+    if not config.get('continuous_reuse', False) and 'continuous_reuse' in result:
+        raise ValueError('unexpected continuous reuse summary')
+    if continuous_counts:
+        get_hits += continuous_counts['hits'] + continuous_counts['verify_hits']
+        get_misses += continuous_counts['misses']
+        refill_puts += continuous_counts['refill_puts']
+        # Bytes use the separate continuous summary below, not first-cohort totals.
     return {'put_acks': planned['initial_puts'] + planned['arrival_puts'] + refill_puts + hot_summary['refill_puts'],
-            'put_bytes': result['put_payload_bytes'] + result['refill_payload_bytes'] + hot_summary['refill_payload_bytes'],
+            'put_bytes': result['put_payload_bytes'] + result['refill_payload_bytes'] + hot_summary['refill_payload_bytes']
+                         + (continuous_counts['refill_payload_bytes'] if continuous_counts else 0),
             'get_hits': get_hits + verify_hits + hot_summary['verify_hits'], 'get_misses': get_misses,
             'get_attempts': get_hits + get_misses + verify_gets + hot_summary['verify_gets']}
 
@@ -611,6 +828,8 @@ def main(argv=None):
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--hot-refill', action='store_true',
                         help='refill hot misses and verify separately; diagnostic PUT bytes, not device amplification')
+    parser.add_argument('--continuous-reuse', action='store_true',
+                        help='sample three arrival keys per namespace/step for delayed first reuse; censor at cutoff')
     parser.add_argument('--metrics-port', type=int, default=12010)
     parser.add_argument('--profile', choices=('accelerated', 'default'), required=True)
     parser.add_argument('--pressure-case', choices=PRESSURE_CASES,
@@ -622,7 +841,7 @@ def main(argv=None):
         parser.error('invalid metrics port')
     try:
         config = profile(args.profile, hot_refill=args.hot_refill, pressure_case=args.pressure_case,
-                         pressure_steps=args.pressure_steps)
+                         pressure_steps=args.pressure_steps, continuous_reuse=args.continuous_reuse)
     except ValueError as error:
         parser.error(str(error))
     args.output.mkdir(parents=True, exist_ok=False)
