@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add a bounded stateful FIFO fake for shared-prefix reuse, suffix refill and
+  serial capacity competition, with raw transition audits and full-denominator
+  accounting; do not model production lifetime/legacy or threaded concurrency.
+
 - Add bounded synthetic prefix-chain traces, separate scripted fake lookup/load
   replay and raw-ledger business accounting with fixed request denominators;
   keep production policies unchanged and distinguish prefix reuse from key hits.

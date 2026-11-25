@@ -4,6 +4,9 @@
 本轮落实[前缀业务口径](DISK_LIFETIME_PREFIX_BUSINESS_ACCEPTANCE.md)的首个可核算子集，
 不代表全部业务场景已覆盖，不属于正式 A/B 或策略收益验收。
 
+另见后续[动态状态、回填与容量竞争模型](DISK_LIFETIME_PREFIX_DYNAMIC_VALIDATION.md)：
+它使用独立 schema 和测试专用 FIFO，不改变本文 V1 脚本合同，也不代表生产策略。
+
 ## 1. 范围先于结果
 
 本工具只支持**合成、线性依赖、每逻辑块一个对象、无本地缓存**。对象由 namespace、
