@@ -293,6 +293,16 @@ if(DFKV_BUILD_TESTS)
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
               -p test_prefix_rdma_runner.py)
     set_tests_properties(python_prefix_rdma_runner PROPERTIES TIMEOUT 60)
+    add_test(NAME python_prefix_delayed
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
+              -p test_prefix_delayed.py)
+    set_tests_properties(python_prefix_delayed PROPERTIES TIMEOUT 60)
+    add_test(NAME python_prefix_delayed_runner
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
+              -p test_prefix_delayed_runner.py)
+    set_tests_properties(python_prefix_delayed_runner PROPERTIES TIMEOUT 60)
     add_test(NAME python_eviction_ab_prepare
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python

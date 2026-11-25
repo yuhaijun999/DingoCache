@@ -213,3 +213,11 @@ RXE ACTIVE、io_uring=0。113 次仅 nvme2/nvme0 样本，最高 42°C、SMART w
 
 仍缺代表性真实业务 trace、引擎采用/重算/TTFT、业务成本与正式数值门槛、
 真实资源预算及独立签署。短时压缩容量验证不代表长时驻留收益或线上资源规模。
+
+## Follow-up
+
+Timed chain reuse and continuous turnover are tracked separately in
+[the delayed-prefix diagnostic](DISK_LIFETIME_PREFIX_DELAYED_VALIDATION.md).
+For this follow-up, real inference-engine adoption, TTFT and GPU validation are
+user-excluded, not pending gates. The earlier missing-evidence list records the
+scope of the historical run above.

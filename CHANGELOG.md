@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add ACK-aged RDMA prefix-chain delay and continuous capacity-turnover diagnostics,
+  with hot-prefix refill, explicit censoring and alternating fresh-policy pairs;
+  preserve scoring defaults and exclude inference-engine adoption and TTFT.
+
 - Add bounded real-RDMA prefix-chain replay and fresh legacy/lifetime correctness
   pairs, with checked payloads, separate refill costs and complete raw accounting;
   report usable-prefix proxies rather than inference-engine adoption or formal A/B.
