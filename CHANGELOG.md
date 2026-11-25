@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add bounded real-RDMA prefix-chain replay and fresh legacy/lifetime correctness
+  pairs, with checked payloads, separate refill costs and complete raw accounting;
+  report usable-prefix proxies rather than inference-engine adoption or formal A/B.
+
 - Add a bounded stateful FIFO fake for shared-prefix reuse, suffix refill and
   serial capacity competition, with raw transition audits and full-denominator
   accounting; do not model production lifetime/legacy or threaded concurrency.

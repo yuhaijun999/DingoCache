@@ -152,3 +152,6 @@ git diff --check
 
 本轮不启动服务/VM/压测，不触碰 HOST `/mnt/disk1` 的压力或 SMART 采样；
 后续真实服务继续仅允许 RDMA，GPU 排除。
+
+下一阶段：[真实 RDMA 前缀链回放与双策略正确性验证](DISK_LIFETIME_PREFIX_RDMA_VALIDATION.md)。
+其直接读取结果仍只是可用前缀代理，不等同真实引擎采用。
