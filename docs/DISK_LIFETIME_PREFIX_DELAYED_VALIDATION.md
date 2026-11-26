@@ -1,5 +1,7 @@
 # RDMA prefix-chain delayed reuse and continuous turnover
 
+Follow-up: [mixed-size prefix / global-watermark long-duration validation](DISK_LIFETIME_PREFIX_MIXED_VALIDATION.md) records twelve separately frozen due-first cases, including prior failures; do not pool those results with this earlier uniform-size experiment.
+
 This is a bounded synthetic cache-service diagnostic, not formal production A/B.
 It measures payload-validated usable-prefix proxies, **not inference-engine adoption
 or TTFT**. The user excludes real inference-engine, TTFT and GPU validation.

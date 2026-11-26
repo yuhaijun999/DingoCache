@@ -27,10 +27,12 @@ NS = 1_000_000_000
 
 
 def generate(**kwargs):
-    if set(kwargs)-set(DEFAULTS):
+    if set(kwargs)-set(DEFAULTS)-{'sizes','due_first'}:
         raise ValueError('unknown config')
+    if 'due_first' in kwargs and ('sizes' not in kwargs or type(kwargs['due_first']) is not bool):
+        raise ValueError('due_first must be an explicit v2 boolean')
     config = dict(DEFAULTS, **kwargs)
-    for name, low, high in [('seed',0,2**64-1),('prefill',12,12288),('steps',1,900),
+    for name, low, high in [('seed',0,2**64-1),('prefill',12,12288),('steps',1,1800),
                             ('interval_sec',1,1),('arrival_batch',24,128),
                             ('chain_length',8,8),('hot_interval_sec',1,30),
                             ('length',1,4096),('max_lateness_sec',1,5)]:
@@ -41,7 +43,18 @@ def generate(**kwargs):
             delays!=sorted(set(delays))):
         raise ValueError('invalid delays')
     config['delays_sec']=list(delays)
-    return _seal(dict(schema='dfkv-prefix-delayed-plan-v1',synthetic=True,config=config))
+    mixed='sizes' in kwargs
+    if mixed:
+        sizes=config['sizes']
+        supported=(4096,16384,65536,1048577,2097152)
+        if (type(sizes) is not list or not 1<=len(sizes)<=len(supported) or
+                any(type(value) is not int or value not in supported for value in sizes) or
+                sizes!=sorted(set(sizes)) or config['length']!=DEFAULTS['length'] or
+                config['arrival_batch']>64):
+            raise ValueError('invalid mixed sizes, scalar length or batch memory bound')
+        config['sizes']=list(sizes)
+    return _seal(dict(schema='dfkv-prefix-delayed-plan-v2' if mixed else 'dfkv-prefix-delayed-plan-v1',
+                      synthetic=True,config=config))
 
 
 def validate(plan):
@@ -71,9 +84,13 @@ def load(path):
 def object_for(plan,index):
     config=plan['config']
     _integer(index,'object_id',0,config['prefill']+config['steps']*config['arrival_batch']-1)
-    return dict(object_id=index,namespace_hex=b'prefix-delayed-v1\x00'.hex(),
-                key_hex=(b'pd\x00'+config['seed'].to_bytes(8,'big')+index.to_bytes(8,'big')).hex(),
-                generation=0,tokens=(index%4+1)*8,length=config['length'])
+    mixed='sizes' in config
+    namespace=b'prefix-mixed-v2\x00' if mixed else b'prefix-delayed-v1\x00'
+    key_prefix=b'pm\x00' if mixed else b'pd\x00'
+    return dict(object_id=index,namespace_hex=namespace.hex(),
+                key_hex=(key_prefix+config['seed'].to_bytes(8,'big')+index.to_bytes(8,'big')).hex(),
+                generation=0,tokens=(index%4+1)*8,
+                length=config['sizes'][index%len(config['sizes'])] if 'sizes' in config else config['length'])
 
 
 def payload(plan,obj):
@@ -91,6 +108,9 @@ def _execute(plan,invoke,schedule,transport):
     config=validate(plan)
     events,controls,requests=[],[],[]
     counts=Counter()
+    size_counts={}
+    mixed='sizes' in config
+    due_first=config.get('due_first',False)
     failed=None
     start=cutoff=None
     enrolled={}
@@ -108,9 +128,19 @@ def _execute(plan,invoke,schedule,transport):
         if op=='put':
             counts[{'ack':'put_acks','error':'put_errors','unknown':'put_unknown'}[status]]+=size
             if status=='ack':
-                counts['put_bytes']+=size*config['length']
+                counts['put_bytes']+=sum(object_for(plan,index)['length'] for index in ids)
         else:
             counts[{'hit':'get_hits','miss':'get_misses','error':'get_errors','unknown':'get_unknown'}[status]]+=1
+        if mixed:
+            for index in ids:
+                length=object_for(plan,index)['length']
+                current=size_counts.setdefault(str(length),Counter())
+                current[op+'_attempts']+=1
+                field=({'ack':'put_acks','error':'put_errors','unknown':'put_unknown'} if op=='put'
+                       else {'hit':'get_hits','miss':'get_misses','error':'get_errors','unknown':'get_unknown'})[status]
+                current[field]+=1
+                if op=='put' and status=='ack':
+                    current['put_bytes']+=length
         if status in ('error','unknown'):
             failed=dict(reason='native_failure',event_index=len(events)-1,status=status)
         return event
@@ -150,7 +180,7 @@ def _execute(plan,invoke,schedule,transport):
                              target_tokens=target,usable_tokens=usable if known else None,
                              confirmed_prefix_tokens=usable,first_unconfirmed_block=boundary,
                              outcomes=statuses+['not_attempted']*(len(ids)-len(statuses)),
-                             refill_put_acks=refill,refill_payload_bytes=refill*config['length'],
+                             refill_put_acks=refill,refill_payload_bytes=sum(object_for(plan,index)['length'] for index in ids[boundary:]) if refill else 0,
                              recompute_proxy_tokens=target-usable if known and boundary<len(ids) else 0,
                              state='completed' if failed is None else 'failed',
                              event_start=begin,event_end=len(events)))
@@ -161,6 +191,10 @@ def _execute(plan,invoke,schedule,transport):
             if not item['done'] and item['ack']+item['delay']*NS<=min(now,cutoff):
                 request(item['ids'],'delayed',identity[0],item['delay'],item['ack'])
                 item['done']=True
+                if due_first:
+                    # Native GET/refill time may make the next chain eligible.
+                    # Reuse ledger times so replay/check have identical ordering.
+                    now=max(now,events[-1]['finished_ns'])
     try:
         # Fillers first, hot shared blocks last, in bounded native batches.
         indexes=list(range(12,config['prefill']))+list(range(12))
@@ -172,7 +206,10 @@ def _execute(plan,invoke,schedule,transport):
             for ids in (list(range(8)),[0,1,2,3,8,9,10,11],list(range(2))):
                 request(ids,'warmup',-1)
                 row=requests[-1]
-                if row['usable_tokens']!=row['target_tokens']:
+                # Mixed-size geometry may reclaim a different class even below
+                # the nominal object count. Observe initial residency, not a pin
+                # guarantee; warmup never refills or changes first-read cohorts.
+                if failed is not None or (not mixed and row['usable_tokens']!=row['target_tokens']):
                     if failed is None:
                         failed=dict(reason='warmup_miss')
                     break
@@ -185,6 +222,14 @@ def _execute(plan,invoke,schedule,transport):
                 if now>target+config['max_lateness_sec']*NS or now>=cutoff:
                     failed=dict(reason='arrival_deadline',step=step)
                     break
+                if due_first:
+                    due(now)
+                    if failed is not None:
+                        break
+                    now=max(now,events[-1]['finished_ns'])
+                    if now>target+config['max_lateness_sec']*NS or now>=cutoff:
+                        failed=dict(reason='arrival_deadline',step=step)
+                        break
                 first=config['prefill']+step*config['arrival_batch']
                 event=call('put',range(first,first+config['arrival_batch']),'arrival')
                 if failed is not None:
@@ -276,7 +321,16 @@ def _execute(plan,invoke,schedule,transport):
         group['due']=sum(item['ack']+delay*NS<=cutoff for key,item in enrolled.items() if key[1]==delay) if cutoff is not None else 0
         group['due_target_tokens']=sum(row['target_tokens'] for row in rows if row.get('ack_ns') is not None and row['ack_ns']+delay*NS<=cutoff) if cutoff is not None else 0
         summary['by_delay'][str(delay)]=group
-    return _seal(dict(schema='dfkv-prefix-delayed-ledger-v1',plan_sha256=plan['sha256'],
+    if mixed:
+        summary['native_by_size']={str(length):{field:size_counts.get(str(length),Counter())[field]
+                                               for field in fields} for length in config['sizes']}
+        # Enrollment bins keep every planned identity, including terminal censor
+        # and unattempted work. They are not completion-time or latency windows.
+        summary['enrollment_window_sec']=300
+        summary['by_enrollment_window']={str(second):summarize([row for row in business
+                                         if second<=row['step']*config['interval_sec']<second+300])
+                                         for second in range(0,config['steps']*config['interval_sec'],300)}
+    return _seal(dict(schema='dfkv-prefix-delayed-ledger-v2' if mixed else 'dfkv-prefix-delayed-ledger-v1',plan_sha256=plan['sha256'],
                       transport=transport,passed=failed is None,failure=failed,
                       measurement_started_ns=start,cutoff_ns=cutoff,controls=controls,
                       events=events,requests=requests,summary=summary))
@@ -400,7 +454,8 @@ def main(argv=None):
             args.output.mkdir(exist_ok=False)
             sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'integration/common/src'))
             from disk_scenarios import load_library
-            backend=RdmaBackend(load_library(args.lib),args.members,b'prefix-delayed-v1\x00')
+            backend=RdmaBackend(load_library(args.lib),args.members,
+                                bytes.fromhex(object_for(plan,0)['namespace_hex']))
             result=replay(plan,backend)
             backend.close()
             backend=None

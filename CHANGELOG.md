@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add opt-in mixed-size prefix-chain diagnostics with explicit global-watermark
+  evidence, periodic resource samples and long-duration alternating policy pairs;
+  retain default scoring and distinguish donor/background activity from watermark
+  victims and continuous-prefix proxies from inference-engine benefits. Preserve
+  earlier ledger ordering and add explicit opt-in due-first scheduling without
+  relaxing timing guards.
+
 - Add ACK-aged RDMA prefix-chain delay and continuous capacity-turnover diagnostics,
   with hot-prefix refill, explicit censoring and alternating fresh-policy pairs;
   preserve scoring defaults and exclude inference-engine adoption and TTFT.
