@@ -380,3 +380,5 @@ already-proven generic behavior solely to inflate completion counts. GPU,
 real inference-engine adoption and TTFT stay excluded, not pending blockers.
 Formal A/B acceptance, representative business thresholds and production rollout
 remain separate; neither this diagnostic nor a low error count flips defaults.
+
+后续恢复与策略切换诊断见 [恢复验证](DISK_LIFETIME_PREFIX_RECOVERY_VALIDATION.md)。

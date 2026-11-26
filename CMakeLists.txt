@@ -318,6 +318,21 @@ if(DFKV_BUILD_TESTS)
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
               -p test_prefix_concurrent_runner.py)
     set_tests_properties(python_prefix_concurrent_runner PROPERTIES TIMEOUT 60)
+    add_test(NAME python_prefix_recovery
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
+              -p test_prefix_recovery.py)
+    set_tests_properties(python_prefix_recovery PROPERTIES TIMEOUT 60)
+    add_test(NAME python_prefix_recovery_runner
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
+              -p test_prefix_recovery_runner.py)
+    set_tests_properties(python_prefix_recovery_runner PROPERTIES TIMEOUT 60)
+    add_test(NAME python_prefix_recovery_active
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python
+              -p test_prefix_recovery_active.py)
+    set_tests_properties(python_prefix_recovery_active PROPERTIES TIMEOUT 60)
     add_test(NAME python_eviction_ab_prepare
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/test/python

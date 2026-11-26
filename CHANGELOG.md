@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add opt-in RDMA prefix recovery diagnostics for clean and dirty restarts,
+  bidirectional eviction-policy switches and repeated recovery under pressure;
+  distinguish warm-cache preservation from intentional dirty cold reset.
+
 - Add independent-worker RDMA prefix-chain diagnostics with privately owned
   handles, fixed per-worker schedules, checked first-gap/refill accounting and
   explicit C-ABI overlap evidence; preserve production scoring and distinguish
