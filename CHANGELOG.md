@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add independent-worker RDMA prefix-chain diagnostics with privately owned
+  handles, fixed per-worker schedules, checked first-gap/refill accounting and
+  explicit C-ABI overlap evidence; preserve production scoring and distinguish
+  paced concurrent streams from a global open-loop performance benchmark.
+
 - Add opt-in mixed-size prefix-chain diagnostics with explicit global-watermark
   evidence, periodic resource samples and long-duration alternating policy pairs;
   retain default scoring and distinguish donor/background activity from watermark

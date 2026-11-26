@@ -444,3 +444,5 @@ strategy/default flip is authorized by these observations.
 Related: [delayed-prefix validation](DISK_LIFETIME_PREFIX_DELAYED_VALIDATION.md),
 [business acceptance](DISK_LIFETIME_PREFIX_BUSINESS_ACCEPTANCE.md),
 [quick multisize validation](DISK_LIFETIME_QUICK_VALIDATION.md).
+
+Next diagnostic: [independent concurrent prefix chains](DISK_LIFETIME_PREFIX_CONCURRENT_VALIDATION.md).
