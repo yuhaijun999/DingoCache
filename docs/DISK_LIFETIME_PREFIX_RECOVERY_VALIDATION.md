@@ -187,3 +187,6 @@ Ubuntu disposable VM，6 vCPU / 8GiB，Debug RDMA ON / io_uring ON；RXE loopbac
 RAM 关闭，PUT ACK=disk，payload write=buffered；watermark/background reclaim 关闭；生产评分九项默认值保持不变，诊断 override 与生产默认值分开。
 同一 VM/文件系统/page cache 的进程重启，不是宿主重启、断电或冷物理盘测试；启动就绪耗时也不是独立恢复 I/O 或生产恢复 SLO。
 资源样本仅 owned server CPU/RSS/threads；不代表客户端、VM、宿主、page cache、注册内存或锁等待的完整资源预算。
+
+后续[参数／资源边界与长时混合验证](DISK_LIFETIME_BOUNDARY_VALIDATION.md)
+补充 server/client 资源采样与 M=1/2/4/63 矩阵，不改写本报告的历史恢复结论。

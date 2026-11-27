@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add RDMA MAX_READS/bucket-boundary diagnostics, identity-bound server/client
+  resource sampling and fail-closed startup rejection checks, with unit tests
+  and explicit limits on synthetic stability and resource-accounting claims.
+
 - Add opt-in RDMA prefix recovery diagnostics for clean and dirty restarts,
   bidirectional eviction-policy switches and repeated recovery under pressure;
   distinguish warm-cache preservation from intentional dirty cold reset.
